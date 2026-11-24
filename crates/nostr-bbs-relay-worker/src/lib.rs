@@ -733,6 +733,39 @@ pub(crate) const PROBE_BLIND_STMTS: [&str; 5] = [
 pub(crate) const EVENT_TAGS_TIME_COLUMN_SQL: &str =
     "ALTER TABLE event_tags ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0";
 
+/// Whether a `pubkey_aliases` table definition (its `sqlite_master.sql`) is
+/// the earlier shape with `new_pubkey` as the primary key, which allowed one
+/// predecessor per successor. Whitespace and case insensitive.
+pub(crate) fn pubkey_aliases_need_upgrade(table_sql: &str) -> bool {
+    let squashed: String = table_sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    squashed.contains("new_pubkey text primary key")
+}
+
+/// Rebuild `pubkey_aliases` with `old_pubkey` as the primary key (also
+/// migration 0016). Rows are copied oldest first with REPLACE, so a key that
+/// the earlier shape linked to several successors keeps its LATEST link (an
+/// old key now resolves to exactly one successor). Idempotent: on the new
+/// shape it rebuilds the same rows.
+pub(crate) const PUBKEY_ALIASES_UPGRADE_STMTS: [&str; 6] = [
+    "DROP TABLE IF EXISTS pubkey_aliases_v2",
+    "CREATE TABLE pubkey_aliases_v2 (\
+        old_pubkey TEXT PRIMARY KEY NOT NULL, \
+        new_pubkey TEXT NOT NULL, \
+        created_by TEXT NOT NULL, \
+        created_at INTEGER NOT NULL, \
+        reason TEXT)",
+    "INSERT OR REPLACE INTO pubkey_aliases_v2 (old_pubkey, new_pubkey, created_by, created_at, reason) \
+     SELECT old_pubkey, new_pubkey, created_by, created_at, reason FROM pubkey_aliases \
+     ORDER BY created_at ASC, rowid ASC",
+    "DROP TABLE pubkey_aliases",
+    "ALTER TABLE pubkey_aliases_v2 RENAME TO pubkey_aliases",
+    "CREATE INDEX IF NOT EXISTS idx_pubkey_aliases_new ON pubkey_aliases(new_pubkey)",
+];
+
 /// The indexes that let a paged history read stop after `limit` rows.
 ///
 /// - `idx_event_tags_time` delivers one tag value's rows newest-first and
@@ -1358,10 +1391,12 @@ async fn ensure_schema(env: &Env) -> bool {
         // inheritance is modelled as an alias: a newly-joining `new_pubkey` is
         // linked to a prior `old_pubkey` so the DISPLAY layer attributes the new
         // key's posts under the prior handle and cohorts can be inherited.
-        // `new_pubkey` is the PK (a joining key maps to at most one prior id).
+        // `old_pubkey` is the PK: a replaced key has exactly one successor, a
+        // successor may replace several keys (see PUBKEY_ALIASES_UPGRADE_STMTS
+        // for deployments created with the earlier new_pubkey PK).
         "CREATE TABLE IF NOT EXISTS pubkey_aliases (\
-            new_pubkey TEXT PRIMARY KEY NOT NULL, \
-            old_pubkey TEXT NOT NULL, \
+            old_pubkey TEXT PRIMARY KEY NOT NULL, \
+            new_pubkey TEXT NOT NULL, \
             created_by TEXT NOT NULL, \
             created_at INTEGER NOT NULL, \
             reason TEXT\
@@ -1419,6 +1454,30 @@ async fn ensure_schema(env: &Env) -> bool {
         let _ = db.prepare(stmt).run().await;
     }
 
+    // pubkey_aliases: rebuild a table created with the earlier new_pubkey
+    // primary key (one predecessor per successor) as old_pubkey-keyed, in one
+    // batch, keeping every row (a key replaced twice keeps its latest link).
+    #[derive(serde::Deserialize)]
+    struct TableSql {
+        sql: Option<String>,
+    }
+    let shape = db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pubkey_aliases'")
+        .first::<TableSql>(None)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.sql);
+    if shape.as_deref().is_some_and(pubkey_aliases_need_upgrade) {
+        let stmts: Vec<D1PreparedStatement> = PUBKEY_ALIASES_UPGRADE_STMTS
+            .iter()
+            .map(|s| db.prepare(*s))
+            .collect();
+        if let Err(e) = db.batch(stmts).await {
+            console_error!("ensure_schema: pubkey_aliases upgrade failed: {e}");
+        }
+    }
+
     // --- Indexes (idempotent via IF NOT EXISTS) ---
     let index_stmts = [
         "CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)",
@@ -1452,9 +1511,8 @@ async fn ensure_schema(env: &Env) -> bool {
         "CREATE INDEX IF NOT EXISTS idx_governance_receipts_stage ON governance_receipts(stage)",
         "CREATE INDEX IF NOT EXISTS idx_governance_receipts_request ON governance_receipts(request_event_id)",
         "CREATE INDEX IF NOT EXISTS idx_governance_receipts_signer ON governance_receipts(signer_pubkey)",
-        // Task #7: reverse lookup old_pubkey -> new_pubkey for display/cohort
-        // resolution (the forward new_pubkey lookup uses the PK).
-        "CREATE INDEX IF NOT EXISTS idx_pubkey_aliases_old ON pubkey_aliases(old_pubkey)",
+        // Task #7: a successor's predecessors (old_pubkey is the PK).
+        "CREATE INDEX IF NOT EXISTS idx_pubkey_aliases_new ON pubkey_aliases(new_pubkey)",
         // ADR-2011 (migration 0006). `idx_broker_cases_pending_age` serves the
         // ageing sweep's state filter; the sweep orders by a computed deadline
         // expression, which SQLite cannot index, so this narrows rather than
@@ -2596,5 +2654,133 @@ mod tombstone_tests {
             vec![(30023, A.to_string(), "post".to_string(), 100)],
             "own addressable refs only: not another author's, a regular kind, or a malformed kind"
         );
+    }
+}
+
+#[cfg(test)]
+mod pubkey_alias_many_to_one_tests {
+    //! pubkey_aliases keyed by old_pubkey: several old keys -> one successor,
+    //! an old key -> exactly one successor, upgraded in place from the 0003
+    //! shape without losing rows.
+    use super::{pubkey_aliases_need_upgrade, PUBKEY_ALIASES_UPGRADE_STMTS};
+    use rusqlite::{params, Connection};
+
+    const MIGRATION_0003: &str = include_str!("../migrations/0003_pubkey_aliases.sql");
+    const MIGRATION_0016: &str = include_str!("../migrations/0016_pubkey_aliases_many_to_one.sql");
+
+    fn table_sql(c: &Connection) -> String {
+        c.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pubkey_aliases'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn upgrade(c: &Connection) {
+        if pubkey_aliases_need_upgrade(&table_sql(c)) {
+            c.execute_batch("BEGIN").unwrap();
+            for s in PUBKEY_ALIASES_UPGRADE_STMTS {
+                c.execute_batch(s).unwrap();
+            }
+            c.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    /// The handler's upsert (user_admin.rs).
+    fn link(c: &Connection, old: &str, new: &str, at: i64) {
+        c.execute(
+            "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at, reason) \
+             VALUES (?1, ?2, 'admin', ?3, NULL) \
+             ON CONFLICT (old_pubkey) DO UPDATE SET new_pubkey = excluded.new_pubkey, \
+             created_by = excluded.created_by, created_at = excluded.created_at, reason = excluded.reason",
+            params![new, old, at],
+        )
+        .unwrap();
+    }
+
+    fn successors(c: &Connection) -> Vec<(String, String)> {
+        let mut s = c
+            .prepare("SELECT old_pubkey, new_pubkey FROM pubkey_aliases ORDER BY old_pubkey")
+            .unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.into(), b.into())
+    }
+
+    #[test]
+    fn the_0003_shape_is_detected_and_the_new_one_is_not() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        assert!(pubkey_aliases_need_upgrade(&table_sql(&c)));
+        upgrade(&c);
+        assert!(!pubkey_aliases_need_upgrade(&table_sql(&c)));
+    }
+
+    #[test]
+    fn upgrading_keeps_every_row_and_the_latest_link_of_a_twice_replaced_key() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        // 0003 shape: new_pubkey PK; one old key linked to two successors.
+        for (new, old, at) in [("live1", "a", 1), ("live2", "b", 2), ("live3", "a", 3)] {
+            c.execute(
+                "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at) VALUES (?1, ?2, 'x', ?3)",
+                params![new, old, at],
+            )
+            .unwrap();
+        }
+        upgrade(&c);
+        assert_eq!(successors(&c), vec![pair("a", "live3"), pair("b", "live2")]);
+        // Re-running is harmless (ensure_schema skips; 0016 rebuilds the same rows).
+        upgrade(&c);
+        c.execute_batch(MIGRATION_0016).unwrap();
+        assert_eq!(successors(&c), vec![pair("a", "live3"), pair("b", "live2")]);
+    }
+
+    #[test]
+    fn several_old_keys_resolve_to_one_successor_and_relinking_moves_one() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        upgrade(&c);
+        // The operator's three old keys and Jezbot's two.
+        for old in ["op1", "op2", "op3"] {
+            link(&c, old, "bfcf20d4", 10);
+        }
+        link(&c, "jez1", "jezlive", 11);
+        link(&c, "jez2", "jezlive", 12);
+        assert_eq!(successors(&c).len(), 5, "no predecessor overwritten");
+        let preds: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pubkey_aliases WHERE new_pubkey = 'bfcf20d4'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(preds, 3);
+        // An old key has exactly one successor: re-linking replaces it.
+        link(&c, "op3", "other", 13);
+        let s: String = c
+            .query_row(
+                "SELECT new_pubkey FROM pubkey_aliases WHERE old_pubkey = 'op3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s, "other");
+        assert_eq!(successors(&c).len(), 5);
+        // The predecessor lookup is served by the index.
+        let plan: String = c
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT old_pubkey FROM pubkey_aliases WHERE new_pubkey = 'x'",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_pubkey_aliases_new"), "{plan}");
     }
 }

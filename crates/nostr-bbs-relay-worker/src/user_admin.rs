@@ -103,6 +103,38 @@ struct AliasBody {
     /// new pubkey's whitelist row so the new key inherits zone access.
     #[serde(default = "default_true")]
     inherit_cohorts: bool,
+    /// Alias an old key that is whitelisted in its own right (an account,
+    /// not just a key that signed history). Refused without it.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Why an alias `old -> new` is refused, if it is. One hop only, so neither
+/// end may already be in a chain: an old key that is itself someone's
+/// successor would leave its own predecessors resolving to it, not to `new`;
+/// a successor that is itself replaced would never be shown. An old key with
+/// its own whitelist row is a live account: linking it hands its display
+/// identity to `new`, so that takes `force` (admins only reach this at all).
+pub(crate) fn alias_refusal(
+    old_is_whitelisted: bool,
+    old_is_a_successor: bool,
+    new_is_replaced: bool,
+    force: bool,
+) -> Option<&'static str> {
+    if old_is_a_successor {
+        return Some(
+            "old_pubkey is itself a successor of other keys: re-point those first (one hop only)",
+        );
+    }
+    if new_is_replaced {
+        return Some("new_pubkey is itself replaced by another key: link to its successor instead");
+    }
+    if old_is_whitelisted && !force {
+        return Some(
+            "old_pubkey is a whitelisted account in its own right: pass force=true to alias it",
+        );
+    }
+    None
 }
 
 fn default_true() -> bool {
@@ -596,8 +628,47 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
     let now = auth::js_now_secs();
     let db = env.d1("DB")?;
 
-    // Persist the alias (new_pubkey is the PK: a joining key maps to at most one
-    // prior identity; re-linking overwrites).
+    // Guards (see alias_refusal). Lookup errors refuse (fail closed).
+    #[derive(Deserialize)]
+    struct N {
+        n: f64,
+    }
+    let count = |sql: &'static str, pk: String| {
+        let db = &db;
+        async move {
+            db.prepare(sql)
+                .bind(&[js_str(&pk)])?
+                .first::<N>(None)
+                .await
+                .map(|r| r.map_or(0.0, |r| r.n) > 0.0)
+        }
+    };
+    let (old_wl, old_succ, new_repl) = match (
+        count(
+            "SELECT COUNT(*) AS n FROM whitelist WHERE pubkey = ?1",
+            old_pk.clone(),
+        )
+        .await,
+        count(
+            "SELECT COUNT(*) AS n FROM pubkey_aliases WHERE new_pubkey = ?1",
+            old_pk.clone(),
+        )
+        .await,
+        count(
+            "SELECT COUNT(*) AS n FROM pubkey_aliases WHERE old_pubkey = ?1",
+            new_pk.clone(),
+        )
+        .await,
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => return json_response(env, &json!({ "error": "Alias lookup failed" }), 503),
+    };
+    if let Some(reason) = alias_refusal(old_wl, old_succ, new_repl, body.force) {
+        return json_response(env, &json!({ "error": reason }), 409);
+    }
+
+    // Persist the alias. old_pubkey is the PK: a replaced key has exactly one
+    // successor (re-linking it overwrites); a successor may replace many keys.
     let reason_val = match body.reason.as_deref() {
         Some(r) if !r.is_empty() => js_str(r),
         _ => JsValue::NULL,
@@ -605,8 +676,8 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
     db.prepare(
         "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at, reason) \
          VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT (new_pubkey) DO UPDATE SET \
-            old_pubkey = excluded.old_pubkey, \
+         ON CONFLICT (old_pubkey) DO UPDATE SET \
+            new_pubkey = excluded.new_pubkey, \
             created_by = excluded.created_by, \
             created_at = excluded.created_at, \
             reason = excluded.reason",
@@ -682,5 +753,32 @@ mod tests {
         assert!(!valid_pubkey(&"a".repeat(65)));
         assert!(!valid_pubkey(&format!("g{}", "a".repeat(63))));
         assert!(!valid_pubkey(""));
+    }
+}
+
+#[cfg(test)]
+mod alias_refusal_tests {
+    use super::alias_refusal;
+
+    #[test]
+    fn chains_are_refused_and_live_accounts_need_force() {
+        assert_eq!(
+            alias_refusal(false, false, false, false),
+            None,
+            "an archive key"
+        );
+        assert!(
+            alias_refusal(false, true, false, true).is_some(),
+            "old key is a successor, even forced"
+        );
+        assert!(
+            alias_refusal(false, false, true, true).is_some(),
+            "new key is replaced, even forced"
+        );
+        assert!(
+            alias_refusal(true, false, false, false).is_some(),
+            "a whitelisted account"
+        );
+        assert_eq!(alias_refusal(true, false, false, true), None, "forced");
     }
 }
