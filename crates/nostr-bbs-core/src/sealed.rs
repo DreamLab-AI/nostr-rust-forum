@@ -354,6 +354,114 @@ pub fn seal_original(
     zone_pk_hex: &str,
     migrator_sk: &SecretKey,
 ) -> Result<NostrEvent, SealError> {
+    check_original(original)?;
+    let zone_pk = check_zone_key(zone, epoch, zone_pk_hex)?;
+    seal_checked(original, zone, epoch, &zone_pk, migrator_sk, |inner| {
+        nip44::encrypt(migrator_sk.as_bytes(), &zone_pk, inner)
+    })
+}
+
+/// Seals many originals into one zone key: [`seal_original`] with the zone
+/// key validated and the NIP-44 conversation key (migrator x zone pubkey)
+/// derived ONCE, for bulk sealing (e.g. an offline, multi-threaded pass).
+///
+/// Every envelope is exactly what [`seal_original`] would produce for the
+/// same inputs (same checks on each original, same tags, same signer), apart
+/// from the random NIP-44 nonce; [`open_sealed`] accepts both. The
+/// conversation key is derived internally from the key it is used with, so
+/// it cannot be paired with the wrong zone. `Send + Sync`: share one sealer
+/// across threads.
+///
+/// # Example
+///
+/// ```
+/// use nostr_bbs_core::keys::SecretKey;
+/// use nostr_bbs_core::sealed::{open_sealed, OriginalSealer};
+/// use nostr_bbs_core::{sign_event_deterministic, UnsignedEvent};
+///
+/// let author = k256::schnorr::SigningKey::from_bytes(&[0x11u8; 32].into()).unwrap();
+/// let original = sign_event_deterministic(
+///     UnsignedEvent {
+///         pubkey: hex::encode(author.verifying_key().to_bytes()),
+///         created_at: 1_600_000_000,
+///         kind: 42,
+///         tags: vec![vec!["e".into(), "c".repeat(64), "".into(), "root".into()]],
+///         content: "hello".into(),
+///     },
+///     &author,
+/// )
+/// .unwrap();
+/// let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+/// let zone_sk = [0x33u8; 32];
+/// let zone_pk = SecretKey::from_bytes(zone_sk).unwrap().public_key().to_hex();
+/// let sealer = OriginalSealer::new("zone2", 1, &zone_pk, migrator).unwrap();
+/// let outer = sealer.seal(&original).unwrap();
+/// assert_eq!(open_sealed(&outer, &zone_sk).unwrap().id, original.id);
+/// ```
+pub struct OriginalSealer {
+    zone: String,
+    epoch: u32,
+    zone_pk: [u8; 32],
+    migrator_sk: SecretKey,
+    conversation_key: [u8; 32],
+}
+
+impl OriginalSealer {
+    /// Validate the zone key and derive the conversation key once.
+    ///
+    /// # Errors
+    ///
+    /// [`SealError::InvalidZoneKey`] for an empty zone, epoch 0, or a zone
+    /// pubkey that is not 64 hex or not on the curve; [`SealError::Encrypt`]
+    /// if the conversation key cannot be derived.
+    pub fn new(
+        zone: &str,
+        epoch: u32,
+        zone_pk_hex: &str,
+        migrator_sk: SecretKey,
+    ) -> Result<Self, SealError> {
+        let zone_pk = check_zone_key(zone, epoch, zone_pk_hex)?;
+        let conversation_key = nip44::conversation_key(migrator_sk.as_bytes(), &zone_pk)
+            .map_err(|e| SealError::Encrypt(e.to_string()))?;
+        Ok(Self {
+            zone: zone.to_string(),
+            epoch,
+            zone_pk,
+            migrator_sk,
+            conversation_key,
+        })
+    }
+
+    /// Seal one original (the same per-original checks as [`seal_original`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`seal_original`] for the original.
+    pub fn seal(&self, original: &NostrEvent) -> Result<NostrEvent, SealError> {
+        check_original(original)?;
+        seal_checked(
+            original,
+            &self.zone,
+            self.epoch,
+            &self.zone_pk,
+            &self.migrator_sk,
+            |inner| nip44::encrypt_with_conversation_key(&self.conversation_key, inner),
+        )
+    }
+}
+
+impl core::fmt::Debug for OriginalSealer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OriginalSealer")
+            .field("zone", &self.zone)
+            .field("epoch", &self.epoch)
+            .field("zone_pk", &hex::encode(self.zone_pk))
+            .finish_non_exhaustive()
+    }
+}
+
+/// The per-original checks of [`seal_original`].
+fn check_original(original: &NostrEvent) -> Result<(), SealError> {
     if original.kind != KIND_CHANNEL_MESSAGE {
         return Err(SealError::WrongKind(original.kind));
     }
@@ -363,8 +471,12 @@ pub fn seal_original(
     if has_zk_tag(&original.tags) {
         return Err(SealError::NestedZoneKey);
     }
-    let channel = channel_of(original).ok_or(SealError::MissingChannel)?;
+    channel_of(original).ok_or(SealError::MissingChannel)?;
+    Ok(())
+}
 
+/// The zone-key checks of [`seal_original`]; the decoded zone pubkey.
+fn check_zone_key(zone: &str, epoch: u32, zone_pk_hex: &str) -> Result<[u8; 32], SealError> {
     if zone.is_empty() {
         return Err(SealError::InvalidZoneKey("empty zone"));
     }
@@ -375,16 +487,29 @@ pub fn seal_original(
         decode_hex32(zone_pk_hex).ok_or(SealError::InvalidZoneKey("zone pubkey must be 64 hex"))?;
     crate::keys::PublicKey::from_bytes(zone_pk)
         .map_err(|_| SealError::InvalidZoneKey("zone pubkey is not on the curve"))?;
+    Ok(zone_pk)
+}
 
+/// Build the envelope for a checked original with `encrypt` for the content.
+fn seal_checked(
+    original: &NostrEvent,
+    zone: &str,
+    epoch: u32,
+    zone_pk: &[u8; 32],
+    migrator_sk: &SecretKey,
+    encrypt: impl FnOnce(&str) -> Result<String, nip44::Nip44Error>,
+) -> Result<NostrEvent, SealError> {
+    let channel = channel_of(original).ok_or(SealError::MissingChannel)?;
     // `NostrEvent` serialises exactly the seven NIP-01 fields in declaration order.
     let inner_json = serde_json::to_string(original).map_err(|_| SealError::MalformedInner)?;
+    let content = encrypt(&inner_json).map_err(|e| SealError::Encrypt(e.to_string()))?;
 
     // The only thread metadata exposed: the topic the original replies to, so
     // the relay can page one topic (`#e:[topic]`). Copied from the original,
     // never supplied by the caller; `quote` and `p` tags stay inside.
     let topic = reply_root_of(original);
-    build_envelope(
-        &inner_json,
+    assemble_envelope(
+        content,
         channel,
         topic,
         is_topic_root(original),
@@ -392,7 +517,7 @@ pub fn seal_original(
         &original.id,
         zone,
         epoch,
-        &zone_pk,
+        zone_pk,
         migrator_sk,
     )
 }
@@ -599,6 +724,7 @@ impl From<InnerWire> for NostrEvent {
 /// Encrypt `inner_json` to the zone key and sign the outer envelope. This does
 /// not validate the plaintext, so tests can craft hostile envelopes with it.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn build_envelope(
     inner_json: &str,
     channel: &str,
@@ -613,6 +739,34 @@ fn build_envelope(
 ) -> Result<NostrEvent, SealError> {
     let content = nip44::encrypt(migrator_sk.as_bytes(), zone_pk, inner_json)
         .map_err(|e| SealError::Encrypt(e.to_string()))?;
+    assemble_envelope(
+        content,
+        channel,
+        topic,
+        root_marker,
+        created_at,
+        inner_id,
+        zone,
+        epoch,
+        zone_pk,
+        migrator_sk,
+    )
+}
+
+/// The envelope for already-encrypted `content`: the tags, the signer.
+#[allow(clippy::too_many_arguments)]
+fn assemble_envelope(
+    content: String,
+    channel: &str,
+    topic: Option<&str>,
+    root_marker: bool,
+    created_at: u64,
+    inner_id: &str,
+    zone: &str,
+    epoch: u32,
+    zone_pk: &[u8; 32],
+    migrator_sk: &SecretKey,
+) -> Result<NostrEvent, SealError> {
     let mut tags = vec![
         vec![
             "e".to_string(),
@@ -1308,6 +1462,39 @@ mod tests {
             "the relay hint is not copied"
         );
         assert_eq!(open(&outer).unwrap().id, orig.id);
+    }
+
+    #[test]
+    fn the_bulk_sealer_produces_what_seal_original_produces() {
+        let zone_sk = *zone().as_bytes();
+        let sealer = OriginalSealer::new("zone3", 1, &zone_pk_hex(), migrator()).unwrap();
+        let reply = original();
+        let root = inner_with(vec![tag(&["e", &channel(), "", "root"])]);
+        for orig in [&reply, &root] {
+            let a = seal_original(orig, "zone3", 1, &zone_pk_hex(), &migrator()).unwrap();
+            let b = sealer.seal(orig).unwrap();
+            assert_eq!(a.tags, b.tags, "same tags");
+            assert_eq!(
+                (a.pubkey.as_str(), a.created_at, a.kind),
+                (b.pubkey.as_str(), b.created_at, b.kind)
+            );
+            assert_ne!(a.content, b.content, "fresh nonce");
+            let (oa, ob) = (open(&a).unwrap(), open(&b).unwrap());
+            assert_eq!(
+                serde_json::to_string(&oa).unwrap(),
+                serde_json::to_string(&ob).unwrap()
+            );
+            assert_eq!(oa.id, orig.id);
+            let _ = zone_sk;
+        }
+        // Same per-original refusals.
+        let mut bad = original();
+        bad.content.push('x');
+        assert_eq!(sealer.seal(&bad).unwrap_err(), SealError::InvalidSignature);
+        assert!(matches!(
+            OriginalSealer::new("", 1, &zone_pk_hex(), migrator()),
+            Err(SealError::InvalidZoneKey(_))
+        ));
     }
 
     #[test]

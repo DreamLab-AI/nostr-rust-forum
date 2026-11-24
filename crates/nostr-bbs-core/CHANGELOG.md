@@ -8,6 +8,12 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 
 ### Added
 
+- `nip44::encrypt_with_conversation_key`: NIP-44 v2 encryption under a precomputed conversation
+  key (counterpart of `decrypt_with_conversation_key`); same length rules and output as `encrypt`.
+- `sealed::OriginalSealer`: bulk sealing into one zone key; validates the zone key and derives the
+  conversation key once, then seals each original exactly as `seal_original` (same checks, tags,
+  signer; fresh nonce). `Send + Sync`.
+
 - `nip44::decrypt_with_conversation_key`: NIP-44 v2 decryption with a conversation key the
   caller already derived, for readers decrypting many messages from one peer. Same payload
   checks as `nip44::decrypt` (size bound, base64, version `0x02`), then upstream

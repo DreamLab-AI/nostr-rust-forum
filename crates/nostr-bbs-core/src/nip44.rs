@@ -75,6 +75,52 @@ pub fn encrypt(
     upstream_encrypt(&sk, &pk, plaintext, Version::V2).map_err(map_upstream_err)
 }
 
+/// Encrypt `plaintext` with NIP-44 v2 under a conversation key the caller
+/// already derived ([`conversation_key`]): the counterpart of
+/// [`decrypt_with_conversation_key`] for a sender encrypting many messages to
+/// one peer. Same length rules and output as [`encrypt`] (base64 of
+/// `nostr::nips::nip44::v2::encrypt_to_bytes`, fresh random nonce); only the
+/// per-message ECDH is skipped.
+///
+/// # Errors
+///
+/// [`Nip44Error::PlaintextTooShort`] / [`Nip44Error::PlaintextTooLong`] for
+/// out-of-range input; an upstream encryption failure otherwise.
+///
+/// # Example
+///
+/// ```
+/// use nostr_bbs_core::nip44::{conversation_key, decrypt, encrypt_with_conversation_key};
+/// use nostr_bbs_core::keys::SecretKey;
+///
+/// let alice = [0x11u8; 32];
+/// let bob = [0x22u8; 32];
+/// let alice_pk = *SecretKey::from_bytes(alice).unwrap().public_key().as_bytes();
+/// let bob_pk = *SecretKey::from_bytes(bob).unwrap().public_key().as_bytes();
+///
+/// let ck = conversation_key(&alice, &bob_pk).unwrap();
+/// let payload = encrypt_with_conversation_key(&ck, "hello").unwrap();
+/// assert_eq!(decrypt(&bob, &alice_pk, &payload).unwrap(), "hello");
+/// ```
+pub fn encrypt_with_conversation_key(
+    conversation_key: &[u8; 32],
+    plaintext: &str,
+) -> Result<String, Nip44Error> {
+    use base64::Engine;
+
+    let pt_bytes = plaintext.as_bytes();
+    if pt_bytes.is_empty() {
+        return Err(Nip44Error::PlaintextTooShort);
+    }
+    if pt_bytes.len() > MAX_PLAINTEXT_LEN {
+        return Err(Nip44Error::PlaintextTooLong);
+    }
+    let ck = ConversationKey::new(*conversation_key);
+    let bytes =
+        nostr::nips::nip44::v2::encrypt_to_bytes(&ck, pt_bytes).map_err(map_upstream_err)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 /// Decrypt a base64-encoded NIP-44 v2 ciphertext.
 ///
 /// Wraps `nostr::nips::nip44::decrypt`. Returns the plaintext UTF-8 string.
@@ -416,6 +462,25 @@ mod conversation_key_decrypt_tests {
             conversation_key(&A, &pk(B)).unwrap(),
             conversation_key(&B, &pk(A)).unwrap()
         );
+    }
+
+    #[test]
+    fn encrypting_with_a_conversation_key_round_trips_both_ways() {
+        let ck = conversation_key(&A, &pk(B)).unwrap();
+        for text in ["x", "hello world", &"é".repeat(5_000)] {
+            let payload = encrypt_with_conversation_key(&ck, text).unwrap();
+            assert_eq!(decrypt(&B, &pk(A), &payload).unwrap(), text);
+            assert_eq!(decrypt_with_conversation_key(&ck, &payload).unwrap(), text);
+        }
+        // Fresh nonce per message.
+        assert_ne!(
+            encrypt_with_conversation_key(&ck, "same").unwrap(),
+            encrypt_with_conversation_key(&ck, "same").unwrap()
+        );
+        assert!(matches!(
+            encrypt_with_conversation_key(&ck, ""),
+            Err(Nip44Error::PlaintextTooShort)
+        ));
     }
 
     #[test]
