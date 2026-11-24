@@ -48,7 +48,12 @@ pub fn DmChatPage() -> impl IntoView {
         let Some(cache) = crate::stores::profile_cache::try_use_profile_cache() else {
             return;
         };
-        if let Some(next) = cache.successor_tracked(&rpk) {
+        // One hop, and never into a chain or loop (a successor that is itself
+        // replaced means the map is inconsistent: stay put rather than bounce).
+        if let Some(next) = cache
+            .successor_tracked(&rpk)
+            .filter(|n| *n != rpk && cache.successor_tracked(n).is_none())
+        {
             navigate(
                 &format!("/dm/{next}"),
                 leptos_router::NavigateOptions {
