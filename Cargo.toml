@@ -49,6 +49,8 @@ members = [
     # sealed-original envelopes, verify, then purge the plaintext (ADR-2017).
     # Pure library + native-only binary, so it still passes the wasm32 check.
     "crates/nostr-bbs-zone-migrate",
+    # Sealed per-zone search: format, age sealing, quantised bge-small (app crate).
+    "crates/nostr-bbs-sealed-search",
 
     # ADR-2011 M4 probe suite: drives the escalation boundary on a live relay
     # and auth API and writes one receipt per probe. Pure library + native bin.

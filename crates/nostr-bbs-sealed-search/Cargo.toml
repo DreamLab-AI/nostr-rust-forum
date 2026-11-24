@@ -1,0 +1,32 @@
+[package]
+name = "nostr-bbs-sealed-search"
+version = "0.1.0"
+publish = false           # app crate: sealed per-zone search (format, sealing, model); not a crates.io dependency
+edition = "2021"
+description = "Sealed per-zone vector search for end-to-end-encrypted forum zones (browser + builder)"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+rust-version = "1.85"
+
+[dependencies]
+candle-core = { version = "0.9", default-features = false }
+candle-nn = { version = "0.9", default-features = false }
+age = { version = "0.11", default-features = false }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+unicode-normalization = "0.1"
+unicode-general-category = "1"
+bech32 = "0.9"
+nostr-bbs-core = { workspace = true }
+k256 = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true }
+getrandom3 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
