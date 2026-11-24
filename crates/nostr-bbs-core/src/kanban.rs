@@ -15,7 +15,10 @@
 //!   an admin's kind-31403 ActionResponse (Approve/Reject) resolves it. A
 //!   kanban approval request is identified by its `["k", "30302"]` tag; the
 //!   relay admits these from ordinary whitelisted members (unlike all other
-//!   31402s, which stay agent-registry-gated).
+//!   31402s, which stay agent-registry-gated). The relay also verifies the
+//!   *entry*: a non-admin card version that enters an approval column must
+//!   follow a stored, admin-approved, unspent request
+//!   ([`check_approved_entry`]; `KANBAN_APPROVAL_GATE`, `warn` by default).
 //! - Kind 38000 **agent intents**: dispatching a card to an agent publishes an
 //!   agent-intent referencing the card, which the agentbox bridge routes to the
 //!   agent's inbox.
@@ -755,6 +758,184 @@ pub fn parse_approval_decision(event: &NostrEvent) -> Option<ApprovalDecision> {
     })
 }
 
+// -- Relay approval gate -----------------------------------------------------------
+
+/// Whether publishing `incoming` is an *entry* into an approval-gated column.
+///
+/// True when the board is known, lists `incoming.column` in its approval
+/// columns, and the latest prior version of the card (if any) sits in a
+/// different column. A card with no prior version counts as entering. Edits,
+/// claims, reranks and tombstones that leave the card where it already is are
+/// not entries, so cards already sitting in an approval column are
+/// grandfathered.
+pub fn entry_requires_approval(
+    board: Option<&KanbanBoard>,
+    prior: Option<&KanbanCard>,
+    incoming: &KanbanCard,
+) -> bool {
+    let Some(board) = board else {
+        return false;
+    };
+    board.column_needs_approval(&incoming.column)
+        && prior.map(|p| p.column != incoming.column).unwrap_or(true)
+}
+
+/// The latest admin-signed kind-31403 that cites an approval request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionFacts<'a> {
+    /// Event id of the decision.
+    pub event_id: &'a str,
+    /// `true` for Approve, `false` for Reject.
+    pub approved: bool,
+    /// The decider's effective principal (device key resolved to its owner).
+    pub decider_principal: &'a str,
+}
+
+/// Everything [`check_approved_entry`] needs, gathered by the caller.
+///
+/// The core crate does no I/O: the relay reads the prior card version, the
+/// request, the decision and the spent-approval table, then hands the facts in.
+#[derive(Debug, Clone)]
+pub struct ApprovalFacts<'a> {
+    /// The card version being published.
+    pub incoming: &'a KanbanCard,
+    /// The latest stored version of the same card, if any.
+    pub prior: Option<&'a KanbanCard>,
+    /// The stored event the prior version's `pending_move` names, if found.
+    pub request: Option<&'a NostrEvent>,
+    /// The request signer's effective principal. When `None`, the request's
+    /// own `pubkey` is used.
+    pub requester_principal: Option<&'a str>,
+    /// The latest admin-signed decision citing the request, if any.
+    pub decision: Option<DecisionFacts<'a>>,
+    /// The card event id that already spent this approval, if any.
+    pub consumed_by: Option<&'a str>,
+}
+
+/// An entry the gate has admitted: the facts to record as spent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedEntry {
+    /// The kind-31402 request being spent.
+    pub request_id: String,
+    /// The kind-31403 decision that approved it.
+    pub decision_id: String,
+    /// Board coordinate of the card.
+    pub board: String,
+    /// The card's `d` tag.
+    pub card_d: String,
+    /// The approval column entered.
+    pub target_col: String,
+}
+
+/// Why the relay refused a card version that enters an approval column.
+///
+/// Each variant has a stable wire token, see [`ApprovalRefusal::token`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalRefusal {
+    /// The prior version carries no `pending_move`.
+    Missing,
+    /// The `pending_move` target, or the request's `target_col`, differs from
+    /// the column being entered.
+    ColumnMismatch,
+    /// The request is not stored, or is not a kanban 31402.
+    RequestMissing,
+    /// The request's `board` or `card_d` differs from the card's.
+    CardMismatch,
+    /// No admin-signed 31403 cites the request.
+    Undecided,
+    /// The latest eligible decision is Reject.
+    Denied,
+    /// The decider and the requester resolve to one principal.
+    SelfReview,
+    /// The request was already spent on a different card event.
+    Consumed,
+    /// A storage error after the entry was found to be gated.
+    Unverifiable,
+}
+
+impl ApprovalRefusal {
+    /// The stable machine token, sent to the client as `blocked: <token>`.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::Missing => "kanban_approval_missing",
+            Self::ColumnMismatch => "kanban_approval_column_mismatch",
+            Self::RequestMissing => "kanban_approval_request_missing",
+            Self::CardMismatch => "kanban_approval_card_mismatch",
+            Self::Undecided => "kanban_approval_undecided",
+            Self::Denied => "kanban_approval_denied",
+            Self::SelfReview => "kanban_approval_self_review",
+            Self::Consumed => "kanban_approval_consumed",
+            Self::Unverifiable => "kanban_approval_unverifiable",
+        }
+    }
+}
+
+/// Decide whether a card version that enters an approval column carries a
+/// valid, unspent, human approval.
+///
+/// The caller has already established the entry is gated
+/// ([`entry_requires_approval`]). Checks run in this order and the first
+/// failure wins: [`Missing`](ApprovalRefusal::Missing),
+/// [`ColumnMismatch`](ApprovalRefusal::ColumnMismatch) (pending target),
+/// [`RequestMissing`](ApprovalRefusal::RequestMissing),
+/// [`CardMismatch`](ApprovalRefusal::CardMismatch),
+/// [`ColumnMismatch`](ApprovalRefusal::ColumnMismatch) (request target),
+/// [`Undecided`](ApprovalRefusal::Undecided),
+/// [`SelfReview`](ApprovalRefusal::SelfReview),
+/// [`Denied`](ApprovalRefusal::Denied),
+/// [`Consumed`](ApprovalRefusal::Consumed). Principals compare
+/// case-insensitively. A redelivery of the card event that already spent the
+/// approval (`consumed_by == incoming.id`) is admitted.
+///
+/// The request is matched on `board` + `card_d`, never on its `a` tag, because
+/// the `a` tag carries the coordinate of whichever author published the card
+/// version that raised the request.
+pub fn check_approved_entry(f: &ApprovalFacts<'_>) -> Result<ApprovedEntry, ApprovalRefusal> {
+    let Some(prior) = f.prior else {
+        return Err(ApprovalRefusal::Missing);
+    };
+    let Some((pending_col, request_id)) = prior.pending_move.as_ref() else {
+        return Err(ApprovalRefusal::Missing);
+    };
+    if *pending_col != f.incoming.column {
+        return Err(ApprovalRefusal::ColumnMismatch);
+    }
+    let request = match f.request {
+        Some(r) if is_kanban_approval_request(r) && r.id == *request_id => r,
+        _ => return Err(ApprovalRefusal::RequestMissing),
+    };
+    if tag_value(request, "board") != Some(f.incoming.board.as_str())
+        || tag_value(request, "card_d") != Some(f.incoming.d_tag.as_str())
+    {
+        return Err(ApprovalRefusal::CardMismatch);
+    }
+    if tag_value(request, "target_col") != Some(f.incoming.column.as_str()) {
+        return Err(ApprovalRefusal::ColumnMismatch);
+    }
+    let Some(decision) = f.decision.as_ref() else {
+        return Err(ApprovalRefusal::Undecided);
+    };
+    let requester = f.requester_principal.unwrap_or(request.pubkey.as_str());
+    if decision.decider_principal.eq_ignore_ascii_case(requester) {
+        return Err(ApprovalRefusal::SelfReview);
+    }
+    if !decision.approved {
+        return Err(ApprovalRefusal::Denied);
+    }
+    if let Some(spent_on) = f.consumed_by {
+        if spent_on != f.incoming.id {
+            return Err(ApprovalRefusal::Consumed);
+        }
+    }
+    Ok(ApprovedEntry {
+        request_id: request.id.clone(),
+        decision_id: decision.event_id.to_string(),
+        board: f.incoming.board.clone(),
+        card_d: f.incoming.d_tag.clone(),
+        target_col: f.incoming.column.clone(),
+    })
+}
+
 // -- Calendar bridge ------------------------------------------------------------------
 
 /// Build a zone-tagged NIP-52 time-based calendar event (kind 31923) for a
@@ -1288,5 +1469,318 @@ mod tests {
             card.pending_move,
             Some(("done".to_string(), "77".repeat(32)))
         );
+    }
+
+    // -- Relay approval gate -----------------------------------------------------
+
+    const BOARD_COORD: &str = "30301:aa:board1";
+
+    fn gate_board(approval: &[&str]) -> KanbanBoard {
+        KanbanBoard {
+            id: "b1".into(),
+            pubkey: "aa".into(),
+            d_tag: "board1".into(),
+            title: "B".into(),
+            description: String::new(),
+            columns: vec![],
+            approval_columns: approval.iter().map(|c| c.to_string()).collect(),
+            maintainers: vec![],
+            zone: Some("family".into()),
+            created_at: 1,
+        }
+    }
+
+    fn gate_card(id: &str, col: &str, pending: Option<(&str, &str)>) -> KanbanCard {
+        KanbanCard {
+            id: id.into(),
+            pubkey: "cc".into(),
+            d_tag: "card1".into(),
+            board: BOARD_COORD.into(),
+            title: "T".into(),
+            description: String::new(),
+            column: col.into(),
+            rank: 0,
+            assignees: vec![],
+            due: None,
+            zone: Some("family".into()),
+            pending_move: pending.map(|(c, r)| (c.to_string(), r.to_string())),
+            deleted: false,
+            created_at: 10,
+        }
+    }
+
+    fn gate_request(id: &str, board: &str, card_d: &str, target: &str, k: bool) -> NostrEvent {
+        let mut tags = vec![
+            vec!["d".to_string(), "req-d".to_string()],
+            vec!["board".to_string(), board.to_string()],
+            vec!["card_d".to_string(), card_d.to_string()],
+            vec!["target_col".to_string(), target.to_string()],
+            // Deliberately the requester's own coordinate, not the board's.
+            vec!["a".to_string(), "30302:cc:card1".to_string()],
+        ];
+        if k {
+            tags.push(vec!["k".to_string(), "30302".to_string()]);
+        }
+        NostrEvent {
+            id: id.into(),
+            pubkey: "dd".into(),
+            created_at: 5,
+            kind: crate::governance::KIND_ACTION_REQUEST,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        }
+    }
+
+    const R: &str = "r1";
+
+    fn decision<'a>(approved: bool, decider: &'a str) -> Option<DecisionFacts<'a>> {
+        Some(DecisionFacts {
+            event_id: "dec1",
+            approved,
+            decider_principal: decider,
+        })
+    }
+
+    struct Honest {
+        incoming: KanbanCard,
+        prior: KanbanCard,
+        request: NostrEvent,
+    }
+
+    fn honest() -> Honest {
+        Honest {
+            incoming: gate_card("fin", "done", None),
+            prior: gate_card("pend", "doing", Some(("done", R))),
+            request: gate_request(R, BOARD_COORD, "card1", "done", true),
+        }
+    }
+
+    fn facts<'a>(h: &'a Honest, decision: Option<DecisionFacts<'a>>) -> ApprovalFacts<'a> {
+        ApprovalFacts {
+            incoming: &h.incoming,
+            prior: Some(&h.prior),
+            request: Some(&h.request),
+            requester_principal: None,
+            decision,
+            consumed_by: None,
+        }
+    }
+
+    #[test]
+    fn gate_honest_path_is_admitted() {
+        let h = honest();
+        let entry = check_approved_entry(&facts(&h, decision(true, "ee"))).unwrap();
+        assert_eq!(entry.request_id, R);
+        assert_eq!(entry.decision_id, "dec1");
+        assert_eq!(entry.board, BOARD_COORD);
+        assert_eq!(entry.card_d, "card1");
+        assert_eq!(entry.target_col, "done");
+    }
+
+    #[test]
+    fn gate_no_pending_move_is_missing() {
+        let mut h = honest();
+        h.prior.pending_move = None;
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "ee"))),
+            Err(ApprovalRefusal::Missing)
+        );
+        let mut f = facts(&h, decision(true, "ee"));
+        f.prior = None;
+        assert_eq!(check_approved_entry(&f), Err(ApprovalRefusal::Missing));
+    }
+
+    #[test]
+    fn gate_no_decision_is_undecided() {
+        let h = honest();
+        assert_eq!(
+            check_approved_entry(&facts(&h, None)),
+            Err(ApprovalRefusal::Undecided)
+        );
+    }
+
+    #[test]
+    fn gate_reject_is_denied() {
+        let h = honest();
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(false, "ee"))),
+            Err(ApprovalRefusal::Denied)
+        );
+    }
+
+    #[test]
+    fn gate_card_a_approval_on_card_b_is_card_mismatch() {
+        let mut h = honest();
+        h.request = gate_request(R, BOARD_COORD, "other-card", "done", true);
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "ee"))),
+            Err(ApprovalRefusal::CardMismatch)
+        );
+        h.request = gate_request(R, "30301:aa:other-board", "card1", "done", true);
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "ee"))),
+            Err(ApprovalRefusal::CardMismatch)
+        );
+    }
+
+    #[test]
+    fn gate_column_x_approval_for_column_y_is_column_mismatch() {
+        // Pending target differs from the column entered.
+        let mut h = honest();
+        h.incoming.column = "review".into();
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "ee"))),
+            Err(ApprovalRefusal::ColumnMismatch)
+        );
+        // Pending target matches, but the stored request was for another column.
+        let mut h = honest();
+        h.request = gate_request(R, BOARD_COORD, "card1", "review", true);
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "ee"))),
+            Err(ApprovalRefusal::ColumnMismatch)
+        );
+    }
+
+    #[test]
+    fn gate_spent_approval_copied_back_is_consumed() {
+        let h = honest();
+        let mut f = facts(&h, decision(true, "ee"));
+        f.consumed_by = Some("earlier-finalise");
+        assert_eq!(check_approved_entry(&f), Err(ApprovalRefusal::Consumed));
+    }
+
+    #[test]
+    fn gate_self_review_is_refused_including_aliases_and_case() {
+        let h = honest();
+        // Requester "dd" decided by the same key.
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "dd"))),
+            Err(ApprovalRefusal::SelfReview)
+        );
+        // Requester device key resolved to its owner, who is the decider.
+        let mut f = facts(&h, decision(true, "ab12"));
+        f.requester_principal = Some("ab12");
+        assert_eq!(check_approved_entry(&f), Err(ApprovalRefusal::SelfReview));
+        // Mixed-case hex still collides.
+        let mut f = facts(&h, decision(true, "AB12"));
+        f.requester_principal = Some("ab12");
+        assert_eq!(check_approved_entry(&f), Err(ApprovalRefusal::SelfReview));
+    }
+
+    #[test]
+    fn gate_request_missing_or_not_kanban() {
+        let mut h = honest();
+        let mut f = facts(&h, decision(true, "ee"));
+        f.request = None;
+        assert_eq!(
+            check_approved_entry(&f),
+            Err(ApprovalRefusal::RequestMissing)
+        );
+        h.request = gate_request(R, BOARD_COORD, "card1", "done", false);
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "ee"))),
+            Err(ApprovalRefusal::RequestMissing)
+        );
+        // A different stored event than the one the pending move names.
+        let mut h = honest();
+        h.request.id = "someone-else".into();
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "ee"))),
+            Err(ApprovalRefusal::RequestMissing)
+        );
+    }
+
+    #[test]
+    fn gate_non_entries_are_not_gated() {
+        let board = gate_board(&["done"]);
+        // Edit, claim, rerank: prior and incoming both already in `done`.
+        let prior = gate_card("p", "done", None);
+        let mut edit = gate_card("e", "done", None);
+        edit.rank = 99;
+        assert!(!entry_requires_approval(Some(&board), Some(&prior), &edit));
+        // A tombstone of a card already in `done`.
+        let mut tomb = gate_card("t", "done", None);
+        tomb.deleted = true;
+        assert!(!entry_requires_approval(Some(&board), Some(&prior), &tomb));
+        // Moving into a column that is not an approval column.
+        let into_todo = gate_card("m", "todo", None);
+        assert!(!entry_requires_approval(
+            Some(&board),
+            Some(&prior),
+            &into_todo
+        ));
+    }
+
+    #[test]
+    fn gate_tombstone_that_enters_is_gated() {
+        let board = gate_board(&["done"]);
+        let prior = gate_card("p", "doing", None);
+        let mut tomb = gate_card("t", "done", None);
+        tomb.deleted = true;
+        assert!(entry_requires_approval(Some(&board), Some(&prior), &tomb));
+    }
+
+    #[test]
+    fn gate_new_card_straight_into_approval_column_is_gated() {
+        let board = gate_board(&["done"]);
+        let fresh = gate_card("n", "done", None);
+        assert!(entry_requires_approval(Some(&board), None, &fresh));
+    }
+
+    #[test]
+    fn gate_adr_2035_agent_republish_is_not_gated() {
+        // The agent keeps `s` on its own column and sets pending_move plus
+        // result/run; that version is not an entry into the approval column.
+        let board = gate_board(&["review"]);
+        let prior = gate_card("p", "todo", None);
+        let agent = gate_card("a", "agent", Some(("review", R)));
+        assert!(!entry_requires_approval(Some(&board), Some(&prior), &agent));
+        // Setting `s` straight to the approval column would be gated.
+        let direct = gate_card("d", "review", Some(("review", R)));
+        assert!(entry_requires_approval(Some(&board), Some(&prior), &direct));
+    }
+
+    #[test]
+    fn gate_board_that_drops_the_column_is_not_gated() {
+        // Policy is owned by the board's author: removing the approval column
+        // from the latest board version lifts the gate.
+        let incoming = gate_card("i", "done", None);
+        let prior = gate_card("p", "doing", None);
+        let relaxed = gate_board(&[]);
+        assert!(!entry_requires_approval(
+            Some(&relaxed),
+            Some(&prior),
+            &incoming
+        ));
+        // An unknown board never gates.
+        assert!(!entry_requires_approval(None, Some(&prior), &incoming));
+    }
+
+    #[test]
+    fn gate_redelivery_of_the_spending_event_is_admitted() {
+        let h = honest();
+        let mut f = facts(&h, decision(true, "ee"));
+        f.consumed_by = Some("fin");
+        assert!(check_approved_entry(&f).is_ok());
+    }
+
+    #[test]
+    fn gate_refusal_tokens_are_stable() {
+        use ApprovalRefusal::*;
+        let all = [
+            (Missing, "kanban_approval_missing"),
+            (ColumnMismatch, "kanban_approval_column_mismatch"),
+            (RequestMissing, "kanban_approval_request_missing"),
+            (CardMismatch, "kanban_approval_card_mismatch"),
+            (Undecided, "kanban_approval_undecided"),
+            (Denied, "kanban_approval_denied"),
+            (SelfReview, "kanban_approval_self_review"),
+            (Consumed, "kanban_approval_consumed"),
+            (Unverifiable, "kanban_approval_unverifiable"),
+        ];
+        for (r, t) in all {
+            assert_eq!(r.token(), t);
+        }
     }
 }

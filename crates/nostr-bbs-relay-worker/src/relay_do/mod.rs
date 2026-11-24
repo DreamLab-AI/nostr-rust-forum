@@ -21,6 +21,8 @@
 mod broadcast;
 mod calendar_projection;
 mod filter;
+mod kanban_gate;
+pub(crate) use kanban_gate::{KANBAN_MOVE_APPROVALS_CREATE_SQL, KANBAN_MOVE_APPROVALS_INDEX_SQL};
 mod mod_cache;
 mod nip42;
 mod nip_handlers;
