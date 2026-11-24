@@ -944,6 +944,21 @@ pub fn tombstoned_ids(db: &Connection, ids: &[String]) -> rusqlite::Result<HashS
     Ok(out)
 }
 
+/// Run the statements of `sql`, line by line. Each generated SQL line holds
+/// whole statements (no string literal spans a line: content, tags and ids
+/// are single-line JSON/base64/hex, and newlines inside values are escaped
+/// by JSON). Executing the multi-megabyte file in one `execute_batch` call
+/// is quadratic (each statement re-scans the remaining tail): a
+/// 10k-envelope chunk took ~35 s that way and ~3 s line by line.
+fn run_statements(c: &Connection, sql: &str) -> rusqlite::Result<()> {
+    for line in sql.lines() {
+        if !line.trim().is_empty() {
+            c.execute_batch(line)?;
+        }
+    }
+    Ok(())
+}
+
 /// Apply SQL chunk files directly to the D1 SQLite file, one transaction
 /// per file, with the relay's own triggers firing as on any insert (the
 /// tag-writing `trg_event_tags_ai_v3` included), so the rows equal what
@@ -972,14 +987,16 @@ pub fn apply_sql_direct(path: &Path, files: &[PathBuf]) -> Result<Vec<(PathBuf, 
     for f in files {
         let sql = std::fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?;
         let t = std::time::Instant::now();
-        c.execute_batch(&format!("BEGIN IMMEDIATE;\n{sql}\nCOMMIT;"))
-            .map_err(|e| {
-                let _ = c.execute_batch("ROLLBACK;");
-                format!(
-                    "{}: {e} (rolled back; earlier files stay applied)",
-                    f.display()
-                )
-            })?;
+        c.execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| e.to_string())?;
+        if let Err(e) = run_statements(&c, &sql) {
+            let _ = c.execute_batch("ROLLBACK;");
+            return Err(format!(
+                "{}: {e} (rolled back; earlier files stay applied)",
+                f.display()
+            ));
+        }
+        c.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
         out.push((f.clone(), t.elapsed().as_millis()));
     }
     Ok(out)
