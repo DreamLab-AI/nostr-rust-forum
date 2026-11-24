@@ -106,6 +106,13 @@ not shadow it).
   printable ASCII (or that contains `;`, quotes or comment markers) as `CAST(X'…' AS TEXT)`, so no
   statement splitter can misread it.
 
+## The bucket-to-bucket copy
+
+`r2-copy.jsonl` comes from URLs inside event content, which is untrusted. Only keys of the form
+`pods/<64-hex>/media/<path>` with safe segments are listed (no dot-files, `.acl`, `.meta`, `..` or
+containers), the import's own objects are excluded, and the copy runs from the old bucket to the
+new one at the identical key, never the other way.
+
 ## Trusted operator input
 
 `identities.json`, `structure.json` and `target.json` are trusted. A mistake in them is a

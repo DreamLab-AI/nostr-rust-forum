@@ -745,9 +745,37 @@ fn keybase_archive_to_sealed_upload_plan() {
     }
     pipeline::scrub(&db_path).unwrap();
 
+    // ── a kept event (a profile from the old deployment) links an object in the OLD
+    //    bucket: it goes into the bucket-to-bucket copy list, hostile paths do not
+    let old_pk = "ef".repeat(32);
+    {
+        let c = Connection::open(&db_path).unwrap();
+        let someone = nostr_bbs_core::keys::generate_keypair().unwrap().secret;
+        let profile = signed(
+            &someone,
+            0,
+            T0,
+            vec![],
+            &json!({"name": "kept", "picture": format!("https://old-pod.example/pods/{old_pk}/media/public/avatar.webp"),
+                    "about": format!("https://old-pod.example/pods/{old_pk}/media/public/.acl https://old-pod.example/pods/{old_pk}/media/../x")})
+            .to_string(),
+        );
+        d1::insert_event(&c, &profile, T0).unwrap();
+    }
     // ── upload plan, rehearsed twice into a fresh D1
     let up = pipeline::upload_plan(&w, &db_path, None, 50).unwrap();
     assert!(up.chunks >= 1);
+    let copy = std::fs::read_to_string(w.upload().join("r2-copy.jsonl")).unwrap();
+    assert_eq!(up.r2_copy, 1, "{copy}");
+    assert!(copy.contains(&format!("pods/{old_pk}/media/public/avatar.webp")));
+    assert!(
+        !copy.contains(&archivist_pk),
+        "the import's own objects are uploaded, not copied"
+    );
+    assert!(
+        w.seal().join("pod-objects.jsonl").exists(),
+        "seal-prep recorded the pre-purge scan"
+    );
     let dump = std::fs::read_to_string(w.upload().join("data-0001.sql")).unwrap();
     assert!(!dump.contains("INSERT OR IGNORE INTO event_tags") && !dump.contains("settings"));
     assert!(

@@ -140,8 +140,11 @@ nostr-bbs-import upload-rehearse --work W --d1 D1 --fresh-d1 FRESH   # FRESH: mi
 ```
 
 `W/upload/` holds `data-NNNN.sql` (an allowlisted `INSERT OR IGNORE` dump: no `event_tags`, which
-the relay trigger rebuilds, and no `settings`), `r2-objects.jsonl`, `quota.sql` (auth database),
-`commands.sh` and `RUNBOOK.md`. The rehearsal applies the dump twice to a fresh D1 and compares
+the relay trigger rebuilds, and no `settings`), `r2-objects.jsonl` (the import's own objects),
+`r2-copy.jsonl` (objects in the OLD bucket that kept events link, such as existing threads and
+profile pictures, copied bucket to bucket at the identical key; found by scanning the plaintext,
+including the pre-purge scan `seal-prep` saved), `quota.sql` (auth database), `commands.sh` and
+`RUNBOOK.md`. The rehearsal applies the dump twice to a fresh D1 and compares
 every table.
 
 ### 10. Cutover and roll-back
@@ -150,7 +153,7 @@ Follow `W/upload/RUNBOOK.md`:
 
 1. A new stack alongside the old one (new workers, D1, R2 bucket, KV). The old one is untouched.
 2. Relay migrations (`0009_events.sql` first, then all in order, with `d1 execute --file`), one
-   relay boot, then the data chunks, the R2 objects and `quota.sql`. `commands.sh` refuses to run
+   relay boot, then the data chunks, the R2 objects, the old-bucket copies and `quota.sql`. `commands.sh` refuses to run
    if a new resource name equals an old one or the new D1 already holds events.
 3. Check counts against the rehearsal and read a sealed topic as a member.
 4. One revertable website commit points the forum at the new stack; freeze the old stack

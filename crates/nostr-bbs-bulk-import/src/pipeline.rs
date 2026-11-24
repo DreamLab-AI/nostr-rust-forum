@@ -574,6 +574,13 @@ pub fn seal_prep(work: &Work, d1_path: &Path, relay: &str) -> Result<SealPrep, I
         .iter()
         .map(|(id, z)| serde_json::json!({"id": id, "zone": z}))
         .collect();
+    // Pod objects linked by plaintext now, before sealing hides them.
+    let mut scan = String::new();
+    for key in scan_pod_objects(&c)? {
+        scan.push_str(&serde_json::json!({"key": key}).to_string());
+        scan.push('\n');
+    }
+    fsutil::write_private_atomic(&dir.join("pod-objects.jsonl"), scan.as_bytes())?;
     fsutil::write_private_atomic(
         &dir.join("channels.json"),
         &serde_json::to_vec_pretty(&list).expect("serialises"),
@@ -1158,6 +1165,74 @@ pub fn table_counts(c: &Connection) -> Result<BTreeMap<String, i64>, ImportError
     Ok(out)
 }
 
+/// `pods/<64-hex>/media/<path>` keys of pod objects that `text` links,
+/// for the bucket-to-bucket copy at cutover. Only safe keys are returned:
+/// every path segment `[A-Za-z0-9._-]`, none starting with `.`, no `.acl`
+/// or `.meta` suffix (the pod's own object-name rule), never a container.
+pub fn pod_object_keys(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("/pods/") {
+        let after = &rest[i + 6..];
+        rest = after;
+        let Some(pk) = after.get(..64) else { break };
+        if !pk.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            continue;
+        }
+        let Some(path) = after[64..].strip_prefix("/media/") else {
+            continue;
+        };
+        let end = path
+            .find(|c: char| c.is_whitespace() || "\"'()<>[]{},;?#|\\`".contains(c))
+            .unwrap_or(path.len());
+        let path = &path[..end];
+        let safe = !path.is_empty()
+            && !path.ends_with('/')
+            && path.split('/').all(|seg| {
+                !seg.is_empty()
+                    && !seg.starts_with('.')
+                    && !seg.ends_with(".acl")
+                    && !seg.ends_with(".meta")
+                    && seg
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            });
+        if safe {
+            out.insert(format!("pods/{pk}/media/{path}"));
+        }
+    }
+    out
+}
+
+/// Pod object keys linked by the plaintext events in `c` (sealed envelopes
+/// are opaque, so `seal-prep` records this scan before the purge too).
+pub fn scan_pod_objects(c: &Connection) -> Result<BTreeSet<String>, ImportError> {
+    let mut out = BTreeSet::new();
+    for ev in d1::read_events(
+        c,
+        "WHERE id NOT IN (SELECT event_id FROM event_tags WHERE name = 'sealed')",
+    )? {
+        out.extend(pod_object_keys(&ev.content));
+    }
+    Ok(out)
+}
+
+fn content_type_of(key: &str) -> &'static str {
+    match key
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("webp") => "image/webp",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("avif") => "image/avif",
+        _ => "application/octet-stream",
+    }
+}
+
 /// What [`upload_plan`] wrote.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UploadReport {
@@ -1167,6 +1242,8 @@ pub struct UploadReport {
     pub rows: BTreeMap<String, usize>,
     /// R2 objects listed.
     pub r2_objects: usize,
+    /// Old-bucket objects to copy at the identical key (`r2-copy.jsonl`).
+    pub r2_copy: usize,
     /// Bytes in the archivist's pod.
     pub pod_bytes: u64,
     /// Warnings (quota and the like).
@@ -1258,6 +1335,31 @@ pub fn upload_plan(
         lines.push('\n');
     }
     fsutil::write_private_atomic(&dir.join("r2-objects.jsonl"), lines.as_bytes())?;
+
+    // Objects in the OLD bucket that kept events link (existing threads,
+    // profile pictures): copied bucket to bucket at the identical key.
+    let mut foreign = scan_pod_objects(&c)?;
+    let pre_purge = work.seal().join("pod-objects.jsonl");
+    if pre_purge.exists() {
+        fsutil::for_each_line(&pre_purge, |_, line| {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(k) = v["key"].as_str() {
+                    // re-validated: the file is ours, but keys must stay safe
+                    foreign.extend(pod_object_keys(&format!("/{k}")));
+                }
+            }
+            Ok(())
+        })?;
+    }
+    let mut copy = String::new();
+    for key in foreign.iter().filter(|k| !objects.contains_key(*k)) {
+        copy.push_str(
+            &serde_json::json!({"key": key, "content_type": content_type_of(key)}).to_string(),
+        );
+        copy.push('\n');
+        report.r2_copy += 1;
+    }
+    fsutil::write_private_atomic(&dir.join("r2-copy.jsonl"), copy.as_bytes())?;
     let quota = format!(
         "-- Auth database (REPLAY_DB): account the bulk-uploaded objects to the archivist's pod.\n\
          INSERT INTO quota_usage (pubkey, used_bytes, updated_at) VALUES ({pk}, {b}, {now}) \
@@ -1317,6 +1419,12 @@ fn upload_commands(chunks: &[String]) -> String {
         "\n# 3. objects (key, file, content type from r2-objects.jsonl)\n\
          jq -r '[.key, .file, .content_type] | @tsv' \"$(dirname \"$0\")/r2-objects.jsonl\" | while IFS=\"$(printf '\\t')\" read -r key file ct; do\n\
          \x20 wrangler r2 object put \"$NEW_BUCKET/$key\" --file \"$file\" --content-type \"$ct\" --remote\n\
+         done\n\n# 3b. objects that kept events link in the OLD bucket: copied at the identical key\n\
+         jq -r '[.key, .content_type] | @tsv' \"$(dirname \"$0\")/r2-copy.jsonl\" | while IFS=\"$(printf '\\t')\" read -r key ct; do\n\
+         \x20 tmp=$(mktemp)\n\
+         \x20 wrangler r2 object get \"$OLD_BUCKET/$key\" --file \"$tmp\" --remote\n\
+         \x20 wrangler r2 object put \"$NEW_BUCKET/$key\" --file \"$tmp\" --content-type \"$ct\" --remote\n\
+         \x20 rm -f \"$tmp\"\n\
          done\n\n# 4. pod accounting on the auth database\n\
          wrangler d1 execute \"$AUTH_DB\" --remote --file \"$(dirname \"$0\")/quota.sql\"\n",
     );
@@ -1333,7 +1441,9 @@ Nothing here has been run. The tool never runs a remote command.
   harmless). Rows: {rows:?}. Never dumped: `event_tags` (the relay trigger rebuilds it from
   `events`) and `settings` (boot marker rows).
 * Objects: {objs} in `r2-objects.jsonl` ({mib:.1} MiB in the archivist's pod), `quota.sql` for the
-  auth database.
+  auth database, and {copy} object(s) in `r2-copy.jsonl` that kept events (existing threads,
+  profile pictures) link in the OLD bucket: copied bucket to bucket at the identical key, so their
+  signed URLs stay valid once the pod host points at the new stack.
 
 1. Stand the NEW stack up alongside the old one: new worker names, a new D1, a new R2 bucket and
    new KV namespaces, config projected from the same forum config. Do not touch the old stack.
@@ -1343,7 +1453,8 @@ Nothing here has been run. The tool never runs a remote command.
    first and fail on a fresh database). Then boot the new relay once so `ensure_schema()`
    installs the v3 tag trigger, `channel_zones`, `admin_log` and the rest.
 3. `wrangler d1 execute <new db> --remote --file data-NNNN.sql` for every chunk, in order.
-4. Upload the objects (`commands.sh` step 3), then run `quota.sql` on the auth database. Sign in
+4. Upload the objects and copy the old-bucket objects (`commands.sh` steps 3 and 3b), then run
+   `quota.sql` on the auth database. Sign in
    once as the archivist on the new stack so its pod is provisioned.
 5. Check: event and tag counts on the new D1 match `nostr-bbs-import upload-rehearse`; open a
    sealed topic as a member and read it.
@@ -1353,6 +1464,7 @@ Nothing here has been run. The tool never runs a remote command.
         chunks = r.chunks,
         rows = r.rows,
         objs = r.r2_objects,
+        copy = r.r2_copy,
         mib = r.pod_bytes as f64 / 1_048_576.0,
         warn = if r.warnings.is_empty() {
             String::new()
@@ -1443,4 +1555,37 @@ pub fn import_dms(
     evs.retain(|(k, _)| !ledger.rows.contains_key(k));
     let applied = d1::apply_events(&mut c, &mut ledger, &evs, |_, _| {})?;
     Ok(serde_json::json!({"copy": copy_report, "rewrap": rewrap, "inserted": applied.inserted}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pod_object_keys_keep_only_safe_object_paths() {
+        let pk = "ab".repeat(32);
+        let text = format!(
+            "see https://old.example/pods/{pk}/media/public/cat.webp, and \
+             {{\"picture\":\"https://old.example/pods/{pk}/media/public/me_1.png\"}} \
+             https://old.example/pods/{pk}/media/public/.acl \
+             https://old.example/pods/{pk}/media/../profile/card \
+             https://old.example/pods/{pk}/media/public/ \
+             https://old.example/pods/{pk}/media/public/x.meta \
+             https://old.example/pods/NOTHEX/media/public/y.webp \
+             https://old.example/pods/{pk}/profile/card"
+        );
+        let keys: Vec<String> = pod_object_keys(&text).into_iter().collect();
+        assert_eq!(
+            keys,
+            vec![
+                format!("pods/{pk}/media/public/cat.webp"),
+                format!("pods/{pk}/media/public/me_1.png"),
+            ]
+        );
+        assert_eq!(content_type_of("pods/x/media/public/a.WEBP"), "image/webp");
+        assert_eq!(
+            content_type_of("pods/x/media/public/a.bin"),
+            "application/octet-stream"
+        );
+    }
 }

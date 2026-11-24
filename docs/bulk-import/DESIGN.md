@@ -232,6 +232,13 @@ following symlinks, owner and mode checked) for the run only.
   (first sign-in) before its listing shows the objects.
 * **Names.** Objects are named by the full source SHA-256 (`<sha256>.webp`,
   `<sha256>_thumb.webp`); a 64-bit prefix could be collided by a crafted archive.
+* **Cutover copy.** `upload/r2-copy.jsonl` lists objects in the OLD bucket that kept
+  events link (existing threads, kind-0 pictures): data-driven, from a scan of the
+  plaintext for `…/pods/<64-hex>/media/<path>` URLs (`seal-prep` saves the scan before
+  sealing hides it), minus the import's own objects, accepting only safe object keys
+  (segments `[A-Za-z0-9._-]`, no dot-files, `.acl` or `.meta`). `commands.sh` copies
+  each from `OLD_BUCKET` to `NEW_BUCKET` at the identical key, so signed URLs keep
+  working once the pod host points at the new stack.
 
 ## 7. Build: local D1 with ingest parity
 
@@ -365,7 +372,7 @@ archivist. Delete `docs.jsonl` after the build.
   dumped copy would double every tag) and `settings` (boot marker rows). Chunks stay
   under D1's statement and request limits. A raw `wrangler d1 export` is not used: it
   emits plain `INSERT`s that collide with boot rows and duplicate `event_tags`.
-* `quota.sql` for the auth database (§6), `r2-objects.jsonl`. Text that is not plain
+* `quota.sql` for the auth database (§6), `r2-objects.jsonl`, `r2-copy.jsonl` (§6). Text that is not plain
   printable ASCII (or contains `;`, quotes, comment markers) is written as
   `CAST(X'…' AS TEXT)` so no statement splitter can misread archive text.
 * `RUNBOOK.md` and `commands.sh`:
@@ -457,8 +464,6 @@ re-inserts no plaintext.
   example a no-network build of its library, or an offline unanchored path).
 * Pinning the archivist pubkey in the kit so the archivist could be demoted after
   sealing (today it must stay admin, §7).
-* A bucket-to-bucket copy list for objects of verbatim live posts (LIVE-MERGE.md);
-  not generated, since verbatim live events are not imported.
 * `secure_delete` during zone-migrate's own `apply-direct` of the purge (the importer's
   `scrub` runs `VACUUM` afterwards instead).
 * Client limits for very long topics (KIT-FIXES.md) are client work.
