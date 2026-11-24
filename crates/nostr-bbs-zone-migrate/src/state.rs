@@ -260,6 +260,29 @@ impl State {
     }
 }
 
+/// A leftover `<state>.tmp` from a save that was killed before its rename.
+/// The real file is still the last complete save, so the leftover is never
+/// used; it is moved aside to `<state>.tmp.stale-<unix seconds>` (kept for
+/// inspection, never deleted) so the next save starts clean. Returns the new
+/// path, if there was one.
+pub fn set_aside_stale_tmp(path: &Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    if !tmp.exists() {
+        return Ok(None);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut aside = tmp.as_os_str().to_owned();
+    aside.push(format!(".stale-{now}"));
+    let aside = std::path::PathBuf::from(aside);
+    std::fs::rename(&tmp, &aside)?;
+    Ok(Some(aside))
+}
+
 /// Load a state file; `Ok(None)` if it does not exist yet.
 pub fn load(path: &Path) -> Result<Option<State>, StateError> {
     match std::fs::read_to_string(path) {

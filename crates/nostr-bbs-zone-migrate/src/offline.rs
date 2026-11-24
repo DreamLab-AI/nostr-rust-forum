@@ -45,8 +45,13 @@ use crate::keys::KeyRing;
 use crate::plan::{scan_channel, ChannelScan};
 use crate::state::{sha256_hex, Entry, State, Status, Step};
 
-/// Statements per envelope in a seal chunk: the insert and the activity count.
+/// Envelopes per seal SQL chunk.
 pub const DEFAULT_CHUNK: usize = 2_000;
+
+/// Ids per purge SQL chunk and audit row: the relay's `MAX_DELETE_IDS`
+/// (one `POST /api/admin/events/delete` call), which also keeps each audit
+/// row well inside D1's statement size limit.
+pub const PURGE_CHUNK: usize = 200;
 
 /// Open the D1 SQLite file read-only (safe while the relay runs).
 pub fn open_d1(path: &Path) -> rusqlite::Result<Connection> {
@@ -105,11 +110,137 @@ pub fn read_events_by_id(
         "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1",
     )?;
     for id in ids {
-        if let Some(ev) = s.query_row([id], row_event).ok().flatten() {
-            out.insert(ev.id.clone(), ev);
+        match s.query_row([id], row_event) {
+            Ok(Some(ev)) => {
+                out.insert(ev.id.clone(), ev);
+            }
+            Ok(None) | Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(out)
+}
+
+/// The zone each channel is bound to in the relay's `channel_zones`
+/// (absent: not bound).
+pub fn read_channel_zones(
+    db: &Connection,
+    channels: &[String],
+) -> rusqlite::Result<HashMap<String, String>> {
+    let mut s = db.prepare("SELECT zone FROM channel_zones WHERE channel_id = ?1")?;
+    let mut out = HashMap::new();
+    for c in channels {
+        match s.query_row([c], |r| r.get::<_, String>(0)) {
+            Ok(z) => {
+                out.insert(c.clone(), z);
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// Why `channels` must not be sealed offline as listed, if they must not:
+/// every listed channel must be bound in `channel_zones` to exactly the
+/// zone the channels file names (the relay refuses a sealed envelope into
+/// a channel bound elsewhere or not at all; offline must not rely on the
+/// channels file alone).
+pub fn binding_refusal(
+    channels: &[ChannelSpec],
+    bound: &HashMap<String, String>,
+) -> Option<String> {
+    for c in channels {
+        match bound.get(&c.id) {
+            Some(z) if *z == c.zone => {}
+            Some(z) => {
+                return Some(format!(
+                    "channel {} is bound to zone {z} in channel_zones, not {} as the channels file says",
+                    c.id, c.zone
+                ))
+            }
+            None => {
+                return Some(format!(
+                    "channel {} is not bound to any zone in channel_zones (the relay would refuse its envelopes)",
+                    c.id
+                ))
+            }
+        }
+    }
+    None
+}
+
+/// The channel each reply topic lives in, from D1: the root-marked channel
+/// of the stored kind-42 with that id, or of the admin-authored sealed
+/// envelope wrapping it (the relay's F2 resolution). Topics that resolve to
+/// nothing, or to envelopes that disagree, are absent.
+pub fn read_topic_channels(
+    db: &Connection,
+    topics: &HashSet<String>,
+) -> rusqlite::Result<HashMap<String, String>> {
+    let mut by_id = db.prepare(
+        "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1 AND kind = 42",
+    )?;
+    let mut sealed = db.prepare(
+        "SELECT s.id, s.pubkey, s.created_at, s.kind, s.tags, s.content, s.sig \
+         FROM event_tags t JOIN events s ON s.id = t.event_id AND s.kind = 42 \
+         WHERE t.name = 'sealed' AND t.value = ?1 \
+           AND s.pubkey IN (SELECT pubkey FROM whitelist WHERE is_admin = 1) LIMIT 8",
+    )?;
+    let mut out = HashMap::new();
+    for topic in topics {
+        let channel = match by_id.query_row([topic], row_event) {
+            Ok(ev) => ev.as_ref().and_then(|e| channel_of(e).map(str::to_string)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let rows: Vec<NostrEvent> = sealed
+                    .query_map([topic], row_event)?
+                    .filter_map(|r| r.transpose())
+                    .collect::<rusqlite::Result<_>>()?;
+                let chans: HashSet<&str> = rows.iter().filter_map(channel_of).collect();
+                (chans.len() == 1).then(|| chans.into_iter().next().unwrap().to_string())
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(c) = channel {
+            out.insert(topic.clone(), c);
+        }
+    }
+    Ok(out)
+}
+
+/// The reply topics named by `events` (for [`read_topic_channels`]).
+pub fn topics_of(events: &HashMap<String, Vec<NostrEvent>>) -> HashSet<String> {
+    events
+        .values()
+        .flatten()
+        .filter_map(|e| nostr_bbs_core::sealed::reply_root_of(e).map(str::to_string))
+        .collect()
+}
+
+/// Why `original` (in `channel`) must not be sealed, if it must not: its
+/// reply topic, if any, must be a 64-hex id of a kind-42 in the same
+/// channel (the relay's F2 rule for kind-42 writes; also keeps untrusted
+/// text out of the generated SQL).
+pub fn topic_refusal(
+    original: &NostrEvent,
+    channel: &str,
+    topic_channels: &HashMap<String, String>,
+) -> Option<String> {
+    let topic = nostr_bbs_core::sealed::reply_root_of(original)?;
+    if topic.len() != 64
+        || !topic
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Some("reply topic is not a 64-character lowercase hex id".into());
+    }
+    match topic_channels.get(topic) {
+        Some(c) if c == channel => None,
+        Some(_) => Some("reply topic is a message in another channel".into()),
+        None => {
+            Some("reply topic is not a stored message (topic roots must be imported first)".into())
+        }
+    }
 }
 
 /// Whether the relay's schema has what the envelope inserts depend on (the
@@ -129,6 +260,8 @@ pub fn check_schema(db: &Connection) -> Result<(), String> {
         ("table", "event_tags"),
         ("table", "deleted_events"),
         ("table", "whitelist"),
+        ("table", "channel_zones"),
+        ("table", "admin_log"),
         ("trigger", "trg_event_tags_ai_v3"),
     ] {
         if !has(kind, name) {
@@ -177,6 +310,7 @@ pub struct OfflineSealReport {
 pub fn seal_offline(
     channels: &[ChannelSpec],
     channel_events: &HashMap<String, Vec<NostrEvent>>,
+    topic_channels: &HashMap<String, String>,
     keys: &KeyRing,
     migrator: &SecretKey,
     state: &mut State,
@@ -252,9 +386,15 @@ pub fn seal_offline(
         return Err(EngineError::MissingKeys(missing));
     }
     // The online anchor check, unchanged: the seal key must be the key the
-    // zone's live encrypted posts use. No unanchored path offline.
+    // zone's live encrypted posts use. No unanchored path offline. Offline it
+    // also runs per channel, so one anchored channel cannot vouch for a
+    // mislisted second channel of the same zone.
     for zone in &zones {
         check_anchor(zone, keys, &scans)?;
+        for scan in scans.iter().filter(|s| s.plan.zone == *zone) {
+            check_anchor(zone, keys, std::slice::from_ref(scan))
+                .map_err(|e| EngineError::Refused(format!("channel {}: {e}", scan.plan.channel)))?;
+        }
     }
 
     // Adopt envelopes already in D1 (e.g. from the online run).
@@ -262,9 +402,14 @@ pub fn seal_offline(
     for (id, created_at) in work {
         let channel = state.entries[&id].channel.clone();
         let existing = envelopes.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
-        if let Some((outer, epoch, digest)) =
-            adopt(existing, &id, &channel, originals.get(&id).copied(), keys)
-        {
+        if let Some((outer, epoch, digest)) = adopt(
+            existing,
+            &id,
+            &channel,
+            originals.get(&id).copied(),
+            keys,
+            &migrator.public_key().to_hex(),
+        ) {
             set_sealed(state, &id, epoch, &outer, digest);
             report.adopted += 1;
         } else {
@@ -285,7 +430,8 @@ pub fn seal_offline(
     // One sealer per zone, and the conversation key for the self-check (the
     // same key: NIP-44 is symmetric, zone secret x migrator pubkey).
     let migrator_pk = migrator.public_key().to_hex();
-    let mut sealers: HashMap<String, (OriginalSealer, [u8; 32], u32)> = HashMap::new();
+    let mut sealers: HashMap<String, (OriginalSealer, zeroize::Zeroizing<[u8; 32]>, u32)> =
+        HashMap::new();
     for zone in &zones {
         let key = keys.current(zone).expect("checked above");
         let sk = SecretKey::from_bytes(*migrator.as_bytes())
@@ -294,18 +440,25 @@ pub fn seal_offline(
             .map_err(|e| EngineError::Refused(format!("zone {zone} key: {e}")))?;
         let mpk = nostr_bbs_core::keys::PublicKey::from_hex(&migrator_pk)
             .map_err(|e| EngineError::Refused(format!("migrator pubkey: {e}")))?;
-        let ck = nostr_bbs_core::nip44::conversation_key(key.secret(), mpk.as_bytes())
-            .map_err(|e| EngineError::Refused(format!("zone {zone} key: {e}")))?;
+        let ck = zeroize::Zeroizing::new(
+            nostr_bbs_core::nip44::conversation_key(key.secret(), mpk.as_bytes())
+                .map_err(|e| EngineError::Refused(format!("zone {zone} key: {e}")))?,
+        );
         sealers.insert(zone.clone(), (sealer, ck, key.epoch()));
     }
 
+    // F2 placement, as the relay checks it for every kind-42 write.
+    let mut misplaced: Vec<(String, String)> = Vec::new();
     let jobs: Vec<(String, u64, String, String, &NostrEvent)> = to_seal
         .iter()
         .filter_map(|(id, ca)| {
             let e = &state.entries[id];
-            originals
-                .get(id)
-                .map(|o| (id.clone(), *ca, e.zone.clone(), e.channel.clone(), *o))
+            let o = originals.get(id)?;
+            if let Some(why) = topic_refusal(o, &e.channel, topic_channels) {
+                misplaced.push((id.clone(), why));
+                return None;
+            }
+            Some((id.clone(), *ca, e.zone.clone(), e.channel.clone(), *o))
         })
         .collect();
     let not_found: Vec<String> = to_seal
@@ -350,6 +503,9 @@ pub fn seal_offline(
             "original not found in D1",
             None,
         );
+    }
+    for (id, why) in misplaced {
+        fail(state, &mut report.failed, &id, Step::Seal, &why, None);
     }
     for r in results {
         match r {
@@ -461,7 +617,7 @@ pub fn write_seal_sql(
     chunk: usize,
     now: u64,
 ) -> std::io::Result<Vec<PathBuf>> {
-    std::fs::create_dir_all(dir)?;
+    prepare_out_dir(dir)?;
     let mut paths = Vec::new();
     for (n, part) in sealed.chunks(chunk.max(1)).enumerate() {
         let mut sql = String::new();
@@ -495,6 +651,22 @@ pub fn write_seal_sql(
 
 /// Entries that failed a check: `(original id, reason)`.
 pub type FailedEntries = Vec<(String, String)>;
+
+/// Create `dir`, refusing one that already holds files: a reused directory
+/// would keep chunk files of an earlier run that a shell glob applies too.
+fn prepare_out_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    if std::fs::read_dir(dir)?.next().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} is not empty: use a fresh directory per run",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// Counts from [`commit_sealed`] / [`commit_purged`].
 #[derive(Debug, Default, Serialize)]
@@ -572,7 +744,7 @@ pub fn purge_candidates(
     keys: &KeyRing,
     outers: &HashMap<String, NostrEvent>,
     zone_events: &HashMap<String, Vec<NostrEvent>>,
-) -> Result<(Vec<String>, FailedEntries), EngineError> {
+) -> Result<(Vec<PurgeItem>, FailedEntries), EngineError> {
     let blocking = state
         .entries
         .values()
@@ -625,7 +797,10 @@ pub fn purge_candidates(
             _ => Err("no complete envelope record; run seal again".to_string()),
         };
         match verdict {
-            Ok(()) => ok.push(id),
+            Ok(()) => {
+                let outer_id = e.outer_id.clone().expect("verdict checked outer_id");
+                ok.push(PurgeItem { id, outer_id });
+            }
             Err(reason) => {
                 e.status = Status::Failed {
                     step: Step::Verify,
@@ -638,22 +813,41 @@ pub fn purge_candidates(
     Ok((ok, failed))
 }
 
+/// One original to purge and the envelope that must still exist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PurgeItem {
+    /// The plaintext original's id.
+    pub id: String,
+    /// Its verified envelope's id.
+    pub outer_id: String,
+}
+
 /// What `POST /api/admin/events/delete` does per id, as SQL: the event-row
-/// tombstone (`TOMBSTONE_EVENT_ROW_SQL`, `deleted_at` = now) then
-/// `DELETE FROM events WHERE id = ? AND kind = 42`; plus one `admin_log` row
-/// per chunk (`events.delete`, details `{count, ids, notFound, skipped}`).
-pub fn purge_sql(ids: &[String], migrator_pk: &str, now: u64) -> String {
+/// tombstone (`TOMBSTONE_EVENT_ROW_SQL`, kind-42 rows only, `deleted_at` =
+/// now) then `DELETE FROM events WHERE id = ? AND kind = 42`; plus one
+/// `admin_log` row per chunk (`events.delete`). Both statements also require
+/// the original's verified envelope to still be in `events` (its id, kind
+/// 42, the migrator as author) when the SQL runs, so plaintext is never
+/// deleted after its envelope has gone (deleted, restored over, or applied to
+/// a different database).
+pub fn purge_sql(items: &[PurgeItem], migrator_pk: &str, now: u64) -> String {
     let mut sql = String::new();
-    for id in ids {
+    for it in items {
+        let guard = format!(
+            "EXISTS (SELECT 1 FROM events WHERE id = {} AND kind = 42 AND pubkey = {})",
+            q(&it.outer_id),
+            q(migrator_pk)
+        );
         let _ = writeln!(
             sql,
             "INSERT OR IGNORE INTO deleted_events (id, pubkey, deleted_at) \
              SELECT id, pubkey, {now} FROM events \
-             WHERE id = {id} AND length(id) = 64 AND id NOT GLOB '*[^0-9a-f]*';\n\
-             DELETE FROM events WHERE id = {id} AND kind = 42;",
-            id = q(id)
+             WHERE id = {id} AND kind = 42 AND length(id) = 64 AND id NOT GLOB '*[^0-9a-f]*' AND {guard};\n\
+             DELETE FROM events WHERE id = {id} AND kind = 42 AND {guard};",
+            id = q(&it.id)
         );
     }
+    let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
     let details = serde_json::json!({
         "count": ids.len(), "ids": ids, "notFound": [], "skipped": [],
     })
@@ -672,21 +866,21 @@ pub fn purge_sql(ids: &[String], migrator_pk: &str, now: u64) -> String {
 /// `purge-manifest.json` (the ids) in `dir`.
 pub fn write_purge_sql(
     dir: &Path,
-    ids: &[String],
+    items: &[PurgeItem],
     migrator_pk: &str,
     chunk: usize,
     now: u64,
 ) -> std::io::Result<Vec<PathBuf>> {
-    std::fs::create_dir_all(dir)?;
+    prepare_out_dir(dir)?;
     let mut paths = Vec::new();
-    for (n, part) in ids.chunks(chunk.max(1)).enumerate() {
+    for (n, part) in items.chunks(chunk.clamp(1, PURGE_CHUNK)).enumerate() {
         let path = dir.join(format!("purge-{:04}.sql", n + 1));
         std::fs::write(&path, purge_sql(part, migrator_pk, now))?;
         paths.push(path);
     }
     std::fs::write(
         dir.join("purge-manifest.json"),
-        serde_json::to_vec_pretty(ids).expect("ids serialise"),
+        serde_json::to_vec_pretty(items).expect("items serialise"),
     )?;
     Ok(paths)
 }
@@ -696,23 +890,28 @@ pub fn write_purge_sql(
 /// ids present in `deleted_events`).
 pub fn commit_purged(
     state: &mut State,
-    ids: &[String],
+    items: &[PurgeItem],
     gone: &HashSet<String>,
     tombstoned: &HashSet<String>,
+    envelopes_present: &HashSet<String>,
 ) -> CommitReport {
     let mut report = CommitReport::default();
-    for id in ids {
+    for PurgeItem { id, outer_id } in items {
         match state.entries.get_mut(id) {
             Some(e)
-                if e.status == Status::Verified && gone.contains(id) && tombstoned.contains(id) =>
+                if e.status == Status::Verified
+                    && gone.contains(id)
+                    && tombstoned.contains(id)
+                    && envelopes_present.contains(outer_id) =>
             {
                 e.status = Status::Purged;
                 report.committed += 1;
             }
             Some(e) if e.status == Status::Purged => {}
-            Some(_) => report
-                .skipped
-                .push((id.clone(), "plaintext still in D1 or no tombstone".into())),
+            Some(_) => report.skipped.push((
+                id.clone(),
+                "plaintext still in D1, no tombstone, or envelope missing".into(),
+            )),
             None => report
                 .skipped
                 .push((id.clone(), "not in the state file".into())),
@@ -741,6 +940,47 @@ pub fn tombstoned_ids(db: &Connection, ids: &[String]) -> rusqlite::Result<HashS
         if s.exists([id])? {
             out.insert(id.clone());
         }
+    }
+    Ok(out)
+}
+
+/// Apply SQL chunk files directly to the D1 SQLite file, one transaction
+/// per file, with the relay's own triggers firing as on any insert (the
+/// tag-writing `trg_event_tags_ai_v3` included), so the rows equal what
+/// `wrangler d1 execute --local --file` produces. Every worker using the
+/// database must be STOPPED: the file is opened read-write and locked
+/// exclusively (refused while another process holds it). Each file is one
+/// transaction: a failed file is rolled back and the apply stops. Returns
+/// per-file milliseconds.
+pub fn apply_sql_direct(path: &Path, files: &[PathBuf]) -> Result<Vec<(PathBuf, u128)>, String> {
+    let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    c.busy_timeout(std::time::Duration::from_millis(0))
+        .map_err(|e| e.to_string())?;
+    c.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;")
+        .map_err(|e| {
+            format!(
+                "cannot lock {} exclusively (stop every worker first): {e}",
+                path.display()
+            )
+        })?;
+    // A large page cache keeps the events/event_tags B-trees in memory.
+    c.execute_batch("PRAGMA cache_size = -4000000; PRAGMA temp_store = MEMORY;")
+        .map_err(|e| e.to_string())?;
+    check_schema(&c)?;
+    let mut out = Vec::new();
+    for f in files {
+        let sql = std::fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        let t = std::time::Instant::now();
+        c.execute_batch(&format!("BEGIN IMMEDIATE;\n{sql}\nCOMMIT;"))
+            .map_err(|e| {
+                let _ = c.execute_batch("ROLLBACK;");
+                format!(
+                    "{}: {e} (rolled back; earlier files stay applied)",
+                    f.display()
+                )
+            })?;
+        out.push((f.clone(), t.elapsed().as_millis()));
     }
     Ok(out)
 }

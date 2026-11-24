@@ -98,8 +98,9 @@ fn full_run_seals_verifies_and_purges_preserving_every_original() {
     assert!(report.failed.is_empty());
     assert_eq!(report.counts.sealed, 5);
     assert_eq!(relay.published.len(), 5);
-    // Saved after recording the plan and after every entry.
-    assert_eq!(sink.saves.len(), 6);
+    // Saved after recording the plan, a checkpoint per entry (the CLI turns
+    // those into a save every --persist-every), and at the end of the phase.
+    assert_eq!(sink.saves.len(), 7);
 
     // Every envelope is on the relay, sealed with the newest epoch, at the
     // original's created_at, and opens to the original byte for byte.

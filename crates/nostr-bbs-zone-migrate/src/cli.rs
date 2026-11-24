@@ -22,15 +22,62 @@ use nostr_bbs_zone_migrate::net::NetRelay;
 /// Declare `$hooks`: engine hooks that save `$path` atomically after each
 /// change and log progress lines to stderr.
 macro_rules! hooks {
-    ($hooks:ident, $path:expr) => {
+    ($hooks:ident, $path:expr, $every:expr) => {
         let path: &Path = $path;
+        let every: usize = ($every).max(1);
         let mut persist = |s: &State| state::save_atomic(path, s);
+        let mut since_save = 0usize;
+        let mut checkpoint = |s: &State| {
+            since_save += 1;
+            if since_save >= every {
+                since_save = 0;
+                state::save_atomic(path, s)
+            } else {
+                Ok(())
+            }
+        };
         let mut progress = |line: &str| eprintln!("{line}");
         let mut $hooks = Hooks {
             persist: &mut persist,
+            checkpoint: &mut checkpoint,
             progress: &mut progress,
         };
     };
+}
+
+/// SIGINT / SIGTERM request a stop: long loops save the state and stop at
+/// the next entry (engine::STOP), so a kill never lands mid-save.
+fn install_stop_handler() {
+    std::thread::spawn(|| {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let (Ok(mut int), Ok(mut term)) = (
+                    signal(SignalKind::interrupt()),
+                    signal(SignalKind::terminate()),
+                ) else {
+                    return;
+                };
+                tokio::select! {
+                    _ = int.recv() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            eprintln!("stop requested: finishing the current entry, saving the state");
+            engine::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    });
 }
 
 /// Exit code when a step ran to completion but some entries failed.
@@ -48,6 +95,12 @@ const EXIT_ENTRIES_FAILED: u8 = 2;
     )
 )]
 struct Cli {
+    /// Save the state file every N recorded entries (and always at the end of
+    /// each phase and on SIGINT/SIGTERM). Resume after a crash adopts
+    /// anything published but not yet recorded.
+    #[arg(long, global = true, value_name = "N", default_value_t = 2000)]
+    persist_every: usize,
+
     /// Relay WebSocket URL (wss://…); its HTTP API is served on the same origin.
     #[arg(long, global = true, value_name = "URL")]
     relay: Option<String>,
@@ -141,6 +194,18 @@ enum Command {
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
     },
+    /// Apply SQL chunk files (seal-offline / purge-offline output) straight to
+    /// the D1 SQLite file, one transaction per file, triggers firing as under
+    /// wrangler. Every worker using the database must be stopped (the file is
+    /// locked exclusively). Faster than wrangler d1 execute for bulk applies.
+    ApplyDirect {
+        /// The D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// SQL files, applied in the order given.
+        #[arg(required = true, value_name = "SQL")]
+        files: Vec<PathBuf>,
+    },
     /// After applying seal-offline's chunks: re-read each envelope from D1,
     /// re-open it, and mark the entry sealed. Unapplied entries stay planned.
     SealOfflineCommit {
@@ -190,6 +255,7 @@ impl Command {
             Command::Status => "status",
             Command::SealOffline { .. } => "seal-offline",
             Command::SealOfflineCommit { .. } => "seal-offline-commit",
+            Command::ApplyDirect { .. } => "apply-direct",
             Command::PurgeOffline { .. } => "purge-offline",
             Command::PurgeOfflineCommit { .. } => "purge-offline-commit",
         }
@@ -207,6 +273,7 @@ impl<E: std::fmt::Display> From<E> for Failure {
 
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
+    install_stop_handler();
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -233,6 +300,20 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
         if let Command::Status = command {
             return status(&cli);
         }
+    }
+    // Needs neither a relay nor a key: it only applies SQL already written.
+    if let Command::ApplyDirect { d1, files } = &command {
+        let t = std::time::Instant::now();
+        let done = offline::apply_sql_direct(d1, files).map_err(Failure)?;
+        for (f, ms) in &done {
+            eprintln!("{} {ms} ms", f.display());
+        }
+        eprintln!(
+            "apply-direct: {} files in {} ms",
+            done.len(),
+            t.elapsed().as_millis()
+        );
+        return Ok(ExitCode::SUCCESS);
     }
 
     let relay_url = cli
@@ -286,7 +367,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             let channels = channels(&cli)?;
             let path = state_path(&cli)?;
             let mut st = load_or_new(path, &relay_url, &me_pk)?;
-            hooks!(hooks, path);
+            hooks!(hooks, path, cli.persist_every);
             let report = engine::seal_with(
                 &mut relay,
                 &me,
@@ -321,7 +402,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
         Command::Verify => {
             let path = state_path(&cli)?;
             let mut st = load_existing(path, &relay_url, &me_pk)?;
-            hooks!(hooks, path);
+            hooks!(hooks, path, cli.persist_every);
             let report = engine::verify(&mut relay, &keys, &mut st, &mut hooks).await?;
             print_failures(&report.failed);
             out["result"] = serde_json::to_value(&report)?;
@@ -330,7 +411,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
         Command::Purge { yes } => {
             let path = state_path(&cli)?;
             let mut st = load_existing(path, &relay_url, &me_pk)?;
-            hooks!(hooks, path);
+            hooks!(hooks, path, cli.persist_every);
             let report = engine::purge(&mut relay, &keys, &mut st, yes, &mut hooks).await?;
             eprintln!(
                 "purge: {} deleted over {} requests, {} already gone, {} skipped (not kind 42)",
@@ -363,14 +444,33 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
                 eprintln!("read {} kind-42 rows for channel {}", evs.len(), c.id);
                 events.insert(c.id.clone(), evs);
             }
-            if let Some(n) = threads {
-                let _ = rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .build_global();
+            // The relay refuses a sealed envelope into a channel not bound to
+            // the zone; offline checks the binding itself (channel_zones).
+            let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
+            let bound = offline::read_channel_zones(&db, &ids)
+                .map_err(|e| Failure(format!("reading channel_zones: {e}")))?;
+            if let Some(why) = offline::binding_refusal(&channels, &bound) {
+                return Err(Failure(format!("refusing to seal offline: {why}")));
             }
-            hooks!(hooks, path);
-            let report =
-                offline::seal_offline(&channels, &events, &keys, &me, &mut st, limit, &mut hooks)?;
+            let topic_channels = offline::read_topic_channels(&db, &offline::topics_of(&events))
+                .map_err(|e| Failure(format!("resolving reply topics: {e}")))?;
+            if let Some(n) = threads {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build_global()
+                    .map_err(|e| Failure(format!("--threads {n}: {e}")))?;
+            }
+            hooks!(hooks, path, cli.persist_every);
+            let report = offline::seal_offline(
+                &channels,
+                &events,
+                &topic_channels,
+                &keys,
+                &me,
+                &mut st,
+                limit,
+                &mut hooks,
+            )?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -397,6 +497,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             });
             exit_for(report.failed.is_empty())
         }
+        Command::ApplyDirect { .. } => unreachable!("handled above"),
         Command::SealOfflineCommit { d1, manifest } => {
             let path = state_path(&cli)?;
             let mut st = load_existing(path, &relay_url, &me_pk)?;
@@ -434,6 +535,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             let mut st = load_existing(path, &relay_url, &me_pk)?;
             let db =
                 offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            offline::check_schema(&db).map_err(Failure)?;
             let outer_ids: Vec<String> = st
                 .entries
                 .values()
@@ -477,12 +579,16 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
         Command::PurgeOfflineCommit { d1, manifest } => {
             let path = state_path(&cli)?;
             let mut st = load_existing(path, &relay_url, &me_pk)?;
-            let ids: Vec<String> = serde_json::from_slice(
+            let items: Vec<offline::PurgeItem> = serde_json::from_slice(
                 &std::fs::read(&manifest)
                     .map_err(|e| Failure(format!("{}: {e}", manifest.display())))?,
             )?;
             let db =
                 offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            let outer_ids: Vec<String> = items.iter().map(|i| i.outer_id.clone()).collect();
+            let envelopes =
+                offline::present_ids(&db, &outer_ids).map_err(|e| Failure(e.to_string()))?;
             let present = offline::present_ids(&db, &ids).map_err(|e| Failure(e.to_string()))?;
             let gone: std::collections::HashSet<String> = ids
                 .iter()
@@ -490,7 +596,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
                 .cloned()
                 .collect();
             let tomb = offline::tombstoned_ids(&db, &ids).map_err(|e| Failure(e.to_string()))?;
-            let report = offline::commit_purged(&mut st, &ids, &gone, &tomb);
+            let report = offline::commit_purged(&mut st, &items, &gone, &tomb, &envelopes);
             state::save_atomic(path, &st).map_err(|e| Failure(e.to_string()))?;
             eprintln!(
                 "purge-offline-commit: {} marked purged, {} left as they were",
@@ -607,7 +713,21 @@ fn state_path(cli: &Cli) -> Result<&Path, Failure> {
         .ok_or_else(|| Failure("--state <path> is required for this command".into()))
 }
 
+fn set_aside_tmp(path: &Path) -> Result<(), Failure> {
+    if let Some(aside) =
+        state::set_aside_stale_tmp(path).map_err(|e| Failure(format!("{}: {e}", path.display())))?
+    {
+        eprintln!(
+            "note: a leftover {}.tmp (an interrupted save) was moved to {}; the state file itself is the last complete save",
+            path.display(),
+            aside.display()
+        );
+    }
+    Ok(())
+}
+
 fn load_or_new(path: &Path, relay: &str, me: &str) -> Result<State, Failure> {
+    set_aside_tmp(path)?;
     match state::load(path)? {
         Some(s) => {
             s.check_matches(relay, me)?;
@@ -618,6 +738,7 @@ fn load_or_new(path: &Path, relay: &str, me: &str) -> Result<State, Failure> {
 }
 
 fn load_existing(path: &Path, relay: &str, me: &str) -> Result<State, Failure> {
+    set_aside_tmp(path)?;
     let s = state::load(path)?.ok_or_else(|| {
         Failure(format!(
             "state file {} does not exist; run seal first",

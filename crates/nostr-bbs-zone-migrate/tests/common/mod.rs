@@ -118,15 +118,20 @@ pub struct Sink {
 
 impl Sink {
     pub fn run<T>(&mut self, f: impl FnOnce(&mut Hooks<'_>) -> T) -> T {
-        let saves = &mut self.saves;
+        let saves = std::cell::RefCell::new(&mut self.saves);
         let lines = &mut self.lines;
         let mut persist = |s: &State| -> Result<(), StateError> {
-            saves.push(s.clone());
+            saves.borrow_mut().push(s.clone());
+            Ok(())
+        };
+        let mut checkpoint = |s: &State| -> Result<(), StateError> {
+            saves.borrow_mut().push(s.clone());
             Ok(())
         };
         let mut progress = |l: &str| lines.push(l.to_string());
         let mut hooks = Hooks {
             persist: &mut persist,
+            checkpoint: &mut checkpoint,
             progress: &mut progress,
         };
         f(&mut hooks)

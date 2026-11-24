@@ -44,10 +44,26 @@ pub enum EngineError {
 
 /// Side effects the engine needs from its caller.
 pub struct Hooks<'a> {
-    /// Save the state (the CLI writes it atomically to `--state`).
+    /// Save the state now (the CLI writes it atomically to `--state`): at
+    /// the end of each phase, before an irreversible step, and on stop.
     pub persist: &'a mut dyn FnMut(&State) -> Result<(), StateError>,
+    /// The state changed by one entry. The CLI saves only every
+    /// `--persist-every` calls: rewriting a large state file per entry was
+    /// the online seal's bottleneck. Resuming after a crash is safe either
+    /// way: an envelope published but not yet recorded is found on the relay
+    /// and adopted, never published twice.
+    pub checkpoint: &'a mut dyn FnMut(&State) -> Result<(), StateError>,
     /// Report one line of human-readable progress (the CLI writes to stderr).
     pub progress: &'a mut dyn FnMut(&str),
+}
+
+/// Set by the CLI's SIGINT/SIGTERM handler: long loops save the state and
+/// stop at the next entry instead of being killed mid-write.
+pub static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a stop was requested (see [`STOP`]).
+pub fn stop_requested() -> bool {
+    STOP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Result of [`scan`]: the plan for every listed channel.
@@ -125,6 +141,8 @@ pub struct SealReport {
     pub remaining: usize,
     /// Whether `--limit` stopped the run early.
     pub limit_reached: bool,
+    /// Whether a stop signal ended the run early (state saved).
+    pub stopped: bool,
     /// State counts after the run.
     pub counts: Counts,
     /// Zones sealed under `--allow-unanchored-first-encryption` in this run.
@@ -336,6 +354,11 @@ pub async fn seal_with<R: Relay>(
             report.limit_reached = true;
             break;
         }
+        if stop_requested() {
+            (hooks.progress)("stop requested: saving the state and stopping");
+            report.stopped = true;
+            break;
+        }
         let (channel, zone) = {
             let e = &state.entries[id];
             (e.channel.clone(), e.zone.clone())
@@ -344,14 +367,21 @@ pub async fn seal_with<R: Relay>(
         let existing = envelopes.get(id).map(|v| v.as_slice()).unwrap_or(&[]);
 
         // 1. Adopt an envelope already on the relay.
-        if let Some((outer, epoch, digest)) = adopt(existing, id, &channel, original, keys) {
+        if let Some((outer, epoch, digest)) = adopt(
+            existing,
+            id,
+            &channel,
+            original,
+            keys,
+            &migrator.public_key().to_hex(),
+        ) {
             set_sealed(state, id, epoch, &outer, digest);
             report.adopted += 1;
             (hooks.progress)(&format!(
                 "[{}/{total}] {id}: adopted envelope {outer}",
                 n + 1
             ));
-            (hooks.persist)(state)?;
+            (hooks.checkpoint)(state)?;
             continue;
         }
 
@@ -366,7 +396,7 @@ pub async fn seal_with<R: Relay>(
                 None,
             );
             (hooks.progress)(&format!("[{}/{total}] {id}: original not found", n + 1));
-            (hooks.persist)(state)?;
+            (hooks.checkpoint)(state)?;
             continue;
         };
         let key = keys.current(&zone).expect("checked above");
@@ -382,7 +412,7 @@ pub async fn seal_with<R: Relay>(
                     None,
                 );
                 (hooks.progress)(&format!("[{}/{total}] {id}: {e}", n + 1));
-                (hooks.persist)(state)?;
+                (hooks.checkpoint)(state)?;
                 continue;
             }
         };
@@ -395,7 +425,7 @@ pub async fn seal_with<R: Relay>(
             };
             fail(state, &mut report.failed, id, Step::Seal, &reason, None);
             (hooks.progress)(&format!("[{}/{total}] {id}: rejected: {reason}", n + 1));
-            (hooks.persist)(state)?;
+            (hooks.checkpoint)(state)?;
             continue;
         }
 
@@ -441,8 +471,10 @@ pub async fn seal_with<R: Relay>(
                 (hooks.progress)(&format!("[{}/{total}] {id}: {reason}", n + 1));
             }
         }
-        (hooks.persist)(state)?;
+        (hooks.checkpoint)(state)?;
     }
+    // End of the phase: everything recorded so far is saved now.
+    (hooks.persist)(state)?;
 
     report.remaining = state
         .entries
@@ -715,17 +747,24 @@ pub(crate) fn adopt(
     channel: &str,
     original: Option<&NostrEvent>,
     keys: &KeyRing,
+    migrator_pk: &str,
 ) -> Option<(String, u32, String)> {
     let expected = original.map(|o| serde_json::to_string(o).expect("event serialises"));
-    envelopes.iter().find_map(|outer| {
-        let zk = zk_of(outer)?;
-        let key = keys.get(&zk.0, zk.1)?;
-        let inner = open_and_check(outer, original_id, channel, key.secret()).ok()?;
-        if expected.as_ref().is_some_and(|e| *e != inner) {
-            return None;
-        }
-        Some((outer.id.clone(), zk.1, sha256_hex(inner.as_bytes())))
-    })
+    // Only the sealer's own envelopes: the relay resolves sealed originals
+    // from admin-authored envelopes, and another author's faithful copy is
+    // not this run's work to record.
+    envelopes
+        .iter()
+        .filter(|o| o.pubkey.eq_ignore_ascii_case(migrator_pk))
+        .find_map(|outer| {
+            let zk = zk_of(outer)?;
+            let key = keys.get(&zk.0, zk.1)?;
+            let inner = open_and_check(outer, original_id, channel, key.secret()).ok()?;
+            if expected.as_ref().is_some_and(|e| *e != inner) {
+                return None;
+            }
+            Some((outer.id.clone(), zk.1, sha256_hex(inner.as_bytes())))
+        })
 }
 
 /// Refuse to seal `zone` unless its current key is the one its live
@@ -733,13 +772,10 @@ pub(crate) fn adopt(
 /// epoch and its pubkey must match. A grant-only key with no observed post at
 /// its epoch is never a seal key. Messages name the epoch and the reason but
 /// never key material.
-// FOLLOW-UP (Phase 4 review): a zone with no live encrypted post is refused,
-// which is correct for a re-seal but blocks the legitimate FIRST encryption of
-// an all-plaintext zone. None of the three live zones are all-plaintext, so
-// this does not affect the current migration; before the kit is used to encrypt
-// a fresh zone, add an explicit `--allow-unanchored-first-encryption` opt-in
-// that permits sealing ONLY when no posts are observed (a populated zone must
-// still match its live ciphertext, flag or not).
+// A zone with no live encrypted post is refused here; the explicit
+// `--allow-unanchored-first-encryption` path (SealOptions,
+// first_encryption_refusal) covers the first encryption of an all-plaintext
+// zone under its own conditions.
 pub(crate) fn check_anchor(
     zone: &str,
     keys: &KeyRing,

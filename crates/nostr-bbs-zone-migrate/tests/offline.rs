@@ -35,6 +35,7 @@ CREATE TRIGGER IF NOT EXISTS trg_event_tags_ai_v3 AFTER INSERT ON events BEGIN
     AND json_extract(je.value, '$[0]') <> 'probe';
 END;
 CREATE TABLE IF NOT EXISTS deleted_events (id TEXT NOT NULL, pubkey TEXT NOT NULL, deleted_at INTEGER NOT NULL, PRIMARY KEY (id, pubkey));
+CREATE TABLE IF NOT EXISTS channel_zones (channel_id TEXT PRIMARY KEY, zone TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS admin_log (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_pubkey TEXT, action TEXT, target_pubkey TEXT, target_id TEXT, previous_value TEXT, new_value TEXT, reason TEXT, created_at INTEGER);
 ";
 
@@ -51,7 +52,16 @@ fn db() -> Connection {
         [pk(MIGRATOR)],
     )
     .unwrap();
+    c.execute(
+        "INSERT INTO channel_zones (channel_id, zone) VALUES (?1, 'zone3')",
+        [CHANNEL],
+    )
+    .unwrap();
     c
+}
+
+fn topics(c: &Connection) -> HashMap<String, String> {
+    offline::read_topic_channels(c, &offline::topics_of(&read(c))).unwrap()
 }
 
 fn store(c: &Connection, ev: &NostrEvent) {
@@ -141,6 +151,7 @@ fn offline_seal_round_trips_through_online_verify_and_offline_purge() {
             offline::seal_offline(
                 &channels(),
                 &read(&c),
+                &topics(&c),
                 &ring(),
                 &sk(MIGRATOR),
                 &mut st,
@@ -216,14 +227,19 @@ fn offline_seal_round_trips_through_online_verify_and_offline_purge() {
         .filter_map(|e| e.outer_id.clone())
         .collect();
     let outers = offline::read_events_by_id(&c, &outer_ids).unwrap();
-    let (ids, failed) =
+    let (items, failed) =
         offline::purge_candidates(&mut st, &ring(), &outers, &HashMap::new()).unwrap();
-    assert_eq!((ids.len(), failed.len()), (300, 0));
-    let pfiles = offline::write_purge_sql(&dir, &ids, &pk(MIGRATOR), 100, 1_700_000_100).unwrap();
+    assert_eq!((items.len(), failed.len()), (300, 0));
+    let pdir = dir.join("purge");
+    let pfiles =
+        offline::write_purge_sql(&pdir, &items, &pk(MIGRATOR), 100, 1_700_000_100).unwrap();
+    assert_eq!(pfiles.len(), 3);
     for f in &pfiles {
         c.execute_batch(&std::fs::read_to_string(f).unwrap())
             .unwrap();
     }
+    let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let outer_ids: Vec<String> = items.iter().map(|i| i.outer_id.clone()).collect();
     let present = offline::present_ids(&c, &ids).unwrap();
     let gone = ids
         .iter()
@@ -231,7 +247,8 @@ fn offline_seal_round_trips_through_online_verify_and_offline_purge() {
         .cloned()
         .collect();
     let tomb = offline::tombstoned_ids(&c, &ids).unwrap();
-    let pc = offline::commit_purged(&mut st, &ids, &gone, &tomb);
+    let envs = offline::present_ids(&c, &outer_ids).unwrap();
+    let pc = offline::commit_purged(&mut st, &items, &gone, &tomb, &envs);
     assert_eq!(pc.committed, 300);
     // The envelopes stay and still open; the plaintext is gone.
     for o in &originals {
@@ -270,6 +287,7 @@ fn offline_envelopes_match_online_envelopes_structurally() {
             offline::seal_offline(
                 &channels(),
                 &read(&c),
+                &topics(&c),
                 &ring(),
                 &sk(MIGRATOR),
                 &mut st,
@@ -307,6 +325,7 @@ fn offline_seal_keeps_the_anchor_check_and_adopts_online_envelopes() {
         offline::seal_offline(
             &channels(),
             &read(&c),
+            &topics(&c),
             &ring(),
             &sk(MIGRATOR),
             &mut st,
@@ -333,6 +352,7 @@ fn offline_seal_keeps_the_anchor_check_and_adopts_online_envelopes() {
             offline::seal_offline(
                 &channels(),
                 &read(&c),
+                &topics(&c),
                 &ring(),
                 &sk(MIGRATOR),
                 &mut st,
@@ -344,4 +364,145 @@ fn offline_seal_keeps_the_anchor_check_and_adopts_online_envelopes() {
     assert_eq!((report.adopted, report.sealed.len()), (1, 1));
     assert_eq!(st.entries[&o1.id].status, Status::Sealed);
     assert_eq!(report.sealed[0].original_id, o2.id);
+}
+
+#[test]
+fn purge_sql_never_deletes_plaintext_whose_envelope_is_gone() {
+    // Review finding 1: the envelope guard is evaluated when the SQL RUNS.
+    let c = db();
+    store(&c, &live_zk_post(CHANNEL, "zone3", 1, ZONE3_E1));
+    let o = post(AUTHOR, CHANNEL, 1_600_000_000, "keep me");
+    store(&c, &o);
+    let env = nostr_bbs_core::sealed::seal_original(&o, "zone3", 1, &pk(ZONE3_E1), &sk(MIGRATOR))
+        .unwrap();
+    store(&c, &env);
+    let item = offline::PurgeItem {
+        id: o.id.clone(),
+        outer_id: env.id.clone(),
+    };
+    let sql = offline::purge_sql(std::slice::from_ref(&item), &pk(MIGRATOR), 5);
+    // The envelope disappears between writing and applying the SQL.
+    c.execute("DELETE FROM events WHERE id = ?1", [&env.id])
+        .unwrap();
+    c.execute_batch(&sql).unwrap();
+    assert_eq!(
+        offline::present_ids(&c, std::slice::from_ref(&o.id)).unwrap().len(),
+        1,
+        "plaintext kept"
+    );
+    assert!(
+        offline::tombstoned_ids(&c, std::slice::from_ref(&o.id))
+            .unwrap()
+            .is_empty(),
+        "no tombstone"
+    );
+    let mut st = State::new(RELAY_URL, &pk(MIGRATOR));
+    let r = offline::commit_purged(
+        &mut st,
+        &[item],
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+    );
+    assert_eq!(r.committed, 0);
+}
+
+#[test]
+fn offline_refuses_a_mislisted_channel_and_misplaced_reply_topics() {
+    // Review finding 2: the binding must match channel_zones.
+    let bound: HashMap<String, String> = [(CHANNEL.to_string(), "zone3".to_string())].into();
+    assert!(offline::binding_refusal(&channels(), &bound).is_none());
+    let wrong = vec![ChannelSpec {
+        id: CHANNEL.into(),
+        zone: "zone2".into(),
+    }];
+    assert!(offline::binding_refusal(&wrong, &bound)
+        .unwrap()
+        .contains("bound to zone zone3"));
+    let unbound = vec![ChannelSpec {
+        id: OTHER_CHANNEL.into(),
+        zone: "zone3".into(),
+    }];
+    assert!(offline::binding_refusal(&unbound, &bound)
+        .unwrap()
+        .contains("not bound"));
+
+    // Review finding 3: a reply topic must be a kind-42 in the same channel.
+    let c = db();
+    store(&c, &live_zk_post(CHANNEL, "zone3", 1, ZONE3_E1));
+    let root = post(AUTHOR, CHANNEL, 1_600_000_000, "root");
+    store(&c, &root);
+    let elsewhere = post(AUTHOR, OTHER_CHANNEL, 1_600_000_000, "other root");
+    store(&c, &elsewhere);
+    let reply = |topic: &str, n: u64| {
+        sign(
+            AUTHOR,
+            42,
+            1_600_000_100 + n,
+            vec![
+                tag(&["e", CHANNEL, "", "root"]),
+                tag(&["e", topic, "", "reply"]),
+            ],
+            &format!("reply {n}"),
+        )
+    };
+    let good = reply(&root.id, 1);
+    let cross = reply(&elsewhere.id, 2);
+    let made_up = reply(&"9".repeat(64), 3);
+    let junk = reply("'); DROP TABLE events; --", 4);
+    for e in [&good, &cross, &made_up, &junk] {
+        store(&c, e);
+    }
+    let mut st = State::new(RELAY_URL, &pk(MIGRATOR));
+    let mut sink = Sink::default();
+    let report = sink
+        .run(|h| {
+            offline::seal_offline(
+                &channels(),
+                &read(&c),
+                &topics(&c),
+                &ring(),
+                &sk(MIGRATOR),
+                &mut st,
+                None,
+                h,
+            )
+        })
+        .unwrap();
+    let sealed: std::collections::HashSet<&str> = report
+        .sealed
+        .iter()
+        .map(|s| s.original_id.as_str())
+        .collect();
+    assert!(sealed.contains(good.id.as_str()) && sealed.contains(root.id.as_str()));
+    let failed: std::collections::HashSet<&str> =
+        report.failed.iter().map(|(id, _)| id.as_str()).collect();
+    for bad in [&cross, &made_up, &junk] {
+        assert!(failed.contains(bad.id.as_str()), "{}", bad.content);
+    }
+}
+
+#[test]
+fn chunk_directories_must_be_fresh_and_purge_chunks_stay_relay_sized() {
+    let dir = std::env::temp_dir().join(format!("zm-fresh-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("seal-0001.sql"), "old").unwrap();
+    assert!(
+        offline::write_seal_sql(&dir, &[], &pk(MIGRATOR), 10, 1).is_err(),
+        "stale files refused"
+    );
+    let items: Vec<offline::PurgeItem> = (0..450u64)
+        .map(|i| offline::PurgeItem {
+            id: format!("{i:064x}"),
+            outer_id: format!("{:064x}", i + 10_000),
+        })
+        .collect();
+    let files = offline::write_purge_sql(&dir.join("p"), &items, &pk(MIGRATOR), 5_000, 1).unwrap();
+    assert_eq!(
+        files.len(),
+        3,
+        "capped at {} ids per chunk",
+        offline::PURGE_CHUNK
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
