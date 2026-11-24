@@ -326,8 +326,9 @@ section topic list also wait for zone keys before reporting an absence (`Lookup:
 zone…", and once it stalls (20 s without progress, 120 s cap, `zone_crypto/grant_backlog.rs:40`, `:49`) a reload message.
 
 > Note 2026-11-24 (kit PR #95): the grant sync now pages past the relay's 1,000-row cap, page 0 plus 50 pages per scope
-> (`zone_crypto/grant_paging.rs:99`, `ScopePager` at `:291`), with a per-identity, per-scope, per-key backfill marker and
-> a warm stop three days below it (off while `GRANT_SWEEP_ENABLED` is on). A wrap left to retry (unanswered admin check,
+> (`zone_crypto/grant_paging.rs:108`, `ScopePager` at `:352`), with a per-identity, per-scope, per-key backfill marker and
+> a warm stop eight days below it (the relay's seven-day past drift plus a day of skew) and below the marker's floor
+> (off while `GRANT_SWEEP_ENABLED` is on). A wrap left to retry (unanswered admin check,
 > refused NIP-07 decrypt) now holds the backlog open, the 120 s cap runs from the last scope's delivery
 > (`grant_backlog.rs:49`), and wraps are unwrapped newest-queued first, four at a time (`zone_crypto/wrap_queue.rs`).
 > Open limits: KF-31 (the relay answers a failed query as empty) and KF-32 (the page bound).

@@ -74,7 +74,7 @@ discarded (`wire_id`, `:158`), so an answer is never credited to a REQ sent afte
 
   > Note 2026-11-24 (kit PR #95, this ADR's review trigger: a change to the grant sync and its cap): the backlog the
   > decision waits on is now complete past the relay's row cap (the grant sync pages, `zone_crypto/grant_paging.rs`), a
-  > wrap left to retry keeps it unsettled (`grant_backlog.rs:300`), so the page reports the keys-timed-out copy rather
+  > wrap left to retry keeps it unsettled (`grant_backlog.rs:324`), so the page reports the keys-timed-out copy rather
   > than an absence, and the 120 s cap runs from the last grant scope's delivery (`grant_backlog.rs:49`). The 20 s stall
   > window is unchanged. The decision itself (`Lookup::decide_with_keys`) is unchanged; a test pins that a grant left to
   > retry never reads as "not found" (`utils/lookup.rs`, `a_grant_left_to_retry_never_reads_as_not_found`).
