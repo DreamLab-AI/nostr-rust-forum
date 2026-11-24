@@ -6,12 +6,18 @@
 //! RVF layout on R2:
 //!   [SegmentHeader(Vec, 0)] [f32 vectors packed: label_u64 + dim*f32 each]
 //!   [SegmentHeader(Meta, 1)] [JSON id↔label mapping]
+//!
+//! v1 is read-only now: `/search` falls back to it while no v2 manifest
+//! exists, and the first v2 ingest migrates it (see [`crate::shard`]).
 
-use rvf_types::constants::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+use rvf_types::constants::SEGMENT_HEADER_SIZE;
+#[cfg(test)]
+use rvf_types::constants::{SEGMENT_MAGIC, SEGMENT_VERSION};
 use rvf_types::segment::SegmentHeader;
 use rvf_types::segment_type::SegmentType;
 
 use std::cmp::Ordering;
+#[cfg(test)]
 use std::collections::HashMap;
 
 use crate::embed::DIM;
@@ -19,7 +25,10 @@ use crate::embed::DIM;
 /// Bytes per stored vector entry: u64 label + DIM * f32.
 const ENTRY_SIZE: usize = 8 + DIM * 4; // 1544 bytes
 
-/// In-memory vector store.
+/// In-memory decoded v1 store. Test-only: the equivalence oracle for
+/// [`search_rvf`] and the v2 index (production reads v1 bytes in place and
+/// writes only v2).
+#[cfg(test)]
 pub struct VectorStore {
     /// Packed storage: (label, embedding).
     entries: Vec<(u64, [f32; DIM])>,
@@ -28,6 +37,7 @@ pub struct VectorStore {
     index: HashMap<u64, usize>,
 }
 
+#[cfg(test)]
 impl VectorStore {
     /// Create an empty store.
     pub fn new() -> Self {
@@ -91,88 +101,6 @@ impl VectorStore {
             .map(|(pos, (label, vec))| (pos, *label, cosine_similarity(query, vec)))
             .filter(|(_, _, score)| *score >= min_score);
         top_k(candidates, k)
-    }
-
-    /// Serialize to RVF binary format.
-    ///
-    /// Layout: Vec segment (vectors) + Meta segment (JSON mapping placeholder).
-    /// The Meta segment contains a version tag; actual id↔label mapping goes to KV.
-    pub fn to_rvf_bytes(&self) -> Vec<u8> {
-        // Vec segment payload: packed entries [u64 label][f32 * DIM] each
-        let vec_payload_len = self.entries.len() * ENTRY_SIZE;
-        let meta_json = serde_json::json!({
-            "format": "rvf-wasm-v1",
-            "dimensions": DIM,
-            "count": self.entries.len(),
-            "metric": "cosine",
-        });
-        let meta_bytes = serde_json::to_vec(&meta_json).unwrap_or_default();
-
-        // Total: 2 headers + vec payload + meta payload (aligned to 64 bytes)
-        let vec_seg_padded = align64(vec_payload_len);
-        let meta_seg_padded = align64(meta_bytes.len());
-        let total = SEGMENT_HEADER_SIZE + vec_seg_padded + SEGMENT_HEADER_SIZE + meta_seg_padded;
-        let mut buf = vec![0u8; total];
-
-        // --- Vec segment header ---
-        let now_ns = (js_sys::Date::now() * 1_000_000.0) as u64;
-        let vec_hdr = SegmentHeader {
-            magic: SEGMENT_MAGIC,
-            version: SEGMENT_VERSION,
-            seg_type: SegmentType::Vec as u8,
-            flags: 0,
-            segment_id: 0,
-            payload_length: vec_payload_len as u64,
-            timestamp_ns: now_ns,
-            checksum_algo: 0,
-            compression: 0,
-            reserved_0: 0,
-            reserved_1: 0,
-            content_hash: [0u8; 16],
-            uncompressed_len: 0,
-            alignment_pad: 0,
-        };
-        write_header(&mut buf[..SEGMENT_HEADER_SIZE], &vec_hdr);
-
-        // --- Vec segment payload ---
-        let payload_start = SEGMENT_HEADER_SIZE;
-        for (i, (label, emb)) in self.entries.iter().enumerate() {
-            let offset = payload_start + i * ENTRY_SIZE;
-            buf[offset..offset + 8].copy_from_slice(&label.to_le_bytes());
-            for (j, val) in emb.iter().enumerate() {
-                let fo = offset + 8 + j * 4;
-                buf[fo..fo + 4].copy_from_slice(&val.to_le_bytes());
-            }
-        }
-
-        // --- Meta segment header ---
-        let meta_hdr_start = SEGMENT_HEADER_SIZE + vec_seg_padded;
-        let meta_hdr = SegmentHeader {
-            magic: SEGMENT_MAGIC,
-            version: SEGMENT_VERSION,
-            seg_type: SegmentType::Meta as u8,
-            flags: 0,
-            segment_id: 1,
-            payload_length: meta_bytes.len() as u64,
-            timestamp_ns: now_ns,
-            checksum_algo: 0,
-            compression: 0,
-            reserved_0: 0,
-            reserved_1: 0,
-            content_hash: [0u8; 16],
-            uncompressed_len: 0,
-            alignment_pad: 0,
-        };
-        write_header(
-            &mut buf[meta_hdr_start..meta_hdr_start + SEGMENT_HEADER_SIZE],
-            &meta_hdr,
-        );
-
-        // --- Meta segment payload ---
-        let meta_payload_start = meta_hdr_start + SEGMENT_HEADER_SIZE;
-        buf[meta_payload_start..meta_payload_start + meta_bytes.len()].copy_from_slice(&meta_bytes);
-
-        buf
     }
 
     /// Deserialize from RVF binary format. Returns None on invalid data.
@@ -266,6 +194,33 @@ fn vec_payloads(data: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/// Every `(label, vector)` of a v1 RVF buffer, decoded one at a time (v1 → v2
+/// migration).
+pub fn rvf_entries(data: &[u8]) -> impl Iterator<Item = (u64, [f32; DIM])> + '_ {
+    vec_payloads(data).into_iter().flat_map(|p| {
+        p.chunks_exact(ENTRY_SIZE).map(|e| {
+            let mut lb = [0u8; 8];
+            lb.copy_from_slice(&e[..8]);
+            let mut v = [0f32; DIM];
+            for (i, c) in e[8..].chunks_exact(4).enumerate() {
+                v[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+            (u64::from_le_bytes(lb), v)
+        })
+    })
+}
+
+/// Vector count of a v1 store given only its first 64 bytes (the Vec segment
+/// header the v1 writer always puts first). 0 if those bytes are not one.
+pub fn rvf_count_from_first_header(first: &[u8]) -> usize {
+    match first.get(..SEGMENT_HEADER_SIZE).and_then(read_header) {
+        Some(h) if h.is_valid_magic() && h.seg_type == SegmentType::Vec as u8 => {
+            h.payload_length as usize / ENTRY_SIZE
+        }
+        _ => 0,
+    }
+}
+
 /// Number of whole vectors in an RVF buffer, without decoding any of them.
 pub fn rvf_count(data: &[u8]) -> usize {
     vec_payloads(data).iter().map(|p| p.len() / ENTRY_SIZE).sum()
@@ -275,7 +230,7 @@ pub fn rvf_count(data: &[u8]) -> usize {
 ///
 /// Same accumulation order as [`cosine_similarity`], so scores are
 /// bit-identical to searching the decoded store.
-fn cosine_le_bytes(query: &[f32], body: &[u8]) -> f32 {
+pub(crate) fn cosine_le_bytes(query: &[f32], body: &[u8]) -> f32 {
     let mut dot = 0.0f32;
     let mut norm_a = 0.0f32;
     let mut norm_b = 0.0f32;
@@ -368,12 +323,12 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Round up to next 64-byte boundary.
-const fn align64(size: usize) -> usize {
+pub(crate) const fn align64(size: usize) -> usize {
     (size + 63) & !63
 }
 
 /// Write a SegmentHeader to a byte buffer (little-endian, matching repr(C) layout).
-fn write_header(buf: &mut [u8], hdr: &SegmentHeader) {
+pub(crate) fn write_header(buf: &mut [u8], hdr: &SegmentHeader) {
     // Safety: SegmentHeader is repr(C) and 64 bytes. We write field by field
     // for portability (no reliance on alignment assumptions in WASM).
     buf[0..4].copy_from_slice(&hdr.magic.to_le_bytes());
@@ -392,12 +347,10 @@ fn write_header(buf: &mut [u8], hdr: &SegmentHeader) {
     buf[60..64].copy_from_slice(&hdr.alignment_pad.to_le_bytes());
 }
 
-/// Build a minimal RVF byte buffer from entries for testing (no js_sys dependency).
-///
-/// This is a test-only helper that replicates `to_rvf_bytes()` logic without
-/// calling `js_sys::Date::now()`.
+/// Build a v1 RVF byte buffer from entries (test fixture: the layout the v1
+/// writer produced, with a zero timestamp).
 #[cfg(test)]
-fn build_rvf_bytes_for_test(entries: &[(u64, [f32; DIM])]) -> Vec<u8> {
+pub(crate) fn build_rvf_bytes_for_test(entries: &[(u64, [f32; DIM])]) -> Vec<u8> {
     let vec_payload_len = entries.len() * ENTRY_SIZE;
     let meta_json = serde_json::json!({
         "format": "rvf-wasm-v1",
@@ -469,7 +422,7 @@ fn build_rvf_bytes_for_test(entries: &[(u64, [f32; DIM])]) -> Vec<u8> {
 }
 
 /// Read a SegmentHeader from a byte buffer.
-fn read_header(buf: &[u8]) -> Option<SegmentHeader> {
+pub(crate) fn read_header(buf: &[u8]) -> Option<SegmentHeader> {
     if buf.len() < SEGMENT_HEADER_SIZE {
         return None;
     }
