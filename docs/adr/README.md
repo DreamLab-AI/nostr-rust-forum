@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_34 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_35 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -55,6 +55,7 @@ _34 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2021](ADR-2021-two-pinned-sidestr-chains-dreamlab-and-dreamlab-txbt4.md) | Pin two sidestr chains — sidestr:dreamlab and sidestr:dreamlab-txbt4 — with one wallet store and one asset table per chain | 2026-10-03 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
 | [ADR-2022](ADR-2022-ingress-recipients-declared-in-config.md) | Declare gift-wrap recipients in config so the relay admits them without a whitelist row | 2026-10-15 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
 | [ADR-2023](ADR-2023-content-free-web-push-for-pwa-alerts.md) | Content-free Web Push delivers reply, DM and new-message alerts to the PWA | 2026-10-19 | accepted | complete | staged | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
+| [ADR-2024](ADR-2024-escalation-panels-are-bound-to-agents-by-the-operator.md) | Escalation panels are bound to agents by the operator, never selected by the request | 2026-10-19 | proposed | partial | inactive | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
 | [ADR-2025](ADR-2025-nip59-unwrap-verifies-the-wrap-and-never-echoes-plaintext.md) | NIP-59 unwrap verifies the outer wrap first and never echoes decrypted bytes in an error | 2026-10-19 | accepted | complete | live | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
 | [ADR-2026](ADR-2026-zone-key-recovery-master.md) | Derive zone epoch keys from a 12-word recovery master so a lost admin device does not lose a zone | 2026-10-19 | superseded | none | inactive | — | ADR-2028 | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
 | [ADR-2027](ADR-2027-nip17-overlay-for-nostr-chat-interop.md) | Reach the nostr.chat cluster by NIP-17 routing changes only; keep NIP-28 channels; consume, never port, the double ratchet | 2026-10-20 | accepted | partial | inactive | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
@@ -65,4 +66,4 @@ _34 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2032](ADR-2032-a-space-is-a-nip29-group-with-a-signed-spatial-descriptor.md) | A space is a NIP-29 group with a relay-signed spatial descriptor, a NIP-53 interactive room and NIP-78 claims, using no new event kinds | 2026-10-30 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
 | [ADR-2033](ADR-2033-nip09-tombstones-member-deletion-gate-and-deleter-scoped-sync.md) | The relay keeps NIP-09 tombstones and gates members' kind-5s; clients sync deletions incrementally and scope each tombstone to its deleter | 2026-11-22 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
 | [ADR-2034](ADR-2034-absence-is-reported-only-after-an-authenticated-answer.md) | A deep-linked page reports "not found" only after an authenticated answer from the relay | 2026-11-22 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
-| [ADR-2035](ADR-2035-kanban-agent-columns-close-the-dispatch-loop-through-a-governed-case.md) | A kanban agent column dispatches its cards to a registered agent, and the agent's result returns as a governed case | 2026-11-23 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
+| [ADR-2035](ADR-2035-kanban-agent-columns-close-the-dispatch-loop-through-a-governed-case.md) | A kanban agent column dispatches its cards to a registered agent, and the agent's result returns as a governed case | 2026-11-23 | proposed | partial | inactive | — | — | jjohare | nostr-rust-forum |
