@@ -689,7 +689,7 @@ async fn handle_embed(req: &Request, env: &Env) -> Result<Response> {
     }
 
     let (embeddings, model) = embed::embed_texts(env, &texts).await;
-    let semantic = model == embed::MODEL_LABEL_SEMANTIC;
+    let semantic = model != embed::MODEL_LABEL_FALLBACK;
 
     json_response(
         req,
@@ -699,8 +699,10 @@ async fn handle_embed(req: &Request, env: &Env) -> Result<Response> {
             "dimensions": DIM,
             "model": model,
             "semantic": semantic,
-            "note": if semantic {
+            "note": if model == embed::MODEL_LABEL_SEMANTIC {
                 "Cloudflare Workers AI bge-small-en-v1.5 (384-dim, L2-normalized)."
+            } else if semantic {
+                "OpenAI-compatible EMBED_URL backend (384-dim, L2-normalized)."
             } else {
                 "Hash-based fallback embedding (AI binding unavailable). Vectors are NOT semantic."
             },
@@ -750,13 +752,10 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
     // pre-date the `model` field (best-effort -- matches historical behavior
     // where ingested vectors were assumed to come from whatever `/embed`
     // would currently produce).
-    let ingest_model = body.model.clone().unwrap_or_else(|| {
-        if embed::ai_binding_available(env) {
-            embed::MODEL_LABEL_SEMANTIC.to_string()
-        } else {
-            embed::MODEL_LABEL_FALLBACK.to_string()
-        }
-    });
+    let ingest_model = body
+        .model
+        .clone()
+        .unwrap_or_else(|| embed::active_model_label(env));
 
     // Fail loudly instead of silently mixing embedding spaces: if the index
     // already holds vectors from a known, different model, reject the
@@ -881,10 +880,14 @@ async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
     // Workers AI binding is configured we serve real BGE-small embeddings;
     // otherwise the worker degrades to the deterministic hash fallback.
     let ai_live = embed::ai_binding_available(env);
-    let model = if ai_live {
-        embed::MODEL_LABEL_SEMANTIC
+    let model = embed::active_model_label(env);
+    let semantic = model != embed::MODEL_LABEL_FALLBACK;
+    let embed_backend = if embed::openai_config(env).is_some() {
+        "openai-compat"
+    } else if ai_live {
+        "workers-ai"
     } else {
-        embed::MODEL_LABEL_FALLBACK
+        "hash"
     };
 
     json_response(
@@ -896,8 +899,9 @@ async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
             "dimensions": DIM,
             "metric": "cosine",
             "model": model,
-            "semantic": ai_live,
+            "semantic": semantic,
             "aiBinding": ai_live,
+            "embedBackend": embed_backend,
             "engine": "rvf-rust",
             "runtime": "workers-rs",
             "format": "rvf-v1",
