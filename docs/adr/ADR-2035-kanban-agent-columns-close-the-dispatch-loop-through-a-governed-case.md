@@ -20,7 +20,7 @@ acceptance_boundary:
 ## Context
 - The parts of a shared agent workflow already exist: zone boards and cards (30301/30302, `kanban.rs`), approval columns that turn a move into a kanban-tagged 31402 (`APPROVAL_COL_TAG`, `kanban.rs:72`), and a 38000 agent intent (`create_agent_intent_signer`, `kanban.rs:802`).
 - Dispatch is manual and runs one way. "Send to agent" asks for a pasted 64-hex pubkey (`board.rs:1316`) although the registry is listed at `GET /api/governance/agents` (`auth-worker/src/lib.rs:511`). Nothing in agentbox reads or writes 30302, so a result never reaches the card.
-- The intent carries no `actor` tag, so agentbox's `resolveActorRef` takes the actor from the `a` coordinate, which is the card's own d-tag (`agentbox mcp/nostr-bridge/default-intent-spec.js:45`). This is filed as finding AB-INTENT-ACTOR-FROM-CARD-DTAG.
+- Until `3e66d40` the intent carried no `actor` tag, so agentbox's `resolveActorRef` takes the actor from the `a` coordinate, which is the card's own d-tag (`agentbox mcp/nostr-bridge/default-intent-spec.js:45`). This is filed as finding AB-INTENT-ACTOR-FROM-CARD-DTAG.
 - The approval-column gate exists only in the client. The relay exempts kanban 31402s from the agent-registry gate (`nip_handlers.rs:1349`) but never checks that a card version naming an approval column carries an approved move. This is filed as finding FORUM-KANBAN-APPROVAL-COL-CLIENT-ONLY.
 - Industry guidance on shared agent workflows (recurring, verifiable, cheaply reversible work run as a shared system with scrutiny) matches the broker that the forum's 31400–31405 surface already provides: tiers from task properties, calibration sampling, seeded probes and receipts. What is missing is the loop that connects the board to that broker.
 - A qualitative field study of 58 companies adopting AI (Anthropic Economics, "Working with AI", 23 November 2026) found that reviewing AI output was the recurring bottleneck: "Without the proper scaffolding in place, that bottleneck is immediate." An agent column can dispatch faster than people decide its cases, so review capacity has to be visible.
@@ -45,6 +45,6 @@ acceptance_boundary:
 
 ## Verification
 - At `c8b8c4e`: `rg -n "approval_col|pending_move|column_needs_approval" crates --glob '!**/kanban.rs' --glob '!**/forum-client/**'` returns only the core re-export (`nostr-bbs-core/src/lib.rs:116`), so the relay holds no approval-column check.
-- From `988873b`, `create_agent_intent_signer` (`kanban.rs`) builds the intent tags `p`, `actor` (= the agent key), `a`, `board` and `card_d`; a unit test pins `actor` equal to `p` and never the card d-tag, which closes AB-INTENT-ACTOR-FROM-CARD-DTAG on the producer side. The `prompt` tag is not built. `board.rs:1316` accepts only a 64-character key.
+- From `3e66d40`, `create_agent_intent_signer` (`kanban.rs`) builds the intent tags `p`, `actor` (= the agent key), `a`, `board` and `card_d`; a unit test pins `actor` equal to `p` and never the card d-tag, which closes AB-INTENT-ACTOR-FROM-CARD-DTAG on the producer side. The `prompt` tag is not built. `board.rs:1316` accepts only a 64-character key.
 - `rg -n "30302|kanban" agentbox/mcp/nostr-bridge` returns nothing at agentbox `59b1aca1c`, so there is no return path.
-- `implementation_status: partial`: nothing in the Decision is built.
+- `implementation_status: partial`: only the `actor` tag of Decision 2 is built. The agent column, registry, `prompt` tag and return path are not.
