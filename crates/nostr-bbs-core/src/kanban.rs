@@ -815,6 +815,23 @@ pub fn entry_requires_approval_at(
         && incoming.created_at > now.saturating_add(FUTURE_SKEW_SECS)
 }
 
+/// Whether deleting `deleted` (a card version) would expose `remaining` (the
+/// latest version that stays) as the card's current version while that
+/// version sits in an approval column the deleted one does not: a re-entry
+/// with no approval. False when the deleted version was not the current one
+/// anyway (it does not beat `remaining` in fold order).
+pub fn deletion_reveals_approval_entry(
+    board: &KanbanBoard,
+    deleted: &KanbanCard,
+    remaining: &KanbanCard,
+) -> bool {
+    let deleted_is_current = deleted.created_at > remaining.created_at
+        || (deleted.created_at == remaining.created_at && deleted.id < remaining.id);
+    deleted_is_current
+        && board.column_needs_approval(&remaining.column)
+        && !board.column_needs_approval(&deleted.column)
+}
+
 /// The latest admin-signed kind-31403 that cites an approval request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionFacts<'a> {
@@ -898,6 +915,9 @@ pub enum ApprovalRefusal {
     Stale,
     /// The approval is older than its lifetime.
     Expired,
+    /// Deleting this version would make an approval-column version of the card
+    /// the current one without an approval.
+    DeletionEntry,
 }
 
 impl ApprovalRefusal {
@@ -915,6 +935,7 @@ impl ApprovalRefusal {
             Self::Unverifiable => "kanban_approval_unverifiable",
             Self::Stale => "kanban_approval_stale",
             Self::Expired => "kanban_approval_expired",
+            Self::DeletionEntry => "kanban_approval_deletion_entry",
         }
     }
 }
@@ -2067,6 +2088,42 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_move_out_version_reveals_the_older_entry() {
+        let board = gate_board(&["done"]);
+        let mut older_in_done = gate_card("old", "done", None);
+        older_in_done.created_at = 5;
+        let mut move_out = gate_card("out", "todo", None);
+        move_out.created_at = 9;
+        assert!(deletion_reveals_approval_entry(
+            &board,
+            &move_out,
+            &older_in_done
+        ));
+        // The deleted version was not current anyway.
+        let mut stale_out = gate_card("out2", "todo", None);
+        stale_out.created_at = 3;
+        assert!(!deletion_reveals_approval_entry(
+            &board,
+            &stale_out,
+            &older_in_done
+        ));
+        // Remaining is not in an approval column, or the deleted one already was.
+        let remaining_todo = gate_card("r", "todo", None);
+        assert!(!deletion_reveals_approval_entry(
+            &board,
+            &move_out,
+            &remaining_todo
+        ));
+        let mut deleted_done = gate_card("dd", "done", None);
+        deleted_done.created_at = 9;
+        assert!(!deletion_reveals_approval_entry(
+            &board,
+            &deleted_done,
+            &older_in_done
+        ));
+    }
+
+    #[test]
     fn gate_refusal_tokens_are_stable() {
         use ApprovalRefusal::*;
         let all = [
@@ -2081,6 +2138,7 @@ mod tests {
             (Unverifiable, "kanban_approval_unverifiable"),
             (Stale, "kanban_approval_stale"),
             (Expired, "kanban_approval_expired"),
+            (DeletionEntry, "kanban_approval_deletion_entry"),
         ];
         for (r, t) in all {
             assert_eq!(r.token(), t);

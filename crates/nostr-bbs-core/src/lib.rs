@@ -112,12 +112,12 @@ pub use kanban::{
     board_coord, card_coord, check_approved_entry, create_agent_intent_signer, create_board,
     create_board_signer, create_card, create_card_approval_request_signer,
     create_card_approval_response_signer, create_card_due_event_signer, create_card_signer,
-    decision_request_link, entry_requires_approval, entry_requires_approval_at,
-    evaluate_pending_move, fold_cards, is_kanban_approval_request, is_kanban_kind,
-    parse_approval_decision, parse_coord, ApprovalDecision, ApprovalFacts, ApprovalRefusal,
-    ApprovedEntry, BoardColumn, CardInput, DecisionFacts, KanbanBoard, KanbanCard, KanbanError,
-    PendingMoveState, APPROVAL_COL_TAG, COL_TAG, DUE_TAG, FUTURE_SKEW_SECS, KIND_AGENT_INTENT,
-    KIND_KANBAN_BOARD, KIND_KANBAN_CARD, PENDING_MOVE_TAG, RANK_TAG, STATUS_TAG,
+    decision_request_link, deletion_reveals_approval_entry, entry_requires_approval,
+    entry_requires_approval_at, evaluate_pending_move, fold_cards, is_kanban_approval_request,
+    is_kanban_kind, parse_approval_decision, parse_coord, ApprovalDecision, ApprovalFacts,
+    ApprovalRefusal, ApprovedEntry, BoardColumn, CardInput, DecisionFacts, KanbanBoard, KanbanCard,
+    KanbanError, PendingMoveState, APPROVAL_COL_TAG, COL_TAG, DUE_TAG, FUTURE_SKEW_SECS,
+    KIND_AGENT_INTENT, KIND_KANBAN_BOARD, KIND_KANBAN_CARD, PENDING_MOVE_TAG, RANK_TAG, STATUS_TAG,
 };
 
 pub use moderation_events::{

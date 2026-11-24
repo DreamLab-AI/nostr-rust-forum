@@ -1573,6 +1573,24 @@ impl NostrRelayDO {
         // (see `kanban_gate.rs`). `warn` (default) logs and admits; `enforce`
         // refuses. An admitted entry is claimed just before the save below.
         let gate_mode = self.kanban_approval_gate_mode();
+        if event.kind == 5 && !is_admin {
+            if let Some(reason) = self.kanban_deletion_gate(&event).await {
+                if gate_mode == kanban_gate::GateMode::Enforce {
+                    Self::send_ok(
+                        ws,
+                        &event.id,
+                        false,
+                        &format!("blocked: {}", reason.token()),
+                    );
+                    return;
+                }
+                console_warn!(
+                    "kanban approval gate (warn): would refuse {}: {}",
+                    &event.id,
+                    reason.token()
+                );
+            }
+        }
         let mut approved_entry: Option<nostr_bbs_core::ApprovedEntry> = None;
         if kanban_gate::kanban_gate_applies(event.kind, is_admin) {
             match self.kanban_approval_gate(&event).await {

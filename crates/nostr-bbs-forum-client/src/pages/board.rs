@@ -99,6 +99,18 @@ fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
 }
 
+/// Whether this signing key may skip the approval request flow. The relay
+/// exempts an admin by the RAW signer key, so an admin account signing with a
+/// different key (a device key) is gated like a member there; the client must
+/// raise the request in that case or the relay refuses the move.
+fn signs_as_admin(
+    account_is_admin: bool,
+    account_pubkey: Option<&str>,
+    signer_pubkey: &str,
+) -> bool {
+    account_is_admin && account_pubkey.is_some_and(|a| a.eq_ignore_ascii_case(signer_pubkey))
+}
+
 /// Move `card` into `target_col`, honouring the approval gate: a direct move
 /// republishes the card; an approval-gated move raises the kanban 31402 first
 /// and republishes the card with the `pending_move` tag. Shared by the card's
@@ -605,13 +617,20 @@ pub fn BoardPage() -> impl IntoView {
                                                 return;
                                             };
                                             let relay = relay_for_dnd.get_value();
+                                            let signer_pk = signer.public_key().to_string();
+                                            let account_for_drop = auth_for_drop.pubkey().get_untracked();
                                             spawn_move(
                                                 relay,
                                                 toasts,
                                                 signer,
                                                 card,
                                                 drop_col.clone(),
-                                                drop_approval && !admin,
+                                                drop_approval
+                                                    && !signs_as_admin(
+                                                        admin,
+                                                        account_for_drop.as_deref(),
+                                                        signer_pk.as_str(),
+                                                    ),
                                             );
                                         };
                                         view! {
@@ -830,7 +849,9 @@ fn CardView(
                 toasts.show("Not authenticated", ToastVariant::Error);
                 return;
             };
-            let needs_approval = approval_columns.contains(&target_col) && !is_admin;
+            let account = auth.pubkey().get_untracked();
+            let needs_approval = approval_columns.contains(&target_col)
+                && !signs_as_admin(is_admin, account.as_deref(), signer.public_key());
             spawn_move(
                 relay.clone(),
                 toasts,
@@ -1569,5 +1590,18 @@ fn CreateCardForm(board: KanbanBoard, on_close: Callback<()>) -> impl IntoView {
                 </button>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signs_as_admin;
+
+    #[test]
+    fn admin_skips_the_request_flow_only_when_the_signer_is_the_account_key() {
+        assert!(signs_as_admin(true, Some("ab12"), "AB12"));
+        assert!(!signs_as_admin(true, Some("ab12"), "device-key"));
+        assert!(!signs_as_admin(false, Some("ab12"), "ab12"));
+        assert!(!signs_as_admin(true, None, "ab12"));
     }
 }

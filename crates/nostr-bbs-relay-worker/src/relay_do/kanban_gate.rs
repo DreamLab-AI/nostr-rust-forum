@@ -26,9 +26,9 @@
 
 use nostr_bbs_core::event::NostrEvent;
 use nostr_bbs_core::{
-    check_approved_entry, entry_requires_approval_at, parse_approval_decision, parse_coord,
-    ApprovalFacts, ApprovalRefusal, ApprovedEntry, DecisionFacts, KanbanBoard, KanbanCard,
-    KIND_KANBAN_BOARD, KIND_KANBAN_CARD,
+    check_approved_entry, deletion_reveals_approval_entry, entry_requires_approval_at,
+    parse_approval_decision, parse_coord, ApprovalFacts, ApprovalRefusal, ApprovedEntry,
+    DecisionFacts, KanbanBoard, KanbanCard, KIND_KANBAN_BOARD, KIND_KANBAN_CARD,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -85,6 +85,19 @@ pub(crate) const SELECT_DECISIONS_SQL: &str = "SELECT e.id, e.pubkey, e.created_
     WHERE e.kind = 31403 \
     AND EXISTS (SELECT 1 FROM event_tags t WHERE t.event_id = e.id AND t.name = 'e' AND t.value = ?1) \
     ORDER BY e.created_at DESC, e.id ASC LIMIT 50";
+
+/// A stored card version by id (a kind-5 `e` target).
+pub(crate) const SELECT_CARD_BY_ID_SQL: &str =
+    "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events \
+    WHERE id = ?1 AND kind = 30302";
+
+/// A signer's stored card versions at one `d` (a kind-5 `a` target).
+pub(crate) const SELECT_CARD_BY_ADDRESS_SQL: &str =
+    "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events \
+    WHERE kind = 30302 AND pubkey = ?1 AND d_tag = ?2 LIMIT 20";
+
+/// How many `e` and `a` targets of one kind-5 the deletion gate examines.
+const DELETION_TARGET_LIMIT: usize = 50;
 
 /// Whether the incoming event id is already stored (a redelivery).
 pub(crate) const SELECT_EVENT_KNOWN_SQL: &str = "SELECT id FROM events WHERE id = ?1 LIMIT 1";
@@ -163,15 +176,32 @@ impl GateMode {
     }
 }
 
-/// Parse the `KANBAN_APPROVAL_GATE` var. Only the exact string `enforce`
-/// enforces; unset, empty and unrecognised values are `warn`.
+/// Parse the `KANBAN_APPROVAL_GATE` var, trimmed and case-insensitive:
+/// `enforce` enforces; `warn`, unset, empty and anything unrecognised are
+/// `warn` (the caller logs the unrecognised case, see [`kanban_mode_is_known`]).
 pub(crate) fn kanban_approval_gate_mode_var(raw: Option<&str>) -> GateMode {
-    if raw == Some("enforce") {
-        GateMode::Enforce
-    } else {
-        GateMode::Warn
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("enforce") => GateMode::Enforce,
+        _ => GateMode::Warn,
     }
 }
+
+/// Whether the var is unset or one of the two documented values.
+pub(crate) fn kanban_mode_is_known(raw: Option<&str>) -> bool {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("warn") | Some("enforce") => true,
+        Some(_) => false,
+    }
+}
+
+/// Whether the decision window was filled without finding an admin decision:
+/// older decisions may exist beyond the limit, so the answer is unknown.
+pub(crate) fn decision_window_exhausted(rows_read: usize, found: bool) -> bool {
+    rows_read >= DECISION_QUERY_LIMIT && !found
+}
+
+/// The `LIMIT` in [`SELECT_DECISIONS_SQL`].
+pub(crate) const DECISION_QUERY_LIMIT: usize = 50;
 
 /// Whether the gate is consulted at all: only for card versions from
 /// non-admins. Admins keep the same bypass they have in the client and in the
@@ -245,14 +275,10 @@ impl NostrRelayDO {
             .map(|v| v.to_string());
         let mode = kanban_approval_gate_mode_var(raw.as_deref());
         if !MODE_LOGGED.swap(true, Ordering::Relaxed) {
-            match raw.as_deref() {
-                None | Some("warn") | Some("enforce") => {
-                    console_log!("kanban approval gate: mode {}", mode.as_str());
-                }
-                Some(other) => console_error!(
-                    "kanban approval gate: {KANBAN_APPROVAL_GATE_VAR}={other:?} is not \
-                     \"warn\" or \"enforce\"; running in warn"
-                ),
+            if kanban_mode_is_known(raw.as_deref()) {
+                console_log!("kanban approval gate: mode {}", mode.as_str());
+            } else {
+                console_warn!("{KANBAN_APPROVAL_GATE_VAR}={raw:?} unrecognised; using warn");
             }
         }
         mode
@@ -267,6 +293,108 @@ impl NostrRelayDO {
                 .map(|v| v.to_string())
                 .as_deref(),
         )
+    }
+
+    /// The latest board version at `(pubkey, d)`. `Err` is a D1 failure,
+    /// `Ok(None)` is no such board.
+    async fn kanban_board(
+        &self,
+        pubkey: &str,
+        d: &str,
+    ) -> std::result::Result<Option<KanbanBoard>, ()> {
+        let rows = self
+            .kanban_query_events(
+                SELECT_BOARD_SQL,
+                &[JsValue::from_str(pubkey), JsValue::from_str(d)],
+            )
+            .await?;
+        Ok(rows.first().and_then(KanbanBoard::from_event))
+    }
+
+    /// A non-admin kind-5 that would delete a card version and so expose an
+    /// older approval-column version as the card's current one is an entry
+    /// without an approval. Looks at `e` targets and at the signer's own `a`
+    /// coordinates for 30302. A D1 failure here fails open (logged): it
+    /// cannot tell whether any target is a kanban card.
+    pub(crate) async fn kanban_deletion_gate(&self, event: &NostrEvent) -> Option<ApprovalRefusal> {
+        let mut targets: Vec<NostrEvent> = Vec::new();
+        for t in event
+            .tags
+            .iter()
+            .filter(|t| t.len() >= 2 && t[0] == "e")
+            .take(DELETION_TARGET_LIMIT)
+        {
+            match self
+                .kanban_query_events(SELECT_CARD_BY_ID_SQL, &[JsValue::from_str(&t[1])])
+                .await
+            {
+                Ok(rows) => targets.extend(rows),
+                Err(()) => {
+                    console_warn!("kanban deletion gate: target read failed for {}", event.id);
+                    return None;
+                }
+            }
+        }
+        for t in event
+            .tags
+            .iter()
+            .filter(|t| t.len() >= 2 && t[0] == "a")
+            .take(DELETION_TARGET_LIMIT)
+        {
+            let Some((kind, pk, d)) = super::filter::split_a_ref(&t[1]) else {
+                continue;
+            };
+            if kind != KIND_KANBAN_CARD as f64 || pk != event.pubkey {
+                continue;
+            }
+            match self
+                .kanban_query_events(
+                    SELECT_CARD_BY_ADDRESS_SQL,
+                    &[JsValue::from_str(pk), JsValue::from_str(d)],
+                )
+                .await
+            {
+                Ok(rows) => targets.extend(rows),
+                Err(()) => {
+                    console_warn!("kanban deletion gate: target read failed for {}", event.id);
+                    return None;
+                }
+            }
+        }
+        for target in targets {
+            let Some(deleted) = KanbanCard::from_event(&target) else {
+                continue;
+            };
+            let Some((_, board_pk, board_d)) = parse_coord(&deleted.board) else {
+                continue;
+            };
+            let Ok(Some(board)) = self.kanban_board(board_pk, board_d).await else {
+                continue;
+            };
+            if board.approval_columns.is_empty() {
+                continue;
+            }
+            let prior_rows = match self
+                .kanban_query_events(
+                    SELECT_PRIOR_CARD_SQL,
+                    &[
+                        JsValue::from_str(&deleted.board),
+                        JsValue::from_str(&deleted.d_tag),
+                        JsValue::from_str(&target.id),
+                    ],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(()) => return Some(ApprovalRefusal::Unverifiable),
+            };
+            if let Some(remaining) = first_card_of_board(prior_rows, &deleted.board) {
+                if deletion_reveals_approval_entry(&board, &deleted, &remaining) {
+                    return Some(ApprovalRefusal::DeletionEntry);
+                }
+            }
+        }
+        None
     }
 
     /// Run a query that returns stored events. `Err` is a D1 failure.
@@ -307,17 +435,17 @@ impl NostrRelayDO {
             return KanbanGate::NotGated;
         }
 
-        let board = match self
-            .kanban_query_events(
-                SELECT_BOARD_SQL,
-                &[JsValue::from_str(board_pk), JsValue::from_str(board_d)],
-            )
-            .await
-        {
-            Ok(rows) => rows.first().and_then(KanbanBoard::from_event),
+        let board = match self.kanban_board(board_pk, board_d).await {
+            Ok(b) => b,
             Err(()) => {
                 console_warn!("kanban approval gate: board read failed for {}", event.id);
-                return KanbanGate::NotGated;
+                // A card with a column may be entering a gated one: refuse
+                // rather than let a transient error open the gate.
+                return if incoming.column.is_empty() {
+                    KanbanGate::NotGated
+                } else {
+                    KanbanGate::Refused(ApprovalRefusal::Unverifiable)
+                };
             }
         };
         let Some(board) = board else {
@@ -383,15 +511,28 @@ impl NostrRelayDO {
             Ok(rows) => rows,
             Err(()) => return KanbanGate::Refused(ApprovalRefusal::Unverifiable),
         };
-        let mut candidates = Vec::with_capacity(decision_rows.len());
+        let rows_read = decision_rows.len();
+        let mut admin_memo: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut candidates = Vec::with_capacity(rows_read);
         for ev in decision_rows {
-            let signer_is_admin = self.admin_cache.is_admin(&ev.pubkey, &self.env).await;
+            let signer_is_admin = match admin_memo.get(&ev.pubkey) {
+                Some(a) => *a,
+                None => {
+                    let a = self.admin_cache.is_admin(&ev.pubkey, &self.env).await;
+                    admin_memo.insert(ev.pubkey.clone(), a);
+                    a
+                }
+            };
             candidates.push(DecisionCandidate {
                 event: ev,
                 signer_is_admin,
             });
         }
         let decision = latest_eligible_decision(&request_id, &candidates);
+        if decision_window_exhausted(rows_read, decision.is_some()) {
+            return KanbanGate::Refused(ApprovalRefusal::Unverifiable);
+        }
         let decider_principal = match decision {
             Some((ev, _)) => Some(self.effective_pubkey(&ev.pubkey).await.to_ascii_lowercase()),
             None => None,
@@ -903,9 +1044,16 @@ mod tests {
         assert_eq!(kanban_approval_gate_mode_var(Some("")), GateMode::Warn);
         assert_eq!(kanban_approval_gate_mode_var(Some("junk")), GateMode::Warn);
         assert_eq!(
-            kanban_approval_gate_mode_var(Some("Enforce")),
+            kanban_approval_gate_mode_var(Some(" Enforce ")),
+            GateMode::Enforce
+        );
+        assert_eq!(
+            kanban_approval_gate_mode_var(Some(" WARN ")),
             GateMode::Warn
         );
+        assert!(kanban_mode_is_known(None));
+        assert!(kanban_mode_is_known(Some(" Enforce ")));
+        assert!(!kanban_mode_is_known(Some("junk")));
         assert_eq!(kanban_approval_gate_mode_var(Some("warn")), GateMode::Warn);
         assert_eq!(
             kanban_approval_gate_mode_var(Some("enforce")),
@@ -1040,6 +1188,76 @@ mod tests {
 
         // An unreadable table keeps the claim.
         assert!(!should_release_claim(None));
+    }
+
+    #[test]
+    fn a_full_decision_window_without_an_admin_decision_is_unknown() {
+        assert!(decision_window_exhausted(DECISION_QUERY_LIMIT, false));
+        assert!(!decision_window_exhausted(DECISION_QUERY_LIMIT, true));
+        assert!(!decision_window_exhausted(DECISION_QUERY_LIMIT - 1, false));
+        // Reviewer-signed 31403s fill the window; the admin one is older.
+        let conn = db();
+        for i in 0..60u64 {
+            insert(
+                &conn,
+                &decision(
+                    &format!("rev{i:02}"),
+                    "reviewer",
+                    100 + i,
+                    plain_tags("r1"),
+                    r#"{"action":"reject"}"#,
+                ),
+            );
+        }
+        insert(
+            &conn,
+            &decision(
+                "adm",
+                "admin",
+                5,
+                plain_tags("r1"),
+                r#"{"action":"approve"}"#,
+            ),
+        );
+        let ids = rows(&conn, SELECT_DECISIONS_SQL, &[&"r1"]);
+        assert_eq!(ids.len(), DECISION_QUERY_LIMIT);
+        assert!(
+            !ids.contains(&"adm".to_string()),
+            "pushed out of the window"
+        );
+        assert!(decision_window_exhausted(ids.len(), false));
+    }
+
+    #[test]
+    fn deleting_the_move_out_version_is_caught_with_the_real_queries() {
+        // A wrote a version in `done`; B's newer version moved it out. B
+        // deleting theirs would expose A's as current.
+        let conn = db();
+        let board =
+            KanbanBoard::from_event(&board_event("b", BOARD_PK, "board1", &["done"])).unwrap();
+        insert(&conn, &card_event("a-done", "ca", 5, BOARD_COORD, "done"));
+        insert(&conn, &card_event("b-out", "cb", 9, BOARD_COORD, "todo"));
+
+        let target = rows(&conn, SELECT_CARD_BY_ID_SQL, &[&"b-out"]);
+        assert_eq!(target, vec!["b-out"]);
+        let by_addr = rows(&conn, SELECT_CARD_BY_ADDRESS_SQL, &[&"cb", &"card1"]);
+        assert_eq!(by_addr, vec!["b-out"]);
+
+        let deleted =
+            KanbanCard::from_event(&card_event("b-out", "cb", 9, BOARD_COORD, "todo")).unwrap();
+        let prior_ids = rows(
+            &conn,
+            SELECT_PRIOR_CARD_SQL,
+            &[&BOARD_COORD, &"card1", &"b-out"],
+        );
+        let events: Vec<NostrEvent> = prior_ids
+            .iter()
+            .map(|id| card_event(id, "ca", 5, BOARD_COORD, "done"))
+            .collect();
+        let remaining = first_card_of_board(events, BOARD_COORD).unwrap();
+        assert!(deletion_reveals_approval_entry(
+            &board, &deleted, &remaining
+        ));
     }
 
     // -- 22: warn mode still claims -----------------------------------------------
