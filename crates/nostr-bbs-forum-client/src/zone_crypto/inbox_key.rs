@@ -499,19 +499,89 @@ pub fn subscription_targets(me: &str, inbox_pk: Option<&str>) -> Vec<String> {
     v
 }
 
-/// Unwrap a gift wrap: with the inbox key first (when present), then the
-/// identity signer.
-pub async fn unwrap_inbox_then_identity(
+/// Which key a gift wrap is addressed to, among those held here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opener {
+    /// The member's inbox key (`RECIPIENT_KEYS_ENABLED`).
+    Inbox,
+    /// The member's identity signer.
+    Identity,
+}
+
+/// The key to open `wrap` with: the inbox key when a `p` tag names it and
+/// it is held, else the identity when a `p` tag names that, else none (the
+/// wrap is not addressed to a key held here).
+pub fn opener_for(wrap: &NostrEvent, inbox_pk: Option<&str>, identity_pk: &str) -> Option<Opener> {
+    let addressed = |pk: &str| {
+        wrap.tags
+            .iter()
+            .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == pk)
+    };
+    match inbox_pk {
+        Some(ipk) if addressed(ipk) => Some(Opener::Inbox),
+        _ if addressed(identity_pk) => Some(Opener::Identity),
+        _ => None,
+    }
+}
+
+/// Unwrap a gift wrap with the key it is addressed to ([`opener_for`]).
+///
+/// A wrap to the inbox key is never offered to the identity signer, nor the
+/// reverse: neither can open the other's wraps, and with a NIP-07 identity
+/// the attempt would raise a permission prompt and read as a refusal.
+pub async fn unwrap_addressed(
     wrap: &NostrEvent,
     inbox: Option<&dyn Signer>,
     identity: &dyn Signer,
-) -> Result<(String, UnsignedEvent), super::UnwrapError> {
-    if let Some(inbox) = inbox {
-        if let Ok(v) = super::unwrap_any(wrap, inbox).await {
-            return Ok(v);
+) -> Result<(String, UnsignedEvent, Opener), super::UnwrapError> {
+    match opener_for(wrap, inbox.map(|s| s.public_key()), identity.public_key()) {
+        Some(Opener::Inbox) => {
+            let inbox = inbox
+                .ok_or_else(|| super::UnwrapError::Invalid("inbox key not held".to_string()))?;
+            let (sealer, rumor) = super::unwrap_any(wrap, inbox).await?;
+            Ok((sealer, rumor, Opener::Inbox))
         }
+        Some(Opener::Identity) => {
+            let (sealer, rumor) = super::unwrap_any(wrap, identity).await?;
+            Ok((sealer, rumor, Opener::Identity))
+        }
+        None => Err(super::UnwrapError::Invalid(
+            "not addressed to a key held here".to_string(),
+        )),
     }
-    super::unwrap_any(wrap, identity).await
+}
+
+/// Open a wrap for the grant sync, or say how its failure counts.
+///
+/// `identity_kind` is whether the identity signer can refuse (NIP-07); the
+/// inbox key is always local. `attempt` is which attempt this is (see
+/// [`super::wrap_queue`]). On success the [`Opener`] tells the caller whether
+/// a refusable signer has just proven it works.
+pub async fn open_for_sync(
+    wrap: &NostrEvent,
+    inbox: Option<&dyn Signer>,
+    identity: &dyn Signer,
+    identity_kind: super::grant_backlog::SignerKind,
+    attempt: super::grant_backlog::Attempt,
+) -> Result<(String, UnsignedEvent, Opener), super::grant_backlog::WrapOutcome> {
+    let kind = signer_kind_for(wrap, inbox, identity, identity_kind);
+    unwrap_addressed(wrap, inbox, identity)
+        .await
+        .map_err(|e| super::grant_backlog::unwrap_failure_outcome(&e, kind, attempt))
+}
+
+/// The kind of signer `wrap` is opened with: local for the inbox key, else
+/// `identity_kind`.
+pub fn signer_kind_for(
+    wrap: &NostrEvent,
+    inbox: Option<&dyn Signer>,
+    identity: &dyn Signer,
+    identity_kind: super::grant_backlog::SignerKind,
+) -> super::grant_backlog::SignerKind {
+    match opener_for(wrap, inbox.map(|s| s.public_key()), identity.public_key()) {
+        Some(Opener::Inbox) => super::grant_backlog::SignerKind::Local,
+        _ => identity_kind,
+    }
 }
 
 // -- Old-grant sweep (decision 5) -------------------------------------------------
@@ -962,16 +1032,20 @@ mod tests {
         let inbox = local_signer();
         let to_inbox = grant_to(&admin, inbox.public_key());
         let to_identity = grant_to(&admin, member.public_key());
-        for wrap in [&to_inbox, &to_identity] {
-            let (sealer, rumor) =
-                block_on(unwrap_inbox_then_identity(wrap, Some(&inbox), &member)).unwrap();
+        for (wrap, opener) in [(&to_inbox, Opener::Inbox), (&to_identity, Opener::Identity)] {
+            let (sealer, rumor, by) =
+                block_on(unwrap_addressed(wrap, Some(&inbox), &member)).unwrap();
             assert_eq!(sealer, admin.public_key());
             assert_eq!(rumor.kind, super::super::KIND_ZONE_KEY_GRANT);
+            assert_eq!(by, opener);
         }
         // Without an inbox key (flag off) identity grants still open, and an
-        // inbox grant does not.
-        assert!(block_on(unwrap_inbox_then_identity(&to_identity, None, &member)).is_ok());
-        assert!(block_on(unwrap_inbox_then_identity(&to_inbox, None, &member)).is_err());
+        // inbox grant does not, without a decrypt being attempted.
+        assert!(block_on(unwrap_addressed(&to_identity, None, &member)).is_ok());
+        assert!(matches!(
+            block_on(unwrap_addressed(&to_inbox, None, &member)),
+            Err(super::super::UnwrapError::Invalid(_))
+        ));
     }
 
     #[test]

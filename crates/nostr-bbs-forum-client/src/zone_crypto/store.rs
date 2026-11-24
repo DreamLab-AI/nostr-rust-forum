@@ -12,9 +12,12 @@
 //! This keeps accounts that share a browser profile apart in the UI; it is not
 //! access control (see the module docs of `key_owner`).
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 
 use leptos::prelude::*;
 use nostr_bbs_core::signer::Signer;
@@ -22,18 +25,20 @@ use nostr_bbs_core::NostrEvent;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
-use super::grant_backlog::{unwrap_failure_outcome, GrantBacklog, KeyPhase, WrapOutcome};
-use super::grant_ledger::{GrantKv, GrantLedger};
-use super::grant_paging::{
-    grant_page_step, parse_marker, warm_marker, GrantScope, GrantStep, PageTally,
+use super::grant_backlog::{
+    unwrap_failure_outcome, Attempt, GrantBacklog, KeyPhase, SignerKind, WrapOutcome,
 };
+use super::grant_ledger::{GrantKv, GrantLedger};
+use super::grant_paging::{parse_marker, warm_marker, GrantScope, PagerAction, ScopePager};
 use super::inbox_key::{
-    deletion_for_wrap, ensure_inbox_key, grant_sweep_enabled, recipient_keys_enabled,
-    subscription_targets, sweep_targets, unwrap_inbox_then_identity, LivePort, SweepCandidate,
+    deletion_for_wrap, ensure_inbox_key, grant_sweep_enabled, open_for_sync,
+    recipient_keys_enabled, signer_kind_for, subscription_targets, sweep_targets, LivePort, Opener,
+    SweepCandidate,
 };
 use super::key_owner::{self, Lease, Owner, Session, Switch};
 use super::keyset::{self, SendKeyError};
 use super::read_cache::ReadCache;
+use super::wrap_queue::{Slot, Started, WrapQueue};
 use super::{is_zone_message, read_outcome, resolve_event, validate_grant, ZoneKey};
 use crate::relay::{EventCallback, Filter, RelayConnection};
 use crate::stores::indexed_db::{ForumDb, MintPut, ZoneKeyPut};
@@ -47,16 +52,19 @@ const KV_PROCESSED: &str = "processed_wraps";
 /// [`ZoneKeyStore::mark_processed`]).
 const PROCESSED_FLUSH_MS: i32 = 1_000;
 
-/// How many gift wraps are unwrapped and processed at once, for every signer.
-/// Each wrap is one NIP-44 decrypt through the signer and, for a grant, the
-/// sealer's admin check (a network fetch, cached per sealer) and IndexedDB
-/// writes. Four overlaps that network and storage latency, which is where a
-/// local key's time goes, while keeping a NIP-07 extension (which serves
-/// requests one by one, and may prompt for each) to a short queue of its
-/// own rather than thousands of calls at once when a page of 1000 lands.
-/// It also stays under the browser's six connections per host for the
-/// admin checks.
-const MAX_CONCURRENT_UNWRAPS: usize = 4;
+/// How long one wrap may hold an unwrap slot (see [`super::wrap_queue`])
+/// before the slot is given to the next wrap. The wrap itself is not
+/// abandoned: it is accounted for when it finishes, and holds the backlog
+/// open until then. One minute is three stall windows
+/// ([`super::grant_backlog::KEYS_STALL_MS`]), long enough for a person to
+/// answer a NIP-07 prompt, short enough that a hung fetch does not idle a
+/// quarter of the queue for the session.
+const UNWRAP_SLOT_TIMEOUT_MS: i32 = 60_000;
+
+/// How long the sealer's admin check may take before it counts as
+/// unanswered (a grant then ends in [`WrapOutcome::Retry`]). The fetch has no
+/// timeout of its own. Ten seconds is half the stall window.
+const ADMIN_CHECK_TIMEOUT_MS: i32 = 10_000;
 
 /// One wrap waiting in [`ZoneKeyStore::wrap_queue`].
 struct WrapJob {
@@ -71,8 +79,11 @@ struct ScopeCtx {
     relay: RelayConnection,
     lease: Lease,
     scope: GrantScope,
+    /// The scope's backfill marker id ([`GrantScope::marker_id`]).
+    marker: String,
     targets: Vec<String>,
     handler: EventCallback,
+    pager: RefCell<ScopePager>,
 }
 
 fn now_secs() -> u64 {
@@ -107,19 +118,14 @@ pub struct ZoneKeyStore {
     /// identity: marker id to completion time in seconds (see
     /// [`super::grant_paging`]).
     backfill_done: StoredValue<HashMap<String, u64>>,
+    /// Each running grant scope's marker id, for `try_write_markers`.
+    scope_markers: StoredValue<HashMap<GrantScope, String>>,
     /// The processed-wrap set changed since it was last written to
     /// IndexedDB, and a flush is scheduled.
     processed_flush_pending: StoredValue<bool>,
-    /// Scopes that have paged to the end this sign-in and await their
-    /// backfill marker (see `try_write_markers`).
-    markers_due: StoredValue<HashSet<GrantScope>>,
-    /// Wraps waiting to be processed, at most [`MAX_CONCURRENT_UNWRAPS`] at
-    /// a time.
-    wrap_queue: StoredValue<std::collections::VecDeque<WrapJob>, LocalStorage>,
-    /// Wraps being processed now.
-    unwraps_active: StoredValue<usize>,
-    /// The grant sync's signer can refuse a decrypt (NIP-07).
-    signer_can_refuse: StoredValue<bool>,
+    /// Wraps waiting to be processed, and the slots running them (see
+    /// [`super::wrap_queue`]).
+    wrap_queue: StoredValue<WrapQueue<WrapJob>, LocalStorage>,
     /// Wrap ids handed to the wrap handler this sign-in. Paging re-delivers
     /// the inclusive `until` boundary row, and a reconnect replays the
     /// long-lived subscriptions; neither should process a wrap twice.
@@ -182,11 +188,9 @@ impl ZoneKeyStore {
             loaded_for: RwSignal::new(None),
             grant_backlog: RwSignal::new(None),
             backfill_done: StoredValue::new(HashMap::new()),
+            scope_markers: StoredValue::new(HashMap::new()),
             processed_flush_pending: StoredValue::new(false),
-            markers_due: StoredValue::new(HashSet::new()),
-            wrap_queue: StoredValue::new_local(std::collections::VecDeque::new()),
-            unwraps_active: StoredValue::new(0),
-            signer_can_refuse: StoredValue::new(false),
+            wrap_queue: StoredValue::new_local(WrapQueue::new()),
             seen_wraps: StoredValue::new(HashSet::new()),
             device_epochs: RwSignal::new(HashMap::new()),
             session: StoredValue::new(Session::default()),
@@ -293,11 +297,11 @@ impl ZoneKeyStore {
         let _ = self.loaded_for.try_set(None);
         let _ = self.grant_backlog.try_set(None);
         self.backfill_done.set_value(HashMap::new());
-        self.markers_due.set_value(HashSet::new());
-        // Queued wraps belong to the old sign-in; ones already running finish
-        // and are ignored (their lease is no longer current).
-        self.wrap_queue
-            .update_value(std::collections::VecDeque::clear);
+        self.scope_markers.set_value(HashMap::new());
+        // Queued and parked wraps belong to the old sign-in; ones already
+        // running finish and are ignored (their lease is no longer current),
+        // and their slots belong to the old generation.
+        self.wrap_queue.update_value(WrapQueue::reset);
         self.seen_wraps.set_value(HashSet::new());
         let _ = self.keys.try_set(HashMap::new());
         let _ = self.conflicts.try_set(Vec::new());
@@ -616,13 +620,13 @@ impl ZoneKeyStore {
         let inbox = db
             .get_zone_kv(&key_owner::inbox_granted_id(lease.owner()))
             .await;
+        // The identity scope's marker; the inbox scope's is loaded once its
+        // key is known (`start_grant_sync`).
         let mut markers = HashMap::new();
-        for scope in [GrantScope::Identity, GrantScope::Inbox] {
-            let id = scope.marker_id(lease.owner().as_str());
-            if let Some(done_at) = parse_marker(db.get_zone_kv(&id).await.ok().flatten().as_deref())
-            {
-                markers.insert(id, done_at);
-            }
+        let owner = lease.owner().as_str();
+        let id = GrantScope::Identity.marker_id(owner, owner);
+        if let Some(done_at) = parse_marker(db.get_zone_kv(&id).await.ok().flatten().as_deref()) {
+            markers.insert(id, done_at);
         }
         if !self.is_current(lease) {
             return;
@@ -685,7 +689,13 @@ impl ZoneKeyStore {
         }
         self.sync_for.set_value(Some(lease.clone()));
         self.grant_relay.set_value(Some(relay.clone()));
-        self.signer_can_refuse.set_value(signer_can_refuse);
+        self.wrap_queue.update_value(|q| {
+            q.set_signer(if signer_can_refuse {
+                SignerKind::CanRefuse
+            } else {
+                SignerKind::Local
+            })
+        });
         let _ = self.grant_backlog.try_set(Some((
             lease.owner().clone(),
             GrantBacklog::new(recipient_keys_enabled(), js_sys::Date::now()),
@@ -721,6 +731,19 @@ impl ZoneKeyStore {
                     store.inbox_sk.set_value(Some(key.sk_hex));
                     let handler = store.wrap_handler(&relay, signer.clone(), lease.clone(), true);
                     store.note_backlog(&lease, GrantBacklog::inbox_opened);
+                    // This inbox key's own backfill marker.
+                    let marker = GrantScope::Inbox.marker_id(lease.owner().as_str(), &key.pubkey);
+                    if let Ok(db) = ForumDb::open().await {
+                        let raw = db.get_zone_kv(&marker).await.ok().flatten();
+                        if let Some(done_at) = parse_marker(raw.as_deref()) {
+                            store.backfill_done.update_value(|m| {
+                                m.insert(marker.clone(), done_at);
+                            });
+                        }
+                    }
+                    if !store.is_current(&lease) {
+                        return;
+                    }
                     store.run_scope(&relay, &lease, GrantScope::Inbox, vec![key.pubkey], handler);
                 }
                 Ok(_) => {}
@@ -733,11 +756,12 @@ impl ZoneKeyStore {
     }
 
     /// Fetch every stored wrap for one grant scope, paging past the relay's
-    /// row cap (see [`super::grant_paging`]), then stay subscribed for live
-    /// wraps. The long-lived subscription is page 0; each further page is its
-    /// own subscription, opened only after the previous one's EOSE and closed
-    /// at its own, so a scope holds at most two relay subscriptions at once.
-    /// The scope counts as delivered (its EOSE is recorded in the backlog)
+    /// row cap, then stay subscribed for live wraps. The paging decisions are
+    /// [`ScopePager`]'s (see [`super::grant_paging`]); this only opens and
+    /// closes the subscriptions it asks for. The long-lived subscription is
+    /// page 0; each further page is its own subscription, opened only after
+    /// the previous one's EOSE and closed at its own, so a scope holds at
+    /// most two relay subscriptions at once. The scope counts as delivered
     /// only when the last page is in.
     fn run_scope(
         &self,
@@ -747,77 +771,90 @@ impl ZoneKeyStore {
         targets: Vec<String>,
         handler: EventCallback,
     ) {
-        let store = *self;
-        let filter = wrap_filter(targets.clone(), None);
+        let owner = lease.owner().as_str();
+        let target = targets.first().map_or(owner, String::as_str);
+        let marker = scope.marker_id(owner, target);
+        self.scope_markers.update_value(|m| {
+            m.insert(scope, marker.clone());
+        });
         let ctx = Rc::new(ScopeCtx {
             relay: relay.clone(),
             lease: lease.clone(),
             scope,
+            marker,
             targets,
-            handler: handler.clone(),
+            handler,
+            pager: RefCell::new(ScopePager::new()),
         });
-        let tally = Rc::new(std::cell::RefCell::new(PageTally::default()));
-        // Page 0's tally covers its stored events only; after the first EOSE
-        // the subscription carries live wraps, which are not a page.
-        let open = Rc::new(std::cell::Cell::new(true));
-        let on_event = {
-            let (tally, open) = (tally.clone(), open.clone());
-            Rc::new(move |ev: NostrEvent| {
-                if open.get() {
-                    let processed = store.processed.with_value(|s| s.contains(&ev.id));
-                    tally.borrow_mut().observe(ev.created_at, processed);
-                }
-                handler(ev);
-            })
-        };
-        let on_eose = Rc::new(move || {
-            // First EOSE only: a replay after a reconnect is not a page.
-            if !open.replace(false) {
-                return;
-            }
-            let t = *tally.borrow();
-            store.after_page(&ctx, 0, None, t, false);
-        });
-        let id = relay.subscribe(vec![filter], on_event, Some(on_eose));
-        self.grant_subs.update_value(|v| v.push(id));
+        self.open_page(&ctx, 0, None);
     }
 
-    /// Act on a scope's page `page` (fetched with `until`) reaching EOSE.
-    fn after_page(
-        &self,
-        ctx: &Rc<ScopeCtx>,
-        page: u32,
-        until: Option<u64>,
-        tally: PageTally,
-        boundary_retry: bool,
-    ) {
+    /// Subscribe page `page` of a scope (`until` inclusive; none for page 0).
+    /// Recorded with the grant subscriptions, so a sign-out mid-page closes
+    /// it rather than leaving it to be replayed under the next sign-in.
+    fn open_page(&self, ctx: &Rc<ScopeCtx>, page: u32, until: Option<u64>) {
+        let store = *self;
+        let sub_id: Rc<RefCell<Option<String>>> = Rc::default();
+        let on_event = {
+            let ctx = ctx.clone();
+            Rc::new(move |ev: NostrEvent| {
+                let processed = store.processed.with_value(|s| s.contains(&ev.id));
+                ctx.pager
+                    .borrow_mut()
+                    .observe(page, &ev.id, ev.created_at, processed);
+                (ctx.handler)(ev);
+            })
+        };
+        let on_eose = {
+            let (ctx, sub_id) = (ctx.clone(), sub_id.clone());
+            Rc::new(move || store.after_page(&ctx, page, &sub_id))
+        };
+        let id = ctx.relay.subscribe(
+            vec![wrap_filter(ctx.targets.clone(), until)],
+            on_event,
+            Some(on_eose),
+        );
+        self.grant_subs.update_value(|v| v.push(id.clone()));
+        *sub_id.borrow_mut() = Some(id);
+    }
+
+    /// Act on page `page` of a scope reaching EOSE (its subscription id in
+    /// `sub_id`).
+    fn after_page(&self, ctx: &Rc<ScopeCtx>, page: u32, sub_id: &RefCell<Option<String>>) {
         let lease = &ctx.lease;
         if !self.is_current(lease) {
             return;
         }
-        let marker = ctx.scope.marker_id(lease.owner().as_str());
-        let completed_at = self.backfill_done.with_value(|m| m.get(&marker).copied());
+        let completed_at = self
+            .backfill_done
+            .with_value(|m| m.get(&ctx.marker).copied());
         let warm = warm_marker(completed_at, grant_sweep_enabled());
-        match grant_page_step(page, until, tally, warm, boundary_retry) {
-            GrantStep::Done => {
+        // `None`: a replayed or stale EOSE, not the current page's first.
+        let Some(end) = ctx.pager.borrow_mut().eose(page, warm) else {
+            return;
+        };
+        if end.close {
+            if let Some(id) = sub_id.borrow_mut().take() {
+                ctx.relay.unsubscribe(&id);
+                // Closed: `stop_grant_sync` need not CLOSE it again.
+                let _ = self.grant_subs.try_update_value(|v| v.retain(|s| s != &id));
+            }
+        }
+        match end.then {
+            PagerAction::Fetch { page, until } => self.open_page(ctx, page, Some(until)),
+            PagerAction::Done { verified } => {
                 if ctx.scope == GrantScope::Identity {
                     // The end of stored events on the identity scope settles
                     // the old-grant cleanup flag the public-inbox opt-in
                     // waits for. With the sweep on there is no warm stop, so
                     // this follows a full walk of the scope.
                     super::public_inbox::sweep_eose(lease.owner().as_str());
-                    self.note_backlog(lease, GrantBacklog::identity_eose);
-                } else {
-                    self.note_backlog(lease, GrantBacklog::inbox_eose);
                 }
-                // The marker is written only once every wrap has finished
-                // with no failure worth retrying (see `try_write_markers`).
-                self.markers_due.update_value(|d| {
-                    d.insert(ctx.scope);
-                });
+                let scope = ctx.scope;
+                self.note_backlog(lease, |b, now| b.scope_delivered(scope, verified, now));
                 self.try_write_markers(lease);
             }
-            GrantStep::GiveUp => {
+            PagerAction::GiveUp => {
                 web_sys::console::warn_1(
                     &format!(
                         "[zone-key] {:?} grant paging stopped at page {page}",
@@ -827,86 +864,35 @@ impl ZoneKeyStore {
                 );
                 self.note_backlog(lease, GrantBacklog::paging_gave_up);
             }
-            GrantStep::Next {
-                until,
-                boundary_retry,
-            } => {
-                self.open_page(ctx, page + 1, until, boundary_retry);
-            }
         }
     }
 
-    /// Open page `page` of a scope: wraps with `created_at <= until`.
-    /// Recorded with the grant subscriptions, so a sign-out mid-page closes
-    /// it rather than leaving it to be replayed under the next sign-in.
-    fn open_page(&self, ctx: &Rc<ScopeCtx>, page: u32, until: u64, boundary_retry: bool) {
-        let store = *self;
-        let tally = Rc::new(std::cell::RefCell::new(PageTally::default()));
-        let sub_id: Rc<std::cell::RefCell<Option<String>>> = Rc::default();
-        let on_event = {
-            let (tally, handler) = (tally.clone(), ctx.handler.clone());
-            Rc::new(move |ev: NostrEvent| {
-                let processed = store.processed.with_value(|s| s.contains(&ev.id));
-                tally.borrow_mut().observe(ev.created_at, processed);
-                handler(ev);
-            })
-        };
-        let on_eose = {
-            let (ctx, sub_id) = (ctx.clone(), sub_id.clone());
-            Rc::new(move || {
-                // First EOSE only; then close the page so the scope never
-                // holds more than one page subscription.
-                let Some(id) = sub_id.borrow_mut().take() else {
-                    return;
-                };
-                ctx.relay.unsubscribe(&id);
-                // Closed: `stop_grant_sync` need not CLOSE it again.
-                let _ = store
-                    .grant_subs
-                    .try_update_value(|v| v.retain(|s| s != &id));
-                let t = *tally.borrow();
-                store.after_page(&ctx, page, Some(until), t, boundary_retry);
-            })
-        };
-        let id = ctx.relay.subscribe(
-            vec![wrap_filter(ctx.targets.clone(), Some(until))],
-            on_event,
-            Some(on_eose),
-        );
-        self.grant_subs.update_value(|v| v.push(id.clone()));
-        *sub_id.borrow_mut() = Some(id);
-    }
-
-    /// Persist the completion time of every scope that has paged to the end,
-    /// once the backlog allows it ([`GrantBacklog::marker_writable`]): every
-    /// wrap of this sign-in finished, none needing a retry. Called when a
-    /// scope finishes paging and whenever a wrap finishes. A session closed
-    /// before then writes nothing, so the next one pages fully.
+    /// Persist the completion time of every scope whose marker has come due
+    /// ([`GrantBacklog::take_due_markers`]: a verified walk, every wrap of
+    /// this sign-in finished, none waiting for a retry). Called when a scope
+    /// finishes paging and whenever a wrap finishes. A session closed before
+    /// then writes nothing, so the next one pages fully.
     fn try_write_markers(&self, lease: &Lease) {
         if !self.is_current(lease) {
             return;
         }
-        let writable = self
-            .grant_backlog
-            .try_with_untracked(|b| {
-                matches!(b, Some((owner, backlog)) if owner == lease.owner() && backlog.marker_writable())
-            })
-            .unwrap_or(false);
-        if !writable {
-            return;
-        }
+        // Untracked: taking the due set changes nothing a page renders.
         let due = self
-            .markers_due
-            .try_update_value(std::mem::take)
+            .grant_backlog
+            .try_update_untracked(|b| match b {
+                Some((owner, backlog)) if owner == lease.owner() => backlog.take_due_markers(),
+                _ => Vec::new(),
+            })
             .unwrap_or_default();
         if due.is_empty() {
             return;
         }
         let done_at = now_secs();
-        let ids: Vec<String> = due
-            .iter()
-            .map(|s| s.marker_id(lease.owner().as_str()))
-            .collect();
+        let ids: Vec<String> = self.scope_markers.with_value(|m| {
+            due.iter()
+                .filter_map(|scope| m.get(scope).cloned())
+                .collect()
+        });
         self.backfill_done.update_value(|m| {
             for id in &ids {
                 m.insert(id.clone(), done_at);
@@ -973,60 +959,105 @@ impl ZoneKeyStore {
         })
     }
 
-    /// Queue a wrap for processing and start as many as the concurrency
-    /// bound allows.
+    /// Queue a wrap for processing and start as many as the queue allows.
     fn enqueue_wrap(&self, job: WrapJob) {
-        self.wrap_queue.update_value(|q| q.push_back(job));
+        self.wrap_queue.update_value(|q| q.push(job));
         self.pump_wraps();
     }
 
-    /// Start queued wraps while fewer than [`MAX_CONCURRENT_UNWRAPS`] are
-    /// being processed.
+    /// Start queued wraps while the queue has free slots. Each slot is given
+    /// back when its wrap finishes or after [`UNWRAP_SLOT_TIMEOUT_MS`],
+    /// whichever comes first.
     fn pump_wraps(&self) {
         loop {
-            let active = self.unwraps_active.try_get_value().unwrap_or(usize::MAX);
-            if active >= MAX_CONCURRENT_UNWRAPS {
-                return;
-            }
-            let Some(job) = self
+            let Some(started) = self
                 .wrap_queue
-                .try_update_value(|q| q.pop_front())
+                .try_update_value(WrapQueue::start_next)
                 .flatten()
             else {
                 return;
             };
-            self.unwraps_active.update_value(|n| *n += 1);
+            let slot = Rc::new(Cell::new(Some(started.slot)));
             let store = *self;
+            {
+                let slot = slot.clone();
+                crate::utils::set_timeout_once(
+                    move || store.release_slot(&slot),
+                    UNWRAP_SLOT_TIMEOUT_MS,
+                );
+            }
             spawn_local(async move {
-                store.run_wrap(job).await;
-                let _ = store
-                    .unwraps_active
-                    .try_update_value(|n| *n = n.saturating_sub(1));
-                store.pump_wraps();
+                store.run_wrap(started).await;
+                store.release_slot(&slot);
             });
         }
     }
 
+    /// Give a slot back once (the wrap finished, or it timed out first).
+    fn release_slot(&self, slot: &Cell<Option<Slot>>) {
+        if let Some(s) = slot.take() {
+            let _ = self.wrap_queue.try_update_value(|q| q.release(s));
+            self.pump_wraps();
+        }
+    }
+
+    /// The refusable signer decrypted a wrap: queue the wraps it refused
+    /// earlier once more (see [`super::wrap_queue`]).
+    fn note_signer_success(&self, lease: &Lease) {
+        let requeued = self
+            .wrap_queue
+            .try_update_value(WrapQueue::signer_succeeded)
+            .unwrap_or(0);
+        for _ in 0..requeued {
+            self.note_backlog(lease, |b, _| b.wrap_started());
+        }
+        if requeued > 0 {
+            self.pump_wraps();
+        }
+    }
+
     /// Process one queued wrap and account for it.
-    async fn run_wrap(&self, job: WrapJob) {
-        let WrapJob {
-            lease,
-            ev,
-            signer,
-            relay,
-        } = job;
-        if !self.is_current(&lease) {
+    async fn run_wrap(&self, started: Started<WrapJob>) {
+        let Started {
+            job,
+            attempt,
+            successes_at_start,
+            ..
+        } = started;
+        if !self.is_current(&job.lease) {
             return; // its sign-in is over; the backlog was reset
         }
-        let outcome = self.process_wrap(&lease, &ev, &*signer, &relay).await;
-        if outcome == WrapOutcome::Retry {
-            // Left unmarked to be retried: let a reconnect's replay of the
-            // same wrap in this session try again.
-            self.seen_wraps.update_value(|s| {
-                s.remove(&ev.id);
-            });
+        let outcome = self
+            .process_wrap(&job.lease, &job.ev, &*job.signer, &job.relay, attempt)
+            .await;
+        let lease = job.lease.clone();
+        let id = job.ev.id.clone();
+        self.note_backlog(&lease, |b, now| b.wrap_done(now, &id, outcome));
+        match outcome {
+            WrapOutcome::Refused => {
+                // Held for the signer's next success. Still seen, so a replay
+                // does not queue it twice; still counted by the sweep.
+                if self.is_current(&lease) {
+                    let requeued = self
+                        .wrap_queue
+                        .try_update_value(|q| q.park(job, successes_at_start))
+                        .unwrap_or(false);
+                    if requeued {
+                        self.note_backlog(&lease, |b, _| b.wrap_started());
+                        self.pump_wraps();
+                    }
+                }
+                return;
+            }
+            WrapOutcome::Retry => {
+                // Left unmarked to be retried: let a reconnect's replay of the
+                // same wrap in this session try again.
+                self.seen_wraps.update_value(|s| {
+                    s.remove(&id);
+                });
+            }
+            WrapOutcome::Settled | WrapOutcome::Unreadable => {}
         }
-        self.note_backlog(&lease, |b, now| b.wrap_done(now, outcome));
         // A switch reset the tracker: an earlier identity's wrap no longer
         // counts towards the new one's cleanup.
         if self.is_current(&lease) {
@@ -1041,6 +1072,7 @@ impl ZoneKeyStore {
         wrap: &NostrEvent,
         signer: &dyn Signer,
         relay: &RelayConnection,
+        attempt: Attempt,
     ) -> WrapOutcome {
         let me = lease.owner().as_str();
         let inbox = self
@@ -1049,22 +1081,19 @@ impl ZoneKeyStore {
             .filter(|_| self.is_current(lease))
             .and_then(|sk| super::inbox_key::inbox_signer(&sk).ok());
         let inbox_ref = inbox.as_ref().map(|s| s as &dyn Signer);
-        let inbox_pk = inbox.as_ref().map(|s| s.public_key().to_string());
-        let via_inbox = inbox_pk
-            .as_deref()
-            .is_some_and(|ipk| p_tags(wrap).any(|p| p == ipk));
-        let (sealer, rumor) = match unwrap_inbox_then_identity(wrap, inbox_ref, signer).await {
-            Ok(v) => v,
-            // Left unmarked so a later session with a capable signer
-            // retries. Whether it also holds this session's backfill marker
-            // depends on whether the failure can be transient.
-            Err(e) => {
-                return unwrap_failure_outcome(
-                    matches!(e, super::UnwrapError::Signer(_)),
-                    self.signer_can_refuse.get_value(),
-                );
-            }
-        };
+        let identity_kind = self.wrap_queue.with_value(WrapQueue::signer);
+        let (sealer, rumor, opener) =
+            match open_for_sync(wrap, inbox_ref, signer, identity_kind, attempt).await {
+                Ok(v) => v,
+                // Left unmarked so a later session with a capable signer
+                // retries; the outcome says whether it holds this one.
+                Err(outcome) => return outcome,
+            };
+        if opener == Opener::Identity && identity_kind == SignerKind::CanRefuse {
+            self.note_signer_success(lease);
+        }
+        let via_inbox = opener == Opener::Inbox;
+        let kind = signer_kind_for(wrap, inbox_ref, signer, identity_kind);
         match super::tickets::route(rumor.kind, super::tickets::zone_groups_enabled()) {
             super::tickets::Route::Grant => {}
             super::tickets::Route::Ignore => {
@@ -1073,7 +1102,7 @@ impl ZoneKeyStore {
             }
             super::tickets::Route::Ticket => {
                 return self
-                    .process_ticket(lease, wrap, inbox_ref, signer, via_inbox)
+                    .process_ticket(lease, wrap, inbox_ref, signer, via_inbox, (kind, attempt))
                     .await;
             }
         }
@@ -1151,6 +1180,8 @@ impl ZoneKeyStore {
     /// and stored as the same [`ZoneKey`] a 21453 grant yields. No admin
     /// check: the group identity is not an admin. Unloaded bindings leave the
     /// wrap unmarked so the next session retries; any other refusal is final.
+    /// `failure` (the signer kind and attempt) classifies a ticket whose own
+    /// decrypt failed (see [`unwrap_failure_outcome`]).
     async fn process_ticket(
         &self,
         lease: &Lease,
@@ -1158,6 +1189,7 @@ impl ZoneKeyStore {
         inbox: Option<&dyn Signer>,
         identity: &dyn Signer,
         via_inbox: bool,
+        failure: (SignerKind, Attempt),
     ) -> WrapOutcome {
         use super::tickets::{
             ensure_bindings_loaded, loaded_bindings, ticket_verdict, TicketVerdict,
@@ -1169,6 +1201,9 @@ impl ZoneKeyStore {
         let me = lease.owner().as_str();
         match ticket_verdict(opened, me, loaded_bindings().as_ref(), now_secs()) {
             TicketVerdict::Retry => WrapOutcome::Retry,
+            // The outer unwrap opened, but the ticket's own decrypt did not: a
+            // NIP-07 refusal is held and retried, never a final refusal.
+            TicketVerdict::SignerFailed(e) => unwrap_failure_outcome(&e, failure.0, failure.1),
             TicketVerdict::Refuse(why) => {
                 web_sys::console::warn_1(&format!("[zone-key] ticket refused: {why}").into());
                 self.mark_processed(&wrap.id).await;
@@ -1436,7 +1471,11 @@ impl ZoneKeyStore {
         if let Some(v) = self.admin_cache.with_value(|m| m.get(pubkey).copied()) {
             return Some(v);
         }
-        let v = fetch_is_admin(pubkey).await?;
+        // Bounded: the fetch has no timeout of its own, and a hung check
+        // would hold an unwrap slot (finding 4).
+        let v = with_timeout(fetch_is_admin(pubkey), ADMIN_CHECK_TIMEOUT_MS)
+            .await
+            .flatten()?;
         self.admin_cache.update_value(|m| {
             m.insert(pubkey.to_string(), v);
         });
@@ -1540,6 +1579,33 @@ fn latest_in(m: &HashMap<String, ZoneKey>, zone: &str) -> Option<ZoneKey> {
         .filter(|k| k.zone == zone)
         .max_by_key(|k| k.epoch)
         .cloned()
+}
+
+/// Resolve after `ms` milliseconds.
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(win) = web_sys::window() {
+            let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+/// `fut`'s output, or `None` if `ms` milliseconds pass first. The future is
+/// dropped on timeout; a fetch it started runs on and is ignored.
+async fn with_timeout<F: Future>(fut: F, ms: i32) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut timer = std::pin::pin!(sleep_ms(ms));
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(v));
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 async fn fetch_is_admin(pubkey: &str) -> Option<bool> {

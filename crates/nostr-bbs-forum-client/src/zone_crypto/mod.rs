@@ -76,6 +76,8 @@ pub mod auto_grant;
 pub mod grant_backlog;
 pub mod grant_ledger;
 pub mod grant_paging;
+#[cfg(test)]
+mod grant_sync_sim;
 pub mod inbox_key;
 pub mod key_owner;
 pub mod keyset;
@@ -84,6 +86,7 @@ pub mod public_inbox;
 pub mod read_cache;
 pub mod store;
 pub mod tickets;
+pub mod wrap_queue;
 
 use nostr_bbs_core::sealed::{has_sealed_tag, open_sealed};
 use nostr_bbs_core::signer::Signer;

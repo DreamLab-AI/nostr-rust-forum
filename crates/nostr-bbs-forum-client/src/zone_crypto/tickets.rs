@@ -33,7 +33,7 @@ use std::rc::Rc;
 use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::{verify_event_strict, NostrEvent, UnsignedEvent};
 
-use super::ZoneKey;
+use super::{UnwrapError, ZoneKey};
 
 /// Kind of an NIP-171 epoch ticket.
 pub const KIND_EPOCH_TICKET: u64 = 1014;
@@ -451,49 +451,62 @@ pub async fn wrap_ticket(
     nostr_bbs_core::gift_wrap::wrap_seal(&seal, recipient_key).map_err(|e| e.to_string())
 }
 
-async fn open_with(wrap: &NostrEvent, signer: &dyn Signer) -> Result<NostrEvent, String> {
+async fn open_with(wrap: &NostrEvent, signer: &dyn Signer) -> Result<NostrEvent, UnwrapError> {
+    let invalid = |m: &str| UnwrapError::Invalid(m.to_string());
+    let signer_failed = |m: &str| UnwrapError::Signer(m.to_string());
     if wrap.kind != nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP {
-        return Err("not a gift wrap".into());
+        return Err(invalid("not a gift wrap"));
     }
-    verify_event_strict(wrap).map_err(|_| "gift wrap id or signature does not verify")?;
+    verify_event_strict(wrap).map_err(|_| invalid("gift wrap id or signature does not verify"))?;
     let seal_json = signer
         .nip44_decrypt(&wrap.pubkey, &wrap.content)
         .await
-        .map_err(|_| "gift wrap layer does not decrypt")?;
-    let seal: NostrEvent = serde_json::from_str(&seal_json).map_err(|_| "seal JSON malformed")?;
+        .map_err(|_| signer_failed("gift wrap layer does not decrypt"))?;
+    let seal: NostrEvent =
+        serde_json::from_str(&seal_json).map_err(|_| invalid("seal JSON malformed"))?;
     if seal.kind != SEAL_KIND {
-        return Err("not a seal".into());
+        return Err(invalid("not a seal"));
     }
-    verify_event_strict(&seal).map_err(|_| "seal id or signature does not verify")?;
+    verify_event_strict(&seal).map_err(|_| invalid("seal id or signature does not verify"))?;
     let inner = signer
         .nip44_decrypt(&seal.pubkey, &seal.content)
         .await
-        .map_err(|_| "seal layer does not decrypt")?;
+        .map_err(|_| signer_failed("seal layer does not decrypt"))?;
     let ticket: NostrEvent =
-        serde_json::from_str(&inner).map_err(|_| "ticket is not a signed event")?;
+        serde_json::from_str(&inner).map_err(|_| invalid("ticket is not a signed event"))?;
     if ticket.kind != KIND_EPOCH_TICKET {
-        return Err(format!("not an epoch ticket (kind {})", ticket.kind));
+        return Err(UnwrapError::Invalid(format!(
+            "not an epoch ticket (kind {})",
+            ticket.kind
+        )));
     }
     if ticket.pubkey != seal.pubkey {
-        return Err("ticket author does not match seal author".into());
+        return Err(invalid("ticket author does not match seal author"));
     }
-    verify_event_strict(&ticket).map_err(|_| "ticket id or signature does not verify")?;
+    verify_event_strict(&ticket).map_err(|_| invalid("ticket id or signature does not verify"))?;
     Ok(ticket)
 }
 
-/// Open a gift wrap that carries a signed ticket, with the inbox key first
-/// (when held) and then the identity. Errors are fixed strings.
+/// Open a gift wrap that carries a signed ticket, with the key it is
+/// addressed to ([`super::inbox_key::opener_for`]). Error messages are fixed
+/// strings; a signer decrypt failure is [`UnwrapError::Signer`], so a
+/// refused NIP-07 prompt is not taken as a final refusal of the ticket.
 pub async fn open_ticket(
     wrap: &NostrEvent,
     inbox: Option<&dyn Signer>,
     identity: &dyn Signer,
-) -> Result<NostrEvent, String> {
-    if let Some(inbox) = inbox {
-        if let Ok(t) = open_with(wrap, inbox).await {
-            return Ok(t);
-        }
+) -> Result<NostrEvent, UnwrapError> {
+    use super::inbox_key::{opener_for, Opener};
+    match opener_for(wrap, inbox.map(|s| s.public_key()), identity.public_key()) {
+        Some(Opener::Inbox) => match inbox {
+            Some(inbox) => open_with(wrap, inbox).await,
+            None => Err(UnwrapError::Invalid("inbox key not held".to_string())),
+        },
+        Some(Opener::Identity) => open_with(wrap, identity).await,
+        None => Err(UnwrapError::Invalid(
+            "not addressed to a key held here".to_string(),
+        )),
     }
-    open_with(wrap, identity).await
 }
 
 /// What the wrap reader does with a rumor of a given kind.
@@ -529,17 +542,22 @@ pub enum TicketVerdict {
     Retry,
     /// Final refusal, with the reason: mark the wrap processed.
     Refuse(String),
+    /// The signer could not decrypt it: classify with
+    /// [`super::grant_backlog::unwrap_failure_outcome`] (a NIP-07 refusal is
+    /// retried, not final).
+    SignerFailed(UnwrapError),
 }
 
 /// Turn the result of [`open_ticket`] into a verdict.
 pub fn ticket_verdict(
-    opened: Result<NostrEvent, String>,
+    opened: Result<NostrEvent, UnwrapError>,
     me: &str,
     bindings: Option<&ZoneGroupBindings>,
     now: u64,
 ) -> TicketVerdict {
     match opened {
-        Err(e) => TicketVerdict::Refuse(e),
+        Err(e @ UnwrapError::Signer(_)) => TicketVerdict::SignerFailed(e),
+        Err(UnwrapError::Invalid(why)) => TicketVerdict::Refuse(why),
         Ok(ev) => match accept_ticket(&ev, me, bindings, now) {
             Ok(k) => TicketVerdict::Accept(Box::new(k)),
             // Transient: the binding set may be incomplete (not yet loaded, a
@@ -897,7 +915,7 @@ mod tests {
         let wrap = nostr_bbs_core::gift_wrap::wrap_seal(&seal, member.public_key()).unwrap();
         assert_eq!(
             block_on(open_ticket(&wrap, None, &member)).unwrap_err(),
-            "ticket author does not match seal author"
+            UnwrapError::Invalid("ticket author does not match seal author".into())
         );
     }
 
@@ -979,7 +997,7 @@ mod tests {
         // 1014: rumor-kind peek (the existing unwrap) routes it, open + verdict accept it.
         let ev = block_on(build_ticket(&g, member.public_key(), 2, &sk, 5)).unwrap();
         let wrap = block_on(wrap_ticket(&g, member.public_key(), &ev, 5)).unwrap();
-        let (sealer, rumor) = block_on(super::super::inbox_key::unwrap_inbox_then_identity(
+        let (sealer, rumor, _) = block_on(super::super::inbox_key::unwrap_addressed(
             &wrap, None, &member,
         ))
         .unwrap();
@@ -1017,7 +1035,7 @@ mod tests {
             5,
         ))
         .unwrap();
-        let (_, rumor) = block_on(super::super::inbox_key::unwrap_inbox_then_identity(
+        let (_, rumor, _) = block_on(super::super::inbox_key::unwrap_addressed(
             &grant, None, &member,
         ))
         .unwrap();
