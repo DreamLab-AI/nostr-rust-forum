@@ -32,6 +32,34 @@ const MAX_BATCH_SIZE: usize = 200;
 /// Debounce window after the last `lookup` miss before flushing the queue.
 const FLUSH_DEBOUNCE_MS: i32 = 100;
 
+/// How long a pubkey the server returned no profile for is not asked again.
+/// Without it every newly mounted card re-queued its author: a thread of
+/// imported history (authors with no kind-0) sent a `/api/profiles/batch`
+/// per page of cards, each 3-16 s on a loaded relay, competing with the
+/// page requests themselves.
+const MISSING_RETRY_SECS: u64 = 600;
+
+/// Pubkeys answered "no profile" at `at`, still within `MISSING_RETRY_SECS`.
+fn recently_missing(missing: &HashMap<String, u64>, pubkey: &str, now: u64) -> bool {
+    missing
+        .get(pubkey)
+        .is_some_and(|at| now.saturating_sub(*at) < MISSING_RETRY_SECS)
+}
+
+fn now_secs() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (js_sys::Date::now() / 1000.0) as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
+
 /// One profile entry, materialised from kind-0 metadata.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProfileEntry {
@@ -145,6 +173,9 @@ pub struct ProfileCache {
     /// (`/api/profiles/successors`). Lookups for a replaced key resolve to the
     /// successor's profile, and pickers drop replaced keys.
     pub successors: RwSignal<HashMap<String, String>>,
+    /// Pubkeys the server returned no profile for, and when (see
+    /// [`MISSING_RETRY_SECS`]). Not reactive: it only gates fetching.
+    missing: StoredValue<HashMap<String, u64>>,
 }
 
 impl Default for ProfileCache {
@@ -161,6 +192,7 @@ impl ProfileCache {
             in_flight: RwSignal::new(HashSet::new()),
             flush_scheduled: RwSignal::new(false),
             successors: RwSignal::new(HashMap::new()),
+            missing: StoredValue::new(HashMap::new()),
         }
     }
 
@@ -253,6 +285,9 @@ impl ProfileCache {
 
     /// Insert or update a fully-formed entry, refreshing the reactive signal.
     pub fn upsert_entry(&self, entry: ProfileEntry) {
+        self.missing.update_value(|m| {
+            m.remove(&entry.pubkey);
+        });
         let pubkey = entry.pubkey.clone();
         // Skip if the existing entry is newer.
         let mut should_persist = true;
@@ -377,6 +412,12 @@ impl ProfileCache {
         if pubkey.is_empty() {
             return;
         }
+        if self
+            .missing
+            .with_value(|m| recently_missing(m, pubkey, now_secs()))
+        {
+            return;
+        }
         // Skip if already queued or already known.
         let mut already = false;
         self.in_flight.update(|set| {
@@ -460,8 +501,17 @@ impl ProfileCache {
                 if !to_persist.is_empty() {
                     cache.persist(&to_persist).await;
                 }
-                // Drop any pubkeys that the server didn't return so future
-                // lookups can retry after some interval.
+                // Pubkeys the server didn't return: release them, and remember
+                // them for MISSING_RETRY_SECS so cards mounted meanwhile do
+                // not ask again.
+                let returned: HashSet<String> =
+                    to_persist.iter().map(|e| e.pubkey.clone()).collect();
+                let at = now_secs();
+                cache.missing.update_value(|m| {
+                    for pk in still_missing.iter().filter(|pk| !returned.contains(*pk)) {
+                        m.insert(pk.clone(), at);
+                    }
+                });
                 cache.in_flight.update(|set| {
                     for pk in &still_missing {
                         set.remove(pk);
@@ -905,5 +955,21 @@ mod tests {
     #[test]
     fn from_kind0_invalid_json_returns_none() {
         assert!(ProfileEntry::from_kind0_content("abc".into(), "not json", 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod missing_retry_tests {
+    use super::{recently_missing, MISSING_RETRY_SECS};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_missing_profile_is_not_asked_again_until_the_retry_window_passes() {
+        let mut m = HashMap::new();
+        m.insert("pk".to_string(), 1_000);
+        assert!(recently_missing(&m, "pk", 1_000));
+        assert!(recently_missing(&m, "pk", 1_000 + MISSING_RETRY_SECS - 1));
+        assert!(!recently_missing(&m, "pk", 1_000 + MISSING_RETRY_SECS));
+        assert!(!recently_missing(&m, "other", 1_000));
     }
 }
