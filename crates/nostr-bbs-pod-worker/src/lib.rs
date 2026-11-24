@@ -364,6 +364,26 @@ fn public_pod_base_url(env: &Env, fallback_origin: &str) -> String {
 }
 
 /// Create a JSON error response with CORS headers.
+/// Answer a failed quota reservation: a real overflow is 413; a busy/locked
+/// or otherwise failing D1 is 503 with Retry-After (transient under load; a
+/// client must not report it as a quota error).
+fn reserve_error(env: &Env, message: &str) -> Result<Response> {
+    match quota::classify_reserve_error(message) {
+        quota::ReserveFailure::OverQuota => json_error(env, message, 413),
+        failure => {
+            let reason = if failure == quota::ReserveFailure::Busy {
+                "storage busy, retry shortly"
+            } else {
+                "storage temporarily unavailable, retry shortly"
+            };
+            let mut resp =
+                json_error_with_reason(env, reason, 503, Some("quota_store_unavailable"))?;
+            resp.headers_mut().set("Retry-After", "2").ok();
+            Ok(resp)
+        }
+    }
+}
+
 fn json_error(env: &Env, message: &str, status: u16) -> Result<Response> {
     json_error_with_reason(env, message, status, None)
 }
@@ -1555,7 +1575,7 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
             )
             .await
             {
-                return json_error(&env, &e.to_string(), 413);
+                return reserve_error(&env, &e.to_string());
             }
 
             // WebID profile: validate HTML with JSON-LD before storing
@@ -1625,7 +1645,7 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                 )
                 .await
                 {
-                    return json_error(&env, &e.to_string(), 413);
+                    return reserve_error(&env, &e.to_string());
                 }
 
                 bucket
@@ -1685,7 +1705,7 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
             )
             .await
             {
-                return json_error(&env, &e.to_string(), 413);
+                return reserve_error(&env, &e.to_string());
             }
 
             let child_path = container::resolve_slug(&resource_path, slug_header.as_deref());
@@ -1778,7 +1798,7 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                 )
                 .await
                 {
-                    return json_error(&env, &e.to_string(), 413);
+                    return reserve_error(&env, &e.to_string());
                 }
             }
 

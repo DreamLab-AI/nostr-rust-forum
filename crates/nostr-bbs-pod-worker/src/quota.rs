@@ -254,6 +254,35 @@ pub async fn get_quota_d1(db: &D1Database, pubkey: &str, default: u64) -> QuotaI
     }
 }
 
+/// How a failed quota reservation should be answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveFailure {
+    /// The write would exceed the limit: 413.
+    OverQuota,
+    /// D1 was busy or locked (`SQLITE_BUSY`, "database is locked"): a
+    /// transient condition under load, answered 503 + Retry-After so the
+    /// client retries instead of reporting a quota error.
+    Busy,
+    /// Any other D1 failure (binding, statement): 503, also retryable.
+    Unavailable,
+}
+
+/// Classify a [`check_and_reserve_with_limit_d1`] error by its message: only
+/// the explicit over-limit refusal is a quota error.
+pub fn classify_reserve_error(message: &str) -> ReserveFailure {
+    let m = message.to_ascii_lowercase();
+    if m.contains("quota exceeded") {
+        ReserveFailure::OverQuota
+    } else if m.contains("sqlite_busy")
+        || m.contains("database is locked")
+        || m.contains("sqlite_locked")
+    {
+        ReserveFailure::Busy
+    } else {
+        ReserveFailure::Unavailable
+    }
+}
+
 /// Set (`Some`) or clear (`None`: follow the default again) an admin limit
 /// for one pod's owner account (`POST /.quota`, admin NIP-98). An explicit
 /// limit may be below the default (to restrict a pod) or above it.
@@ -371,6 +400,28 @@ mod tests {
         assert_eq!(
             reservation_account(owner, Some("bb"), "/private/note", big),
             (owner.to_string(), big)
+        );
+    }
+
+    #[test]
+    fn only_a_real_overflow_is_a_quota_error() {
+        assert_eq!(
+            classify_reserve_error("Quota exceeded: 2147483648 of 2147483648 bytes used, need 10"),
+            ReserveFailure::OverQuota
+        );
+        assert_eq!(
+            classify_reserve_error(
+                "d1 run quota init: JsValue(Error: D1_ERROR: database is locked: SQLITE_BUSY)"
+            ),
+            ReserveFailure::Busy
+        );
+        assert_eq!(
+            classify_reserve_error("d1 bind reserve: SQLITE_LOCKED"),
+            ReserveFailure::Busy
+        );
+        assert_eq!(
+            classify_reserve_error("d1 run reserve: network"),
+            ReserveFailure::Unavailable
         );
     }
 
