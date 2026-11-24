@@ -291,31 +291,36 @@ struct EmbedRequest {
 // Store lifecycle (R2 + KV)
 // ---------------------------------------------------------------------------
 
-/// Load the vector store from R2, or create empty if none exists.
-async fn load_store(env: &Env) -> Result<VectorStore> {
-    let store_key = env
-        .var("RVF_STORE_KEY")
+fn store_key(env: &Env) -> String {
+    env.var("RVF_STORE_KEY")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "nostr-bbs.rvf".to_string());
+        .unwrap_or_else(|_| "nostr-bbs.rvf".to_string())
+}
 
+/// Fetch the raw RVF bytes from R2 (empty when the object does not exist).
+async fn load_store_bytes(env: &Env) -> Result<Vec<u8>> {
     let bucket = env.bucket("VECTORS")?;
-    let obj = bucket.get(&store_key).execute().await?;
-
-    if let Some(obj) = obj {
+    match bucket.get(store_key(env)).execute().await? {
         // Sprint v9 D5: never panic on a missing body. R2 can in principle
         // return an object with no body (e.g. zero-length write race or
         // bucket inconsistency); surface a typed worker::Error instead so
         // the caller returns a 5xx rather than crashing the isolate.
-        let body = obj
+        Some(obj) => obj
             .body()
-            .ok_or_else(|| worker::Error::RustError("R2 object missing body".into()))?;
-        let bytes = body.bytes().await?;
-        if let Some(store) = VectorStore::from_rvf_bytes(&bytes) {
-            return Ok(store);
-        }
+            .ok_or_else(|| worker::Error::RustError("R2 object missing body".into()))?
+            .bytes()
+            .await,
+        None => Ok(Vec::new()),
     }
+}
 
-    Ok(VectorStore::new())
+/// Load the vector store from R2, or create empty if none exists.
+///
+/// Decodes every vector (a second in-memory copy of the object). Only ingest
+/// needs that; `/search` and `/status` work on the bytes directly.
+async fn load_store(env: &Env) -> Result<VectorStore> {
+    let bytes = load_store_bytes(env).await?;
+    Ok(VectorStore::from_rvf_bytes(&bytes).unwrap_or_else(VectorStore::new))
 }
 
 /// Persist the vector store to R2 as RVF binary + mapping to KV.
@@ -476,10 +481,13 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         );
     }
 
-    let store = load_store(env).await?;
+    // Search the persisted bytes in place: decoding them into a VectorStore
+    // first doubled peak memory for no benefit on a read-only request.
+    let store_bytes = load_store_bytes(env).await?;
+    let total_vectors = store::rvf_count(&store_bytes);
     let k = body.k.clamp(1, 100);
 
-    if store.count() == 0 {
+    if total_vectors == 0 {
         return json_response(
             req,
             env,
@@ -503,7 +511,8 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
     // to `k`. Filtering a set the store had already truncated to `k` could only
     // shrink it -- an index whose top-`k` neighbours are private returned
     // nothing at all while public matches sat just below the cut.
-    let candidates = store.search(&embedding, overfetch_k(k), body.min_score);
+    let candidates = store::search_rvf(&store_bytes, &embedding, overfetch_k(k), body.min_score);
+    drop(store_bytes);
     let results = visible_top_k(&candidates, &public_labels, k);
 
     // Jev option (NF-07-S1-01): off by default. Runs after the model-match gate
@@ -545,7 +554,7 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
     json_response(
         req,
         env,
-        &search_body(&results, &label_to_id, store.count(), jev_note),
+        &search_body(&results, &label_to_id, total_vectors, jev_note),
         200,
     )
 }
@@ -874,7 +883,7 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
 }
 
 async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
-    let store = load_store(env).await?;
+    let total_vectors = store::rvf_count(&load_store_bytes(env).await?);
 
     // Report the model actually in use, not a hardcoded string. When the
     // Workers AI binding is configured we serve real BGE-small embeddings;
@@ -895,7 +904,7 @@ async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
         env,
         &serde_json::json!({
             "status": "healthy",
-            "totalVectors": store.count(),
+            "totalVectors": total_vectors,
             "dimensions": DIM,
             "metric": "cosine",
             "model": model,
@@ -1008,8 +1017,11 @@ async fn route(req: &Request, env: &Env, path: &str) -> Result<Response> {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    // Touch R2 to keep the connection warm
-    let _ = load_store(&env).await;
+    // Touch R2 to keep the connection warm. A HEAD, not a full GET: the
+    // object is ~1.5 KB per vector, and this fires every 5 minutes.
+    if let Ok(bucket) = env.bucket("VECTORS") {
+        let _ = bucket.head(store_key(&env)).await;
+    }
 }
 
 #[cfg(test)]

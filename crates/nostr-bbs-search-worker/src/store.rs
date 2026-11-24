@@ -11,6 +11,9 @@ use rvf_types::constants::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use rvf_types::segment::SegmentHeader;
 use rvf_types::segment_type::SegmentType;
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
 use crate::embed::DIM;
 
 /// Bytes per stored vector entry: u64 label + DIM * f32.
@@ -20,6 +23,9 @@ const ENTRY_SIZE: usize = 8 + DIM * 4; // 1544 bytes
 pub struct VectorStore {
     /// Packed storage: (label, embedding).
     entries: Vec<(u64, [f32; DIM])>,
+    /// label -> position of its FIRST entry, so `insert` replaces in O(1)
+    /// exactly the entry the old linear `find` would have replaced.
+    index: HashMap<u64, usize>,
 }
 
 impl VectorStore {
@@ -27,6 +33,7 @@ impl VectorStore {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            index: HashMap::new(),
         }
     }
 
@@ -42,11 +49,19 @@ impl VectorStore {
         arr.copy_from_slice(embedding);
 
         // Replace existing
-        if let Some(entry) = self.entries.iter_mut().find(|(l, _)| *l == label) {
-            entry.1 = arr;
+        if let Some(&pos) = self.index.get(&label) {
+            self.entries[pos].1 = arr;
             return;
         }
+        self.index.insert(label, self.entries.len());
         self.entries.push((label, arr));
+    }
+
+    fn push_loaded(&mut self, label: u64, emb: [f32; DIM]) {
+        // A file can in principle hold a label twice; keep both entries (as
+        // before) and index the first, which is the one `insert` replaces.
+        self.index.entry(label).or_insert(self.entries.len());
+        self.entries.push((label, emb));
     }
 
     /// Cosine similarity k-NN search. Returns (label, score) pairs sorted by
@@ -60,25 +75,22 @@ impl VectorStore {
     /// `overfetch_k` / `visible_top_k` in `lib.rs`. Passing the user-facing `k`
     /// here and then filtering silently starves the result set whenever the top
     /// neighbours happen to be non-public.
+    ///
+    /// Test-only: production searches the persisted bytes with [`search_rvf`],
+    /// and this decoded-store path is kept as its equivalence oracle.
+    #[cfg(test)]
     pub fn search(&self, query: &[f32], k: usize, min_score: f32) -> Vec<(u64, f32)> {
         if self.entries.is_empty() || query.len() != DIM {
             return Vec::new();
         }
 
-        let mut results: Vec<(u64, f32)> = self
+        let candidates = self
             .entries
             .iter()
-            .map(|(label, vec)| {
-                let score = cosine_similarity(query, vec);
-                (*label, score)
-            })
-            .filter(|(_, score)| *score >= min_score)
-            .collect();
-
-        // Sort descending by score
-        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(k);
-        results
+            .enumerate()
+            .map(|(pos, (label, vec))| (pos, *label, cosine_similarity(query, vec)))
+            .filter(|(_, _, score)| *score >= min_score);
+        top_k(candidates, k)
     }
 
     /// Serialize to RVF binary format.
@@ -192,7 +204,7 @@ impl VectorStore {
                         let fo = pos + 8 + j * 4;
                         *slot = f32::from_le_bytes(payload[fo..fo + 4].try_into().ok()?);
                     }
-                    store.entries.push((label, emb));
+                    store.push_loaded(label, emb);
                     pos += ENTRY_SIZE;
                 }
             }
@@ -207,10 +219,119 @@ impl VectorStore {
 }
 
 // ---------------------------------------------------------------------------
+// Zero-copy search over the persisted bytes
+// ---------------------------------------------------------------------------
+
+/// Vec-segment payloads of an RVF buffer, walked exactly as
+/// [`VectorStore::from_rvf_bytes`] walks them (stop at bad magic or a
+/// truncated payload; skip non-Vec segments).
+fn vec_payloads(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset + SEGMENT_HEADER_SIZE <= data.len() {
+        let Some(hdr) = read_header(&data[offset..offset + SEGMENT_HEADER_SIZE]) else {
+            break;
+        };
+        if !hdr.is_valid_magic() {
+            break;
+        }
+        let payload_start = offset + SEGMENT_HEADER_SIZE;
+        let payload_len = hdr.payload_length as usize;
+        if payload_start + payload_len > data.len() {
+            break;
+        }
+        if hdr.seg_type == SegmentType::Vec as u8 {
+            out.push(&data[payload_start..payload_start + payload_len]);
+        }
+        offset = payload_start + align64(payload_len);
+    }
+    out
+}
+
+/// Number of whole vectors in an RVF buffer, without decoding any of them.
+pub fn rvf_count(data: &[u8]) -> usize {
+    vec_payloads(data).iter().map(|p| p.len() / ENTRY_SIZE).sum()
+}
+
+/// Cosine similarity of `query` against one packed little-endian entry body.
+///
+/// Same accumulation order as [`cosine_similarity`], so scores are
+/// bit-identical to searching the decoded store.
+fn cosine_le_bytes(query: &[f32], body: &[u8]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (a, chunk) in query.iter().zip(body.chunks_exact(4)) {
+        let b = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        dot += a * b;
+        norm_a += a * a;
+        norm_b += b * b;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
+}
+
+/// k-NN straight off the persisted RVF bytes.
+///
+/// Returns exactly what `VectorStore::from_rvf_bytes(data)?.search(..)` would,
+/// without materialising a second copy of every vector: at 1,544 B per vector
+/// that copy doubled peak memory, which is what binds against the 128 MB
+/// isolate limit.
+pub fn search_rvf(data: &[u8], query: &[f32], k: usize, min_score: f32) -> Vec<(u64, f32)> {
+    if query.len() != DIM {
+        return Vec::new();
+    }
+    let mut pos = 0usize;
+    let mut candidates = Vec::new();
+    for payload in vec_payloads(data) {
+        for entry in payload.chunks_exact(ENTRY_SIZE) {
+            let mut lb = [0u8; 8];
+            lb.copy_from_slice(&entry[..8]);
+            let score = cosine_le_bytes(query, &entry[8..]);
+            if score >= min_score {
+                candidates.push((pos, u64::from_le_bytes(lb), score));
+            }
+            pos += 1;
+        }
+    }
+    top_k(candidates.into_iter(), k)
+}
+
+/// Best `k` of `(position, label, score)` candidates, by descending score and
+/// then ascending position.
+///
+/// Scores are never NaN here (callers filter with `>= min_score`, which NaN
+/// fails), so this is a total order: the result is deterministic, which the
+/// old unstable full sort did not guarantee among equal scores. Selection is
+/// O(n) plus O(k log k) instead of an O(n log n) sort of every candidate.
+fn top_k(candidates: impl Iterator<Item = (usize, u64, f32)>, k: usize) -> Vec<(u64, f32)> {
+    let cmp = |a: &(usize, u64, f32), b: &(usize, u64, f32)| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
+    let mut v: Vec<(usize, u64, f32)> = candidates.collect();
+    if k == 0 {
+        return Vec::new();
+    }
+    if v.len() > k {
+        v.select_nth_unstable_by(k - 1, cmp);
+        v.truncate(k);
+    }
+    v.sort_unstable_by(cmp);
+    v.into_iter().map(|(_, l, s)| (l, s)).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Cosine similarity between two vectors.
+/// Cosine similarity between two vectors (test oracle for [`cosine_le_bytes`]).
+#[cfg(test)]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f32;
     let mut norm_a = 0.0f32;
@@ -695,6 +816,112 @@ mod tests {
         let result = VectorStore::from_rvf_bytes(&[]);
         assert!(result.is_some());
         assert_eq!(result.unwrap().count(), 0);
+    }
+
+    // ── O(1) insert, top-k selection, zero-copy search ────────────────────
+
+    /// Deterministic pseudo-random vectors (LCG), no extra dev-dependency.
+    fn lcg_vecs(n: usize, seed: u64) -> Vec<(u64, [f32; DIM])> {
+        let mut x = seed;
+        let mut next = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((x >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        (0..n)
+            .map(|i| {
+                let mut v = [0.0f32; DIM];
+                for slot in v.iter_mut() {
+                    *slot = next();
+                }
+                (i as u64 * 7 + 3, v)
+            })
+            .collect()
+    }
+
+    /// The pre-change algorithm: score all, full sort, truncate.
+    fn reference_search(entries: &[(u64, [f32; DIM])], q: &[f32], k: usize, min: f32) -> Vec<(u64, f32)> {
+        let mut r: Vec<(usize, u64, f32)> = entries
+            .iter()
+            .enumerate()
+            .map(|(p, (l, v))| (p, *l, cosine_similarity(q, v)))
+            .filter(|(_, _, s)| *s >= min)
+            .collect();
+        r.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then(a.0.cmp(&b.0)));
+        r.truncate(k);
+        r.into_iter().map(|(_, l, s)| (l, s)).collect()
+    }
+
+    #[test]
+    fn search_paths_match_reference_exactly() {
+        let entries = lcg_vecs(3_000, 42);
+        let queries = lcg_vecs(12, 7);
+        let bytes = build_rvf_bytes_for_test(&entries);
+        let store = VectorStore::from_rvf_bytes(&bytes).unwrap();
+        for (_, q) in &queries {
+            for &(k, min) in &[(1, -1.0), (10, 0.0), (40, -1.0), (400, 0.05), (5_000, -1.0)] {
+                let want = reference_search(&entries, q, k, min);
+                assert_eq!(store.search(q, k, min), want, "store k={k} min={min}");
+                // Bit-identical scores, identical order.
+                assert_eq!(search_rvf(&bytes, q, k, min), want, "bytes k={k} min={min}");
+            }
+        }
+    }
+
+    #[test]
+    fn top_k_breaks_ties_by_position() {
+        let mut store = VectorStore::new();
+        for l in [9u64, 4, 6] {
+            store.insert(l, &unit_vec(0));
+        }
+        store.insert(1, &unit_vec(1));
+        let got = store.search(&unit_vec(0), 2, -1.0);
+        assert_eq!(got, vec![(9, 1.0), (4, 1.0)]);
+        assert!(store.search(&unit_vec(0), 0, -1.0).is_empty());
+    }
+
+    #[test]
+    fn rvf_count_and_search_handle_bad_input() {
+        let entries = lcg_vecs(5, 1);
+        let bytes = build_rvf_bytes_for_test(&entries);
+        assert_eq!(rvf_count(&bytes), 5);
+        assert_eq!(rvf_count(&[]), 0);
+        assert_eq!(rvf_count(&[0xFF; 100]), 0);
+        let mut cut = bytes.clone();
+        cut.truncate(SEGMENT_HEADER_SIZE + 10);
+        assert_eq!(rvf_count(&cut), 0);
+        assert!(search_rvf(&cut, &entries[0].1, 3, -1.0).is_empty());
+        assert!(search_rvf(&bytes, &[1.0; DIM / 2], 3, -1.0).is_empty());
+        assert_eq!(search_rvf(&bytes, &entries[2].1, 1, -1.0)[0].0, entries[2].0);
+    }
+
+    #[test]
+    fn insert_replaces_first_duplicate_after_load() {
+        // A file holding a label twice: both load, insert replaces the first.
+        let entries = vec![(5u64, unit_vec(0)), (5u64, unit_vec(1)), (6u64, unit_vec(2))];
+        let bytes = build_rvf_bytes_for_test(&entries);
+        let mut store = VectorStore::from_rvf_bytes(&bytes).unwrap();
+        assert_eq!(store.count(), 3);
+        store.insert(5, &unit_vec(3));
+        assert_eq!(store.count(), 3);
+        assert_eq!(store.search(&unit_vec(3), 1, 0.5), vec![(5, 1.0)]);
+        assert_eq!(store.search(&unit_vec(1), 1, 0.5), vec![(5, 1.0)]);
+        assert!(store.search(&unit_vec(0), 1, 0.5).is_empty());
+        // New labels still append.
+        store.insert(7, &unit_vec(4));
+        assert_eq!(store.count(), 4);
+    }
+
+    #[test]
+    fn insert_many_is_fast_and_consistent() {
+        let mut store = VectorStore::new();
+        let entries = lcg_vecs(20_000, 3);
+        for (l, v) in &entries {
+            store.insert(*l, v);
+        }
+        for (l, v) in entries.iter().take(100) {
+            store.insert(*l, v);
+        }
+        assert_eq!(store.count(), 20_000);
     }
 
     // ── ENTRY_SIZE constant ─────────────────────────────────────────────
