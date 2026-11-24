@@ -554,6 +554,9 @@ pub struct PurgeReport {
     pub not_found: Vec<String>,
     /// Ids the relay kept because they are not kind 42; marked `failed`.
     pub skipped: Vec<String>,
+    /// Whether a stop signal ended the run between chunks (state saved;
+    /// the remaining `verified` entries were not touched).
+    pub stopped: bool,
     /// State counts after the run.
     pub counts: Counts,
 }
@@ -642,6 +645,11 @@ pub async fn purge<R: Relay>(
     let mut report = PurgeReport::default();
     let chunks = todo.len().div_ceil(MAX_DELETE_IDS);
     for (n, chunk) in todo.chunks(MAX_DELETE_IDS).enumerate() {
+        if stop_requested() {
+            (hooks.progress)("stop requested: no further chunks will be deleted");
+            report.stopped = true;
+            break;
+        }
         let mut failures = Vec::new();
         check_entries(relay, keys, state, chunk, &mut failures).await?;
         if !failures.is_empty() {

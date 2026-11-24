@@ -173,13 +173,16 @@ pub fn binding_refusal(
 /// The channel each reply topic lives in, from D1: the root-marked channel
 /// of the stored kind-42 with that id, or of the admin-authored sealed
 /// envelope wrapping it (the relay's F2 resolution). Topics that resolve to
-/// nothing, or to envelopes that disagree, are absent.
+/// nothing, to a stored event that is not kind 42, or to envelopes that
+/// disagree, are absent. Envelopes count only in the shape the relay's
+/// `SEALED_ENVELOPES_FOR_SQL` accepts: a `sealed` tag for the topic with a
+/// numeric version, and a `zk` tag.
 pub fn read_topic_channels(
     db: &Connection,
     topics: &HashSet<String>,
 ) -> rusqlite::Result<HashMap<String, String>> {
     let mut by_id = db.prepare(
-        "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1 AND kind = 42",
+        "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1",
     )?;
     let mut sealed = db.prepare(
         "SELECT s.id, s.pubkey, s.created_at, s.kind, s.tags, s.content, s.sig \
@@ -190,13 +193,33 @@ pub fn read_topic_channels(
     let mut out = HashMap::new();
     for topic in topics {
         let channel = match by_id.query_row([topic], row_event) {
-            Ok(ev) => ev.as_ref().and_then(|e| channel_of(e).map(str::to_string)),
+            Ok(ev) => ev
+                .as_ref()
+                .filter(|e| e.kind == 42)
+                .and_then(|e| channel_of(e).map(str::to_string)),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 let rows: Vec<NostrEvent> = sealed
                     .query_map([topic], row_event)?
                     .filter_map(|r| r.transpose())
                     .collect::<rusqlite::Result<_>>()?;
-                let chans: HashSet<&str> = rows.iter().filter_map(channel_of).collect();
+                let relay_shape = |e: &&NostrEvent| {
+                    let sealed_ok = e.tags.iter().any(|t| {
+                        t.len() >= 3
+                            && t[0] == "sealed"
+                            && t[1] == *topic
+                            && !t[2].is_empty()
+                            && t[2].bytes().all(|b| b.is_ascii_digit())
+                    });
+                    sealed_ok
+                        && e.tags
+                            .iter()
+                            .any(|t| t.first().map(String::as_str) == Some("zk"))
+                };
+                let chans: HashSet<&str> = rows
+                    .iter()
+                    .filter(relay_shape)
+                    .filter_map(channel_of)
+                    .collect();
                 (chans.len() == 1).then(|| chans.into_iter().next().unwrap().to_string())
             }
             Err(e) => return Err(e),
@@ -576,11 +599,17 @@ fn q(s: &str) -> String {
 /// Not written (as for the migrator's bulk import, see INGEST-PARITY.md):
 /// live broadcast, push fan-out and search embeddings.
 pub fn envelope_insert_sql(env: &NostrEvent, received_at: u64) -> String {
+    envelope_insert_sql_if(env, received_at, "")
+}
+
+/// [`envelope_insert_sql`] with an extra SQL condition (`extra`, empty or
+/// starting with ` AND `) on the insert.
+fn envelope_insert_sql_if(env: &NostrEvent, received_at: u64, extra: &str) -> String {
     let tags = serde_json::to_string(&env.tags).expect("tags serialise");
     format!(
         "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, d_tag, received_at) \
          SELECT {id}, {pk}, {ca}, {kind}, {tags}, {content}, {sig}, '', {received_at} \
-         WHERE NOT EXISTS (SELECT 1 FROM deleted_events WHERE id = {id}) \
+         WHERE NOT EXISTS (SELECT 1 FROM deleted_events WHERE id = {id}){extra} \
          ON CONFLICT (id) DO NOTHING;\n\
          UPDATE whitelist SET posts_created = posts_created + changes() WHERE pubkey = {pk};\n",
         id = q(&env.id),
@@ -630,7 +659,7 @@ pub fn write_seal_sql(
             q(migrator_pk)
         );
         let path = dir.join(format!("seal-{:04}.sql", n + 1));
-        std::fs::write(&path, sql)?;
+        write_generated(&path, &sql)?;
         paths.push(path);
     }
     let manifest: Vec<ManifestEntry> = sealed
@@ -654,6 +683,17 @@ pub type FailedEntries = Vec<(String, String)>;
 
 /// Create `dir`, refusing one that already holds files: a reused directory
 /// would keep chunk files of an earlier run that a shell glob applies too.
+/// First line of every SQL file this tool writes; [`apply_sql_direct`]
+/// refuses files without it (its line-by-line runner relies on the layout
+/// the generators guarantee).
+pub const GENERATED_HEADER: &str =
+    "-- nostr-bbs-zone-migrate generated SQL: whole statements per line, no transaction control";
+
+/// Write generated SQL with [`GENERATED_HEADER`] on top.
+fn write_generated(path: &Path, sql: &str) -> std::io::Result<()> {
+    std::fs::write(path, format!("{GENERATED_HEADER}\n{sql}"))
+}
+
 fn prepare_out_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     if std::fs::read_dir(dir)?.next().is_some() {
@@ -686,81 +726,109 @@ pub fn commit_sealed(
     outers: &HashMap<String, NostrEvent>,
     keys: &KeyRing,
 ) -> CommitReport {
-    commit_sealed_with(state, manifest, outers, keys, false)
+    commit_sealed_with(state, manifest, outers, keys, false, &HashMap::new())
 }
 
 /// [`commit_sealed`]; with `reseal`, entries already `sealed` or `verified`
 /// (under a legacy envelope) are re-recorded with the replacement and drop
-/// back to `sealed` for re-verification, and entries the state file lacks
-/// (an envelope published but never recorded) are added.
+/// back to `sealed` for re-verification, `purged` entries keep their status
+/// but point at the replacement, and entries the state file lacks (an
+/// envelope published but never recorded) are added, but only when the
+/// envelope's channel is listed in `bindings` (channel → zone, from the
+/// channels file) under the zone its `zk` tag names.
+///
+/// Every envelope must be the migrator's, carry a `zk` tag for the entry's
+/// zone at the manifest epoch, verify, open in the entry's channel to the
+/// manifest original and match its digest. Nothing is recorded, and no
+/// entry added, before all of that passes.
 pub fn commit_sealed_with(
     state: &mut State,
     manifest: &[ManifestEntry],
     outers: &HashMap<String, NostrEvent>,
     keys: &KeyRing,
     reseal: bool,
+    bindings: &HashMap<String, String>,
 ) -> CommitReport {
     let mut report = CommitReport::default();
+    let migrator = state.migrator.clone();
     for m in manifest {
-        if reseal && !state.entries.contains_key(&m.id) {
-            if let Some(outer) = outers.get(&m.outer_id) {
-                let channel = channel_of(outer).unwrap_or_default().to_string();
-                let zone = outer
-                    .tags
-                    .iter()
-                    .find(|t| t.len() >= 2 && t[0] == "zk")
-                    .map(|t| t[1].clone())
-                    .unwrap_or_default();
-                state.entries.insert(
-                    m.id.clone(),
-                    Entry::planned(&channel, &zone, outer.created_at),
-                );
-            }
-        }
-        let Some(e) = state.entries.get(&m.id) else {
-            report
-                .skipped
-                .push((m.id.clone(), "not in the state file".into()));
-            continue;
-        };
-        let replaceable = reseal && matches!(e.status, Status::Sealed | Status::Verified);
-        if !needs_seal(&e.status) && !replaceable {
-            report
-                .skipped
-                .push((m.id.clone(), format!("already {}", e.status.label())));
-            continue;
-        }
+        let mut skip = |why: String| report.skipped.push((m.id.clone(), why));
         let Some(outer) = outers.get(&m.outer_id) else {
-            report.skipped.push((
-                m.id.clone(),
-                "envelope not in D1 (chunk not applied?)".into(),
-            ));
+            skip("envelope not in D1 (chunk not applied?)".into());
             continue;
         };
-        let Some(key) = keys.get(&e.zone, m.epoch) else {
-            report
-                .skipped
-                .push((m.id.clone(), format!("no key for {}:{}", e.zone, m.epoch)));
-            continue;
-        };
-        match crate::engine::open_and_check(outer, &m.id, &e.channel, key.secret()) {
-            Ok(inner) if sha256_hex(inner.as_bytes()) == m.inner_sha256 => {
-                let (id, epoch, outer_id, digest) = (
-                    m.id.clone(),
-                    m.epoch,
-                    m.outer_id.clone(),
-                    m.inner_sha256.clone(),
-                );
-                set_sealed(state, &id, epoch, &outer_id, digest);
-                report.committed += 1;
+        let (channel, zone, new_entry) = match state.entries.get(&m.id) {
+            Some(e) => {
+                let replaceable = reseal
+                    && matches!(e.status, Status::Sealed | Status::Verified | Status::Purged);
+                if !needs_seal(&e.status) && !replaceable {
+                    skip(format!("already {}", e.status.label()));
+                    continue;
+                }
+                (e.channel.clone(), e.zone.clone(), false)
             }
-            Ok(_) => report
-                .skipped
-                .push((m.id.clone(), "inner event differs from the manifest".into())),
-            Err(why) => report.skipped.push((m.id.clone(), why)),
+            None if reseal => {
+                let channel = channel_of(outer).unwrap_or_default().to_string();
+                let Some(zone) = bindings.get(&channel) else {
+                    skip("not in the state file and its channel is not listed".into());
+                    continue;
+                };
+                (channel, zone.clone(), true)
+            }
+            None => {
+                skip("not in the state file".into());
+                continue;
+            }
+        };
+        if outer.pubkey != migrator {
+            skip("envelope is not signed by the migrator".into());
+            continue;
         }
+        if envelope_epoch(outer, &zone) != Some(m.epoch) {
+            skip(format!("envelope has no zk tag for {zone}:{}", m.epoch));
+            continue;
+        }
+        let Some(key) = keys.get(&zone, m.epoch) else {
+            skip(format!("no key for {zone}:{}", m.epoch));
+            continue;
+        };
+        match crate::engine::open_and_check(outer, &m.id, &channel, key.secret()) {
+            Ok(inner) if sha256_hex(inner.as_bytes()) == m.inner_sha256 => {}
+            Ok(_) => {
+                skip("inner event differs from the manifest".into());
+                continue;
+            }
+            Err(why) => {
+                skip(why);
+                continue;
+            }
+        }
+        if new_entry {
+            state.entries.insert(
+                m.id.clone(),
+                Entry::planned(&channel, &zone, outer.created_at),
+            );
+        }
+        let e = state.entries.get_mut(&m.id).expect("entry exists");
+        if e.status == Status::Purged {
+            e.epoch = Some(m.epoch);
+            e.outer_id = Some(m.outer_id.clone());
+            e.inner_sha256 = Some(m.inner_sha256.clone());
+        } else {
+            set_sealed(state, &m.id, m.epoch, &m.outer_id, m.inner_sha256.clone());
+        }
+        report.committed += 1;
     }
     report
+}
+
+/// The epoch of `outer`'s `zk` tag for `zone`, if it has one.
+pub fn envelope_epoch(outer: &NostrEvent, zone: &str) -> Option<u32> {
+    outer
+        .tags
+        .iter()
+        .find(|t| t.len() >= 3 && t[0] == "zk" && t[1] == zone)
+        .and_then(|t| t[2].parse::<u32>().ok())
 }
 
 /// The `verified` entries that may be purged now, re-checked from D1 as the
@@ -905,7 +973,7 @@ pub fn write_purge_sql(
     let mut paths = Vec::new();
     for (n, part) in items.chunks(chunk.clamp(1, PURGE_CHUNK)).enumerate() {
         let path = dir.join(format!("purge-{:04}.sql", n + 1));
-        std::fs::write(&path, purge_sql(part, migrator_pk, now))?;
+        write_generated(&path, &purge_sql(part, migrator_pk, now))?;
         paths.push(path);
     }
     std::fs::write(
@@ -928,6 +996,10 @@ pub fn commit_purged(
     let mut report = CommitReport::default();
     for PurgeItem { id, outer_id } in items {
         match state.entries.get_mut(id) {
+            Some(e) if e.outer_id.as_deref() != Some(outer_id.as_str()) => report.skipped.push((
+                id.clone(),
+                "manifest envelope differs from the state file's".into(),
+            )),
             Some(e)
                 if e.status == Status::Verified
                     && gone.contains(id)
@@ -980,24 +1052,47 @@ pub fn tombstoned_ids(db: &Connection, ids: &[String]) -> rusqlite::Result<HashS
 /// by JSON). Executing the multi-megabyte file in one `execute_batch` call
 /// is quadratic (each statement re-scans the remaining tail): a
 /// 10k-envelope chunk took ~35 s that way and ~3 s line by line.
-fn run_statements(c: &Connection, sql: &str) -> rusqlite::Result<()> {
-    for line in sql.lines() {
-        if !line.trim().is_empty() {
-            c.execute_batch(line)?;
+fn run_statements(c: &Connection, sql: &str) -> Result<(), String> {
+    for (n, line) in sql.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("--") {
+            continue;
         }
+        if let Some(why) = refused_statement(t) {
+            return Err(format!("line {}: {why}", n + 1));
+        }
+        c.execute_batch(line)
+            .map_err(|e| format!("line {}: {e}", n + 1))?;
     }
     Ok(())
 }
 
-/// Apply SQL chunk files directly to the D1 SQLite file, one transaction
-/// per file, with the relay's own triggers firing as on any insert (the
-/// tag-writing `trg_event_tags_ai_v3` included), so the rows equal what
-/// `wrangler d1 execute --local --file` produces. Every worker using the
-/// database must be STOPPED: the file is opened read-write and locked
-/// exclusively (refused while another process holds it). Each file is one
-/// transaction: a failed file is rolled back and the apply stops. Returns
-/// per-file milliseconds.
-pub fn apply_sql_direct(path: &Path, files: &[PathBuf]) -> Result<Vec<(PathBuf, u128)>, String> {
+/// Statements a generated file never holds and [`apply_sql_direct`]
+/// refuses: transaction control (it would break one transaction per file),
+/// PRAGMA, ATTACH/DETACH and VACUUM.
+fn refused_statement(line: &str) -> Option<&'static str> {
+    let first = line
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    match first.as_str() {
+        "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" => {
+            Some("transaction control is not allowed in an applied file")
+        }
+        "PRAGMA" | "ATTACH" | "DETACH" | "VACUUM" => {
+            Some("PRAGMA, ATTACH, DETACH and VACUUM are not allowed in an applied file")
+        }
+        _ => None,
+    }
+}
+
+/// Open the SQLite file read-write and take an exclusive lock held until
+/// the connection closes (`locking_mode = EXCLUSIVE`, then a write
+/// transaction to acquire it): no other process can read or write the file
+/// meanwhile, in rollback-journal or WAL mode. Refused at once (no busy
+/// wait) while another connection holds any lock.
+pub fn lock_exclusive(path: &Path) -> Result<Connection, String> {
     let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     c.busy_timeout(std::time::Duration::from_millis(0))
@@ -1009,17 +1104,46 @@ pub fn apply_sql_direct(path: &Path, files: &[PathBuf]) -> Result<Vec<(PathBuf, 
                 path.display()
             )
         })?;
+    Ok(c)
+}
+
+/// Apply SQL chunk files directly to the D1 SQLite file, one transaction
+/// per file, with the relay's own triggers firing as on any insert (the
+/// tag-writing `trg_event_tags_ai_v3` included), so the rows equal what
+/// `wrangler d1 execute --local --file` produces. Every worker using the
+/// database must be STOPPED: the file is opened read-write and locked
+/// exclusively (refused while another process holds it). Each file is one
+/// transaction: a failed file is rolled back and the apply stops. Only files
+/// this tool generated are accepted ([`GENERATED_HEADER`]; no transaction
+/// control, PRAGMA or ATTACH lines). A stop signal ([`crate::engine::STOP`])
+/// ends the apply between files. Returns per-file milliseconds for the
+/// files applied.
+pub fn apply_sql_direct(path: &Path, files: &[PathBuf]) -> Result<Vec<(PathBuf, u128)>, String> {
+    let c = lock_exclusive(path)?;
     // A large page cache keeps the events/event_tags B-trees in memory.
     c.execute_batch("PRAGMA cache_size = -4000000; PRAGMA temp_store = MEMORY;")
         .map_err(|e| e.to_string())?;
     check_schema(&c)?;
-    let mut out = Vec::new();
+    let mut sqls = Vec::with_capacity(files.len());
     for f in files {
         let sql = std::fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        if sql.lines().next() != Some(GENERATED_HEADER) {
+            return Err(format!(
+                "{}: not a file written by this tool (no generated-SQL header); nothing was applied",
+                f.display()
+            ));
+        }
+        sqls.push(sql);
+    }
+    let mut out = Vec::new();
+    for (f, sql) in files.iter().zip(&sqls) {
+        if crate::engine::stop_requested() {
+            break;
+        }
         let t = std::time::Instant::now();
         c.execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| e.to_string())?;
-        if let Err(e) = run_statements(&c, &sql) {
+        if let Err(e) = run_statements(&c, sql) {
             let _ = c.execute_batch("ROLLBACK;");
             return Err(format!(
                 "{}: {e} (rolled back; earlier files stay applied)",
@@ -1098,6 +1222,43 @@ pub fn reseal_legacy(
     topic_channels: &HashMap<String, String>,
 ) -> (Vec<Reseal>, Vec<(String, String)>) {
     let migrator_pk = migrator.public_key().to_hex();
+    let mpk = hex32(&migrator_pk).expect("hex pubkey");
+    // One sealer and one conversation key per (zone, epoch) in use, built
+    // once (the migrator secret is not copied per envelope).
+    type Sealers = HashMap<(String, u32), (OriginalSealer, zeroize::Zeroizing<[u8; 32]>)>;
+    let mut sealers: Sealers = HashMap::new();
+    let mut setup_failed: HashMap<(String, u32), String> = HashMap::new();
+    for (channel, outer) in envelopes {
+        let Some(zone) = zones.get(channel) else {
+            continue;
+        };
+        let Some(epoch) = envelope_epoch(outer, zone) else {
+            continue;
+        };
+        let k = (zone.clone(), epoch);
+        if sealers.contains_key(&k) || setup_failed.contains_key(&k) {
+            continue;
+        }
+        let built = keys
+            .get(zone, epoch)
+            .ok_or_else(|| format!("no key for {zone}:{epoch}"))
+            .and_then(|key| {
+                let sk = SecretKey::from_bytes(*migrator.as_bytes()).map_err(|e| e.to_string())?;
+                let sealer = OriginalSealer::new(zone, epoch, key.pubkey(), sk)
+                    .map_err(|e| e.to_string())?;
+                let ck = nostr_bbs_core::nip44::conversation_key(key.secret(), &mpk)
+                    .map_err(|e| e.to_string())?;
+                Ok((sealer, zeroize::Zeroizing::new(ck)))
+            });
+        match built {
+            Ok(v) => {
+                sealers.insert(k, v);
+            }
+            Err(why) => {
+                setup_failed.insert(k, why);
+            }
+        }
+    }
     let results: Vec<Result<Option<Reseal>, (String, String)>> = envelopes
         .par_iter()
         .map(|(channel, outer)| {
@@ -1107,21 +1268,31 @@ pub fn reseal_legacy(
                     "channel not in the channels file".to_string(),
                 )
             })?;
-            let epoch = outer
-                .tags
-                .iter()
-                .find(|t| t.len() >= 3 && t[0] == "zk" && t[1] == *zone)
-                .and_then(|t| t[2].parse::<u32>().ok())
-                .ok_or_else(|| {
-                    (
-                        outer.id.clone(),
-                        "envelope has no zk tag for its zone".to_string(),
-                    )
-                })?;
-            let key = keys
-                .get(zone, epoch)
-                .ok_or_else(|| (outer.id.clone(), format!("no key for {zone}:{epoch}")))?;
-            let original = nostr_bbs_core::sealed::open_sealed(outer, key.secret())
+            // The outer signature is the only proof the migrator wrote it
+            // (any zone member can produce content that opens).
+            if outer.pubkey != migrator_pk || !verify_event(outer) {
+                return Err((
+                    outer.id.clone(),
+                    "envelope is not a verified migrator event".to_string(),
+                ));
+            }
+            let epoch = envelope_epoch(outer, zone).ok_or_else(|| {
+                (
+                    outer.id.clone(),
+                    "envelope has no zk tag for its zone".to_string(),
+                )
+            })?;
+            let k = (zone.clone(), epoch);
+            let (sealer, ck) = sealers.get(&k).ok_or_else(|| {
+                (
+                    outer.id.clone(),
+                    setup_failed
+                        .get(&k)
+                        .cloned()
+                        .unwrap_or_else(|| format!("no key for {zone}:{epoch}")),
+                )
+            })?;
+            let original = open_sealed_with_conversation_key(outer, &mpk, ck)
                 .map_err(|e| (outer.id.clone(), format!("does not open: {e}")))?;
             if !is_legacy_envelope(outer, &original) {
                 return Ok(None);
@@ -1129,25 +1300,16 @@ pub fn reseal_legacy(
             if let Some(why) = topic_refusal(&original, channel, topic_channels) {
                 return Err((original.id.clone(), why));
             }
-            let sk = SecretKey::from_bytes(*migrator.as_bytes())
-                .map_err(|e| (outer.id.clone(), e.to_string()))?;
-            let sealer = OriginalSealer::new(zone, epoch, key.pubkey(), sk)
-                .map_err(|e| (outer.id.clone(), e.to_string()))?;
             let envelope = sealer
                 .seal(&original)
                 .map_err(|e| (original.id.clone(), e.to_string()))?;
-            let mpk = hex32(&migrator_pk).expect("hex pubkey");
-            let ck = zeroize::Zeroizing::new(
-                nostr_bbs_core::nip44::conversation_key(key.secret(), &mpk)
-                    .map_err(|e| (original.id.clone(), e.to_string()))?,
-            );
             let expected = serde_json::to_string(&original).expect("event serialises");
             self_check(
                 &envelope,
                 &original.id,
                 channel,
                 &migrator_pk,
-                &ck,
+                ck,
                 &expected,
             )
             .map_err(|r| (original.id.clone(), r))?;
@@ -1197,7 +1359,15 @@ pub fn reseal_legacy(
 pub fn reseal_sql(items: &[Reseal], migrator_pk: &str, now: u64) -> String {
     let mut sql = String::new();
     for it in items {
-        sql.push_str(&envelope_insert_sql(&it.envelope, now));
+        // The replacement goes in only while the legacy envelope is still
+        // there: a second, differently randomised reseal file for the same
+        // envelope then inserts nothing (no duplicate, no count drift).
+        let old_present = format!(
+            " AND EXISTS (SELECT 1 FROM events WHERE id = {} AND kind = 42 AND pubkey = {})",
+            q(&it.old_outer_id),
+            q(migrator_pk)
+        );
+        sql.push_str(&envelope_insert_sql_if(&it.envelope, now, &old_present));
         let guard = format!(
             "EXISTS (SELECT 1 FROM events WHERE id = {} AND kind = 42 AND pubkey = {})",
             q(&it.envelope.id),
@@ -1227,7 +1397,7 @@ pub fn write_reseal_sql(
 ) -> std::io::Result<PathBuf> {
     prepare_out_dir(dir)?;
     let path = dir.join("reseal-0001.sql");
-    std::fs::write(&path, reseal_sql(items, migrator_pk, now))?;
+    write_generated(&path, &reseal_sql(items, migrator_pk, now))?;
     let manifest: Vec<ManifestEntry> = items
         .iter()
         .map(|s| ManifestEntry {

@@ -45,8 +45,11 @@ macro_rules! hooks {
     };
 }
 
-/// SIGINT / SIGTERM request a stop: long loops save the state and stop at
-/// the next entry (engine::STOP), so a kill never lands mid-save.
+/// SIGINT / SIGTERM request a stop for the commands whose loops check
+/// [`engine::STOP`] (`seal`, `purge`, `apply-direct`): they finish the
+/// current entry, chunk or file, save the state and stop. A second signal
+/// exits at once (code 130). Other commands keep the default behaviour
+/// (the handler is not installed for them), so a signal always stops them.
 fn install_stop_handler() {
     std::thread::spawn(|| {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -69,13 +72,26 @@ fn install_stop_handler() {
                     _ = int.recv() => {}
                     _ = term.recv() => {}
                 }
+                eprintln!(
+                    "stop requested: finishing the current step and saving the state (signal again to exit now)"
+                );
+                engine::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+                tokio::select! {
+                    _ = int.recv() => {}
+                    _ = term.recv() => {}
+                }
             }
             #[cfg(not(unix))]
             {
                 let _ = tokio::signal::ctrl_c().await;
+                eprintln!(
+                    "stop requested: finishing the current step and saving the state (signal again to exit now)"
+                );
+                engine::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = tokio::signal::ctrl_c().await;
             }
-            eprintln!("stop requested: finishing the current entry, saving the state");
-            engine::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("second stop signal: exiting now");
+            std::process::exit(130);
         });
     });
 }
@@ -291,7 +307,12 @@ impl<E: std::fmt::Display> From<E> for Failure {
 
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
-    install_stop_handler();
+    if matches!(
+        cli.command,
+        Some(Command::Seal { .. } | Command::Purge { .. } | Command::ApplyDirect { .. })
+    ) {
+        install_stop_handler();
+    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -327,10 +348,17 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             eprintln!("{} {ms} ms", f.display());
         }
         eprintln!(
-            "apply-direct: {} files in {} ms",
+            "apply-direct: {} of {} files in {} ms",
             done.len(),
+            files.len(),
             t.elapsed().as_millis()
         );
+        if done.len() < files.len() {
+            return Err(Failure(format!(
+                "stopped by signal after {} files; the rest were not applied (each applied file is complete)",
+                done.len()
+            )));
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -409,6 +437,8 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
                 report.remaining,
                 if report.limit_reached {
                     " (stopped at --limit)"
+                } else if report.stopped {
+                    " (stopped by signal)"
                 } else {
                     ""
                 }
@@ -432,14 +462,19 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             hooks!(hooks, path, cli.persist_every);
             let report = engine::purge(&mut relay, &keys, &mut st, yes, &mut hooks).await?;
             eprintln!(
-                "purge: {} deleted over {} requests, {} already gone, {} skipped (not kind 42)",
+                "purge: {} deleted over {} requests, {} already gone, {} skipped (not kind 42){}",
                 report.deleted,
                 report.requests,
                 report.not_found.len(),
-                report.skipped.len()
+                report.skipped.len(),
+                if report.stopped {
+                    " (stopped by signal)"
+                } else {
+                    ""
+                }
             );
             out["result"] = serde_json::to_value(&report)?;
-            exit_for(report.skipped.is_empty())
+            exit_for(report.skipped.is_empty() && !report.stopped)
         }
         Command::Status => unreachable!("handled above"),
         Command::SealOffline {
@@ -544,7 +579,10 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
                 .map(|c| (c.id.clone(), c.zone.clone()))
                 .collect();
             for (ch, outer) in &envelopes {
-                if let Some(k) = zones.get(ch).and_then(|z| keys.current(z)) {
+                let key = zones
+                    .get(ch)
+                    .and_then(|z| keys.get(z, offline::envelope_epoch(outer, z)?));
+                if let Some(k) = key {
                     if let Ok(o) = nostr_bbs_core::sealed::open_sealed(outer, k.secret()) {
                         if let Some(t) = nostr_bbs_core::sealed::reply_root_of(&o) {
                             topics.insert(t.to_string());
@@ -588,7 +626,12 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             let outer_ids: Vec<String> = entries.iter().map(|m| m.outer_id.clone()).collect();
             let outers = offline::read_events_by_id(&db, &outer_ids)
                 .map_err(|e| Failure(format!("reading envelopes: {e}")))?;
-            let report = offline::commit_sealed_with(&mut st, &entries, &outers, &keys, reseal);
+            let bindings: std::collections::HashMap<String, String> = channels(&cli)?
+                .into_iter()
+                .map(|c| (c.id, c.zone))
+                .collect();
+            let report =
+                offline::commit_sealed_with(&mut st, &entries, &outers, &keys, reseal, &bindings);
             state::save_atomic(path, &st).map_err(|e| Failure(e.to_string()))?;
             eprintln!(
                 "seal-offline-commit: {} marked sealed, {} left as they were",

@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS admin_log (id INTEGER PRIMARY KEY AUTOINCREMENT, acto
 
 fn db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
+    init(&c);
+    c
+}
+
+/// The relay schema plus the migrator's whitelist row and CHANNEL's binding.
+fn init(c: &Connection) {
     c.execute_batch(MIGRATION_0009).unwrap();
     c.execute_batch(MIGRATION_0004).unwrap();
     let _ =
@@ -57,7 +63,6 @@ fn db() -> Connection {
         [CHANNEL],
     )
     .unwrap();
-    c
 }
 
 fn topics(c: &Connection) -> HashMap<String, String> {
@@ -509,12 +514,13 @@ fn chunk_directories_must_be_fresh_and_purge_chunks_stay_relay_sized() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[test]
-fn reseal_legacy_replaces_an_unrecorded_legacy_envelope_and_verify_passes() {
-    let c = db();
-    store(&c, &live_zk_post(CHANNEL, "zone3", 1, ZONE3_E1));
+/// A topic root and a reply in CHANNEL, plus a legacy envelope of the reply
+/// (the current envelope with the topic tag stripped, re-signed by the
+/// migrator), stored in `c`. Returns (root, legacy envelope).
+fn legacy_fixture(c: &Connection) -> (NostrEvent, NostrEvent) {
+    store(c, &live_zk_post(CHANNEL, "zone3", 1, ZONE3_E1));
     let root = post(AUTHOR, CHANNEL, 1_600_000_000, "root");
-    store(&c, &root);
+    store(c, &root);
     let reply = sign(
         AUTHOR,
         42,
@@ -525,7 +531,7 @@ fn reseal_legacy_replaces_an_unrecorded_legacy_envelope_and_verify_passes() {
         ],
         "reply",
     );
-    store(&c, &reply);
+    store(c, &reply);
     // A legacy envelope: the current one with the topic tag stripped (as the
     // earlier sealer wrote it), re-signed by the migrator.
     let current =
@@ -545,13 +551,35 @@ fn reseal_legacy_replaces_an_unrecorded_legacy_envelope_and_verify_passes() {
     );
     assert!(offline::is_legacy_envelope(&legacy, &reply));
     assert!(!offline::is_legacy_envelope(&current, &reply));
-    store(&c, &legacy);
+    store(c, &legacy);
     c.execute(
         "UPDATE whitelist SET posts_created = 1 WHERE pubkey = ?1",
         [pk(MIGRATOR)],
     )
     .unwrap();
 
+    (root, legacy)
+}
+
+/// reseal-legacy over `c` (CHANNEL in zone3).
+fn reseal_items(c: &Connection, root: &NostrEvent) -> Vec<offline::Reseal> {
+    let envs = offline::read_migrator_envelopes(c, &channels(), &pk(MIGRATOR)).unwrap();
+    let zones: HashMap<String, String> = [(CHANNEL.to_string(), "zone3".to_string())].into();
+    let topics_map = offline::read_topic_channels(c, &[root.id.clone()].into()).unwrap();
+    let (items, failed) =
+        offline::reseal_legacy(&envs, &zones, &ring(), &sk(MIGRATOR), &topics_map);
+    assert!(failed.is_empty(), "{failed:?}");
+    items
+}
+
+fn bindings() -> HashMap<String, String> {
+    [(CHANNEL.to_string(), "zone3".to_string())].into()
+}
+
+#[test]
+fn reseal_legacy_replaces_an_unrecorded_legacy_envelope_and_verify_passes() {
+    let c = db();
+    let (root, legacy) = legacy_fixture(&c);
     // Not recorded in the state file at all (killed mid-save).
     let mut st = State::new(RELAY_URL, &pk(MIGRATOR));
     let envs = offline::read_migrator_envelopes(&c, &channels(), &pk(MIGRATOR)).unwrap();
@@ -594,7 +622,11 @@ fn reseal_legacy_replaces_an_unrecorded_legacy_envelope_and_verify_passes() {
             inner_sha256: s.inner_sha256.clone(),
         })
         .collect();
-    let r = offline::commit_sealed_with(&mut st, &manifest, &new, &ring(), true);
+    // Unlisted channel: nothing recorded, no phantom entry.
+    let r = offline::commit_sealed_with(&mut st, &manifest, &new, &ring(), true, &HashMap::new());
+    assert_eq!((r.committed, r.skipped.len()), (0, 1));
+    assert!(st.entries.is_empty());
+    let r = offline::commit_sealed_with(&mut st, &manifest, &new, &ring(), true, &bindings());
     assert_eq!(r.committed, 1);
     let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
     for ev in all_events(&c) {
@@ -605,4 +637,178 @@ fn reseal_legacy_replaces_an_unrecorded_legacy_envelope_and_verify_passes() {
         .run(|h| block_on(engine::verify(&mut relay, &ring(), &mut st, h)))
         .unwrap();
     assert_eq!((v.verified, v.failed.len()), (1, 0));
+}
+
+#[test]
+fn two_reseal_files_for_one_envelope_leave_one_replacement() {
+    let c = db();
+    let (root, legacy) = legacy_fixture(&c);
+    // Two runs before either is applied: NIP-44 is randomised, so the
+    // replacements differ.
+    let a = reseal_items(&c, &root);
+    let b = reseal_items(&c, &root);
+    assert_ne!(a[0].envelope.id, b[0].envelope.id);
+    c.execute_batch(&offline::reseal_sql(&a, &pk(MIGRATOR), 9))
+        .unwrap();
+    c.execute_batch(&offline::reseal_sql(&b, &pk(MIGRATOR), 9))
+        .unwrap();
+    let ids = [
+        legacy.id.clone(),
+        a[0].envelope.id.clone(),
+        b[0].envelope.id.clone(),
+    ];
+    let present = offline::present_ids(&c, &ids).unwrap();
+    assert_eq!(present, [a[0].envelope.id.clone()].into());
+    assert_eq!(posts_created(&c), 1);
+}
+
+#[test]
+fn commit_rejects_a_manifest_envelope_not_signed_by_the_migrator() {
+    let c = db();
+    let (root, _legacy) = legacy_fixture(&c);
+    let items = reseal_items(&c, &root);
+    // The same envelope tags and content, signed by a zone member instead.
+    let forged = sign(
+        AUTHOR,
+        42,
+        items[0].envelope.created_at,
+        items[0].envelope.tags.clone(),
+        &items[0].envelope.content,
+    );
+    let manifest = vec![offline::ManifestEntry {
+        id: items[0].original_id.clone(),
+        outer_id: forged.id.clone(),
+        epoch: items[0].epoch,
+        inner_sha256: items[0].inner_sha256.clone(),
+    }];
+    let outers: HashMap<String, NostrEvent> = [(forged.id.clone(), forged)].into();
+    let mut st = State::new(RELAY_URL, &pk(MIGRATOR));
+    let r = offline::commit_sealed_with(&mut st, &manifest, &outers, &ring(), true, &bindings());
+    assert_eq!(r.committed, 0);
+    assert!(
+        r.skipped[0].1.contains("not signed by the migrator"),
+        "{r:?}"
+    );
+    assert!(st.entries.is_empty());
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "zm-offline-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[test]
+fn apply_direct_applies_generated_files_and_refuses_anything_else() {
+    let dir = temp_dir("apply");
+    let path = dir.join("d1.sqlite");
+    let (root, legacy) = {
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        init(&c);
+        legacy_fixture(&c)
+    };
+    let items = {
+        let c = Connection::open(&path).unwrap();
+        reseal_items(&c, &root)
+    };
+    let file = offline::write_reseal_sql(&dir.join("sql"), &items, &pk(MIGRATOR), 9).unwrap();
+
+    // Not generated by the tool: refused before anything runs.
+    let bare = dir.join("bare.sql");
+    std::fs::write(&bare, "DELETE FROM events;\n").unwrap();
+    let err = offline::apply_sql_direct(&path, &[file.clone(), bare]).unwrap_err();
+    assert!(err.contains("not a file written by this tool"), "{err}");
+    // Generated header but transaction control inside: rolled back.
+    let sneaky = dir.join("sneaky.sql");
+    std::fs::write(
+        &sneaky,
+        format!(
+            "{}\nDELETE FROM events;\nCOMMIT;\n",
+            offline::GENERATED_HEADER
+        ),
+    )
+    .unwrap();
+    let err = offline::apply_sql_direct(&path, &[sneaky]).unwrap_err();
+    assert!(err.contains("transaction control"), "{err}");
+    {
+        let c = Connection::open(&path).unwrap();
+        assert_eq!(
+            offline::present_ids(&c, std::slice::from_ref(&legacy.id))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // The generated file applies, line by line, with the relay trigger.
+    let done = offline::apply_sql_direct(&path, &[file]).unwrap();
+    assert_eq!(done.len(), 1);
+    let c = Connection::open(&path).unwrap();
+    assert!(offline::present_ids(&c, std::slice::from_ref(&legacy.id))
+        .unwrap()
+        .is_empty());
+    let sealed_rows: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM event_tags WHERE event_id = ?1 AND name = 'sealed'",
+            [&items[0].envelope.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sealed_rows, 1);
+    assert_eq!(posts_created(&c), 1);
+    drop(c);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn exclusive_lock_keeps_every_other_connection_out_in_both_journal_modes() {
+    for mode in ["WAL", "DELETE"] {
+        let dir = temp_dir("lock");
+        let path = dir.join("d1.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(&format!("PRAGMA journal_mode = {mode};"))
+                .unwrap();
+            init(&c);
+        }
+        let held = offline::lock_exclusive(&path).unwrap();
+        let probe = |what: &str| {
+            let other = Connection::open(&path).unwrap();
+            other
+                .busy_timeout(std::time::Duration::from_millis(0))
+                .unwrap();
+            assert!(
+                other
+                    .query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))
+                    .is_err(),
+                "{mode}: a reader got in {what}"
+            );
+            assert!(
+                other.execute("DELETE FROM whitelist", []).is_err(),
+                "{mode}: a writer got in {what}"
+            );
+            assert!(
+                offline::lock_exclusive(&path).is_err(),
+                "{mode}: locked twice {what}"
+            );
+        };
+        probe("after locking");
+        // Between files: a committed transaction keeps the lock.
+        held.execute_batch("BEGIN IMMEDIATE; UPDATE whitelist SET posts_created = 7; COMMIT;")
+            .unwrap();
+        probe("between transactions");
+        drop(held);
+        let c = Connection::open(&path).unwrap();
+        assert_eq!(posts_created(&c), 7, "{mode}: released and committed");
+        drop(c);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
