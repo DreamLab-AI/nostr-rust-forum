@@ -3495,7 +3495,6 @@ dependencies = [
  "hex",
  "js-sys",
  "nostr-bbs-core",
- "nostr-bbs-jev",
  "nostr-bbs-rate-limit",
  "rvf-types",
  "serde",
