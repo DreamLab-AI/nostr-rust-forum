@@ -1,6 +1,6 @@
 # Bulk import: design
 
-Status: **revised after the architecture review** (2026-11-24); security review in §15.
+Status: **implemented** (2026-11-24) after the architecture and security reviews (§15).
 
 A kit-native pipeline that loads an external chat archive (Keybase today; Discord,
 Slack or Matrix through new adapters) into a forum deployment **offline**, seals the
@@ -21,7 +21,8 @@ Goals
 
 * Any operator can turn an archive into a forum deployment with original timestamps,
   reply structure, attachments and reactions preserved, and no plaintext of an
-  encrypted zone left behind.
+  encrypted zone left in the deployed database (local residue is the operator's to
+  destroy: SECURITY.md checklist; zone media are access-controlled, not encrypted).
 * Every step is offline, resumable and idempotent. Re-running any step with the same
   inputs changes nothing.
 * Nothing the tool does can reach a production service. **The crate makes no network
@@ -133,8 +134,7 @@ attachments copied by content address). Two adapters ship:
 | Decision | Signs that author's history | Forum key | Recovery sheet |
 |---|---|---|---|
 | `fresh` (default) | a new key generated here | same | yes |
-| `existing { pubkey }` | a per-person **archive key** generated here | live key kept; alias archive → live | optional |
-| `existing_signs { }` | not allowed: we never hold another person's live secret | — | — |
+| `existing { pubkey, proof \| trust }` | a per-person **archive key** generated here | live key kept; alias archive → live; the live key is whitelisted **only with a signed `proof`** (`trust: operator` writes the alias only) | optional |
 | `merge { into }` | the target author's key (after its own decision) | — | — |
 | `drop` | nothing imported; replies to it carry a "not migrated" note | — | — |
 | `operator { handle, defer }` | the operator's key; with `defer` the messages are recorded and imported later by `build --deferred-only` once the operator imports their key (`keys import`) | operator | no |
@@ -152,15 +152,17 @@ successor since migration 0016) makes every client show the live identity. Signi
 history with an operator key and attributing it in text would forge authorship;
 holding people's live keys would be key custody. See `SECURITY.md`.
 
-**Keystore.** `keys.json` (0600, directory 0700): `{version:1, keys:{<label>:{pk, sk,
-created_at, role}}}`. Every write goes through one function: temp file in the same
-directory opened `O_EXCL` 0600, write, fsync, rename, fsync directory, and it refuses
-(writing nothing) if any existing label would be removed or have `pk`/`sk` changed.
-Keys come from `nostr_bbs_core::keys::generate_keypair` (OS RNG). Secret bytes are
-held in `Zeroizing` buffers and never formatted into logs, errors or the ledger.
-`keys import --label L --from FILE` (FILE 0600, hex or nsec) is the only way an external
-secret enters (the deferred operator path); it is refused if `L` exists with a
-different key.
+**Keystore.** `keys.json` (0600, directory 0700): `{version:1, keys:{<label>:{pk, sk?,
+created_at, role, retired_at?}}}`. Every write goes through one function, under a lock
+file: temp file in the same directory opened `O_EXCL` 0600, write, fsync, rename, fsync
+directory; it refuses (writing nothing) if any existing label would be removed, change
+its `pk`, or regain a secret after retirement. **Retirement** (secret dropped, public
+key kept) is the only permitted change. Keys come from
+`nostr_bbs_core::keys::generate_keypair` (OS RNG); secrets are held in `Zeroizing`
+buffers and never formatted into logs, errors, `Debug` output or the ledger. **The
+operator key is never stored**: `keys import --from FILE` records its public key, and a
+run that signs as the operator reads the secret from that 0600 file (opened without
+following symlinks, owner and mode checked) for the run only.
 
 ## 5. Structure mapping
 
@@ -228,8 +230,8 @@ different key.
   `REPLAY_DB`, which holds `quota_usage`) raises the archivist pod's `used_bytes` by the
   uploaded total (`MAX`, idempotent). The pod must be provisioned through the pod API
   (first sign-in) before its listing shows the objects.
-* **Cutover copy.** `upload/r2-copy.jsonl` lists objects that must move bucket to
-  bucket at the identical key (e.g. verbatim live posts that link the old pod).
+* **Names.** Objects are named by the full source SHA-256 (`<sha256>.webp`,
+  `<sha256>_thumb.webp`); a 64-bit prefix could be collided by a crafted archive.
 
 ## 7. Build: local D1 with ingest parity
 
@@ -363,14 +365,20 @@ archivist. Delete `docs.jsonl` after the build.
   dumped copy would double every tag) and `settings` (boot marker rows). Chunks stay
   under D1's statement and request limits. A raw `wrangler d1 export` is not used: it
   emits plain `INSERT`s that collide with boot rows and duplicate `event_tags`.
-* `quota.sql` for the auth database (§6), `r2-objects.jsonl`, `r2-copy.jsonl`.
+* `quota.sql` for the auth database (§6), `r2-objects.jsonl`. Text that is not plain
+  printable ASCII (or contains `;`, quotes, comment markers) is written as
+  `CAST(X'…' AS TEXT)` so no statement splitter can misread archive text.
 * `RUNBOOK.md` and `commands.sh`:
   1. New stack alongside the old one (new worker names, D1, R2 bucket, KV), config
      projected from the same forum config.
-  2. `wrangler d1 migrations apply <new db> --remote` (0001–0016: `event_tags`, its
-     delete trigger and 0016 exist only there), then boot the relay once so
-     `ensure_schema()` installs the v3 trigger, `channel_zones`, `admin_log` and the
-     rest, then `wrangler d1 execute <new db> --remote --file data-NNNN.sql` per chunk.
+  2. Relay migrations with `wrangler d1 execute --remote --file`: `0009_events.sql`
+     first (0004's trigger reads `events`), then all in numeric order (`event_tags`,
+     its delete trigger and 0016 exist only there; `migrations apply` would run 0004
+     first and fail on a fresh database). Boot the relay once so `ensure_schema()`
+     installs the v3 trigger, `channel_zones`, `admin_log` and the rest, then
+     `wrangler d1 execute <new db> --remote --file data-NNNN.sql` per chunk.
+     `commands.sh` (bash, `set -euo pipefail`) refuses when a new resource name equals
+     an old one or the new D1 already holds events.
   3. R2 object puts, the bucket-to-bucket copy list, `quota.sql` on the auth database.
   4. One revertable website commit points the forum at the new stack; the old stack is
      frozen read-only (not deleted). Roll-back = revert that commit.
@@ -386,8 +394,9 @@ storage and class-A operations for the puts, the pod quota (`POD_QUOTA_MB`).
 ## 11. DMs
 
 * **Verbatim copy** of kind-1059 wraps (id and signature verified, exactly one `p`)
-  whose recipient keeps their key and is whitelisted in the new deployment (the relay
-  only accepts wraps to whitelisted recipients): same id, signature and `created_at`,
+  whose recipient is a live key kept by a proven identity, or the operator, and is
+  whitelisted in the new deployment (the relay only accepts wraps to whitelisted
+  recipients): same id, signature and `created_at`,
   nothing decrypted. Zone-key grants (rumor 21453) cannot be told apart without
   decrypting, so copies need `--allow-stale-grants` (stale epochs are noise, not a
   leak: they are addressed to the same recipient).
@@ -395,7 +404,10 @@ storage and class-A operations for the puts, the pod quota (`POD_QUOTA_MB`).
   old key (0600 file), require rumor author = old key, re-seal with the old key (the
   seal signer must be the rumor author), wrap to the new key. Rumors by anyone else
   are skipped and counted: we never forge a sender. Only NIP-17 kinds (14, 7, 5, 15)
-  travel. Uses `nostr_bbs_core::gift_wrap`. Output goes into the D1 like any event.
+  travel. Opening uses `nostr_bbs_core::gift_wrap::unwrap_gift`, which verifies the
+  wrap and seal signatures and the rumor-author = seal-signer binding. Output goes into
+  the D1 like any event. The new zone key must be minted at an epoch above any old one,
+  so copied stale grants cannot shadow it.
 
 ## 12. Parity invariants (`verify-parity`, and the e2e test)
 
@@ -443,6 +455,12 @@ re-inserts no plaintext.
   "keep keys and posts as-is") beyond DMs.
 * Anything that needs a zone-migrate change is a follow-up, not edited here (for
   example a no-network build of its library, or an offline unanchored path).
+* Pinning the archivist pubkey in the kit so the archivist could be demoted after
+  sealing (today it must stay admin, §7).
+* A bucket-to-bucket copy list for objects of verbatim live posts (LIVE-MERGE.md);
+  not generated, since verbatim live events are not imported.
+* `secure_delete` during zone-migrate's own `apply-direct` of the purge (the importer's
+  `scrub` runs `VACUUM` afterwards instead).
 * Client limits for very long topics (KIT-FIXES.md) are client work.
 
 ## 15. Reviews
@@ -468,3 +486,20 @@ URL, objects routed to the R2 list (S6); v1 limits of the format stated (S7). Ni
 adopted: cross-thread replies become a note; `keys export --out` instead of shell
 extraction; `WRANGLER_SEND_METRICS=false`; per-author media dropped from v1. Not adopted:
 dropping the DM re-wrap (the operator asked for it).
+
+### 15.2 Security review (security-reviewer, 2026-11-24): accepted, fixed in code
+
+No critical findings, no path to production, no hand-rolled cryptography.
+
+| # | Finding | Resolution |
+|---|---|---|
+| H1 | the keystore's derived `Debug` printed every secret through its change baseline | manual `Debug` (public data only); the baseline holds public keys only; test |
+| H2 | `existing` live keys were whitelisted, granted and aliased unverified | signed `proof` (content = `link_statement`, `verify_event_strict`) required to whitelist; `trust: operator` writes the alias only; live keys may not equal any keystore key |
+| H3 | `keys.json` held every secret indefinitely, the operator's included | retirement as the one permitted keystore change; operator stored as public key only and unlocked per run; custody timeline in SECURITY.md |
+| M1 | a Keybase asset path could name a message file (raw lines carry decryption keys) | asset paths confined to `assets/`, symlinks refused; e2e test |
+| M2 | symlinks could escape the Keybase input tree | every read checks for a regular file; channel dirs are one segment and confined |
+| M3 | ledger keys could collide (`root:` message ids) | separate namespaces `#m:`, `#root:`, `#thread:`, `#profile:`, `#dm:` |
+| M4 | plaintext survives purge on disk | `scrub` (`secure_delete`, `VACUUM`, WAL truncate); residue checklist; §1 claim corrected |
+| M5 | offline grants left no audit trail | `admin_log` rows with the relay's action names, actor = archivist |
+| M6 | the upload script could merge into the live stack | bash `set -euo pipefail`, refuses new = old names and a non-empty new D1; objects are image or search files only |
+| Low | stale-grant shadowing; unwrap function unnamed; DM copy recipients too broad; keystore save race; secret-file checks; `keys import` role; hash-then-copy race; oversized messages; SQL encoding in the dump; R2 key length; ImageMagick policy; `keys export`; bots never dropped; unbounded lines | epoch rule documented; `unwrap_gift` named; recipients limited to proven live keys and the operator; lock file; `O_NOFOLLOW` + owner + mode; import is operator-only; copies re-hashed; 40 000-byte budget (§7); hex-encoded dump text; full-digest names; deny-all `policy.xml` with limits; `O_EXCL` 0600 export and prefix-env form; Keybase `bot`/`restrictedBot` roles; 16 MiB line cap |
