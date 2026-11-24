@@ -36,8 +36,8 @@ pub const CODE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Default number of first-stage candidates rescored exactly. Measured on real
 /// bge-small vectors (250k): recall@10 = 0.955 at 80 (0.898 at 40, 0.974 at 200).
 pub const DEFAULT_RESCORE: usize = 80;
-/// Ingest commit attempts before reporting a conflict.
-const COMMIT_ATTEMPTS: usize = 3;
+/// Ingest commit attempts before reporting a conflict (409, client retries).
+const COMMIT_ATTEMPTS: usize = 5;
 
 thread_local! {
     static MANIFEST: RefCell<Option<CachedManifest>> = const { RefCell::new(None) };
@@ -136,15 +136,34 @@ async fn get_range(env: &Env, key: &str, offset: usize, length: usize) -> Result
     }
 }
 
-async fn put(env: &Env, key: &str, bytes: Vec<u8>, only_if_etag: Option<&str>) -> Result<Option<String>> {
+/// Condition on a put.
+enum PutIf<'a> {
+    /// Unconditional (new, uniquely named objects).
+    Always,
+    /// Only if the object does not exist yet (first manifest).
+    Absent,
+    /// Only if the current etag matches (manifest commit).
+    Etag(&'a str),
+}
+
+async fn put(env: &Env, key: &str, bytes: Vec<u8>, cond: PutIf<'_>) -> Result<Option<String>> {
     count_op();
     let bucket = env.bucket("VECTORS")?;
     let mut b = bucket.put(key, bytes);
-    if let Some(e) = only_if_etag {
-        b = b.only_if(Conditional {
-            etag_matches: Some(e.to_string()),
-            ..Default::default()
-        });
+    match cond {
+        PutIf::Always => {}
+        PutIf::Absent => {
+            b = b.only_if(Conditional {
+                etag_does_not_match: Some("*".to_string()),
+                ..Default::default()
+            })
+        }
+        PutIf::Etag(e) => {
+            b = b.only_if(Conditional {
+                etag_matches: Some(e.to_string()),
+                ..Default::default()
+            })
+        }
     }
     Ok(b.execute().await?.map(|o| o.etag()))
 }
@@ -280,10 +299,18 @@ pub async fn search(
         }))
         .await;
         let mut rows: Vec<((usize, usize), Vec<u8>)> = Vec::with_capacity(cands.len());
+        let mut missing = false;
         for ((si, pos, _), f) in cands.iter().zip(fetched) {
-            if let Some(b) = f? {
-                rows.push(((*si, *pos), b));
+            match f? {
+                Some(b) => rows.push(((*si, *pos), b)),
+                None => missing = true,
             }
+        }
+        if missing && !force {
+            // A commit elsewhere replaced a shard between our manifest read
+            // and the row reads: reload the manifest and search again once.
+            force = true;
+            continue;
         }
         let refs: Vec<((usize, usize), &[u8])> = rows.iter().map(|(p, b)| (*p, b.as_slice())).collect();
         return Ok(Some(SearchOutcome {
@@ -344,6 +371,7 @@ pub async fn ingest<F, Fut>(
     store: &str,
     model: &str,
     entries: Vec<NewEntry>,
+    nonce: &str,
     v1_rows: F,
 ) -> std::result::Result<IngestOutcome, IngestError>
 where
@@ -351,7 +379,15 @@ where
     Fut: std::future::Future<Output = Result<Vec<Row>>>,
 {
     let key = manifest_key(store);
-    for _ in 0..COMMIT_ATTEMPTS {
+    for attempt in 0..COMMIT_ATTEMPTS {
+        if attempt > 0 {
+            // Jittered backoff so racing writers stop colliding in lockstep.
+            let ms = 10 + (js_sys::Math::random() * 40.0 * attempt as f64) as u64;
+            worker::Delay::from(std::time::Duration::from_millis(ms)).await;
+        }
+        // Unique per write attempt: shard keys never collide with a racing
+        // writer's, so a loser's cleanup deletes only its own objects.
+        let attempt_nonce = format!("{nonce}{attempt}");
         let current = get_full(env, &key).await?;
         let (base, base_etag, migrated) = match &current {
             Some((bytes, etag)) => {
@@ -394,10 +430,10 @@ where
             };
             upsert(&mut rows, batch);
             for (d, p, part) in split_until_fits(rows, depth, prefix, base.shard_cap) {
-                let k = shard_key(store, &zone, d, p, generation);
+                let k = shard_key(store, &zone, d, p, generation, &attempt_nonce);
                 let public = part.iter().filter(|r| r.public).count();
                 let count = part.len();
-                let etag = put(env, &k, encode_shard(&part, &zone, d, p), None)
+                let etag = put(env, &k, encode_shard(&part, &zone, d, p), PutIf::Always)
                     .await?
                     .ok_or_else(|| worker::Error::RustError("unconditional put refused".into()))?;
                 written.push(k.clone());
@@ -413,9 +449,13 @@ where
         }
         let old_keys: Vec<String> = replaced.iter().map(|&t| base.shards[t].key.clone()).collect();
         let next = shard::commit(&base, &replaced, added, generation, model, migrated_n > 0);
-        // First creation is unconditional (no etag to match); afterwards the
-        // commit only lands if nobody else committed since we read.
-        match put(env, &key, next.to_rvf(), base_etag.as_deref()).await? {
+        // The commit only lands if nobody else committed since we read: the
+        // first manifest only if none exists, later ones only on our etag.
+        let cond = match base_etag.as_deref() {
+            Some(e) => PutIf::Etag(e),
+            None => PutIf::Absent,
+        };
+        match put(env, &key, next.to_rvf(), cond).await? {
             Some(_) => {
                 delete_keys(env, &old_keys).await;
                 MANIFEST.with(|m| *m.borrow_mut() = None);

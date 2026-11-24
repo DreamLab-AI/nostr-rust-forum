@@ -840,7 +840,13 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
     // RVF v2: copy-on-write shards + conditional manifest commit. The first
     // v2 ingest migrates an existing v1 store (object + KV mapping).
     let store_key = store_key(env);
-    let outcome = match index_v2::ingest(env, &store_key, &ingest_model, entries, || v1_rows(env)).await {
+    // Write-attempt nonce for shard keys: uniqueness, not secrecy, is needed.
+    let nonce = format!(
+        "{:x}{:08x}",
+        js_sys::Date::now() as u64,
+        (js_sys::Math::random() * f64::from(u32::MAX)) as u32
+    );
+    let outcome = match index_v2::ingest(env, &store_key, &ingest_model, entries, &nonce, || v1_rows(env)).await {
         Ok(o) => o,
         Err(index_v2::IngestError::ModelMismatch(indexed)) => {
             console_error!(
@@ -1000,11 +1006,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let result = route(&req, &env, path).await;
     match result {
         Ok(mut resp) => {
-            // R2 calls this request made through the v2 index (measurement aid;
-            // v1 fallback reads are not counted).
-            let _ = resp
-                .headers_mut()
-                .set("X-Search-R2-Ops", &index_v2::take_r2_ops().to_string());
+            // Measurement aid, off unless SEARCH_DEBUG_OPS=1: R2 calls made
+            // through the v2 index during this request. The counter is per
+            // isolate, so concurrent requests on one isolate blur it.
+            let ops = index_v2::take_r2_ops();
+            if env.var("SEARCH_DEBUG_OPS").map(|v| v.to_string() == "1").unwrap_or(false) {
+                let _ = resp.headers_mut().set("X-Search-R2-Ops", &ops.to_string());
+            }
             Ok(resp)
         }
         Err(e) => {

@@ -28,8 +28,9 @@
 //! - `{store}.v2/manifest.rvf`: one `Manifest` segment holding [`Manifest`] as
 //!   JSON. It is the only mutable object and is replaced with a conditional
 //!   put (`etagMatches`), so concurrent ingests cannot lose each other's work.
-//! - `{store}.v2/{zone}/{depth}-{prefix:016x}-g{generation}.rvf`: immutable
-//!   shard objects (copy-on-write). A reader holding an older manifest still
+//! - `{store}.v2/{zone}/{depth}-{prefix:016x}-g{generation}-{nonce}.rvf`:
+//!   immutable shard objects (copy-on-write; the nonce is unique per write
+//!   attempt, so racing writers never share a key). A reader holding an older manifest still
 //!   reads consistent shards.
 //!
 //! # Shard layout (RVF segments, 64-byte headers, payloads padded to 64)
@@ -204,9 +205,14 @@ pub fn manifest_key(store_key: &str) -> String {
     format!("{store_key}.v2/manifest.rvf")
 }
 
-/// R2 key of a shard written at `generation`.
-pub fn shard_key(store_key: &str, zone: &str, depth: u8, prefix: u64, generation: u64) -> String {
-    format!("{store_key}.v2/{zone}/{depth}-{prefix:016x}-g{generation}.rvf")
+/// R2 key of a shard written at `generation` by the write attempt `nonce`.
+///
+/// The nonce is unique per write attempt. Two ingests that read the same
+/// manifest compute the same generation; without the nonce they would write
+/// the same key, and the loser's cleanup would delete the object the
+/// winner's manifest points at.
+pub fn shard_key(store_key: &str, zone: &str, depth: u8, prefix: u64, generation: u64, nonce: &str) -> String {
+    format!("{store_key}.v2/{zone}/{depth}-{prefix:016x}-g{generation}-{nonce}.rvf")
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +823,10 @@ mod tests {
 
     /// Simulate ingest rounds natively: group, upsert, split, encode, commit.
     fn ingest_round(m: &Manifest, objects: &mut HashMap<String, Vec<u8>>, rows: Vec<(String, Row)>, cap: usize) -> Manifest {
+        ingest_round_n(m, objects, rows, cap, "n")
+    }
+
+    fn ingest_round_n(m: &Manifest, objects: &mut HashMap<String, Vec<u8>>, rows: Vec<(String, Row)>, cap: usize, nonce: &str) -> Manifest {
         let gen = m.generation + 1;
         let mut replaced = Vec::new();
         let mut added = Vec::new();
@@ -827,7 +837,7 @@ mod tests {
             };
             upsert(&mut cur, g.rows);
             for (d, p, part) in split_until_fits(cur, g.depth, g.prefix, cap) {
-                let key = shard_key("t.rvf", &g.zone, d, p, gen);
+                let key = shard_key("t.rvf", &g.zone, d, p, gen, nonce);
                 objects.insert(key.clone(), encode_shard(&part, &g.zone, d, p));
                 added.push(ShardInfo { zone: g.zone.clone(), depth: d, prefix: p, count: part.len(), public: part.iter().filter(|r| r.public).count(), key, etag: format!("e{gen}") });
             }
@@ -973,6 +983,29 @@ mod tests {
     }
 
     #[test]
+    fn racing_writers_never_share_or_delete_each_others_keys() {
+        // Two ingests read the same base and touch the same (only) shard.
+        let rows: Vec<Row> = lcg_rows(40, 61, 1);
+        let mut objects = HashMap::new();
+        let base = ingest_round(&Manifest::new("m"), &mut objects, rows[..20].iter().map(|r| ("_".into(), r.clone())).collect(), 8192);
+        let before: std::collections::HashSet<String> = objects.keys().cloned().collect();
+        let winner = ingest_round_n(&base, &mut objects, rows[20..30].iter().map(|r| ("_".into(), r.clone())).collect(), 8192, "w1");
+        let loser = ingest_round_n(&base, &mut objects, rows[30..].iter().map(|r| ("_".into(), r.clone())).collect(), 8192, "l1");
+        assert_eq!(winner.generation, loser.generation);
+        let wk: std::collections::HashSet<&String> = winner.shards.iter().map(|s| &s.key).collect();
+        let lk: Vec<&String> = loser.shards.iter().map(|s| &s.key).filter(|k| !before.contains(*k)).collect();
+        // The loser's cleanup set (what it wrote) never intersects the winner's committed keys.
+        assert!(lk.iter().all(|k| !wk.contains(k)));
+        for k in &lk {
+            objects.remove(*k);
+        }
+        // Every key the committed manifest names still exists and decodes.
+        for s in &winner.shards {
+            assert_eq!(decode_shard(&objects[&s.key]).unwrap().len(), s.count);
+        }
+    }
+
+    #[test]
     fn zone_and_hash_helpers() {
         assert!(valid_zone("_") && valid_zone("zone1") && valid_zone("a-b"));
         assert!(!valid_zone("") && !valid_zone("Zone") && !valid_zone("../x") && !valid_zone(&"a".repeat(33)));
@@ -980,6 +1013,6 @@ mod tests {
         assert!(owns(0, 0, h));
         assert!(owns(1, h >> 63, h) && !owns(1, (h >> 63) ^ 1, h));
         assert_eq!(id_hash("abc"), h);
-        assert_eq!(shard_key("s.rvf", "_", 3, 5, 7), "s.rvf.v2/_/3-0000000000000005-g7.rvf");
+        assert_eq!(shard_key("s.rvf", "_", 3, 5, 7, "ab"), "s.rvf.v2/_/3-0000000000000005-g7-ab.rvf");
     }
 }
