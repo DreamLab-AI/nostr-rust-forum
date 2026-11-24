@@ -663,3 +663,86 @@ fn a_grant_refused_twice_is_reached_again_by_the_next_warm_session() {
     assert_eq!(control.pages, 1);
     assert!(control.keys.is_empty());
 }
+
+/// Security re-review finding A, across two sessions. A warm device last
+/// completed a backfill at D0. A grant lands a day later, dated (as the
+/// relay allows) five days before it landed, below 3,000 wraps an earlier
+/// session processed. Thirty days on, session 1's page 0 query fails and
+/// comes back empty (KF-31): it must not write a fresh marker. Session 2
+/// then pages with the old marker and still reaches the grant. With a fresh
+/// marker from session 1 the processed wraps would be a warm stop above it.
+#[test]
+fn a_failed_page_zero_writes_no_marker_and_a_late_grant_is_still_reached() {
+    let day = 24 * 60 * 60;
+    let d0: u64 = 1_900_000_000;
+    let member = PrfSigner::new(generate_keypair().unwrap());
+    let admin_signer = PrfSigner::new(generate_keypair().unwrap());
+    let key = generate_zone_key("late", 1, admin_signer.public_key(), 100).unwrap();
+    let grant = block_on(build_grant_wrap(
+        &admin_signer,
+        member.public_key(),
+        &key,
+        100,
+    ))
+    .unwrap();
+    let processed = RefCell::new(HashSet::new());
+    let mut events = HashMap::new();
+    let mut relay = FakeRelay::default();
+    // Processed wraps a day after D0, newest first.
+    for i in 0..3_000u64 {
+        let id = format!("seen{i:05}");
+        processed.borrow_mut().insert(id.clone());
+        events.insert(
+            id.clone(),
+            NostrEvent {
+                id: id.clone(),
+                ..grant.clone()
+            },
+        );
+        relay.rows.push((id, d0 + day + 3_000 - i));
+    }
+    // The late grant, dated five days before it landed (D0 + 1 day).
+    relay.rows.push((grant.id.clone(), d0 - 4 * day));
+    events.insert(grant.id.clone(), grant.clone());
+    let fresh_admin = admin_signer.public_key().to_string();
+    let admin = move |pk: &str| Some(pk == fresh_admin);
+    let old = Marker {
+        done_at: d0,
+        floor: None,
+    };
+
+    let mut failing = relay.clone();
+    failing.fail_queries = [0].into_iter().collect();
+    let first = Session::new(&member, SignerKind::Local, &admin, &processed)
+        .sync(&mut sim(failing, &events), Some(old));
+    assert_eq!(first.end, PagerAction::Done { verified: false });
+    assert!(
+        first.markers.is_empty(),
+        "no fresh marker over an empty page 0"
+    );
+
+    // The device keeps the marker it had, or writes the one session 1 made.
+    let session_1_time = d0 + 30 * day;
+    let kept = if first.markers.is_empty() {
+        old
+    } else {
+        Marker {
+            done_at: session_1_time,
+            floor: first.floor,
+        }
+    };
+    let second = Session::new(&member, SignerKind::Local, &admin, &processed)
+        .sync(&mut sim(relay.clone(), &events), Some(kept));
+    assert_eq!(second.keys, HashSet::from([("late".to_string(), 1)]));
+    assert!(second.backlog.settled());
+
+    // Control: had session 1 written a marker at its own time, the warm
+    // stop would halt on the processed wraps and miss the grant.
+    let fresh = Marker {
+        done_at: session_1_time,
+        floor: None,
+    };
+    let control = Session::new(&member, SignerKind::Local, &admin, &processed)
+        .sync(&mut sim(relay, &events), Some(fresh));
+    assert!(control.keys.is_empty());
+}

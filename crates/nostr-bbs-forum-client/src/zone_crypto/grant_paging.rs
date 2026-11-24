@@ -253,8 +253,9 @@ impl PageTally {
 ///
 /// - **Warm stop:** with a marker, a full page with nothing unprocessed whose
 ///   newest wrap is older than `warm - WARM_STOP_MARGIN_SECS`: done.
-/// - **Empty page:** page 0 → done (there are no wraps); a later page → ask
-///   once more with an exclusive boundary; empty again → done, unverified.
+/// - **Empty page:** page 0 → done, unverified (no wraps, or a failed
+///   query); a later page → the same `until` again, then once past the
+///   boundary; empty again → done, unverified.
 /// - **Otherwise** the deletion sync's rule, page 0 included (with `until`
 ///   taken as one past its newest row, so any rows at all lead to one more
 ///   page): nothing older than `until` → done, unless that page is full of
@@ -279,8 +280,12 @@ pub fn grant_page_step(
     }
     if tally.rows == 0 {
         return match (until, retry) {
-            // Page 0 empty: the member has no wraps at all.
-            (None, _) => GrantStep::Done { verified: true },
+            // Page 0 empty: the member has no wraps, or the query failed (the
+            // relay answers a storage error as empty, KF-31). Done either
+            // way, but unverified: a fresh marker over a failed page 0 could
+            // put a wrap that landed since below the next warm stop. A
+            // member with no wraps loses nothing by having no marker.
+            (None, _) => GrantStep::Done { verified: false },
             // Ask the same inclusive `until` again: one failed query must
             // not skip the unseen wraps sharing the boundary timestamp.
             (Some(u), EmptyRetry::No) => GrantStep::Next {
@@ -471,11 +476,14 @@ pub(crate) mod tests {
         );
     }
 
+    /// Security re-review finding A: an empty page 0 is also what a failed
+    /// D1 query looks like (KF-31), so it ends the walk unverified and
+    /// writes no marker. A member with no wraps loses nothing by that.
     #[test]
-    fn empty_first_page_is_done() {
+    fn empty_first_page_is_done_but_unverified() {
         assert_eq!(
             grant_page_step(0, None, PageTally::default(), None, EmptyRetry::No),
-            DONE
+            GrantStep::Done { verified: false }
         );
     }
 
