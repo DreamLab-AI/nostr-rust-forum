@@ -578,15 +578,11 @@ pub type Candidate = (usize, usize, f32);
 /// Best `r` **public** rows over all shards by approximate score. Non-public
 /// rows are skipped here, before the cut, so every rescored candidate is
 /// visible (fail-closed: a clear bit is never returned).
+///
+/// Memory is O(`r`): candidates go into a buffer of at most `4r`, which is cut
+/// back to the best `r` whenever it fills. The order is total (score, then
+/// shard, then position), so the result equals a full sort's top `r`.
 pub fn first_stage(lut: &QueryLut, shards: &[&ShardCodes], r: usize) -> Vec<Candidate> {
-    let mut v: Vec<Candidate> = Vec::new();
-    for (si, s) in shards.iter().enumerate() {
-        for i in 0..s.count {
-            if s.is_public(i) {
-                v.push((si, i, lut.score(&s.codes[i * CODE_BYTES..(i + 1) * CODE_BYTES])));
-            }
-        }
-    }
     let cmp = |a: &Candidate, b: &Candidate| {
         b.2.partial_cmp(&a.2)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -596,10 +592,25 @@ pub fn first_stage(lut: &QueryLut, shards: &[&ShardCodes], r: usize) -> Vec<Cand
     if r == 0 {
         return Vec::new();
     }
-    if v.len() > r {
-        v.select_nth_unstable_by(r - 1, cmp);
-        v.truncate(r);
+    let cap = r.saturating_mul(4).max(64);
+    let mut v: Vec<Candidate> = Vec::with_capacity(cap);
+    let cut = |v: &mut Vec<Candidate>| {
+        if v.len() > r {
+            v.select_nth_unstable_by(r - 1, cmp);
+            v.truncate(r);
+        }
+    };
+    for (si, s) in shards.iter().enumerate() {
+        for i in 0..s.count {
+            if s.is_public(i) {
+                v.push((si, i, lut.score(&s.codes[i * CODE_BYTES..(i + 1) * CODE_BYTES])));
+                if v.len() == cap {
+                    cut(&mut v);
+                }
+            }
+        }
     }
+    cut(&mut v);
     v.sort_unstable_by(cmp);
     v
 }
@@ -930,6 +941,35 @@ mod tests {
         assert_eq!(n.model, "old"); // non-empty index keeps its model
         assert!(n.migrated_from_v1 && n.generation == 4);
         assert_eq!(commit(&Manifest::new("x"), &[], vec![add], 1, "new", false).model, "new");
+    }
+
+    #[test]
+    fn bounded_first_stage_equals_full_sort() {
+        let rows = lcg_rows(5000, 51, 3);
+        let parts = split_until_fits(rows, 0, 0, 700);
+        let codes: Vec<ShardCodes> = parts
+            .iter()
+            .map(|(d, p, rs)| {
+                let b = encode_shard(rs, "_", *d, *p);
+                let (x, y) = ShardLayout::new(rs.len()).hot_range();
+                ShardCodes::from_hot_range(rs.len(), &b[x..y]).unwrap()
+            })
+            .collect();
+        let refs: Vec<&ShardCodes> = codes.iter().collect();
+        let lut = QueryLut::new(&lcg_rows(1, 52, 1)[0].vec);
+        let mut full: Vec<Candidate> = Vec::new();
+        for (si, s) in refs.iter().enumerate() {
+            for i in 0..s.count {
+                if s.is_public(i) {
+                    full.push((si, i, lut.score(&s.codes[i * CODE_BYTES..(i + 1) * CODE_BYTES])));
+                }
+            }
+        }
+        full.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+        for r in [1usize, 7, 80, 300, 10_000] {
+            let want: Vec<Candidate> = full.iter().take(r).copied().collect();
+            assert_eq!(first_stage(&lut, &refs, r), want, "r={r}");
+        }
     }
 
     #[test]
