@@ -149,6 +149,6 @@ An event signed here does not establish every other service's state. The estate'
 
 ## Documentation, credit and licence
 
-[Setup](SETUP.md) · [Architecture](docs/architecture.md) · [Decision ledger](docs/adr/README.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+[Setup](SETUP.md) · [Architecture](docs/architecture.md) · [Decision ledger](docs/adr/README.md) · [Bulk import](docs/bulk-import/README.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 Application/worker code follows **AGPL-3.0-only**. `nostr-bbs-core` declares **MIT OR Apache-2.0** from its beta.18 relicense; its default-off `did` feature adds the Solid dependency and changes the combined dependency obligations. Inspect the actual feature graph and individual manifests rather than applying a blanket licence to every build. [LICENSE](LICENSE), [core documentation](crates/nostr-bbs-core/README.md) and [MAINTAINERS.md](MAINTAINERS.md) carry terms and attribution, including the Solid/JSS lineage of Melvin Carvalho's work.
