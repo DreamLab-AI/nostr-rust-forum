@@ -68,7 +68,7 @@ use crate::utils::{arrow_left_svg, set_timeout_once};
 const BOOTSTRAP_DEADLINE_MS: i32 = 8000;
 
 /// Parsed channel metadata from the kind 40 event.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct ChannelHeader {
     name: String,
     description: String,
@@ -224,13 +224,27 @@ pub fn ChannelPage() -> impl IntoView {
         })
     };
 
-
     // Read-position store for mark-as-read
     let read_store = use_read_positions();
 
     // State
     let messages = RwSignal::new(Vec::<MessageData>::new());
-    let channel_info: RwSignal<Option<ChannelHeader>> = RwSignal::new(None);
+    // The kind-40 header as fetched (archived flag, first paint)...
+    let channel_info_raw: RwSignal<Option<ChannelHeader>> = RwSignal::new(None);
+    // ...and what is shown: name and description from the store's channel
+    // entry, which folds the latest kind-41 edit (fold_meta_into), exactly as
+    // the channel list and section/thread headers do. A renamed channel shows
+    // one name everywhere.
+    let store_for_header = use_context::<ChannelStore>();
+    let channel_info = Memo::new(move |_| {
+        let raw = channel_info_raw.get()?;
+        let cid = channel_id();
+        let folded = store_for_header.and_then(|s| {
+            s.channels
+                .with(|list| list.iter().find(|c| c.id == cid).cloned())
+        });
+        Some(effective_header(raw, folded.as_ref()))
+    });
     let pinned = RwSignal::new(Vec::<PinnedMessage>::new());
     // Held in a `StoredValue` (Copy) so the reply-divider closure below can be
     // move-captured into the `Show`-gated flat view without making that view
@@ -315,7 +329,7 @@ pub fn ChannelPage() -> impl IntoView {
     if let Some(store) = use_context::<ChannelStore>() {
         Effect::new(move |_| {
             // Don't clobber a header already populated by the kind-40 query.
-            if channel_info.with_untracked(|c| c.is_some()) {
+            if channel_info_raw.with_untracked(|c| c.is_some()) {
                 return;
             }
             let cid = channel_id();
@@ -329,7 +343,7 @@ pub fn ChannelPage() -> impl IntoView {
                         || c.name.to_lowercase() == needle_lower
                         || c.section.to_lowercase() == needle_lower
                 }) {
-                    channel_info.set(Some(ChannelHeader {
+                    channel_info_raw.set(Some(ChannelHeader {
                         name: found.name.clone(),
                         description: found.description.clone(),
                         archived: false,
@@ -383,7 +397,7 @@ pub fn ChannelPage() -> impl IntoView {
             ..Default::default()
         };
 
-        let channel_info_sig = channel_info;
+        let channel_info_sig = channel_info_raw;
         let store_for_kind40 = use_context::<ChannelStore>();
         // Captured here, inside the effect's owner: the relay callbacks below
         // run without one (ADR-2016 decryption at ingest).
@@ -1399,6 +1413,28 @@ impl HasCreatedAt for MessageData {
 }
 
 /// Parse kind 40 event content JSON into channel name, description, and archived status.
+/// The header a channel page shows: the store's channel entry (which folds
+/// the latest kind-41 over the kind-40, last-write-wins) supplies name and
+/// description; the kind-40 header supplies them until the entry exists, and
+/// the archived flag (kind-41 edits do not carry it).
+fn effective_header(
+    raw: ChannelHeader,
+    folded: Option<&crate::stores::channels::ChannelMeta>,
+) -> ChannelHeader {
+    match folded {
+        Some(meta) => ChannelHeader {
+            name: if meta.name.trim().is_empty() {
+                raw.name
+            } else {
+                meta.name.clone()
+            },
+            description: meta.description.clone(),
+            archived: raw.archived,
+        },
+        None => raw,
+    }
+}
+
 fn parse_channel_metadata(content: &str) -> ChannelHeader {
     match serde_json::from_str::<serde_json::Value>(content) {
         Ok(val) => ChannelHeader {
@@ -1448,5 +1484,52 @@ mod merge_tests {
         );
         merge_by_time(&mut list, vec![M("e", 50)]);
         assert_eq!(list.last(), Some(&M("e", 50)));
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::{effective_header, ChannelHeader};
+    use crate::stores::channels::{fold_meta_into, ChannelMeta, MetaUpdate};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_kind41_rename_shows_on_the_channel_page_as_in_the_list() {
+        let raw = ChannelHeader {
+            name: "Fairfield Events".into(),
+            description: "old".into(),
+            archived: true,
+        };
+        let mut list = vec![ChannelMeta {
+            id: "c".into(),
+            name: "Fairfield Events".into(),
+            description: "old".into(),
+            section: String::new(),
+            picture: String::new(),
+            created_at: 100,
+        }];
+        let mut ts = HashMap::new();
+        // Before any edit: the kind-40.
+        assert_eq!(
+            effective_header(raw.clone(), Some(&list[0])).name,
+            "Fairfield Events"
+        );
+        // The same fold the channel list uses applies the latest kind-41.
+        let edit = MetaUpdate {
+            channel_id: "c".into(),
+            name: Some("Events".into()),
+            about: Some("new".into()),
+            picture: None,
+            created_at: 200,
+        };
+        assert!(fold_meta_into(&mut list, &mut ts, &edit));
+        let shown = effective_header(raw.clone(), Some(&list[0]));
+        assert_eq!(
+            (shown.name.as_str(), shown.description.as_str()),
+            ("Events", "new")
+        );
+        assert!(shown.archived, "archived still comes from the kind-40");
+        // No store entry yet: the kind-40 header.
+        assert_eq!(effective_header(raw, None).name, "Fairfield Events");
     }
 }
