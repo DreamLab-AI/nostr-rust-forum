@@ -11,5 +11,7 @@ pub mod format;
 pub mod fsutil;
 pub mod identity;
 pub mod keystore;
+pub mod plan;
+pub mod structure;
 
 pub use error::ImportError;
