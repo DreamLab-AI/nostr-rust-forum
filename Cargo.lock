@@ -3486,6 +3486,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostr-bbs-search-build"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "k256",
+ "nostr-bbs-core",
+ "nostr-bbs-sealed-search",
+ "nostr-bbs-zone-migrate",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "nostr-bbs-search-worker"
 version = "1.0.0-beta.10"
 dependencies = [

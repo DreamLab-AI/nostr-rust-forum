@@ -17,3 +17,4 @@ tailwind.dist.css
 
 # Agent-runtime litter
 .claude-flow/
+/target-native

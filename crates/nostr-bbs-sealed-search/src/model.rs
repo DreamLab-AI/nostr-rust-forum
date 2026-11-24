@@ -35,7 +35,7 @@ fn e<E: std::fmt::Display>(x: E) -> String {
 }
 
 enum Lin {
-    /// FP32 weight + bias (builder, native only).
+    /// FP32 weight (stored transposed, `(in, out)`) + bias (builder, native only).
     #[cfg(not(target_arch = "wasm32"))]
     F(Tensor, Tensor),
     Q(QMatMul, Tensor),
@@ -45,7 +45,11 @@ impl Lin {
     fn fwd(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            Lin::F(w, b) => x.broadcast_matmul(&w.t()?)?.broadcast_add(b),
+            Lin::F(wt, b) => {
+                // (b, t, in) → (b·t, in) @ (in, out): one contiguous GEMM.
+                let (bsz, t, d) = x.dims3()?;
+                x.reshape((bsz * t, d))?.matmul(wt)?.reshape((bsz, t, wt.dim(1)?))?.broadcast_add(b)
+            }
             Lin::Q(m, b) => m.forward(x)?.broadcast_add(b),
         }
     }
@@ -136,7 +140,12 @@ impl Bge {
         let f = |n: &str| -> Res<Tensor> {
             tensors.get(n).cloned().ok_or_else(|| format!("missing {n}"))?.to_dtype(DType::F32).map_err(e)
         };
-        Self::build(f, |n: &str| Ok(Lin::F(f(&format!("{n}.weight"))?, f(&format!("{n}.bias"))?)), tok)
+        // Store each weight pre-transposed and contiguous: (out, in) → (in, out).
+        let lin = |n: &str| -> Res<Lin> {
+            let wt = f(&format!("{n}.weight"))?.t().map_err(e)?.contiguous().map_err(e)?;
+            Ok(Lin::F(wt, f(&format!("{n}.bias"))?))
+        };
+        Self::build(f, lin, tok)
     }
 
     /// Q8 model from GGUF bytes (written by [`to_gguf_q8`]) and `vocab.txt`.

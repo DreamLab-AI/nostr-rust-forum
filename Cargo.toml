@@ -51,6 +51,7 @@ members = [
     "crates/nostr-bbs-zone-migrate",
     # Sealed per-zone search: format, age sealing, quantised bge-small (app crate).
     "crates/nostr-bbs-sealed-search",
+    "crates/nostr-bbs-search-build",
 
     # ADR-2011 M4 probe suite: drives the escalation boundary on a live relay
     # and auth API and writes one receipt per probe. Pure library + native bin.
