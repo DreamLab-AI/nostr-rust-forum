@@ -39,12 +39,20 @@ impl Target {
     /// Parse and check `target.json`: a lowercase name, an `http(s)` pod
     /// URL without credentials, query or fragment.
     pub fn parse(bytes: &[u8]) -> Result<Self, ImportError> {
-        let mut t: Target =
-            serde_json::from_slice(bytes).map_err(|e| ImportError::Format(format!("target.json: {e}")))?;
-        if t.name.is_empty() || !t.name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
-            return Err(ImportError::Format("target.json: name must be [a-z0-9-]+".into()));
+        let mut t: Target = serde_json::from_slice(bytes)
+            .map_err(|e| ImportError::Format(format!("target.json: {e}")))?;
+        if t.name.is_empty()
+            || !t
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(ImportError::Format(
+                "target.json: name must be [a-z0-9-]+".into(),
+            ));
         }
-        let u = url::Url::parse(&t.pod.http).map_err(|e| ImportError::Format(format!("target.json pod.http: {e}")))?;
+        let u = url::Url::parse(&t.pod.http)
+            .map_err(|e| ImportError::Format(format!("target.json pod.http: {e}")))?;
         if !matches!(u.scheme(), "http" | "https")
             || !u.username().is_empty()
             || u.password().is_some()
@@ -52,7 +60,9 @@ impl Target {
             || u.fragment().is_some()
             || u.host_str().is_none()
         {
-            return Err(ImportError::Format("target.json pod.http must be a plain http(s) URL".into()));
+            return Err(ImportError::Format(
+                "target.json pod.http must be a plain http(s) URL".into(),
+            ));
         }
         t.pod.http = t.pod.http.trim_end_matches('/').to_string();
         Ok(t)
@@ -61,7 +71,10 @@ impl Target {
     /// `<pod>/pods/<owner>/media/zones/<zone>/<name>`: where a zone image
     /// is served (pod zone ACL: members of the zone only).
     pub fn zone_media_url(&self, owner_pk: &str, zone: &str, name: &str) -> String {
-        format!("{}/pods/{owner_pk}/media/zones/{zone}/{name}", self.pod.http)
+        format!(
+            "{}/pods/{owner_pk}/media/zones/{zone}/{name}",
+            self.pod.http
+        )
     }
 }
 
@@ -71,8 +84,12 @@ mod tests {
 
     #[test]
     fn parses_and_refuses() {
-        let t = Target::parse(br#"{"name":"prod","pod":{"http":"https://pod.example.org/"}}"#).unwrap();
-        assert_eq!(t.zone_media_url("ab", "zone2", "x.webp"), "https://pod.example.org/pods/ab/media/zones/zone2/x.webp");
+        let t =
+            Target::parse(br#"{"name":"prod","pod":{"http":"https://pod.example.org/"}}"#).unwrap();
+        assert_eq!(
+            t.zone_media_url("ab", "zone2", "x.webp"),
+            "https://pod.example.org/pods/ab/media/zones/zone2/x.webp"
+        );
         assert!(Target::parse(br#"{"name":"Prod","pod":{"http":"https://p"}}"#).is_err());
         assert!(Target::parse(br#"{"name":"p","pod":{"http":"https://u:pw@p"}}"#).is_err());
         assert!(Target::parse(br#"{"name":"p","pod":{"http":"ftp://p"}}"#).is_err());

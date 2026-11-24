@@ -113,7 +113,9 @@ fn is_hex64(s: &str) -> bool {
 }
 
 fn is_slug(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// The zone the forum client routes a kind-40 `section` to, given the
@@ -126,7 +128,10 @@ pub fn section_to_zone<'a>(section: &str, zone_ids: &[&'a str]) -> Option<&'a st
     if let Some(z) = zone_ids.iter().find(|z| z.to_lowercase() == sec) {
         return Some(z);
     }
-    if let Some(z) = zone_ids.iter().find(|z| sec.starts_with(&format!("{}-", z.to_lowercase()))) {
+    if let Some(z) = zone_ids
+        .iter()
+        .find(|z| sec.starts_with(&format!("{}-", z.to_lowercase())))
+    {
         return Some(z);
     }
     zone_ids.first().copied()
@@ -136,16 +141,22 @@ pub fn section_to_zone<'a>(section: &str, zone_ids: &[&'a str]) -> Option<&'a st
 /// not through the catch-all.
 pub fn section_routes_to(section: &str, zone: &str) -> bool {
     let (sec, z) = (section.to_lowercase(), zone.to_lowercase());
-    sec == z || sec.strip_prefix(&z).is_some_and(|rest| rest.starts_with('-') && rest.len() > 1)
+    sec == z
+        || sec
+            .strip_prefix(&z)
+            .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1)
 }
 
 impl Structure {
     /// Parse `structure.json` (validated separately against an archive).
     pub fn parse(bytes: &[u8]) -> Result<Self, ImportError> {
-        let s: Structure =
-            serde_json::from_slice(bytes).map_err(|e| ImportError::Format(format!("structure.json: {e}")))?;
+        let s: Structure = serde_json::from_slice(bytes)
+            .map_err(|e| ImportError::Format(format!("structure.json: {e}")))?;
         if s.version != 1 {
-            return Err(ImportError::Format(format!("structure.json version {} unsupported", s.version)));
+            return Err(ImportError::Format(format!(
+                "structure.json version {} unsupported",
+                s.version
+            )));
         }
         Ok(s)
     }
@@ -166,23 +177,44 @@ impl Structure {
                 .filter(|p| !p.is_empty())
                 .collect::<Vec<_>>()
                 .join("-");
-            let slug = if slug.is_empty() { "general".to_string() } else { slug };
+            let slug = if slug.is_empty() {
+                "general".to_string()
+            } else {
+                slug
+            };
             let mut key = slug.clone();
             let mut n = 2;
             while threads.contains_key(&key) {
                 key = format!("{slug}-{n}");
                 n += 1;
             }
-            threads.insert(key.clone(), Thread {
-                zone: zone.into(),
-                section: format!("{zone}-{key}"),
-                channel: ThreadChannel::New { name: c.name.clone(), about: c.topic.clone().unwrap_or_default() },
-            });
-            channels.insert(c.id.clone(), ChannelMap { thread: Some(key), topic: None, skip: false });
+            threads.insert(
+                key.clone(),
+                Thread {
+                    zone: zone.into(),
+                    section: format!("{zone}-{key}"),
+                    channel: ThreadChannel::New {
+                        name: c.name.clone(),
+                        about: c.topic.clone().unwrap_or_default(),
+                    },
+                },
+            );
+            channels.insert(
+                c.id.clone(),
+                ChannelMap {
+                    thread: Some(key),
+                    topic: None,
+                    skip: false,
+                },
+            );
         }
         Structure {
             version: 1,
-            zones: vec![Zone { id: zone.into(), cohorts: vec![zone.into()], encrypted: false }],
+            zones: vec![Zone {
+                id: zone.into(),
+                cohorts: vec![zone.into()],
+                encrypted: false,
+            }],
             threads,
             channels,
         }
@@ -204,7 +236,10 @@ impl Structure {
                 errs.push(format!("zone {:?} has no cohorts", z.id));
             }
             if z.cohorts.iter().any(|c| c == "agent") {
-                errs.push(format!("zone {:?}: the agent cohort is never granted (grants skip agent keys)", z.id));
+                errs.push(format!(
+                    "zone {:?}: the agent cohort is never granted (grants skip agent keys)",
+                    z.id
+                ));
             }
         }
         let mut existing = BTreeSet::new();
@@ -231,13 +266,18 @@ impl Structure {
             }
             if let Some(other) = sections.insert(t.section.as_str(), key.as_str()) {
                 if matches!(t.channel, ThreadChannel::New { .. }) {
-                    errs.push(format!("threads {other:?} and {key:?} both create section {:?}", t.section));
+                    errs.push(format!(
+                        "threads {other:?} and {key:?} both create section {:?}",
+                        t.section
+                    ));
                 }
             }
             match &t.channel {
                 ThreadChannel::Existing(id) => {
                     if !is_hex64(id) {
-                        errs.push(format!("thread {key:?}: existing id must be 64 lowercase hex"));
+                        errs.push(format!(
+                            "thread {key:?}: existing id must be 64 lowercase hex"
+                        ));
                     } else if !existing.insert(id.clone()) {
                         errs.push(format!("thread {key:?}: existing id used by two threads"));
                     }
@@ -251,13 +291,17 @@ impl Structure {
         }
         for c in &archive.channels {
             match self.channels.get(&c.id) {
-                None => errs.push(format!("channel {:?} (#{}) has no entry (map it or set \"skip\": true)", c.id, c.name)),
+                None => errs.push(format!(
+                    "channel {:?} (#{}) has no entry (map it or set \"skip\": true)",
+                    c.id, c.name
+                )),
                 Some(m) if m.skip => {}
                 Some(m) => match &m.thread {
                     None => errs.push(format!("channel {:?} (#{}): no thread", c.id, c.name)),
-                    Some(t) if !self.threads.contains_key(t) => {
-                        errs.push(format!("channel {:?} (#{}): unknown thread {t:?}", c.id, c.name))
-                    }
+                    Some(t) if !self.threads.contains_key(t) => errs.push(format!(
+                        "channel {:?} (#{}): unknown thread {t:?}",
+                        c.id, c.name
+                    )),
                     Some(_) => {}
                 },
             }
@@ -283,7 +327,11 @@ impl Structure {
 
     /// Union of the cohorts of every zone (what imported members receive).
     pub fn member_cohorts(&self) -> Vec<String> {
-        let set: BTreeSet<&str> = self.zones.iter().flat_map(|z| z.cohorts.iter().map(String::as_str)).collect();
+        let set: BTreeSet<&str> = self
+            .zones
+            .iter()
+            .flat_map(|z| z.cohorts.iter().map(String::as_str))
+            .collect();
         set.into_iter().map(str::to_string).collect()
     }
 }
@@ -300,7 +348,10 @@ mod tests {
         assert!(!section_routes_to("zone22-rants", "zone2"));
         assert!(!section_routes_to("minimoonoir-rants", "zone2"));
         assert_eq!(section_to_zone("a-b-c", &["a", "a-b"]), Some("a"));
-        assert_eq!(section_to_zone("Zone2-X", &["zone1", "zone2"]), Some("zone2"));
+        assert_eq!(
+            section_to_zone("Zone2-X", &["zone1", "zone2"]),
+            Some("zone2")
+        );
         assert_eq!(section_to_zone("stray", &["zone1", "zone2"]), Some("zone1"));
     }
 }

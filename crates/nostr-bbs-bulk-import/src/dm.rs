@@ -111,7 +111,9 @@ pub fn rewrap_operator_sent(
 ) -> Result<(Vec<(String, NostrEvent)>, RewrapReport), ImportError> {
     let old_pk = old.public_key().to_hex();
     if old_pk == new_pk {
-        return Err(ImportError::Refused("old and new operator keys are the same".into()));
+        return Err(ImportError::Refused(
+            "old and new operator keys are the same".into(),
+        ));
     }
     let new_bytes: [u8; 32] = hex::decode(new_pk)
         .ok()
@@ -133,7 +135,8 @@ pub fn rewrap_operator_sent(
             r.third_party += 1;
             continue;
         }
-        let seal = seal_rumor(&g.rumor, old.as_bytes(), &new_bytes).map_err(|e| ImportError::Key(e.to_string()))?;
+        let seal = seal_rumor(&g.rumor, old.as_bytes(), &new_bytes)
+            .map_err(|e| ImportError::Key(e.to_string()))?;
         let wrap = wrap_seal(&seal, new_pk).map_err(|e| ImportError::Key(e.to_string()))?;
         out.push((w.id.clone(), wrap));
         r.rewrapped += 1;
@@ -155,7 +158,11 @@ mod tests {
         let old = kp();
         let new = kp();
         let friend = kp();
-        let (old_pk, new_pk, friend_pk) = (old.public_key().to_hex(), new.public_key().to_hex(), friend.public_key().to_hex());
+        let (old_pk, new_pk, friend_pk) = (
+            old.public_key().to_hex(),
+            new.public_key().to_hex(),
+            friend.public_key().to_hex(),
+        );
         // the operator's self-copy of a DM it sent (addressed to the old key)
         let mine = gift_wrap(old.as_bytes(), &old_pk, &old_pk, "sent by me").unwrap();
         // a DM the friend sent to the operator
@@ -164,20 +171,32 @@ mod tests {
         assert_eq!((r.addressed, r.rewrapped, r.third_party), (2, 1, 1));
         let g = unwrap_gift(&out[0].1, new.as_bytes()).unwrap();
         assert_eq!(g.rumor.content, "sent by me");
-        assert_eq!(g.rumor.pubkey, old_pk, "the author stays the old key: never re-authored");
+        assert_eq!(
+            g.rumor.pubkey, old_pk,
+            "the author stays the old key: never re-authored"
+        );
     }
 
     #[test]
     fn copy_needs_ack_and_whitelisted_recipient() {
         let a = kp();
         let b = kp();
-        let w = gift_wrap(a.as_bytes(), &a.public_key().to_hex(), &b.public_key().to_hex(), "x").unwrap();
-        assert!(copy_plan(&[w.clone()], &BTreeSet::new(), false).is_err());
-        let (none, r) = copy_plan(&[w.clone()], &BTreeSet::new(), true).unwrap();
+        let w = gift_wrap(
+            a.as_bytes(),
+            &a.public_key().to_hex(),
+            &b.public_key().to_hex(),
+            "x",
+        )
+        .unwrap();
+        assert!(copy_plan(std::slice::from_ref(&w), &BTreeSet::new(), false).is_err());
+        let (none, r) = copy_plan(std::slice::from_ref(&w), &BTreeSet::new(), true).unwrap();
         assert!(none.is_empty() && r.not_whitelisted == 1);
         let wl: BTreeSet<String> = [b.public_key().to_hex()].into();
-        let (one, _) = copy_plan(&[w.clone()], &wl, true).unwrap();
-        assert_eq!((one[0].id.as_str(), one[0].sig.as_str()), (w.id.as_str(), w.sig.as_str()));
+        let (one, _) = copy_plan(std::slice::from_ref(&w), &wl, true).unwrap();
+        assert_eq!(
+            (one[0].id.as_str(), one[0].sig.as_str()),
+            (w.id.as_str(), w.sig.as_str())
+        );
         let mut forged = w;
         forged.content.push('x');
         assert_eq!(copy_plan(&[forged], &wl, true).unwrap().1.invalid, 1);

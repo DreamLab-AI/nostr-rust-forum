@@ -38,7 +38,10 @@ pub enum ImportError {
 impl ImportError {
     /// An I/O error on `path`.
     pub fn io(path: &Path, source: std::io::Error) -> Self {
-        ImportError::Io { path: path.display().to_string(), source }
+        ImportError::Io {
+            path: path.display().to_string(),
+            source,
+        }
     }
 }
 

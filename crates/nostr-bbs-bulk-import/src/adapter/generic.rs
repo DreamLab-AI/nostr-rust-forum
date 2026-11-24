@@ -26,7 +26,10 @@ impl SourceAdapter for GenericAdapter {
         // Keep the original platform as the source, so provenance tags still
         // name it after re-writing.
         out.set_source(&a.manifest.source, &a.manifest.source_id);
-        let mut report = AdapterReport { channels: a.channels.len(), ..Default::default() };
+        let mut report = AdapterReport {
+            channels: a.channels.len(),
+            ..Default::default()
+        };
         for au in &a.authors {
             out.author(au.clone());
         }

@@ -19,8 +19,10 @@
 //! - messages of dropped authors are not imported, and an `operator` author
 //!   with `defer` is planned but marked deferred.
 //!
-//! Source keys (`<source>:<source_id>#<message id>`, roots
-//! `…#root:<channel id>`) identify plan items in the ledger.
+//! Ledger keys identify plan items, in separate namespaces so no source id
+//! can collide with another kind of item: `<source>:<source_id>#m:<message
+//! id>`, `…#root:<channel id>`, `…#thread:<thread key>`, `…#profile:<label>`,
+//! `…#dm:<wrap id>`.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -158,11 +160,30 @@ pub fn iso_date(t: u64) -> String {
 /// `:shortcode:` (optionally with a skin tone) → emoji; anything else as is.
 pub fn emoji_of(body: &str) -> String {
     const SHORTCODES: &[(&str, &str)] = &[
-        ("+1", "👍"), ("-1", "👎"), ("thumbsup", "👍"), ("thumbsdown", "👎"), ("heart", "❤️"),
-        ("joy", "😂"), ("laughing", "😆"), ("smile", "😄"), ("grinning", "😀"), ("tada", "🎉"),
-        ("fire", "🔥"), ("clap", "👏"), ("eyes", "👀"), ("pray", "🙏"), ("cry", "😢"), ("sob", "😭"),
-        ("thinking", "🤔"), ("100", "💯"), ("rocket", "🚀"), ("wave", "👋"), ("ok_hand", "👌"),
-        ("raised_hands", "🙌"), ("facepalm", "🤦"), ("skull", "💀"),
+        ("+1", "👍"),
+        ("-1", "👎"),
+        ("thumbsup", "👍"),
+        ("thumbsdown", "👎"),
+        ("heart", "❤️"),
+        ("joy", "😂"),
+        ("laughing", "😆"),
+        ("smile", "😄"),
+        ("grinning", "😀"),
+        ("tada", "🎉"),
+        ("fire", "🔥"),
+        ("clap", "👏"),
+        ("eyes", "👀"),
+        ("pray", "🙏"),
+        ("cry", "😢"),
+        ("sob", "😭"),
+        ("thinking", "🤔"),
+        ("100", "💯"),
+        ("rocket", "🚀"),
+        ("wave", "👋"),
+        ("ok_hand", "👌"),
+        ("raised_hands", "🙌"),
+        ("facepalm", "🤦"),
+        ("skull", "💀"),
     ];
     let b = body.trim();
     if b.is_empty() {
@@ -239,7 +260,17 @@ fn kind_of(mime: &str) -> &'static str {
 }
 
 /// Image types a zone media container accepts (pod zone ACL).
-pub const ZONE_IMAGE_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/heic", "image/heif", "image/tiff", "image/bmp"];
+pub const ZONE_IMAGE_TYPES: &[&str] = &[
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/avif",
+    "image/heic",
+    "image/heif",
+    "image/tiff",
+    "image/bmp",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum St {
@@ -252,16 +283,32 @@ enum St {
 /// archive ([`Structure::validate`]).
 pub fn build(archive: &Archive, ids: &IdentityPlan, structure: &Structure) -> ImportPlan {
     let prov = format!("{}:{}", archive.manifest.source, archive.manifest.source_id);
-    let key_of = |id: &str| format!("{prov}#{id}");
-    let mut plan = ImportPlan { provenance: prov.clone(), ..Default::default() };
-    let handle_of = |author: &str| ids.authors.get(author).map(|r| r.handle.clone()).unwrap_or_else(|| author.to_string());
+    let key_of = |id: &str| format!("{prov}#m:{id}");
+    let mut plan = ImportPlan {
+        provenance: prov.clone(),
+        ..Default::default()
+    };
+    let handle_of = |author: &str| {
+        ids.authors
+            .get(author)
+            .map(|r| r.handle.clone())
+            .unwrap_or_else(|| author.to_string())
+    };
 
     // message → (status, channel, thread, handle, created_at)
     let mut status: HashMap<&str, (St, &str, String, String, u64)> = HashMap::new();
     let mut by_channel: BTreeMap<usize, Vec<&Message>> = BTreeMap::new();
-    let order: HashMap<&str, usize> = archive.channels.iter().enumerate().map(|(i, c)| (c.id.as_str(), i)).collect();
+    let order: HashMap<&str, usize> = archive
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.as_str(), i))
+        .collect();
     for m in &archive.messages {
-        by_channel.entry(order[m.channel.as_str()]).or_default().push(m);
+        by_channel
+            .entry(order[m.channel.as_str()])
+            .or_default()
+            .push(m);
     }
     for c in &archive.channels {
         let map = structure.channels.get(&c.id);
@@ -273,7 +320,11 @@ pub fn build(archive: &Archive, ids: &IdentityPlan, structure: &Structure) -> Im
             }
         };
         plan.stats.channels += 1;
-        for m in by_channel.get(&order[c.id.as_str()]).map(Vec::as_slice).unwrap_or(&[]) {
+        for m in by_channel
+            .get(&order[c.id.as_str()])
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
             let has_body = !m.text.trim().is_empty() || !m.attachments.is_empty();
             let st = match ids.authors.get(&m.author).map(|r| &r.signer) {
                 Some(Signer::Dropped) | None => {
@@ -287,28 +338,63 @@ pub fn build(archive: &Archive, ids: &IdentityPlan, structure: &Structure) -> Im
                 Some(Signer::Key { deferred: true, .. }) => St::Deferred,
                 Some(Signer::Key { .. }) => St::Imported,
             };
-            status.insert(m.id.as_str(), (st, c.id.as_str(), thread.clone(), handle_of(&m.author), m.created_at));
+            status.insert(
+                m.id.as_str(),
+                (
+                    st,
+                    c.id.as_str(),
+                    thread.clone(),
+                    handle_of(&m.author),
+                    m.created_at,
+                ),
+            );
         }
     }
 
     // reactions per target, reactor handles (dropped reactors left out)
     let mut reacts: HashMap<&str, Vec<(String, String)>> = HashMap::new();
     for r in &archive.reactions {
-        if matches!(ids.authors.get(&r.author).map(|x| &x.signer), Some(Signer::Key { .. })) {
-            reacts.entry(r.message.as_str()).or_default().push((handle_of(&r.author), emoji_of(&r.emoji)));
+        if matches!(
+            ids.authors.get(&r.author).map(|x| &x.signer),
+            Some(Signer::Key { .. })
+        ) {
+            reacts
+                .entry(r.message.as_str())
+                .or_default()
+                .push((handle_of(&r.author), emoji_of(&r.emoji)));
         }
     }
 
     for c in &archive.channels {
-        let Some(thread) = structure.channels.get(&c.id).filter(|m| !m.skip).and_then(|m| m.thread.clone()) else {
+        let Some(thread) = structure
+            .channels
+            .get(&c.id)
+            .filter(|m| !m.skip)
+            .and_then(|m| m.thread.clone())
+        else {
             continue;
         };
-        let msgs = by_channel.get(&order[c.id.as_str()]).map(Vec::as_slice).unwrap_or(&[]);
-        let live: Vec<&&Message> = msgs.iter().filter(|m| status.get(m.id.as_str()).is_some_and(|s| s.0 != St::Skipped)).collect();
-        let Some(first) = live.iter().map(|m| m.created_at).min() else { continue };
+        let msgs = by_channel
+            .get(&order[c.id.as_str()])
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let live: Vec<&&Message> = msgs
+            .iter()
+            .filter(|m| {
+                status
+                    .get(m.id.as_str())
+                    .is_some_and(|s| s.0 != St::Skipped)
+            })
+            .collect();
+        let Some(first) = live.iter().map(|m| m.created_at).min() else {
+            continue;
+        };
         let last = live.iter().map(|m| m.created_at).max().unwrap_or(first);
-        let topic = structure.channels[&c.id].topic.clone().unwrap_or_else(|| c.name.clone());
-        let root_key = key_of(&format!("root:{}", c.id));
+        let topic = structure.channels[&c.id]
+            .topic
+            .clone()
+            .unwrap_or_else(|| c.name.clone());
+        let root_key = format!("{prov}#root:{}", c.id);
         plan.roots.push(RootPlan {
             key: root_key.clone(),
             channel: c.id.clone(),
@@ -316,13 +402,19 @@ pub fn build(archive: &Archive, ids: &IdentityPlan, structure: &Structure) -> Im
             created_at: first.saturating_sub(1),
             content: format!(
                 "#{topic} — archived from {} {} ({} – {}, {} messages)",
-                archive.manifest.source, archive.manifest.source_id, iso_date(first), iso_date(last), live.len()
+                archive.manifest.source,
+                archive.manifest.source_id,
+                iso_date(first),
+                iso_date(last),
+                live.len()
             ),
         });
         plan.stats.topics += 1;
 
         for m in msgs {
-            let Some(&(st, _, _, _, _)) = status.get(m.id.as_str()) else { continue };
+            let Some(&(st, _, _, _, _)) = status.get(m.id.as_str()) else {
+                continue;
+            };
             if st == St::Skipped {
                 continue;
             }
@@ -336,7 +428,8 @@ pub fn build(archive: &Archive, ids: &IdentityPlan, structure: &Structure) -> Im
                 match status.get(parent.as_str()) {
                     Some((pst, _, pthread, phandle, pat)) => {
                         let linkable = *pthread == thread
-                            && (*pst == St::Imported || (st == St::Deferred && *pst == St::Deferred));
+                            && (*pst == St::Imported
+                                || (st == St::Deferred && *pst == St::Deferred));
                         if linkable {
                             quote = Some(key_of(parent));
                         } else if *pst != St::Skipped {
@@ -358,21 +451,33 @@ pub fn build(archive: &Archive, ids: &IdentityPlan, structure: &Structure) -> Im
             if !m.text.trim().is_empty() {
                 let mut t = m.text.clone();
                 if t.chars().count() > MAX_CONTENT {
-                    t = t.chars().take(MAX_CONTENT).collect::<String>() + "\n…[truncated during import]";
+                    t = t.chars().take(MAX_CONTENT).collect::<String>()
+                        + "\n…[truncated during import]";
                     plan.stats.truncated += 1;
                 }
                 parts.push(Part::Text(t));
             }
             for att in &m.attachments {
                 let kind = kind_of(&att.mime);
-                if kind == "image" && att.status == AttachmentStatus::Ok && ZONE_IMAGE_TYPES.contains(&att.mime.to_ascii_lowercase().as_str()) {
+                if kind == "image"
+                    && att.status == AttachmentStatus::Ok
+                    && ZONE_IMAGE_TYPES.contains(&att.mime.to_ascii_lowercase().as_str())
+                {
                     if let Some(sha) = &att.sha256 {
-                        parts.push(Part::Image(ImageRef { sha256: sha.clone(), filename: att.filename.clone() }));
+                        parts.push(Part::Image(ImageRef {
+                            sha256: sha.clone(),
+                            filename: att.filename.clone(),
+                        }));
                         plan.stats.images += 1;
                         continue;
                     }
                 }
-                parts.push(Part::Text(format!("[{kind} not migrated: {}, {}, {}]", att.filename, size_text(att.bytes), iso_date(m.created_at))));
+                parts.push(Part::Text(format!(
+                    "[{kind} not migrated: {}, {}, {}]",
+                    att.filename,
+                    size_text(att.bytes),
+                    iso_date(m.created_at)
+                )));
                 plan.stats.not_migrated += 1;
             }
             let reactions = reacts.get(m.id.as_str()).and_then(|rs| {
@@ -402,7 +507,12 @@ pub fn build(archive: &Archive, ids: &IdentityPlan, structure: &Structure) -> Im
             });
         }
     }
-    let chan_order: HashMap<String, usize> = archive.channels.iter().enumerate().map(|(i, c)| (c.id.clone(), i)).collect();
+    let chan_order: HashMap<String, usize> = archive
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.clone(), i))
+        .collect();
     plan.messages.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
@@ -445,8 +555,16 @@ mod tests {
         assert_eq!(emoji_of("🙂"), "🙂");
         assert_eq!(emoji_of(":unknown:"), ":unknown:");
         assert_eq!(emoji_of(""), "❓");
-        let rs = vec![("a".to_string(), "👍".to_string()), ("b".into(), "👍".into()), ("a".into(), "👍".into()), ("c".into(), "😂".into())];
-        assert_eq!(reaction_line(&rs).unwrap(), "— reactions: 👍 ×2 (a, b) · 😂 ×1 (c)");
+        let rs = vec![
+            ("a".to_string(), "👍".to_string()),
+            ("b".into(), "👍".into()),
+            ("a".into(), "👍".into()),
+            ("c".into(), "😂".into()),
+        ];
+        assert_eq!(
+            reaction_line(&rs).unwrap(),
+            "— reactions: 👍 ×2 (a, b) · 😂 ×1 (c)"
+        );
         assert!(reaction_line(&[]).is_none());
     }
 }

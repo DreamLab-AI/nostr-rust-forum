@@ -80,7 +80,13 @@ fn tag(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
-fn serialized_len(pubkey: &str, created_at: u64, kind: u64, tags: &[Vec<String>], content: &str) -> usize {
+fn serialized_len(
+    pubkey: &str,
+    created_at: u64,
+    kind: u64,
+    tags: &[Vec<String>],
+    content: &str,
+) -> usize {
     let ev = NostrEvent {
         id: "0".repeat(64),
         pubkey: pubkey.to_string(),
@@ -90,7 +96,9 @@ fn serialized_len(pubkey: &str, created_at: u64, kind: u64, tags: &[Vec<String>]
         content: content.to_string(),
         sig: "0".repeat(128),
     };
-    serde_json::to_string(&ev).map(|s| s.len()).unwrap_or(usize::MAX)
+    serde_json::to_string(&ev)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
 }
 
 /// Assemble a message body from its parts, cutting the longest text part
@@ -104,7 +112,12 @@ pub fn fit_content(
     tags: &[Vec<String>],
 ) -> Result<(String, bool), ImportError> {
     let join = |ps: &[String]| {
-        let head = ps.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join("\n");
+        let head = ps
+            .iter()
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
         match tail {
             Some(t) if !t.is_empty() => format!("{head}\n\n{t}"),
             _ => head,
@@ -115,7 +128,9 @@ pub fn fit_content(
         return Ok((full, false));
     }
     let Some((idx, _)) = parts.iter().enumerate().max_by_key(|(_, p)| p.len()) else {
-        return Err(ImportError::Plan("an event without text does not fit the sealing budget".into()));
+        return Err(ImportError::Plan(
+            "an event without text does not fit the sealing budget".into(),
+        ));
     };
     let chars: Vec<char> = parts[idx].chars().collect();
     let (mut lo, mut hi) = (0usize, chars.len());
@@ -134,7 +149,9 @@ pub fn fit_content(
     }
     let c = attempt(lo);
     if serialized_len(pubkey, created_at, 42, tags, &c) > MAX_EVENT_BYTES {
-        return Err(ImportError::Plan("message does not fit the sealing budget even when cut".into()));
+        return Err(ImportError::Plan(
+            "message does not fit the sealing budget even when cut".into(),
+        ));
     }
     Ok((c, true))
 }
@@ -159,7 +176,10 @@ pub struct SignInput<'a> {
     pub emit: Emit,
 }
 
-fn key_entry<'a>(keys: &'a Keystore, label: &str) -> Result<&'a crate::keystore::KeyEntry, ImportError> {
+fn key_entry<'a>(
+    keys: &'a Keystore,
+    label: &str,
+) -> Result<&'a crate::keystore::KeyEntry, ImportError> {
     keys.get(label).ok_or_else(|| {
         if label == OPERATOR {
             ImportError::Refused("the operator key is not in the keystore: import it first (keys import --label operator)".into())
@@ -171,7 +191,16 @@ fn key_entry<'a>(keys: &'a Keystore, label: &str) -> Result<&'a crate::keystore:
 
 /// Sign everything this run needs (see the module docs).
 pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
-    let SignInput { plan, structure, ids, keys, media, target, ledger, emit } = *input;
+    let SignInput {
+        plan,
+        structure,
+        ids,
+        keys,
+        media,
+        target,
+        ledger,
+        emit,
+    } = *input;
     let archivist = key_entry(keys, ARCHIVIST)?;
     let archivist_sk = archivist.secret()?;
     let mut out = Signed::default();
@@ -191,8 +220,13 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
         .filter(|m| m.deferred == (emit == Emit::DeferredOnly))
         .filter(|m| !ledger.contains_key(&m.key))
         .collect();
-    out.reused += plan.messages.iter().filter(|m| m.deferred == (emit == Emit::DeferredOnly) && ledger.contains_key(&m.key)).count();
-    let roots_needed: std::collections::BTreeSet<&str> = emitted.iter().map(|m| m.root.as_str()).collect();
+    out.reused += plan
+        .messages
+        .iter()
+        .filter(|m| m.deferred == (emit == Emit::DeferredOnly) && ledger.contains_key(&m.key))
+        .count();
+    let roots_needed: std::collections::BTreeSet<&str> =
+        emitted.iter().map(|m| m.root.as_str()).collect();
 
     // ── thread headers (new threads used by this run)
     let mut thread_id: HashMap<String, String> = HashMap::new();
@@ -207,15 +241,25 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
                     thread_id.insert(tkey.clone(), id.clone());
                     continue;
                 }
-                let first_root = plan.roots.iter().filter(|r| &r.thread == tkey && roots_needed.contains(r.key.as_str())).map(|r| r.created_at).min();
+                let first_root = plan
+                    .roots
+                    .iter()
+                    .filter(|r| &r.thread == tkey && roots_needed.contains(r.key.as_str()))
+                    .map(|r| r.created_at)
+                    .min();
                 let Some(at) = first_root else { continue };
                 let ev = sign_event(
                     UnsignedEvent {
                         pubkey: archivist.pk.clone(),
                         created_at: at.saturating_sub(1),
                         kind: 40,
-                        tags: vec![tag(&["section", &t.section]), tag(&["zone", &t.zone]), tag(&["import", &k])],
-                        content: serde_json::json!({"name": name, "about": about, "picture": ""}).to_string(),
+                        tags: vec![
+                            tag(&["section", &t.section]),
+                            tag(&["zone", &t.zone]),
+                            tag(&["import", &k]),
+                        ],
+                        content: serde_json::json!({"name": name, "about": about, "picture": ""})
+                            .to_string(),
                     },
                     &signing_key(&archivist_sk)?,
                 )
@@ -233,14 +277,20 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
         if !roots_needed.contains(r.key.as_str()) || id_of.contains_key(&r.key) {
             continue;
         }
-        let thread = thread_id.get(&r.thread).ok_or_else(|| ImportError::Plan(format!("thread {:?} has no channel id", r.thread)))?;
+        let thread = thread_id
+            .get(&r.thread)
+            .ok_or_else(|| ImportError::Plan(format!("thread {:?} has no channel id", r.thread)))?;
         let section = &structure.threads[&r.thread].section;
         let ev = sign_event(
             UnsignedEvent {
                 pubkey: archivist.pk.clone(),
                 created_at: r.created_at,
                 kind: 42,
-                tags: vec![tag(&["e", thread, "", "root"]), tag(&["section", section]), tag(&["import", &r.key])],
+                tags: vec![
+                    tag(&["e", thread, "", "root"]),
+                    tag(&["section", section]),
+                    tag(&["import", &r.key]),
+                ],
                 content: r.content.clone(),
             },
             &signing_key(&archivist_sk)?,
@@ -260,10 +310,8 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
         for m in pending {
             let root = id_of.get(&m.root).cloned();
             let quote = match &m.quote {
-                Some(q) => match id_of.get(q) {
-                    Some(x) => Some(Some(x.clone())),
-                    None => None, // parent not resolved yet
-                },
+                // None: the parent is not resolved yet
+                Some(q) => id_of.get(q).map(|x| Some(x.clone())),
                 None => Some(None),
             };
             let (Some((root_id, root_pk)), Some(quote)) = (root, quote) else {
@@ -274,10 +322,16 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
             if !sks.contains_key(&m.signer) {
                 sks.insert(m.signer.clone(), entry.secret()?);
             }
-            let thread = thread_id.get(&m.thread).ok_or_else(|| ImportError::Plan(format!("thread {:?} has no channel id", m.thread)))?;
+            let thread = thread_id.get(&m.thread).ok_or_else(|| {
+                ImportError::Plan(format!("thread {:?} has no channel id", m.thread))
+            })?;
             let section = &structure.threads[&m.thread].section;
             let zone = &structure.threads[&m.thread].zone;
-            let mut tags = vec![tag(&["e", thread, "", "root"]), tag(&["e", &root_id, "", "reply"]), tag(&["p", &root_pk])];
+            let mut tags = vec![
+                tag(&["e", thread, "", "root"]),
+                tag(&["e", &root_id, "", "reply"]),
+                tag(&["p", &root_pk]),
+            ];
             if let Some((qid, qpk)) = &quote {
                 tags.push(tag(&["e", qid, "", "quote"]));
                 if qpk != &root_pk {
@@ -300,12 +354,24 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
                     },
                 })
                 .collect();
-            let (content, cut) = fit_content(&parts, m.reactions.as_deref(), &entry.pk, m.created_at, &tags)?;
+            let (content, cut) = fit_content(
+                &parts,
+                m.reactions.as_deref(),
+                &entry.pk,
+                m.created_at,
+                &tags,
+            )?;
             if cut {
                 out.fitted += 1;
             }
             let ev = sign_event(
-                UnsignedEvent { pubkey: entry.pk.clone(), created_at: m.created_at, kind: 42, tags, content },
+                UnsignedEvent {
+                    pubkey: entry.pk.clone(),
+                    created_at: m.created_at,
+                    kind: 42,
+                    tags,
+                    content,
+                },
                 &signing_key(&sks[&m.signer])?,
             )
             .map_err(|e| ImportError::Key(e.to_string()))?;
@@ -352,26 +418,43 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
             let r = by_label.get(&label);
             let handle = r.map(|r| r.handle.clone()).unwrap_or_else(|| label.clone());
             let about = if label.starts_with("archive:") {
-                format!("Archived history of {handle}, imported from {}", plan.provenance)
+                format!(
+                    "Archived history of {handle}, imported from {}",
+                    plan.provenance
+                )
             } else {
-                r.and_then(|r| r.about.clone()).unwrap_or_else(|| format!("Imported from {}", plan.provenance))
+                r.and_then(|r| r.about.clone())
+                    .unwrap_or_else(|| format!("Imported from {}", plan.provenance))
             };
             serde_json::json!({"name": handle, "display_name": r.and_then(|r| r.display_name.clone()).unwrap_or_else(|| handle.clone()), "about": about})
         };
         let ev = sign_event(
-            UnsignedEvent { pubkey: entry.pk.clone(), created_at: at.saturating_sub(1), kind: 0, tags: vec![tag(&["import", &k])], content: content.to_string() },
+            UnsignedEvent {
+                pubkey: entry.pk.clone(),
+                created_at: at.saturating_sub(1),
+                kind: 0,
+                tags: vec![tag(&["import", &k])],
+                content: content.to_string(),
+            },
             &signing_key(&entry.secret()?)?,
         )
         .map_err(|e| ImportError::Key(e.to_string()))?;
         out.events.push((k, ev));
     }
 
-    out.events.sort_by(|a, b| a.1.created_at.cmp(&b.1.created_at).then(a.1.id.cmp(&b.1.id)));
+    out.events.sort_by(|a, b| {
+        a.1.created_at
+            .cmp(&b.1.created_at)
+            .then(a.1.id.cmp(&b.1.id))
+    });
     Ok(out)
 }
 
-fn signing_key(sk: &nostr_bbs_core::keys::SecretKey) -> Result<k256::schnorr::SigningKey, ImportError> {
-    nostr_bbs_core::keys::signing_key_from_bytes(sk.as_bytes()).map_err(|e| ImportError::Key(e.to_string()))
+fn signing_key(
+    sk: &nostr_bbs_core::keys::SecretKey,
+) -> Result<k256::schnorr::SigningKey, ImportError> {
+    nostr_bbs_core::keys::signing_key_from_bytes(sk.as_bytes())
+        .map_err(|e| ImportError::Key(e.to_string()))
 }
 
 #[cfg(test)]

@@ -38,6 +38,47 @@ pub fn sha256_file(path: &Path) -> Result<String, ImportError> {
     Ok(hex::encode(h.finalize()))
 }
 
+/// Longest line accepted from any JSONL input (a hostile file cannot make
+/// the reader allocate without bound).
+pub const MAX_LINE: usize = 16 * 1024 * 1024;
+
+/// Call `f(line_number, line)` for every line of `path`, refusing any line
+/// longer than [`MAX_LINE`] bytes. Lines are passed without the newline;
+/// invalid UTF-8 is an error.
+pub fn for_each_line(
+    path: &Path,
+    mut f: impl FnMut(usize, &str) -> Result<(), ImportError>,
+) -> Result<(), ImportError> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).map_err(|e| ImportError::io(path, e))?;
+    let mut r = std::io::BufReader::new(file);
+    let mut buf = Vec::new();
+    let mut n = 0usize;
+    loop {
+        buf.clear();
+        let got = (&mut r)
+            .take(MAX_LINE as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .map_err(|e| ImportError::io(path, e))?;
+        if got == 0 {
+            return Ok(());
+        }
+        n += 1;
+        if buf.len() > MAX_LINE {
+            return Err(ImportError::Format(format!(
+                "{}:{n}: line longer than {MAX_LINE} bytes",
+                path.display()
+            )));
+        }
+        while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+            buf.pop();
+        }
+        let line = std::str::from_utf8(&buf)
+            .map_err(|_| ImportError::Format(format!("{}:{n}: not UTF-8", path.display())))?;
+        f(n, line)?;
+    }
+}
+
 /// Create `dir` (and parents) with mode 0700 for the leaf.
 pub fn create_private_dir(dir: &Path) -> Result<(), ImportError> {
     std::fs::create_dir_all(dir).map_err(|e| ImportError::io(dir, e))?;
@@ -100,6 +141,14 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), ImportError
     Ok(())
 }
 
+/// Write `bytes` to a NEW 0600 file (`O_EXCL`: refuses to overwrite), fsynced.
+pub fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), ImportError> {
+    let mut f = open_new_private(path).map_err(|e| ImportError::io(path, e))?;
+    f.write_all(bytes)
+        .and_then(|_| f.sync_all())
+        .map_err(|e| ImportError::io(path, e))
+}
+
 /// Append `bytes` to `path` (created 0600) and fsync.
 pub fn append_private(path: &Path, bytes: &[u8]) -> Result<(), ImportError> {
     let mut o = std::fs::OpenOptions::new();
@@ -124,21 +173,80 @@ pub fn copy_private(src: &Path, dst: &Path) -> Result<(), ImportError> {
         .map_err(|e| ImportError::io(dst, e))
 }
 
-/// Refuse a secret file readable by group or others.
-pub fn require_private_file(path: &Path) -> Result<(), ImportError> {
+/// Read a secret file safely: opened without following a symlink, it must
+/// be a regular file owned by the current user with no group or other
+/// permission bits, and it is read from the same descriptor that was
+/// checked. The bytes are zeroized on drop.
+pub fn read_private_file(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, ImportError> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let m = std::fs::metadata(path).map_err(|e| ImportError::io(path, e))?;
-        if m.permissions().mode() & 0o077 != 0 {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = o.open(path).map_err(|e| ImportError::io(path, e))?;
+    let meta = f.metadata().map_err(|e| ImportError::io(path, e))?;
+    if !meta.is_file() {
+        return Err(ImportError::Refused(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if meta.uid() != me {
+            return Err(ImportError::Refused(format!(
+                "{} is not owned by the current user",
+                path.display()
+            )));
+        }
+        if meta.mode() & 0o077 != 0 {
             return Err(ImportError::Refused(format!(
                 "{} must be mode 0600 (is {:o})",
                 path.display(),
-                m.permissions().mode() & 0o777
+                meta.mode() & 0o777
             )));
         }
     }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(meta.len() as usize));
+    f.read_to_end(&mut buf)
+        .map_err(|e| ImportError::io(path, e))?;
+    Ok(buf)
+}
+
+/// Refuse a secret file readable by group or others (see
+/// [`read_private_file`] for reading one).
+pub fn require_private_file(path: &Path) -> Result<(), ImportError> {
+    read_private_file(path).map(|_| ())
+}
+
+/// An exclusive lock file (`O_EXCL`), removed on drop. A stale lock after a
+/// crash names itself in the error.
+#[derive(Debug)]
+pub struct LockFile(std::path::PathBuf);
+
+impl LockFile {
+    /// Take the lock at `path`.
+    pub fn take(path: &Path) -> Result<Self, ImportError> {
+        match open_new_private(path) {
+            Ok(_) => Ok(LockFile(path.to_path_buf())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(ImportError::Refused(format!(
+                    "{} exists: another run holds the lock (remove it only if no run is active)",
+                    path.display()
+                )))
+            }
+            Err(e) => Err(ImportError::io(path, e)),
+        }
+    }
+}
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }

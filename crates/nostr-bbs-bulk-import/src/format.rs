@@ -37,7 +37,7 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -231,9 +231,10 @@ pub fn confined_path(root: &Path, rel: &str) -> Result<PathBuf, ImportError> {
             "attachment path {rel:?} must be relative without '..'"
         )));
     }
-    let full = root.join(p).canonicalize().map_err(|e| {
-        ImportError::Format(format!("attachment path {rel:?}: {e}"))
-    })?;
+    let full = root
+        .join(p)
+        .canonicalize()
+        .map_err(|e| ImportError::Format(format!("attachment path {rel:?}: {e}")))?;
     if !full.starts_with(root) {
         return Err(ImportError::Format(format!(
             "attachment path {rel:?} resolves outside the archive"
@@ -242,23 +243,46 @@ pub fn confined_path(root: &Path, rel: &str) -> Result<PathBuf, ImportError> {
     Ok(full)
 }
 
+fn has_nul(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::String(s) => s.contains('\0'),
+        serde_json::Value::Array(a) => a.iter().any(has_nul),
+        serde_json::Value::Object(o) => o.iter().any(|(k, v)| k.contains('\0') || has_nul(v)),
+        _ => false,
+    }
+}
+
 fn read_jsonl<T: DeserializeOwned>(path: &Path, required: bool) -> Result<Vec<T>, ImportError> {
-    let f = match std::fs::File::open(path) {
-        Ok(f) => f,
+    match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => return Ok(vec![]),
         Err(e) => return Err(ImportError::io(path, e)),
-    };
-    let mut out = Vec::new();
-    for (n, line) in std::io::BufReader::new(f).lines().enumerate() {
-        let line = line.map_err(|e| ImportError::io(path, e))?;
-        if line.trim().is_empty() {
-            continue;
+        Ok(m) if !m.is_file() => {
+            return Err(ImportError::Format(format!(
+                "{} must be a regular file (not a symlink)",
+                path.display()
+            )))
         }
-        let v = serde_json::from_str(&line).map_err(|e| {
-            ImportError::Format(format!("{}:{}: {e}", path.display(), n + 1))
-        })?;
-        out.push(v);
+        Ok(_) => {}
     }
+    let mut out = Vec::new();
+    fsutil::for_each_line(path, |n, line| {
+        if line.trim().is_empty() {
+            return Ok(());
+        }
+        let v: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| ImportError::Format(format!("{}:{n}: {e}", path.display())))?;
+        if has_nul(&v) {
+            return Err(ImportError::Format(format!(
+                "{}:{n}: NUL characters are not accepted",
+                path.display()
+            )));
+        }
+        out.push(
+            serde_json::from_value(v)
+                .map_err(|e| ImportError::Format(format!("{}:{n}: {e}", path.display())))?,
+        );
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -267,10 +291,9 @@ impl Archive {
     pub fn open(dir: &Path) -> Result<Self, ImportError> {
         let root = dir.canonicalize().map_err(|e| ImportError::io(dir, e))?;
         let mpath = root.join("manifest.json");
-        let manifest: Manifest = serde_json::from_slice(
-            &std::fs::read(&mpath).map_err(|e| ImportError::io(&mpath, e))?,
-        )
-        .map_err(|e| ImportError::Format(format!("manifest.json: {e}")))?;
+        let manifest: Manifest =
+            serde_json::from_slice(&std::fs::read(&mpath).map_err(|e| ImportError::io(&mpath, e))?)
+                .map_err(|e| ImportError::Format(format!("manifest.json: {e}")))?;
         let a = Archive {
             authors: read_jsonl(&root.join("authors.jsonl"), true)?,
             channels: read_jsonl(&root.join("channels.jsonl"), true)?,
@@ -290,7 +313,10 @@ impl Archive {
         let mut errs: Vec<String> = Vec::new();
         let m = &self.manifest;
         if m.format != FORMAT_NAME {
-            errs.push(format!("manifest format is {:?}, not {FORMAT_NAME:?}", m.format));
+            errs.push(format!(
+                "manifest format is {:?}, not {FORMAT_NAME:?}",
+                m.format
+            ));
         }
         if m.version != FORMAT_VERSION {
             errs.push(format!(
@@ -329,9 +355,18 @@ impl Archive {
                 }
             }
         };
-        dup("authors", self.authors.iter().map(|a| a.id.as_str()).collect());
-        dup("channels", self.channels.iter().map(|c| c.id.as_str()).collect());
-        dup("messages", self.messages.iter().map(|x| x.id.as_str()).collect());
+        dup(
+            "authors",
+            self.authors.iter().map(|a| a.id.as_str()).collect(),
+        );
+        dup(
+            "channels",
+            self.channels.iter().map(|c| c.id.as_str()).collect(),
+        );
+        dup(
+            "messages",
+            self.messages.iter().map(|x| x.id.as_str()).collect(),
+        );
         let authors: HashSet<&str> = self.authors.iter().map(|a| a.id.as_str()).collect();
         let channels: HashSet<&str> = self.channels.iter().map(|c| c.id.as_str()).collect();
         let messages: HashSet<&str> = self.messages.iter().map(|x| x.id.as_str()).collect();
@@ -342,10 +377,16 @@ impl Archive {
         }
         for msg in &self.messages {
             if !channels.contains(msg.channel.as_str()) {
-                errs.push(format!("message {:?}: unknown channel {:?}", msg.id, msg.channel));
+                errs.push(format!(
+                    "message {:?}: unknown channel {:?}",
+                    msg.id, msg.channel
+                ));
             }
             if !authors.contains(msg.author.as_str()) {
-                errs.push(format!("message {:?}: unknown author {:?}", msg.id, msg.author));
+                errs.push(format!(
+                    "message {:?}: unknown author {:?}",
+                    msg.id, msg.author
+                ));
             }
             if msg.created_at == 0 {
                 errs.push(format!("message {:?}: created_at is 0", msg.id));
@@ -514,7 +555,9 @@ impl ArchiveWriter {
         mime: &str,
     ) -> Result<Attachment, ImportError> {
         let sha = fsutil::sha256_file(file)?;
-        let bytes = std::fs::metadata(file).map_err(|e| ImportError::io(file, e))?.len();
+        let bytes = std::fs::metadata(file)
+            .map_err(|e| ImportError::io(file, e))?
+            .len();
         let rel = format!("attachments/{}/{}", &sha[..2], sha);
         self.files.insert(rel.clone(), file.to_path_buf());
         Ok(Attachment {
@@ -542,12 +585,18 @@ impl ArchiveWriter {
         let ids: HashSet<String> = self.messages.keys().cloned().collect();
         self.reactions.retain(|r| ids.contains(&r.message));
         self.reactions.sort_by(|a, b| {
-            (a.message.as_str(), a.created_at, a.author.as_str(), a.emoji.as_str()).cmp(&(
-                b.message.as_str(),
-                b.created_at,
-                b.author.as_str(),
-                b.emoji.as_str(),
-            ))
+            (
+                a.message.as_str(),
+                a.created_at,
+                a.author.as_str(),
+                a.emoji.as_str(),
+            )
+                .cmp(&(
+                    b.message.as_str(),
+                    b.created_at,
+                    b.author.as_str(),
+                    b.emoji.as_str(),
+                ))
         });
         self.reactions.dedup();
         let mut messages: Vec<Message> = self.messages.into_values().collect();
@@ -565,6 +614,16 @@ impl ArchiveWriter {
             }
             if !dst.exists() {
                 fsutil::copy_private(src, &dst)?;
+            }
+            // The digest was taken when the file was registered; the copy
+            // must still match it (no swap between hashing and copying).
+            let want = rel.rsplit('/').next().unwrap_or("");
+            if fsutil::sha256_file(&dst)? != want {
+                let _ = std::fs::remove_file(&dst);
+                return Err(ImportError::Refused(format!(
+                    "{} changed after it was hashed",
+                    src.display()
+                )));
             }
         }
         let authors: Vec<Author> = self.authors.into_values().collect();
@@ -618,11 +677,28 @@ mod tests {
     fn sample() -> ArchiveWriter {
         let mut w = ArchiveWriter::new("test", "t");
         w.exported_at(1);
-        w.author(Author { id: "a".into(), handle: "alice".into(), display_name: None, about: None, bot: false });
-        w.channel(Channel { id: "c".into(), name: "gen".into(), topic: None, created_at: None });
+        w.author(Author {
+            id: "a".into(),
+            handle: "alice".into(),
+            display_name: None,
+            about: None,
+            bot: false,
+        });
+        w.channel(Channel {
+            id: "c".into(),
+            name: "gen".into(),
+            topic: None,
+            created_at: None,
+        });
         w.message(Message {
-            id: "m1".into(), channel: "c".into(), author: "a".into(), created_at: 10,
-            text: "hi".into(), reply_to: None, edited_at: None, attachments: vec![],
+            id: "m1".into(),
+            channel: "c".into(),
+            author: "a".into(),
+            created_at: 10,
+            text: "hi".into(),
+            reply_to: None,
+            edited_at: None,
+            attachments: vec![],
         });
         w
     }
@@ -633,8 +709,35 @@ mod tests {
         let a = sample().finish(&d).unwrap();
         assert_eq!(a.manifest.counts.messages, 1);
         let line = std::fs::read_to_string(d.join("messages.jsonl")).unwrap();
-        std::fs::write(d.join("messages.jsonl"), line.replace("\"text\"", "\"txt\"")).unwrap();
+        std::fs::write(
+            d.join("messages.jsonl"),
+            line.replace("\"text\"", "\"txt\""),
+        )
+        .unwrap();
         assert!(Archive::open(&d).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn nul_refused_but_its_spelling_accepted() {
+        let d = tmp("nul");
+        sample().finish(&d).unwrap();
+        let line = std::fs::read_to_string(d.join("messages.jsonl")).unwrap();
+        std::fs::write(
+            d.join("messages.jsonl"),
+            line.replace("\"hi\"", "\"a\\\\u0000b\""),
+        )
+        .unwrap();
+        assert!(
+            Archive::open(&d).is_ok(),
+            "the text backslash-u0000 is fine"
+        );
+        std::fs::write(
+            d.join("messages.jsonl"),
+            line.replace("\"hi\"", "\"a\\u0000b\""),
+        )
+        .unwrap();
+        assert!(Archive::open(&d).unwrap_err().to_string().contains("NUL"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -643,8 +746,14 @@ mod tests {
         let d = tmp("dangling");
         let mut w = sample();
         w.message(Message {
-            id: "m2".into(), channel: "nope".into(), author: "ghost".into(), created_at: 11,
-            text: "x".into(), reply_to: None, edited_at: None, attachments: vec![],
+            id: "m2".into(),
+            channel: "nope".into(),
+            author: "ghost".into(),
+            created_at: 11,
+            text: "x".into(),
+            reply_to: None,
+            edited_at: None,
+            attachments: vec![],
         });
         let err = w.finish(&d).unwrap_err().to_string();
         assert!(err.contains("unknown channel"), "{err}");
@@ -675,10 +784,18 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("f.txt"), b"bytes").unwrap();
         let mut w = sample();
-        let att = w.attach_file(&src.join("f.txt"), "f.txt", "text/plain").unwrap();
+        let att = w
+            .attach_file(&src.join("f.txt"), "f.txt", "text/plain")
+            .unwrap();
         w.message(Message {
-            id: "m3".into(), channel: "c".into(), author: "a".into(), created_at: 12,
-            text: String::new(), reply_to: None, edited_at: None, attachments: vec![att.clone()],
+            id: "m3".into(),
+            channel: "c".into(),
+            author: "a".into(),
+            created_at: 12,
+            text: String::new(),
+            reply_to: None,
+            edited_at: None,
+            attachments: vec![att.clone()],
         });
         let a = w.finish(&d).unwrap();
         let p = a.attachment_file(&att).unwrap();

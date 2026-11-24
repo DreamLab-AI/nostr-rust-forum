@@ -18,9 +18,10 @@
 //!    GPS).
 //!
 //! Original timestamps (first send time, EXIF `DateTimeOriginal`) live in
-//! `media/manifest.json`, not in the stored bytes. Objects are named
-//! `<sha256[0..16]>.webp` / `.gif` and `<sha256[0..16]>_thumb.webp` (the
-//! client's thumbnail convention) and placed in the archivist's zone
+//! `media/manifest.json`, not in the stored bytes. Objects are named by the
+//! full source digest, `<sha256>.webp` / `.gif` and `<sha256>_thumb.webp`
+//! (the client's thumbnail convention; a shorter prefix could be collided
+//! by a crafted archive) and placed in the archivist's zone
 //! container ([`crate::target::Target::zone_media_url`]).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -130,7 +131,8 @@ pub fn webp_has_metadata(bytes: &[u8]) -> bool {
     let mut i = 12usize;
     while i + 8 <= bytes.len() {
         let id = &bytes[i..i + 4];
-        let len = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
+        let len =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
         if id == b"EXIF" || id == b"XMP " {
             return true;
         }
@@ -160,7 +162,12 @@ pub fn gif_has_metadata(b: &[u8]) -> bool {
             return None;
         }
         let flags = b[10];
-        let mut i = 13 + if flags & 0x80 != 0 { 3 * (1usize << ((flags & 7) + 1)) } else { 0 };
+        let mut i = 13
+            + if flags & 0x80 != 0 {
+                3 * (1usize << ((flags & 7) + 1))
+            } else {
+                0
+            };
         loop {
             match *b.get(i)? {
                 0x3B => return Some(false),
@@ -184,7 +191,12 @@ pub fn gif_has_metadata(b: &[u8]) -> bool {
                 }
                 0x2C => {
                     let f = *b.get(i + 9)?;
-                    i += 10 + if f & 0x80 != 0 { 3 * (1usize << ((f & 7) + 1)) } else { 0 };
+                    i += 10
+                        + if f & 0x80 != 0 {
+                            3 * (1usize << ((f & 7) + 1))
+                        } else {
+                            0
+                        };
                     i = skip_sub_blocks(b, i + 1)?; // LZW minimum code size, then data
                 }
                 _ => return None,
@@ -252,8 +264,12 @@ impl MediaManifest {
     pub fn load(media_dir: &Path) -> Result<Self, ImportError> {
         let p = media_dir.join("manifest.json");
         match std::fs::read(&p) {
-            Ok(b) => serde_json::from_slice(&b).map_err(|e| ImportError::Format(format!("{}: {e}", p.display()))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(MediaManifest { version: 1, objects: BTreeMap::new() }),
+            Ok(b) => serde_json::from_slice(&b)
+                .map_err(|e| ImportError::Format(format!("{}: {e}", p.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(MediaManifest {
+                version: 1,
+                objects: BTreeMap::new(),
+            }),
             Err(e) => Err(ImportError::io(&p, e)),
         }
     }
@@ -261,12 +277,18 @@ impl MediaManifest {
     /// Save atomically (0600).
     pub fn save(&self, media_dir: &Path) -> Result<(), ImportError> {
         fsutil::create_private_dir(media_dir)?;
-        fsutil::write_private_atomic(&media_dir.join("manifest.json"), &serde_json::to_vec_pretty(self).expect("manifest serialises"))
+        fsutil::write_private_atomic(
+            &media_dir.join("manifest.json"),
+            &serde_json::to_vec_pretty(self).expect("manifest serialises"),
+        )
     }
 
     /// The main object of a processed image.
     pub fn main_of(&self, sha: &str) -> Option<&StoredObject> {
-        self.objects.get(sha).filter(|e| e.status == "ok").and_then(|e| e.main.as_ref())
+        self.objects
+            .get(sha)
+            .filter(|e| e.status == "ok")
+            .and_then(|e| e.main.as_ref())
     }
 
     /// Total stored bytes (main + thumbnail) of the given source hashes.
@@ -274,7 +296,9 @@ impl MediaManifest {
         shas.into_iter()
             .filter_map(|s| self.objects.get(s))
             .filter(|e| e.status == "ok")
-            .map(|e| e.main.as_ref().map_or(0, |o| o.bytes) + e.thumb.as_ref().map_or(0, |o| o.bytes))
+            .map(|e| {
+                e.main.as_ref().map_or(0, |o| o.bytes) + e.thumb.as_ref().map_or(0, |o| o.bytes)
+            })
             .sum()
     }
 }
@@ -283,13 +307,27 @@ impl MediaManifest {
 pub fn parse_exif_date(s: &str) -> Option<String> {
     let t = s.trim();
     let b = t.as_bytes();
-    if b.len() < 19 || b[4] != b':' || b[7] != b':' || !(b[10] == b' ' || b[10] == b'T') || b[13] != b':' || b[16] != b':' {
+    if b.len() < 19
+        || b[4] != b':'
+        || b[7] != b':'
+        || !(b[10] == b' ' || b[10] == b'T')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
-    let digits = |r: std::ops::Range<usize>| t.get(r.clone()).filter(|x| x.bytes().all(|c| c.is_ascii_digit()));
+    let digits = |r: std::ops::Range<usize>| {
+        t.get(r.clone())
+            .filter(|x| x.bytes().all(|c| c.is_ascii_digit()))
+    };
     Some(format!(
         "{}-{}-{}T{}:{}:{}",
-        digits(0..4)?, digits(5..7)?, digits(8..10)?, digits(11..13)?, digits(14..16)?, digits(17..19)?
+        digits(0..4)?,
+        digits(5..7)?,
+        digits(8..10)?,
+        digits(11..13)?,
+        digits(14..16)?,
+        digits(17..19)?
     ))
 }
 
@@ -306,10 +344,20 @@ impl Magick {
         let policy_dir = work.join("magick-policy");
         fsutil::create_private_dir(&policy_dir)?;
         fsutil::write_private_atomic(&policy_dir.join("policy.xml"), POLICY_XML.as_bytes())?;
-        let m = Magick { binary: binary.to_path_buf(), policy_dir };
-        let out = m.cmd().arg("-version").output().map_err(|e| ImportError::Tool(format!("{}: {e}", binary.display())))?;
+        let m = Magick {
+            binary: binary.to_path_buf(),
+            policy_dir,
+        };
+        let out = m
+            .cmd()
+            .arg("-version")
+            .output()
+            .map_err(|e| ImportError::Tool(format!("{}: {e}", binary.display())))?;
         if !out.status.success() {
-            return Err(ImportError::Tool(format!("{} -version failed", binary.display())));
+            return Err(ImportError::Tool(format!(
+                "{} -version failed",
+                binary.display()
+            )));
         }
         Ok(m)
     }
@@ -325,37 +373,83 @@ impl Magick {
     }
 
     fn run(&self, args: &[String]) -> Result<Vec<u8>, ImportError> {
-        let out = self.cmd().args(args).output().map_err(|e| ImportError::Tool(format!("magick: {e}")))?;
+        let out = self
+            .cmd()
+            .args(args)
+            .output()
+            .map_err(|e| ImportError::Tool(format!("magick: {e}")))?;
         if !out.status.success() {
             let msg = String::from_utf8_lossy(&out.stderr);
-            return Err(ImportError::Tool(msg.lines().next().unwrap_or("magick failed").chars().take(200).collect()));
+            return Err(ImportError::Tool(
+                msg.lines()
+                    .next()
+                    .unwrap_or("magick failed")
+                    .chars()
+                    .take(200)
+                    .collect(),
+            ));
         }
         Ok(out.stdout)
     }
 
     /// Process one image into `dir` (`main.webp|main.gif`, `thumb.webp`).
-    pub fn process(&self, src: &Path, ty: ImageType, dir: &Path) -> Result<(PathBuf, PathBuf, Option<String>), ImportError> {
-        let input = |frame0: bool| format!("{}:{}{}", ty.coder(), src.display(), if frame0 { "[0]" } else { "" });
+    pub fn process(
+        &self,
+        src: &Path,
+        ty: ImageType,
+        dir: &Path,
+    ) -> Result<(PathBuf, PathBuf, Option<String>), ImportError> {
+        let input = |frame0: bool| {
+            format!(
+                "{}:{}{}",
+                ty.coder(),
+                src.display(),
+                if frame0 { "[0]" } else { "" }
+            )
+        };
         let exif = self
-            .run(&[input(true), "-format".into(), "%[EXIF:DateTimeOriginal]".into(), "info:".into()])
+            .run(&[
+                input(true),
+                "-format".into(),
+                "%[EXIF:DateTimeOriginal]".into(),
+                "info:".into(),
+            ])
             .ok()
             .and_then(|o| parse_exif_date(&String::from_utf8_lossy(&o)));
         let thumb = dir.join("thumb.webp");
         let main = if ty == ImageType::Gif {
             let main = dir.join("main.gif");
-            self.run(&[input(false), "-strip".into(), format!("gif:{}", main.display())])?;
+            self.run(&[
+                input(false),
+                "-strip".into(),
+                format!("gif:{}", main.display()),
+            ])?;
             main
         } else {
             let main = dir.join("main.webp");
             self.run(&[
-                input(true), "-auto-orient".into(), "-strip".into(), "-resize".into(), format!("{MAX_EDGE}x{MAX_EDGE}>"),
-                "-quality".into(), "82".into(), "-define".into(), "webp:method=4".into(), format!("webp:{}", main.display()),
+                input(true),
+                "-auto-orient".into(),
+                "-strip".into(),
+                "-resize".into(),
+                format!("{MAX_EDGE}x{MAX_EDGE}>"),
+                "-quality".into(),
+                "82".into(),
+                "-define".into(),
+                "webp:method=4".into(),
+                format!("webp:{}", main.display()),
             ])?;
             main
         };
         self.run(&[
-            input(true), "-auto-orient".into(), "-strip".into(), "-thumbnail".into(), format!("{THUMB_EDGE}x{THUMB_EDGE}>"),
-            "-quality".into(), "75".into(), format!("webp:{}", thumb.display()),
+            input(true),
+            "-auto-orient".into(),
+            "-strip".into(),
+            "-thumbnail".into(),
+            format!("{THUMB_EDGE}x{THUMB_EDGE}>"),
+            "-quality".into(),
+            "75".into(),
+            format!("webp:{}", thumb.display()),
         ])?;
         Ok((main, thumb, exif))
     }
@@ -376,7 +470,11 @@ pub struct MediaReport {
 
 /// Process every `ok` image attachment of `archive` into `media_dir`,
 /// resumably (entries already `ok` are kept; failures are retried).
-pub fn process_archive(archive: &Archive, magick: &Magick, media_dir: &Path) -> Result<(MediaManifest, MediaReport), ImportError> {
+pub fn process_archive(
+    archive: &Archive,
+    magick: &Magick,
+    media_dir: &Path,
+) -> Result<(MediaManifest, MediaReport), ImportError> {
     fsutil::create_private_dir(media_dir)?;
     let mut manifest = MediaManifest::load(media_dir)?;
     manifest.version = 1;
@@ -384,7 +482,9 @@ pub fn process_archive(archive: &Archive, magick: &Magick, media_dir: &Path) -> 
     let mut todo: BTreeMap<String, (&crate::format::Attachment, u64)> = BTreeMap::new();
     for m in &archive.messages {
         for a in &m.attachments {
-            if a.status != AttachmentStatus::Ok || !a.mime.to_ascii_lowercase().starts_with("image/") {
+            if a.status != AttachmentStatus::Ok
+                || !a.mime.to_ascii_lowercase().starts_with("image/")
+            {
                 continue;
             }
             if let Some(sha) = &a.sha256 {
@@ -419,7 +519,14 @@ pub fn process_archive(archive: &Archive, magick: &Magick, media_dir: &Path) -> 
     Ok((manifest, report))
 }
 
-fn process_one(archive: &Archive, magick: &Magick, media_dir: &Path, sha: &str, att: &crate::format::Attachment, first: u64) -> MediaEntry {
+fn process_one(
+    archive: &Archive,
+    magick: &Magick,
+    media_dir: &Path,
+    sha: &str,
+    att: &crate::format::Attachment,
+    first: u64,
+) -> MediaEntry {
     let mut entry = MediaEntry {
         status: "failed".into(),
         reason: None,
@@ -438,7 +545,9 @@ fn process_one(archive: &Archive, magick: &Magick, media_dir: &Path, sha: &str, 
             let mut f = std::fs::File::open(&src).map_err(|e| ImportError::io(&src, e))?;
             f.read(&mut head).map_err(|e| ImportError::io(&src, e))?
         };
-        let ty = sniff(&head[..n]).ok_or_else(|| ImportError::Refused("not a supported raster image (magic bytes)".into()))?;
+        let ty = sniff(&head[..n]).ok_or_else(|| {
+            ImportError::Refused("not a supported raster image (magic bytes)".into())
+        })?;
         entry.image_type = Some(ty);
         let dir = media_dir.join(&sha[..2]).join(sha);
         if dir.exists() {
@@ -447,14 +556,30 @@ fn process_one(archive: &Archive, magick: &Magick, media_dir: &Path, sha: &str, 
         fsutil::create_private_dir(&dir)?;
         let (main, thumb, exif) = magick.process(&src, ty, &dir)?;
         entry.exif_date_time_original = exif;
-        let stamp = &sha[..16];
+        let stamp = sha;
         let mut objects = Vec::new();
         for (path, name, mime, is_gif) in [
-            (&main, format!("{stamp}.{}", if ty == ImageType::Gif { "gif" } else { "webp" }), if ty == ImageType::Gif { "image/gif" } else { "image/webp" }, ty == ImageType::Gif),
+            (
+                &main,
+                format!(
+                    "{stamp}.{}",
+                    if ty == ImageType::Gif { "gif" } else { "webp" }
+                ),
+                if ty == ImageType::Gif {
+                    "image/gif"
+                } else {
+                    "image/webp"
+                },
+                ty == ImageType::Gif,
+            ),
             (&thumb, format!("{stamp}_thumb.webp"), "image/webp", false),
         ] {
             let bytes = std::fs::read(path).map_err(|e| ImportError::io(path, e))?;
-            let dirty = if is_gif { gif_has_metadata(&bytes) } else { webp_has_metadata(&bytes) };
+            let dirty = if is_gif {
+                gif_has_metadata(&bytes)
+            } else {
+                webp_has_metadata(&bytes)
+            };
             if dirty {
                 return Err(ImportError::Refused("output still carries metadata".into()));
             }
@@ -463,8 +588,18 @@ fn process_one(archive: &Archive, magick: &Magick, media_dir: &Path, sha: &str, 
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
             }
-            let rel = path.strip_prefix(media_dir).unwrap_or(path).to_string_lossy().into_owned();
-            objects.push(StoredObject { name, mime: mime.into(), bytes: bytes.len() as u64, sha256: fsutil::sha256_hex(&bytes), file: rel });
+            let rel = path
+                .strip_prefix(media_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            objects.push(StoredObject {
+                name,
+                mime: mime.into(),
+                bytes: bytes.len() as u64,
+                sha256: fsutil::sha256_hex(&bytes),
+                file: rel,
+            });
         }
         entry.thumb = objects.pop();
         entry.main = objects.pop();
@@ -524,7 +659,10 @@ mod tests {
 
     #[test]
     fn exif_dates() {
-        assert_eq!(parse_exif_date("2024:05:17 14:03:22\n").as_deref(), Some("2024-05-17T14:03:22"));
+        assert_eq!(
+            parse_exif_date("2024:05:17 14:03:22\n").as_deref(),
+            Some("2024-05-17T14:03:22")
+        );
         assert_eq!(parse_exif_date(""), None);
         assert_eq!(parse_exif_date("2024:05:17"), None);
     }
