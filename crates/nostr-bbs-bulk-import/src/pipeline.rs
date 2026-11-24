@@ -554,27 +554,36 @@ fn seal_runbook(work: &Work, d1_path: &Path, relay: &str) -> String {
 Prerequisites: `seal-prep` reports nothing missing; the zone key is minted and granted in the
 client; every thread holds an archivist anchor; a backup of the D1 file exists.
 
-The archivist key goes into the environment from a 0600 file, never on a command line:
+The archivist key is passed per command from a 0600 file: never on a command line and never
+`export`ed (that would leave it in every later process's environment). Define, in the shell you
+seal from:
 
-    nostr-bbs-import keys export --work {w} --label archivist --out {w}/seal/archivist.key
-    export NOSTR_BBS_MIGRATE_KEY="$(cat {w}/seal/archivist.key)"
-    ZM="nostr-bbs-zone-migrate --relay {relay} --channels {w}/seal/channels.json --fetch-grants --state {w}/seal/state.json"
+```sh
+nostr-bbs-import keys export --work {w} --label archivist --out {w}/seal/archivist.key
+# stack UP: talks to the LOCAL relay (admin check, --fetch-grants harvests the zone key)
+zm()  {{ NOSTR_BBS_MIGRATE_KEY="$(cat {w}/seal/archivist.key)" nostr-bbs-zone-migrate \
+          --relay {relay} --channels {w}/seal/channels.json --fetch-grants --state {w}/seal/state.json "$@"; }}
+# stack DOWN: apply-direct only writes SQL into the D1 file; it needs neither a relay nor a key
+zmd() {{ nostr-bbs-zone-migrate "$@"; }}
+```
 
 | Stack | Step |
 |---|---|
-| up   | `$ZM seal-offline --d1 {d} --sql-out {w}/seal/sql` |
-| down | `$ZM apply-direct --d1 {d} {w}/seal/sql/seal-*.sql` |
-| up   | `$ZM seal-offline-commit --d1 {d} --manifest {w}/seal/sql/seal-manifest.json` |
-| up   | `$ZM verify` |
+| up   | `zm seal-offline --d1 {d} --sql-out {w}/seal/sql` |
+| down | `zmd apply-direct --d1 {d} {w}/seal/sql/seal-*.sql` |
+| up   | `zm seal-offline-commit --d1 {d} --manifest {w}/seal/sql/seal-manifest.json` |
+| up   | `zm verify` |
 | any  | `nostr-bbs-import search-input --work {w} --d1 {d}` (BEFORE purge) |
 | any  | `nostr-bbs-import verify-parity --work {w} --d1 {d} --phase sealed` |
-| up   | `$ZM purge-offline --d1 {d} --sql-out {w}/seal/purge --yes` |
-| down | `$ZM apply-direct --d1 {d} {w}/seal/purge/purge-*.sql` |
-| up   | `$ZM purge-offline-commit --d1 {d} --manifest {w}/seal/purge/purge-manifest.json` |
+| up   | `zm purge-offline --d1 {d} --sql-out {w}/seal/purge --yes` |
+| down | `zmd apply-direct --d1 {d} {w}/seal/purge/purge-*.sql` |
+| up   | `zm purge-offline-commit --d1 {d} --manifest {w}/seal/purge/purge-manifest.json` |
 | any  | `nostr-bbs-import verify-parity --work {w} --d1 {d} --phase purged` |
+| down | `nostr-bbs-import scrub --d1 {d}` |
 
-Afterwards: `unset NOSTR_BBS_MIGRATE_KEY; shred -u {w}/seal/archivist.key`. If a zone key file was
-ever used instead of a grant, rotate the zone in the client.
+Afterwards: `unset -f zm zmd; shred -u {w}/seal/archivist.key`, then retire the archivist here
+(`nostr-bbs-import keys --work {w} retire --label archivist`) once its key is stored offline. If
+a zone key file was ever used instead of a grant, rotate the zone in the client.
 "#
     )
 }
