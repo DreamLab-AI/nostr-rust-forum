@@ -1,0 +1,45 @@
+[package]
+name = "nostr-bbs-bulk-import"
+version = "0.1.0"
+edition = "2021"
+description = "Offline bulk import of external chat archives into a nostr-bbs forum deployment: adapters, identity planning, ingest-parity D1 build, sealing glue and upload plan"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-bulk-import"
+keywords = ["nostr", "bbs", "import", "migration", "d1"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+rust-version = "1.85"
+# Project-specific operator tool: the keystore, ledger and plan files are
+# private formats of this kit, not a reusable library format.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nostr-bbs-import"
+path = "src/main.rs"
+
+[dependencies]
+nostr-bbs-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+url = { workspace = true }
+k256 = { workspace = true }
+
+# SQLite and the CLI are native only, so the workspace wasm32 check still
+# covers the pure planning library. No HTTP or WebSocket client: this crate
+# makes no network calls (zone-migrate, which links one, is driven through its
+# CLI and used here only as a dev-dependency for the end-to-end test).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rusqlite = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+nostr-bbs-zone-migrate = { path = "../nostr-bbs-zone-migrate" }
