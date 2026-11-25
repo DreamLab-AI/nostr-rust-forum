@@ -150,6 +150,9 @@ pub struct ChannelStore {
     roots_targets: StoredValue<HashMap<String, String>>,
     /// Channels whose root list has been answered (reactive).
     roots_answered: RwSignal<HashSet<String>>,
+    /// Channels whose root list came back under its limit: every marked
+    /// topic root is held, so channel history paging lists no new topic.
+    roots_complete: RwSignal<HashSet<String>>,
     /// Newest reply per topic as the relay answers it (`#e:[root]`,
     /// `limit:1`): lower-case root id -> (created_at, author). Only opened
     /// replies count (a still-locked envelope names the migrator, not the
@@ -212,6 +215,7 @@ impl ChannelStore {
             topic_targets: StoredValue::new(HashMap::new()),
             roots_targets: StoredValue::new(HashMap::new()),
             roots_answered: RwSignal::new(HashSet::new()),
+            roots_complete: RwSignal::new(HashSet::new()),
             topic_latest: RwSignal::new(HashMap::new()),
             topic_stats_asked: StoredValue::new(HashSet::new()),
             topic_stats_queue: StoredValue::new(std::collections::VecDeque::new()),
@@ -1216,13 +1220,26 @@ impl ChannelStore {
                 ..Default::default()
             },
             wait_auth,
-            Box::new(move |events, _page| {
+            Box::new(move |events, page| {
+                let held = !events.is_empty();
                 store.apply_page(events);
+                if held && page.delivered < RELAY_FILTER_LIMIT {
+                    store.roots_complete.update(|s| {
+                        s.insert(channel.clone());
+                    });
+                }
                 store.roots_answered.update(|s| {
                     s.insert(channel);
                 });
             }),
         );
+    }
+
+    /// Whether channel `cid`'s root list is complete: answered under its
+    /// limit with at least one root, so the section's topics are all listed
+    /// and paging the channel's history adds none. Reactive.
+    pub fn topic_roots_complete(&self, cid: &str) -> bool {
+        self.roots_complete.with(|s| s.contains(cid))
     }
 
     /// Whether channel `cid`'s root list has been answered. Reactive.

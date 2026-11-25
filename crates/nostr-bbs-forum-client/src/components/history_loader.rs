@@ -46,7 +46,13 @@ pub fn HistoryLoader(
     /// A topic list is keyed `topic:<root>` but paged by `#e:[root]`.
     #[prop(optional, into)]
     needles: Option<Signal<Vec<String>>>,
+    /// When true, this direction has nothing more the view would show (a
+    /// section whose complete root list already lists every topic): the
+    /// loader is hidden and pages nothing, by scroll or otherwise.
+    #[prop(optional, into)]
+    exhausted: Option<Signal<bool>>,
 ) -> impl IntoView {
+    let exhausted = move || exhausted.is_some_and(|e| e.get());
     let store = expect_context::<ChannelStore>();
     let relay = expect_context::<RelayConnection>();
     let sentinel = NodeRef::<leptos::html::Div>::new();
@@ -109,7 +115,7 @@ pub fn HistoryLoader(
     // Keep paging while the sentinel is on screen: re-runs on every cursor
     // change (a page landed) and on visibility changes.
     Effect::new(move |_| {
-        if visible.get() && can_request() {
+        if visible.get() && !exhausted() && can_request() {
             request.with_value(|f| f());
         }
     });
@@ -148,11 +154,14 @@ pub fn HistoryLoader(
     });
 
     let label = StoredValue::new(label);
-    let shown = move || match direction {
-        HistoryDirection::Older => true,
-        HistoryDirection::Newer => {
-            state.with(|c| c.as_ref().is_some_and(|c| c.newer_from.is_some()))
-        }
+    let shown = move || {
+        !exhausted()
+            && match direction {
+                HistoryDirection::Older => true,
+                HistoryDirection::Newer => {
+                    state.with(|c| c.as_ref().is_some_and(|c| c.newer_from.is_some()))
+                }
+            }
     };
     let state_attr = move || match (direction, state.get()) {
         (_, Some(c)) if c.loading => "loading",

@@ -658,6 +658,13 @@ pub fn SectionPage() -> impl IntoView {
                     // back until the start of the channel.
                     let history_cid = Signal::derive(move || resolved_channel.get().map(|c| c.id));
                     let history_gated = Signal::derive(move || zone_is_gated(&category_slug(), &load_zones()));
+                    // The complete root list already lists every topic:
+                    // channel paging (older or newer) would add none.
+                    let topics_complete = Signal::derive(move || {
+                        resolved_channel
+                            .get()
+                            .is_some_and(|c| store.topic_roots_complete(&c.id))
+                    });
                     // Bounded window: once older pages have evicted the
                     // newest topics, a loader above the list brings them back.
                     view! {
@@ -666,6 +673,7 @@ pub fn SectionPage() -> impl IntoView {
                             gated=history_gated
                             label="Load newer topics"
                             direction=crate::components::history_loader::HistoryDirection::Newer
+                            exhausted=topics_complete
                         />
                         <TopicList
                             channel_id=ch_id
@@ -676,6 +684,7 @@ pub fn SectionPage() -> impl IntoView {
                             channel_id=history_cid
                             gated=history_gated
                             label="Load older topics"
+                            exhausted=topics_complete
                         />
                     }.into_any()
                 } else {
@@ -738,12 +747,21 @@ async fn publish_topic_root(
         .ok_or_else(|| "Not authenticated".to_string())?;
 
     let now = (js_sys::Date::now() / 1000.0) as u64;
-    let mut tags = vec![vec![
-        "e".to_string(),
-        section_channel_id.to_string(),
-        String::new(),
-        "root".to_string(),
-    ]];
+    // The topic marker lists the root in the section's root list
+    // (`#t:["topic"]`), as sealed roots are, so it is never only reachable
+    // by paging the channel's history.
+    let mut tags = vec![
+        vec![
+            "e".to_string(),
+            section_channel_id.to_string(),
+            String::new(),
+            "root".to_string(),
+        ],
+        vec![
+            "t".to_string(),
+            nostr_bbs_core::sealed::TOPIC_MARKER.to_string(),
+        ],
+    ];
     // @handles get ["p", pubkey] tags so mentioned users / agents (e.g.
     // @junkiejarvis) are addressable and reachable via the relay's #p-filtered
     // subscriptions. Two sources, de-duped: the pubkeys the user picked from the
