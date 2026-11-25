@@ -90,7 +90,14 @@ pub fn ConnectPage() -> impl IntoView {
             }
             auth.clear_error();
             match auth.login_with_local_key(&key) {
-                Ok(()) => state.set(ConnectState::Welcome),
+                Ok(()) => {
+                    // Leave the /connect URL (a reload must not land here
+                    // again); the welcome screen stays mounted.
+                    if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
+                        let _ = h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&base_href("/")));
+                    }
+                    state.set(ConnectState::Welcome);
+                }
                 Err(e) => state.set(ConnectState::Error(e)),
             }
             drop(key);

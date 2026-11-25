@@ -89,7 +89,13 @@ pub fn WelcomeOnboarding() -> impl IntoView {
     let navigate = StoredValue::new(use_navigate());
 
     let standalone = pwa_install::is_standalone();
-    let path = Memo::new(move |_| {
+    // Once the prompt path is chosen it stays chosen: showing the prompt
+    // consumes the deferred event (`installable` drops to false), and the
+    // outcome must still render in the prompt section.
+    let path = Memo::new(move |prev: Option<&InstallPath>| {
+        if prev == Some(&InstallPath::Prompt) {
+            return InstallPath::Prompt;
+        }
         choose_install_path(
             standalone,
             pwa_install::feature_enabled(),
@@ -210,7 +216,6 @@ pub fn WelcomeOnboarding() -> impl IntoView {
         <div class="bg-gray-800/30 border border-gray-700/50 rounded-2xl p-6 space-y-6" data-testid="welcome-onboarding">
             // 1. Welcome
             <div class="space-y-2 text-center">
-                <div class="text-3xl">"👋"</div>
                 <h1 class="text-2xl font-bold text-white" data-testid="welcome-name">
                     "Welcome, " {move || name.get()}
                 </h1>
@@ -346,11 +351,11 @@ fn IosShareIllustration() -> impl IntoView {
             </svg>
             <span class="text-2xl text-gray-500">"→"</span>
             // Menu row: plus-in-square + label.
-            <svg width="150" height="44" viewBox="0 0 150 44">
-                <rect x="1" y="1" width="148" height="42" rx="10" fill="#1f2937" stroke="#4b5563" />
+            <svg width="176" height="44" viewBox="0 0 176 44">
+                <rect x="1" y="1" width="174" height="42" rx="10" fill="#1f2937" stroke="#4b5563" />
                 <text x="12" y="27" fill="#e5e7eb" font-size="12" font-family="sans-serif">"Add to Home Screen"</text>
-                <rect x="124" y="12" width="18" height="18" rx="4" fill="none" stroke="#e5e7eb" stroke-width="1.6" />
-                <path d="M133 16v10M128 21h10" stroke="#e5e7eb" stroke-width="1.6" stroke-linecap="round" />
+                <rect x="148" y="12" width="18" height="18" rx="4" fill="none" stroke="#e5e7eb" stroke-width="1.6" />
+                <path d="M157 16v10M152 21h10" stroke="#e5e7eb" stroke-width="1.6" stroke-linecap="round" />
             </svg>
         </div>
     }
