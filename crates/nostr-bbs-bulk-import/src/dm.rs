@@ -1,5 +1,7 @@
 //! DMs: already-signed kind-1059 gift wraps (NIP-59) only. Source-platform
-//! DMs are never imported (they would need forged signatures).
+//! DMs are never imported (they would need forged signatures), and DM
+//! migration as a whole is OFF by default: it runs only when the operator
+//! opts in with `--include-dms` (see [`crate::pipeline::import_dms`]).
 //!
 //! - **Verbatim copy** ([`copy_plan`]): a wrap whose id and signature verify,
 //!   with exactly one `p` recipient, is copied byte for byte when that

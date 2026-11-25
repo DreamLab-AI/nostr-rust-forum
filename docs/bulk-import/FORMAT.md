@@ -114,7 +114,9 @@ as kind 7, which the relay's retention sweep deletes after 30 days.
 
 ## `dms.jsonl`
 
-Already-signed NIP-59 gift wraps (kind 1059), verbatim, one per line. They are copied only to
+Already-signed NIP-59 gift wraps (kind 1059), verbatim, one per line. **DMs are not migrated
+unless the operator chooses to**: `adapt` leaves this file out of the archive unless it is given
+`--include-dms`, and importing needs the separate `dm --include-dms` step. They are copied only to
 recipients that keep their key in the new deployment, or re-wrapped when the operator wrote them
 (see SECURITY.md). **Source-platform DMs are out of scope**: importing them would mean signing
 in someone else's name.

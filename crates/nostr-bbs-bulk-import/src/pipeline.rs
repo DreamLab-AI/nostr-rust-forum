@@ -1711,13 +1711,28 @@ pub fn scrub(d1_path: &Path) -> Result<(), ImportError> {
 /// Import DMs: verbatim copies to the kept live keys (and the operator),
 /// plus optional re-wraps of the operator's sent DMs (old key from a 0600
 /// file).
+///
+/// DM migration is **off by default**: nothing else in the pipeline touches
+/// DMs, and this step refuses unless `include_dms` (the operator's explicit
+/// `--include-dms`) is set and the archive was adapted with DMs included.
 pub fn import_dms(
     work: &Work,
     d1_path: &Path,
+    include_dms: bool,
     allow_stale_grants: bool,
     rewrap_old_key: Option<&Path>,
 ) -> Result<serde_json::Value, ImportError> {
+    if !include_dms {
+        return Err(ImportError::Refused(
+            "DMs are not migrated unless you choose to: pass --include-dms to run this step".into(),
+        ));
+    }
     let l = load(work)?;
+    if l.archive.dms.is_empty() {
+        return Err(ImportError::Refused(
+            "the archive holds no DM wraps: adapt it with --include-dms first (DM migration is off by default)".into(),
+        ));
+    }
     let mut c = d1::open_rw(d1_path)?;
     d1::check_schema(&c)?;
     let mut ledger = Ledger::load(&work.state(), &c, &l.plan.provenance)?;

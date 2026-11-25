@@ -17,7 +17,8 @@
 //! - never copy raw source records through: they can hold secrets (Keybase
 //!   lines carry per-attachment decryption keys);
 //! - leave source-platform DMs out (the format carries only already-signed
-//!   kind-1059 wraps, see [`crate::dm`]).
+//!   kind-1059 wraps, see [`crate::dm`]), and carry even those only when the
+//!   operator opted in with `--include-dms`: DM migration is off by default.
 //!
 //! Shipped adapters: [`generic`] and [`keybase`]. Discord, Slack and Matrix
 //! adapters follow the same shape (see FORMAT.md, "Writing an adapter").
@@ -49,6 +50,10 @@ pub struct AdapterReport {
     pub attachments_ok: usize,
     /// Attachments recorded without bytes (unavailable or skipped upstream).
     pub attachments_missing: usize,
+    /// DM wraps carried into the archive (only with `--include-dms`).
+    pub dms: usize,
+    /// DM wraps in the source left out because DM migration is off.
+    pub dms_left_out: usize,
     /// Source records ignored (unknown types, undecodable lines).
     pub ignored: usize,
     /// Free-form warnings (one line each, no message text).

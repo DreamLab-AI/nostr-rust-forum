@@ -472,6 +472,17 @@ fn keybase_archive_to_sealed_upload_plan() {
     let again = pipeline::build(&w, &opts).unwrap();
     assert_eq!((again.signed, again.inserted), (0, 0));
 
+    // ── DM migration is off by default: the step refuses without the opt-in,
+    //    and an archive adapted without --include-dms carries no wraps
+    let off = pipeline::import_dms(&w, &db_path, false, true, None)
+        .unwrap_err()
+        .to_string();
+    assert!(off.contains("--include-dms"), "{off}");
+    let empty = pipeline::import_dms(&w, &db_path, true, true, None)
+        .unwrap_err()
+        .to_string();
+    assert!(empty.contains("holds no DM wraps"), "{empty}");
+
     // ── a second target (production) from the same work directory and keys:
     //    its own target file, D1 and state directory
     let prod_target = root.join("target-prod.json");

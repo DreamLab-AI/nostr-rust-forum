@@ -121,6 +121,8 @@ Review them like code.
 
 ## DMs
 
+* **Off by default.** DMs are not migrated unless the operator chooses to: `adapt` leaves DM
+  wraps out unless given `--include-dms`, and the `dm` step refuses without `--include-dms`.
 * Only already-signed gift wraps travel. Source-platform DMs are never imported.
 * **Copy** is verbatim (same id and signature, nothing decrypted), and only to live keys kept by
   proven identities (or the operator) that are whitelisted in the new deployment.

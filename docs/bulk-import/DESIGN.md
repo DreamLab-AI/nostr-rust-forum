@@ -42,7 +42,8 @@ Non-goals
 * Executing the remote upload or the R2 copy.
 * Minting or granting zone keys offline. Key distribution stays in the forum client
   (§8.2); an offline grant generator would be bespoke key distribution.
-* Importing source-platform DMs. Only already-signed kind-1059 wraps travel (§11).
+* Importing source-platform DMs. Only already-signed kind-1059 wraps travel, and only
+  when the operator opts in with `--include-dms` (§11).
 
 ## 2. Pipeline
 
@@ -414,6 +415,12 @@ Cost notes (README): D1 rows written/stored per event (1 `events` row + one
 storage and class-A operations for the puts, the pod quota (`POD_QUOTA_MB`).
 
 ## 11. DMs
+
+**Off by default.** DMs are not migrated unless the operator chooses to
+(operator rule, 2026-11-25). Two explicit opt-ins are needed: `adapt --include-dms`
+carries `dms.jsonl` into the archive (otherwise it is left out and counted), and the
+separate `dm --include-dms` step writes them into the D1. `build`, sealing and the
+upload plan never touch DMs on their own. When the operator opts in:
 
 * **Verbatim copy** of kind-1059 wraps (id and signature verified, exactly one `p`)
   whose recipient is a live key kept by a proven identity, or the operator, and is

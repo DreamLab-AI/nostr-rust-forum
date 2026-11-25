@@ -126,6 +126,9 @@ mod cli {
             /// Export name recorded in the manifest (team, guild); default: the input directory name.
             #[arg(long)]
             source_id: Option<String>,
+            /// Carry DM wraps into the archive (DM migration is OFF by default).
+            #[arg(long)]
+            include_dms: bool,
         },
         /// Write identities.json / structure.json templates if absent, else validate and print the plan.
         Plan {
@@ -193,12 +196,15 @@ mod cli {
             #[arg(long = "key", value_name = "LABEL=FILE", value_parser = parse_unlock)]
             unlock: Vec<(String, PathBuf)>,
         },
-        /// Copy and re-wrap DMs into the local D1 (stack DOWN).
+        /// Opt-in: copy and re-wrap DMs into the local D1 (stack DOWN). DMs are not migrated unless you pass --include-dms.
         Dm {
             #[command(flatten)]
             work: RunPaths,
             #[arg(long)]
             d1: PathBuf,
+            /// Required: you choose to migrate DMs (off by default).
+            #[arg(long)]
+            include_dms: bool,
             /// Accept that zone-key grants among the wraps travel too.
             #[arg(long)]
             allow_stale_grants: bool,
@@ -284,9 +290,11 @@ mod cli {
                 input,
                 work,
                 source_id,
+                include_dms,
             } => {
                 let w = Work::new(&work);
                 nostr_bbs_bulk_import::fsutil::create_private_dir(&w.dir)?;
+                let generic = GenericAdapter { include_dms };
                 let id = source_id.unwrap_or_else(|| {
                     input
                         .file_name()
@@ -295,7 +303,7 @@ mod cli {
                         .to_string()
                 });
                 let a: &dyn SourceAdapter = match source {
-                    Source::Generic => &GenericAdapter,
+                    Source::Generic => &generic,
                     Source::Keybase => &KeybaseAdapter,
                 };
                 let (archive, report) = adapter::run(a, &input, &id, &w.archive())?;
@@ -444,12 +452,14 @@ mod cli {
             Cmd::Dm {
                 work,
                 d1,
+                include_dms,
                 allow_stale_grants,
                 rewrap_old_key,
             } => (
                 pipeline::import_dms(
                     &work.work(),
                     &d1,
+                    include_dms,
                     allow_stale_grants,
                     rewrap_old_key.as_deref(),
                 )?,

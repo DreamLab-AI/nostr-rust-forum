@@ -38,8 +38,10 @@
 //!   `pubkey_aliases`, counters, audit rows), with every value bound.
 //! - **No forged authorship.** Each person's history is signed by their own
 //!   new key, or by a per-person archive key aliased to the live key they
-//!   keep (whitelisted only with a signed proof). DMs are copied verbatim or
-//!   re-wrapped only when the operator wrote them.
+//!   keep (whitelisted only with a signed proof).
+//! - **DMs off by default.** They are migrated only when the operator opts
+//!   in (`--include-dms`), and then copied verbatim or re-wrapped only when
+//!   the operator wrote them.
 //! - **No hand-rolled cryptography.** Keys, signatures, NIP-44 and gift wraps
 //!   come from `nostr-bbs-core` (RustCrypto underneath); sealing from
 //!   `nostr-bbs-zone-migrate`.

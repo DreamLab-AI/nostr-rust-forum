@@ -32,6 +32,7 @@ written), 1 = error.
 
 ```sh
 nostr-bbs-import adapt keybase --in ~/archive/myteam --work W --source-id myteam
+# DMs are left out unless you add --include-dms (see step 5)
 # or, for an archive another tool wrote in the intermediate format:
 nostr-bbs-import adapt generic --in ./export --work W
 ```
@@ -103,8 +104,13 @@ nostr-bbs-import verify-parity --work W --d1 D1 --phase built
 ```
 
 Re-running is safe and adds nothing. The operator's deferred history is imported later with
-`build --deferred-only --operator-key op.key`. Copied or re-wrapped DMs:
-`nostr-bbs-import dm --work W --d1 D1 --allow-stale-grants [--rewrap-old-key old.key]`.
+`build --deferred-only --operator-key op.key`.
+
+**DMs are not migrated unless you choose to.** By default `adapt` leaves DM wraps out of the
+archive (it reports how many) and nothing else touches them. To migrate them, opt in twice:
+`adapt … --include-dms`, then
+`nostr-bbs-import dm --work W --d1 D1 --include-dms --allow-stale-grants [--rewrap-old-key old.key]`.
+Read the DM section of [SECURITY.md](SECURITY.md) first.
 
 #### Changing titles after a build: reset
 

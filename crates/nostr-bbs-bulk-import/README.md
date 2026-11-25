@@ -12,7 +12,7 @@ new adapters) into a nostr-bbs forum deployment. Library plus the `nostr-bbs-imp
 * Glue for `nostr-bbs-zone-migrate` offline sealing, the sealed-search hand-off, and an upload
   plan (allowlisted dump, R2 object list, cutover runbook) that the tool never runs.
 
-It makes no network calls. It is the generalised successor of the Node migrator written for the
+DMs are not migrated unless the operator opts in with `--include-dms`. It makes no network calls. It is the generalised successor of the Node migrator written for the
 Keybase pilot.
 
 ```sh
