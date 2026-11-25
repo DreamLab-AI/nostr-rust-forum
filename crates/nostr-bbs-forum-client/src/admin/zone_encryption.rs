@@ -231,12 +231,18 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         crate::zone_crypto::keyset::MintPlan::Mint { epoch, .. } => epoch.to_string(),
         _ => "…".into(),
     };
+    // Refused (or displaced) keys for this zone, with the key held for the
+    // same slot when there is one: (offered, held pubkey).
     let zone_conflicts = move || {
         let zone_id = zone.with_value(|z| z.id.clone());
+        let held = keys.keys.get();
         keys.conflicts.with(|v| {
             v.iter()
-                .filter(|(z, _, _)| *z == zone_id)
-                .map(|(_, e, by)| (*e, by.clone()))
+                .filter(|k| k.zone == zone_id)
+                .filter_map(|k| {
+                    let h = held.get(&k.store_id())?;
+                    crate::zone_crypto::conflicts(h, k).then(|| (k.clone(), h.pubkey.clone()))
+                })
                 .collect::<Vec<_>>()
         })
     };
@@ -595,12 +601,42 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             {move || {
                 let c = zone_conflicts();
                 (!c.is_empty()).then(|| view! {
-                    <p class="text-sm text-red-300" role="alert">
-                        {c.iter().map(|(e, by)| format!(
-                            "Refused a second, different key for epoch {e} from {}…: this device keeps the one it already holds. Someone created that epoch from a device without it.",
-                            by.get(..8).unwrap_or(by)
-                        )).collect::<Vec<_>>().join(" ")}
-                    </p>
+                    <div class="space-y-2" role="alert">
+                        {c.into_iter().map(|(offered, held_pk)| {
+                            let short = |s: &str| s.get(..8).unwrap_or(s).to_string();
+                            let text = format!(
+                                "Two different keys for epoch {}: this device uses {}…; {}… (from {}…) was set aside. Posts that \"could not be decrypted\" usually mean the key in use is the stale one.",
+                                offered.epoch,
+                                short(&held_pk),
+                                short(&offered.pubkey),
+                                short(&offered.granted_by),
+                            );
+                            let key = offered.clone();
+                            view! {
+                                <div class="flex flex-wrap items-center gap-2 text-sm text-red-300">
+                                    <span>{text}</span>
+                                    <button
+                                        class="px-2 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-200 text-xs"
+                                        on:click=move |_| {
+                                            let key = key.clone();
+                                            spawn_local(async move {
+                                                match keys.use_refused(&key).await {
+                                                    Ok(()) => status.set(Some(format!(
+                                                        "Now using {}… for epoch {}; the other key is kept here in case you need it back.",
+                                                        key.pubkey.get(..8).unwrap_or(&key.pubkey),
+                                                        key.epoch
+                                                    ))),
+                                                    Err(why) => status.set(Some(why)),
+                                                }
+                                            });
+                                        }
+                                    >
+                                        "Use the granted key"
+                                    </button>
+                                </div>
+                            }
+                        }).collect_view()}
+                    </div>
                 })
             }}
 

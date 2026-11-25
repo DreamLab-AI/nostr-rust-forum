@@ -332,6 +332,65 @@ impl Session {
     }
 }
 
+// -- Conflicting keys for one slot ---------------------------------------------
+
+/// Most refused keys kept per identity (oldest dropped first). A slot holds
+/// at most a handful in practice; this bounds what a flood of admin grants
+/// could pile up in `zone_kv`.
+pub const MAX_REFUSED_KEYS: usize = 16;
+
+/// `zone_kv` id of `owner`'s refused keys: keys a current admin granted for a
+/// slot this identity already held a different key for, kept (secret
+/// included, like `zone_keys` rows) so the conflict can be resolved later
+/// without the grant being delivered again.
+pub fn refused_keys_id(owner: &Owner) -> String {
+    format!("refused_keys:{owner}")
+}
+
+/// Add `key` to `refused` unless the same key is already listed; the oldest
+/// entries go beyond [`MAX_REFUSED_KEYS`]. Returns whether the list changed.
+pub fn note_refused(refused: &mut Vec<ZoneKey>, key: &ZoneKey) -> bool {
+    if refused
+        .iter()
+        .any(|k| k.store_id() == key.store_id() && k.secret == key.secret && k.pubkey == key.pubkey)
+    {
+        return false;
+    }
+    refused.push(key.clone());
+    if refused.len() > MAX_REFUSED_KEYS {
+        let drop = refused.len() - MAX_REFUSED_KEYS;
+        refused.drain(..drop);
+    }
+    true
+}
+
+/// Whether the refused `grant` should replace the `held` key for their slot
+/// without asking: the two conflict, the held key is not this device's own
+/// key still awaiting delivery, and the posts seen for the slot name the
+/// grant's epoch pubkey and never the held key's (`seen`: lower-case epoch
+/// pubkeys from `zk` tags for that zone and epoch). A post names the key it
+/// was encrypted to, so a held key no post names has opened nothing there,
+/// and cannot. "Opened nothing" alone is not enough: grants are processed
+/// before any post loads. The grant's sender must also still be an admin;
+/// the caller checks that.
+pub fn grant_supersedes(
+    held: &ZoneKey,
+    grant: &ZoneKey,
+    seen: &std::collections::HashSet<String>,
+) -> bool {
+    super::conflicts(held, grant)
+        && !held.pending_delivery
+        && seen.contains(&grant.pubkey.to_ascii_lowercase())
+        && !seen.contains(&held.pubkey.to_ascii_lowercase())
+}
+
+/// Whether a replacement may be written over `view` (what the identity's
+/// slot holds now): only while it still holds `expected`, so a key that
+/// changed meanwhile (another tab, a new grant) is never overwritten.
+pub fn swap_allowed(view: Option<&ZoneKey>, expected: &ZoneKey) -> bool {
+    view.is_some_and(|v| v.secret == expected.secret && v.pubkey == expected.pubkey)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,5 +917,66 @@ mod tests {
             can_mint(&ready_for, &a, &memory),
             MintPlan::Mint { epoch: 4, .. }
         ));
+    }
+
+    fn seen(pks: &[&ZoneKey]) -> std::collections::HashSet<String> {
+        pks.iter().map(|k| k.pubkey.clone()).collect()
+    }
+
+    #[test]
+    fn a_grant_replaces_a_held_key_only_when_posts_name_the_grant_and_never_the_held_key() {
+        let held = with_pk(key("zone2", 1, 'a'), 'c');
+        let grant = with_pk(key("zone2", 1, 'b'), 'd');
+        // The pilot case: every post names the grant's pubkey.
+        assert!(grant_supersedes(&held, &grant, &seen(&[&grant])));
+        // At boot, before any post: never.
+        assert!(!grant_supersedes(&held, &grant, &Default::default()));
+        // Some post names the held key: both are in use, ask a human.
+        assert!(!grant_supersedes(&held, &grant, &seen(&[&grant, &held])));
+        // Posts only name the held key: keep it.
+        assert!(!grant_supersedes(&held, &grant, &seen(&[&held])));
+        // This device's own undelivered mint is never replaced silently.
+        let mut mint = held.clone();
+        mint.pending_delivery = true;
+        assert!(!grant_supersedes(&mint, &grant, &seen(&[&grant])));
+        // The same key, or another slot, is no conflict.
+        assert!(!grant_supersedes(&held, &held, &seen(&[&held])));
+        let other = with_pk(key("zone2", 2, 'b'), 'd');
+        assert!(!grant_supersedes(&held, &other, &seen(&[&other])));
+    }
+
+    #[test]
+    fn seen_pubkeys_compare_case_insensitively() {
+        let held = with_pk(key("zone2", 1, 'a'), 'c');
+        let mut grant = with_pk(key("zone2", 1, 'b'), 'd');
+        grant.pubkey = grant.pubkey.to_ascii_uppercase();
+        let s: std::collections::HashSet<String> = ["d".repeat(64)].into();
+        assert!(grant_supersedes(&held, &grant, &s));
+    }
+
+    #[test]
+    fn a_swap_is_written_only_over_the_key_it_replaces() {
+        let held = with_pk(key("zone2", 1, 'a'), 'c');
+        let other = with_pk(key("zone2", 1, 'b'), 'd');
+        assert!(swap_allowed(Some(&held), &held));
+        assert!(!swap_allowed(Some(&other), &held));
+        assert!(!swap_allowed(None, &held));
+    }
+
+    #[test]
+    fn refused_keys_are_listed_once_and_bounded() {
+        let mut v = Vec::new();
+        let k = with_pk(key("zone2", 1, 'b'), 'd');
+        assert!(note_refused(&mut v, &k));
+        assert!(!note_refused(&mut v, &k));
+        for i in 0..(MAX_REFUSED_KEYS as u32 + 3) {
+            note_refused(&mut v, &key("zone9", i + 1, 'e'));
+        }
+        assert_eq!(v.len(), MAX_REFUSED_KEYS);
+        assert!(!v.contains(&k), "oldest dropped first");
+        assert_eq!(
+            refused_keys_id(&owner('a')),
+            format!("refused_keys:{}", "a".repeat(64))
+        );
     }
 }

@@ -458,6 +458,34 @@ impl ForumDb {
         Ok(ZoneKeyPut::Stored)
     }
 
+    /// Replace the key `owner` sees for `new`'s slot with `new`, but only
+    /// while that slot still holds `expected` (see
+    /// [`key_owner::swap_allowed`]); one transaction. Returns whether it
+    /// wrote. Used to resolve a conflict in favour of a refused grant; the
+    /// owner's own row is written, which `visible_keys` prefers over a
+    /// legacy row.
+    pub async fn replace_zone_key(
+        &self,
+        owner: &Owner,
+        expected: &crate::zone_crypto::ZoneKey,
+        new: &crate::zone_crypto::ZoneKey,
+    ) -> Result<bool, JsValue> {
+        if expected.store_id() != new.store_id() {
+            return Ok(false);
+        }
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
+        let store = tx.object_store(STORE_ZONE_KEYS)?;
+        let view = slot_view_in(&store, owner, &new.store_id()).await?;
+        if !key_owner::swap_allowed(view.as_ref(), expected) {
+            return Ok(false);
+        }
+        let rec = StoredZoneKey::owned(owner, new);
+        idb_request_result(&store.put(&to_js(&rec)?)?).await?;
+        Ok(true)
+    }
+
     /// Store a key this device just created as `owner`'s row: the slot guard
     /// of [`put_zone_key_unless_conflicting`](Self::put_zone_key_unless_conflicting),
     /// plus a check over every row on the device, of every owner, so two
