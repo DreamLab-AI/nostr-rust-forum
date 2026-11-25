@@ -132,6 +132,9 @@ pub struct ZoneKeyStore {
     /// [`key_owner::grant_supersedes`]; a `zk` tag alone proves nothing.
     /// Dropped on every identity switch.
     opened: StoredValue<HashMap<(String, u32, String), HashSet<String>>>,
+    /// Slots with an automatic resolution in flight: evidence arriving
+    /// meanwhile must not start a second (its compare-and-swap would refuse).
+    resolving: StoredValue<HashSet<(String, u32)>>,
     /// Highest `zk` epoch seen per `(zone named in the tag, channel)`, with the
     /// post id. The Encryption card counts only channels that resolve to the
     /// zone, so a tag in some other channel cannot steer a rotation. Kept
@@ -167,6 +170,7 @@ impl ZoneKeyStore {
             inbox_sk: StoredValue::new(None),
             conflicts: RwSignal::new(Vec::new()),
             opened: StoredValue::new(HashMap::new()),
+            resolving: StoredValue::new(HashSet::new()),
             epochs_seen: RwSignal::new(HashMap::new()),
         }
     }
@@ -516,13 +520,29 @@ impl ZoneKeyStore {
         let Some(entry) = candidate else {
             return;
         };
+        let slot = (zone.to_string(), epoch);
+        let first = self
+            .resolving
+            .try_update_value(|s| s.insert(slot.clone()))
+            .unwrap_or(false);
+        if !first {
+            return;
+        }
         let store = *self;
         spawn_local(async move {
-            if !store.is_current(&lease) {
+            let result = if store.is_current(&lease) {
+                Some(store.use_refused(&entry).await)
+            } else {
+                None
+            };
+            store.resolving.update_value(|s| {
+                s.remove(&slot);
+            });
+            let Some(result) = result else {
                 return;
-            }
+            };
             let k = &entry.key;
-            match store.use_refused(&entry).await {
+            match result {
                 Ok(()) => web_sys::console::log_1(
                     &format!(
                         "[zone-key] {} epoch {}: replaced a held key that opened no post with the key an admin granted, which opened {} or more",

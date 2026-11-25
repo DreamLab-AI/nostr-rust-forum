@@ -21,15 +21,22 @@ const SCOPE_KEY: &str = "nostrbbs:relay_scope";
 /// localStorage entries holding relay data, removed when the scope changes.
 pub const RELAY_SCOPED_LOCAL_KEYS: &[&str] = &[
     "nostrbbs_channel_cache",
-    "nostrbbs:notifications",
-    "nostrbbs:notif_sync",
     "admin_settings_cache",
     "nostrbbs_admin_seen_joiners",
+    "nostrbbs:push_refreshed_ms",
 ];
 
-/// Prefixes of localStorage entries holding relay data (per-zone sealed-search
-/// high-water marks), removed when the scope changes.
-pub const RELAY_SCOPED_LOCAL_PREFIXES: &[&str] = &["nbss:"];
+/// Prefixes of localStorage entries holding relay data, removed when the
+/// scope changes: per-zone sealed-search high-water marks, per-identity
+/// notification lists and sync cursors, deletion-sync cursors, and the
+/// "DM relay list already published" marks (the new relay needs its own).
+pub const RELAY_SCOPED_LOCAL_PREFIXES: &[&str] = &[
+    "nbss:",
+    "nostrbbs:notifications",
+    "nostrbbs:notif_sync",
+    "nostrbbs_deletion_sync",
+    "nostr_bbs_dm_relay_published_",
+];
 
 /// Whether localStorage entry `key` holds relay data.
 pub fn relay_scoped_local(key: &str) -> bool {
@@ -180,6 +187,13 @@ mod tests {
             assert!(!relay_scoped_local(kept), "{kept}");
         }
         assert!(relay_scoped_local("nbss:hw:zone2"));
+        let o = "a".repeat(64);
+        assert!(relay_scoped_local(&format!("nostrbbs:notifications:{o}")));
+        assert!(relay_scoped_local(&format!("nostrbbs:notif_sync:{o}")));
+        assert!(relay_scoped_local("nostrbbs_deletion_sync_v3_channels"));
+        assert!(relay_scoped_local(&format!(
+            "nostr_bbs_dm_relay_published_{o}"
+        )));
         assert!(relay_scoped_local("nostrbbs_channel_cache"));
         use crate::stores::indexed_db::relay_scoped_kv;
         let o = "a".repeat(64);
