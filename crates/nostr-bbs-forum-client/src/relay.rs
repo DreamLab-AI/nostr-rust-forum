@@ -1687,6 +1687,12 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
     }
 }
 
+/// The relay URL connections use (see [`get_relay_url`]); browser data is
+/// scoped to it (`stores::relay_scope`).
+pub(crate) fn configured_relay_url() -> String {
+    get_relay_url()
+}
+
 /// Read the relay URL from the environment or fall back to the default.
 fn get_relay_url() -> String {
     if let Some(window) = web_sys::window() {

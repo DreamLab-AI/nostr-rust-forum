@@ -238,10 +238,10 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         let held = keys.keys.get();
         keys.conflicts.with(|v| {
             v.iter()
-                .filter(|k| k.zone == zone_id)
-                .filter_map(|k| {
-                    let h = held.get(&k.store_id())?;
-                    crate::zone_crypto::conflicts(h, k).then(|| (k.clone(), h.pubkey.clone()))
+                .filter(|r| r.key.zone == zone_id)
+                .filter_map(|r| {
+                    let h = held.get(&r.key.store_id())?;
+                    crate::zone_crypto::conflicts(h, &r.key).then(|| (r.clone(), h.pubkey.clone()))
                 })
                 .collect::<Vec<_>>()
         })
@@ -602,25 +602,32 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 let c = zone_conflicts();
                 (!c.is_empty()).then(|| view! {
                     <div class="space-y-2" role="alert">
-                        {c.into_iter().map(|(offered, held_pk)| {
+                        {c.into_iter().map(|(entry, held_pk)| {
+                            let offered = entry.key.clone();
                             let short = |s: &str| s.get(..8).unwrap_or(s).to_string();
+                            let origin = if entry.displaced {
+                                "the key used before".to_string()
+                            } else {
+                                format!("granted by {}…", short(&offered.granted_by))
+                            };
                             let text = format!(
-                                "Two different keys for epoch {}: this device uses {}…; {}… (from {}…) was set aside. Posts that \"could not be decrypted\" usually mean the key in use is the stale one.",
+                                "Two different keys for epoch {}: this device uses {}…; {}… ({}) was set aside. Posts that \"could not be decrypted\" usually mean the key in use is the stale one.",
                                 offered.epoch,
                                 short(&held_pk),
                                 short(&offered.pubkey),
-                                short(&offered.granted_by),
+                                origin,
                             );
-                            let key = offered.clone();
+                            let label = if entry.displaced { "Use the earlier key" } else { "Use the granted key" };
                             view! {
                                 <div class="flex flex-wrap items-center gap-2 text-sm text-red-300">
                                     <span>{text}</span>
                                     <button
                                         class="px-2 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-200 text-xs"
                                         on:click=move |_| {
-                                            let key = key.clone();
+                                            let entry = entry.clone();
                                             spawn_local(async move {
-                                                match keys.use_refused(&key).await {
+                                                let key = entry.key.clone();
+                                                match keys.use_refused(&entry).await {
                                                     Ok(()) => status.set(Some(format!(
                                                         "Now using {}… for epoch {}; the other key is kept here in case you need it back.",
                                                         key.pubkey.get(..8).unwrap_or(&key.pubkey),
@@ -631,7 +638,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                                             });
                                         }
                                     >
-                                        "Use the granted key"
+                                        {label}
                                     </button>
                                 </div>
                             }

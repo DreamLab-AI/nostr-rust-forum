@@ -46,6 +46,7 @@ fn main() {
             .map(|v| v.is_undefined())
             .unwrap_or(true)
         {
+            stores::relay_scope::abandon();
             web_sys::console::warn_1(&"[relay-scope] storage check timed out; mounting".into());
         }
         leptos::mount::mount_to_body(App);

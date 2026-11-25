@@ -274,6 +274,33 @@ async fn row_in(
 /// The key `owner` sees for `store_id`, within the caller's transaction:
 /// [`key_owner::slot_view`] over their row and the legacy row. A row at the
 /// legacy id that carries an owner is not a legacy row and is ignored.
+/// The refused list stored under `id` in `kv` (empty when absent or
+/// unreadable as the current format).
+async fn refused_in(
+    kv: &web_sys::IdbObjectStore,
+    id: &str,
+) -> Result<Vec<key_owner::RefusedKey>, JsValue> {
+    let result = idb_request_result(&kv.get(&JsValue::from_str(id))?).await?;
+    if result.is_undefined() || result.is_null() {
+        return Ok(Vec::new());
+    }
+    let rec: ZoneKvRecord = from_js(result)?;
+    Ok(serde_json::from_str(&rec.value).unwrap_or_default())
+}
+
+async fn put_refused_in(
+    kv: &web_sys::IdbObjectStore,
+    id: &str,
+    list: &[key_owner::RefusedKey],
+) -> Result<(), JsValue> {
+    let rec = ZoneKvRecord {
+        id: id.to_string(),
+        value: serde_json::to_string(list).map_err(|e| JsValue::from_str(&e.to_string()))?,
+    };
+    idb_request_result(&kv.put(&to_js(&rec)?)?).await?;
+    Ok(())
+}
+
 async fn slot_view_in(
     store: &web_sys::IdbObjectStore,
     owner: &Owner,
@@ -460,30 +487,73 @@ impl ForumDb {
 
     /// Replace the key `owner` sees for `new`'s slot with `new`, but only
     /// while that slot still holds `expected` (see
-    /// [`key_owner::swap_allowed`]); one transaction. Returns whether it
-    /// wrote. Used to resolve a conflict in favour of a refused grant; the
-    /// owner's own row is written, which `visible_keys` prefers over a
-    /// legacy row.
-    pub async fn replace_zone_key(
+    /// [`key_owner::swap_allowed`]), and record `expected` as displaced in
+    /// `owner`'s refused list ([`key_owner::after_swap`]), in ONE transaction
+    /// over `zone_keys` and `zone_kv`: the displaced key (possibly its only
+    /// copy) is never lost between the two. Returns the stored refused list
+    /// after the swap, or `None` when the slot changed meanwhile (nothing
+    /// written). The owner's own row is written, which `visible_keys`
+    /// prefers over a legacy row.
+    pub async fn swap_zone_key(
         &self,
         owner: &Owner,
         expected: &crate::zone_crypto::ZoneKey,
         new: &crate::zone_crypto::ZoneKey,
-    ) -> Result<bool, JsValue> {
+    ) -> Result<Option<Vec<key_owner::RefusedKey>>, JsValue> {
         if expected.store_id() != new.store_id() {
-            return Ok(false);
+            return Ok(None);
         }
+        let names = js_sys::Array::of2(
+            &JsValue::from_str(STORE_ZONE_KEYS),
+            &JsValue::from_str(STORE_ZONE_KV),
+        );
         let tx = self
             .db
-            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
-        let store = tx.object_store(STORE_ZONE_KEYS)?;
-        let view = slot_view_in(&store, owner, &new.store_id()).await?;
+            .transaction_with_str_sequence_and_mode(&names, IdbTransactionMode::Readwrite)?;
+        let keys = tx.object_store(STORE_ZONE_KEYS)?;
+        let kv = tx.object_store(STORE_ZONE_KV)?;
+        let view = slot_view_in(&keys, owner, &new.store_id()).await?;
         if !key_owner::swap_allowed(view.as_ref(), expected) {
-            return Ok(false);
+            return Ok(None);
         }
+        let kv_id = key_owner::refused_keys_id(owner);
+        let list = key_owner::after_swap(refused_in(&kv, &kv_id).await?, new, expected);
         let rec = StoredZoneKey::owned(owner, new);
-        idb_request_result(&store.put(&to_js(&rec)?)?).await?;
-        Ok(true)
+        idb_request_result(&keys.put(&to_js(&rec)?)?).await?;
+        put_refused_in(&kv, &kv_id, &list).await?;
+        Ok(Some(list))
+    }
+
+    /// Add `entry` to `owner`'s stored refused list: read, merge
+    /// ([`key_owner::note_refused`]) and write in one transaction, so two
+    /// tabs never overwrite each other's entries. Returns the stored list.
+    pub async fn add_refused_key(
+        &self,
+        owner: &Owner,
+        entry: key_owner::RefusedKey,
+    ) -> Result<Vec<key_owner::RefusedKey>, JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KV, IdbTransactionMode::Readwrite)?;
+        let kv = tx.object_store(STORE_ZONE_KV)?;
+        let kv_id = key_owner::refused_keys_id(owner);
+        let mut list = refused_in(&kv, &kv_id).await?;
+        if key_owner::note_refused(&mut list, entry) {
+            put_refused_in(&kv, &kv_id, &list).await?;
+        }
+        Ok(list)
+    }
+
+    /// `owner`'s stored refused list.
+    pub async fn refused_keys(&self, owner: &Owner) -> Result<Vec<key_owner::RefusedKey>, JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KV, IdbTransactionMode::Readonly)?;
+        refused_in(
+            &tx.object_store(STORE_ZONE_KV)?,
+            &key_owner::refused_keys_id(owner),
+        )
+        .await
     }
 
     /// Store a key this device just created as `owner`'s row: the slot guard
@@ -808,7 +878,10 @@ impl ForumDb {
     /// channel, profile and deletion caches, the outbox (events signed for
     /// that relay are not sent to another), and the `zone_kv` bookkeeping in
     /// [`relay_scoped_kv`]. Zone keys, the inbox key and member choices stay.
-    pub async fn clear_relay_scoped(&self) -> Result<(), JsValue> {
+    ///
+    /// `go_on` is asked before each step; once it says no, nothing more is
+    /// cleared and `Ok(false)` is returned.
+    pub async fn clear_relay_scoped(&self, go_on: &dyn Fn() -> bool) -> Result<bool, JsValue> {
         for name in [
             STORE_MESSAGES,
             STORE_CHANNELS,
@@ -816,10 +889,16 @@ impl ForumDb {
             STORE_DELETIONS,
             STORE_OUTBOX,
         ] {
+            if !go_on() {
+                return Ok(false);
+            }
             let tx = self
                 .db
                 .transaction_with_str_and_mode(name, IdbTransactionMode::Readwrite)?;
             idb_request_result(&tx.object_store(name)?.clear()?).await?;
+        }
+        if !go_on() {
+            return Ok(false);
         }
         let tx = self
             .db
@@ -832,7 +911,7 @@ impl ForumDb {
                 idb_request_result(&store.delete(&k)?).await?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     // -- Eviction -----------------------------------------------------------
@@ -1071,15 +1150,18 @@ mod tests {
 }
 
 /// Whether `zone_kv` entry `id` records relay state, cleared when the relay
-/// changes: wraps unwrapped there, keys refused or received through the inbox
-/// there, grants sent there, and the old-grant cleanup flag. Never the inbox
-/// key, DM consents, or the public-inbox choice (they are the member's, not
-/// the relay's).
+/// changes: wraps unwrapped there, keys received through the inbox there,
+/// grants sent there (`grants_sent:…`; re-sending one repeats the same key),
+/// and the old-grant cleanup flag. Never anything holding a secret (the
+/// inbox key, refused and displaced keys), member choices (DM consents, the
+/// public-inbox choice), or the approved-targets sets: emptying those would
+/// re-open the first-grant confirmation gate to the new relay's whole roster.
 pub fn relay_scoped_kv(id: &str) -> bool {
     id.starts_with("processed_wraps")
         || id.starts_with("inbox_granted:")
-        || id.starts_with("refused_keys:")
         || id.starts_with("grant_cleanup_finished:")
-        || id == crate::zone_crypto::grant_ledger::KV_GRANTS_SENT
-        || id == crate::zone_crypto::grant_ledger::KV_APPROVED_TARGETS
+        || id.starts_with(&format!(
+            "{}:",
+            crate::zone_crypto::grant_ledger::KV_GRANTS_SENT
+        ))
 }

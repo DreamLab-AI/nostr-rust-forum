@@ -334,54 +334,93 @@ impl Session {
 
 // -- Conflicting keys for one slot ---------------------------------------------
 
-/// Most refused keys kept per identity (oldest dropped first). A slot holds
-/// at most a handful in practice; this bounds what a flood of admin grants
-/// could pile up in `zone_kv`.
+/// Most refused keys kept per identity. Only refused grants are dropped to
+/// stay within it (oldest first); a displaced key or this device's own
+/// undelivered key is never dropped, since it may be the only copy.
 pub const MAX_REFUSED_KEYS: usize = 16;
 
+/// Posts that must open under a refused key, with none opening under the
+/// held one, before the refused key replaces it without asking.
+pub const MIN_SWAP_EVIDENCE: usize = 3;
+
+/// A key set aside for a slot the identity holds a different key for.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefusedKey {
+    /// The key, secret included.
+    pub key: ZoneKey,
+    /// `true` when it was the held key and a resolution replaced it (so it
+    /// may be the only copy); `false` for a refused grant.
+    #[serde(default)]
+    pub displaced: bool,
+}
+
+impl RefusedKey {
+    /// Whether it must never be dropped to stay within [`MAX_REFUSED_KEYS`].
+    pub fn protected(&self) -> bool {
+        self.displaced || self.key.pending_delivery
+    }
+}
+
 /// `zone_kv` id of `owner`'s refused keys: keys a current admin granted for a
-/// slot this identity already held a different key for, kept (secret
-/// included, like `zone_keys` rows) so the conflict can be resolved later
-/// without the grant being delivered again.
+/// slot this identity already held a different key for, and held keys a
+/// resolution displaced. Kept whole (secret included, like `zone_keys`
+/// rows), so a conflict can be resolved later without the grant being
+/// delivered again. Never cleared with relay data.
 pub fn refused_keys_id(owner: &Owner) -> String {
     format!("refused_keys:{owner}")
 }
 
-/// Add `key` to `refused` unless the same key is already listed; the oldest
-/// entries go beyond [`MAX_REFUSED_KEYS`]. Returns whether the list changed.
-pub fn note_refused(refused: &mut Vec<ZoneKey>, key: &ZoneKey) -> bool {
-    if refused
-        .iter()
-        .any(|k| k.store_id() == key.store_id() && k.secret == key.secret && k.pubkey == key.pubkey)
-    {
+/// Add `entry` to `list` unless the same key is already listed (a displaced
+/// entry upgrades a listed refused one). Unprotected entries go, oldest
+/// first, beyond [`MAX_REFUSED_KEYS`]. Returns whether the list changed.
+pub fn note_refused(list: &mut Vec<RefusedKey>, entry: RefusedKey) -> bool {
+    let same = |r: &RefusedKey| {
+        r.key.store_id() == entry.key.store_id()
+            && r.key.secret == entry.key.secret
+            && r.key.pubkey == entry.key.pubkey
+    };
+    if let Some(r) = list.iter_mut().find(|r| same(r)) {
+        if entry.displaced && !r.displaced {
+            r.displaced = true;
+            return true;
+        }
         return false;
     }
-    refused.push(key.clone());
-    if refused.len() > MAX_REFUSED_KEYS {
-        let drop = refused.len() - MAX_REFUSED_KEYS;
-        refused.drain(..drop);
+    list.push(entry);
+    while list.len() > MAX_REFUSED_KEYS {
+        let Some(i) = list.iter().position(|r| !r.protected()) else {
+            break;
+        };
+        list.remove(i);
     }
     true
 }
 
+/// Remove `key` from `list`. Returns whether it was there.
+pub fn drop_refused(list: &mut Vec<RefusedKey>, key: &ZoneKey) -> bool {
+    let n = list.len();
+    list.retain(|r| !(r.key.store_id() == key.store_id() && r.key.secret == key.secret));
+    list.len() != n
+}
+
 /// Whether the refused `grant` should replace the `held` key for their slot
-/// without asking: the two conflict, the held key is not this device's own
-/// key still awaiting delivery, and the posts seen for the slot name the
-/// grant's epoch pubkey and never the held key's (`seen`: lower-case epoch
-/// pubkeys from `zk` tags for that zone and epoch). A post names the key it
-/// was encrypted to, so a held key no post names has opened nothing there,
-/// and cannot. "Opened nothing" alone is not enough: grants are processed
-/// before any post loads. The grant's sender must also still be an admin;
-/// the caller checks that.
+/// without asking: they conflict, the held key is not this device's own key
+/// still awaiting delivery, no post seen has opened under the held key
+/// (`held_opens`), and at least [`MIN_SWAP_EVIDENCE`] posts in the zone's own
+/// channels have actually opened under the grant (`grant_opens`). Opening is
+/// the evidence, not a post's `zk` tag, which anyone can write. "Opened
+/// nothing" alone is not enough: grants are processed before any post
+/// loads. The grant's sender must also still be an admin; the caller checks.
 pub fn grant_supersedes(
     held: &ZoneKey,
     grant: &ZoneKey,
-    seen: &std::collections::HashSet<String>,
+    held_opens: usize,
+    grant_opens: usize,
 ) -> bool {
     super::conflicts(held, grant)
         && !held.pending_delivery
-        && seen.contains(&grant.pubkey.to_ascii_lowercase())
-        && !seen.contains(&held.pubkey.to_ascii_lowercase())
+        && held_opens == 0
+        && grant_opens >= MIN_SWAP_EVIDENCE
 }
 
 /// Whether a replacement may be written over `view` (what the identity's
@@ -389,6 +428,24 @@ pub fn grant_supersedes(
 /// changed meanwhile (another tab, a new grant) is never overwritten.
 pub fn swap_allowed(view: Option<&ZoneKey>, expected: &ZoneKey) -> bool {
     view.is_some_and(|v| v.secret == expected.secret && v.pubkey == expected.pubkey)
+}
+
+/// The refused list after `new` replaced `displaced` for their slot: `new`
+/// removed, `displaced` kept as displaced.
+pub fn after_swap(
+    mut list: Vec<RefusedKey>,
+    new: &ZoneKey,
+    displaced: &ZoneKey,
+) -> Vec<RefusedKey> {
+    drop_refused(&mut list, new);
+    note_refused(
+        &mut list,
+        RefusedKey {
+            key: displaced.clone(),
+            displaced: true,
+        },
+    );
+    list
 }
 
 #[cfg(test)]
@@ -919,39 +976,32 @@ mod tests {
         ));
     }
 
-    fn seen(pks: &[&ZoneKey]) -> std::collections::HashSet<String> {
-        pks.iter().map(|k| k.pubkey.clone()).collect()
+    fn refused(k: ZoneKey) -> RefusedKey {
+        RefusedKey {
+            key: k,
+            displaced: false,
+        }
     }
 
     #[test]
-    fn a_grant_replaces_a_held_key_only_when_posts_name_the_grant_and_never_the_held_key() {
+    fn a_grant_replaces_a_held_key_only_on_opened_evidence() {
         let held = with_pk(key("zone2", 1, 'a'), 'c');
         let grant = with_pk(key("zone2", 1, 'b'), 'd');
-        // The pilot case: every post names the grant's pubkey.
-        assert!(grant_supersedes(&held, &grant, &seen(&[&grant])));
-        // At boot, before any post: never.
-        assert!(!grant_supersedes(&held, &grant, &Default::default()));
-        // Some post names the held key: both are in use, ask a human.
-        assert!(!grant_supersedes(&held, &grant, &seen(&[&grant, &held])));
-        // Posts only name the held key: keep it.
-        assert!(!grant_supersedes(&held, &grant, &seen(&[&held])));
+        // The pilot case: posts open under the grant, none under the held key.
+        assert!(grant_supersedes(&held, &grant, 0, MIN_SWAP_EVIDENCE));
+        // At boot, before any post, or on too little evidence: never.
+        assert!(!grant_supersedes(&held, &grant, 0, 0));
+        assert!(!grant_supersedes(&held, &grant, 0, MIN_SWAP_EVIDENCE - 1));
+        // A post opened under the held key: both are in use, ask a human.
+        assert!(!grant_supersedes(&held, &grant, 1, 50));
         // This device's own undelivered mint is never replaced silently.
         let mut mint = held.clone();
         mint.pending_delivery = true;
-        assert!(!grant_supersedes(&mint, &grant, &seen(&[&grant])));
+        assert!(!grant_supersedes(&mint, &grant, 0, 50));
         // The same key, or another slot, is no conflict.
-        assert!(!grant_supersedes(&held, &held, &seen(&[&held])));
+        assert!(!grant_supersedes(&held, &held, 0, 50));
         let other = with_pk(key("zone2", 2, 'b'), 'd');
-        assert!(!grant_supersedes(&held, &other, &seen(&[&other])));
-    }
-
-    #[test]
-    fn seen_pubkeys_compare_case_insensitively() {
-        let held = with_pk(key("zone2", 1, 'a'), 'c');
-        let mut grant = with_pk(key("zone2", 1, 'b'), 'd');
-        grant.pubkey = grant.pubkey.to_ascii_uppercase();
-        let s: std::collections::HashSet<String> = ["d".repeat(64)].into();
-        assert!(grant_supersedes(&held, &grant, &s));
+        assert!(!grant_supersedes(&held, &other, 0, 50));
     }
 
     #[test]
@@ -964,16 +1014,65 @@ mod tests {
     }
 
     #[test]
-    fn refused_keys_are_listed_once_and_bounded() {
+    fn a_swap_keeps_the_displaced_key_and_drops_the_used_one() {
+        let held = with_pk(key("zone2", 1, 'a'), 'c');
+        let grant = with_pk(key("zone2", 1, 'b'), 'd');
+        let list = after_swap(vec![refused(grant.clone())], &grant, &held);
+        assert_eq!(
+            list,
+            vec![RefusedKey {
+                key: held.clone(),
+                displaced: true
+            }]
+        );
+        // Swapping back restores the first state, the grant now displaced.
+        let back = after_swap(list, &held, &grant);
+        assert_eq!(
+            back,
+            vec![RefusedKey {
+                key: grant,
+                displaced: true
+            }]
+        );
+    }
+
+    #[test]
+    fn refused_keys_are_listed_once_and_only_unprotected_ones_are_dropped() {
         let mut v = Vec::new();
+        let displaced = RefusedKey {
+            key: with_pk(key("zone2", 1, 'a'), 'c'),
+            displaced: true,
+        };
+        let mut mint = with_pk(key("zone2", 2, 'f'), 'e');
+        mint.pending_delivery = true;
+        assert!(note_refused(&mut v, displaced.clone()));
+        assert!(note_refused(&mut v, refused(mint.clone())));
         let k = with_pk(key("zone2", 1, 'b'), 'd');
-        assert!(note_refused(&mut v, &k));
-        assert!(!note_refused(&mut v, &k));
+        assert!(note_refused(&mut v, refused(k.clone())));
+        assert!(!note_refused(&mut v, refused(k.clone())));
         for i in 0..(MAX_REFUSED_KEYS as u32 + 3) {
-            note_refused(&mut v, &key("zone9", i + 1, 'e'));
+            note_refused(&mut v, refused(key("zone9", i + 1, 'e')));
         }
         assert_eq!(v.len(), MAX_REFUSED_KEYS);
-        assert!(!v.contains(&k), "oldest dropped first");
+        assert!(v.contains(&displaced), "displaced keys are never dropped");
+        assert!(
+            v.iter().any(|r| r.key == mint),
+            "undelivered mints are never dropped"
+        );
+        assert!(
+            !v.iter().any(|r| r.key == k),
+            "oldest refused grant dropped first"
+        );
+        // A displaced entry upgrades a listed refused one.
+        let mut w = vec![refused(k.clone())];
+        assert!(note_refused(
+            &mut w,
+            RefusedKey {
+                key: k.clone(),
+                displaced: true
+            }
+        ));
+        assert!(w[0].displaced);
         assert_eq!(
             refused_keys_id(&owner('a')),
             format!("refused_keys:{}", "a".repeat(64))

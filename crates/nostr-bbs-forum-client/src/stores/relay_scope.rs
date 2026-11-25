@@ -49,10 +49,26 @@ pub fn scope_of(url: &str, epoch: Option<&str>) -> String {
     }
 }
 
-/// The current relay scope.
+thread_local! {
+    /// Set once the app has mounted without waiting for [`enforce`]: a clear
+    /// still running then stops before its next step, so it never deletes
+    /// what the live app writes; it is retried on the next load.
+    static ABANDONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Stop a still-running [`enforce`] before its next step (see `ABANDONED`).
+pub fn abandon() {
+    ABANDONED.with(|a| a.set(true));
+}
+
+fn go_on() -> bool {
+    !ABANDONED.with(std::cell::Cell::get)
+}
+
+/// The current relay scope, from the URL the relay connection itself uses.
 pub fn current() -> String {
     scope_of(
-        &crate::utils::relay_url::relay_url(),
+        &crate::relay::configured_relay_url(),
         crate::utils::relay_url::window_env("VITE_RELAY_EPOCH").as_deref(),
     )
 }
@@ -78,12 +94,19 @@ pub async fn enforce() {
     let mut ok = true;
     // No IndexedDB at all (blocked storage): nothing persisted there to clear.
     if let Ok(db) = crate::stores::indexed_db::ForumDb::open().await {
-        if let Err(e) = db.clear_relay_scoped().await {
-            web_sys::console::warn_1(
-                &format!("[relay-scope] clearing cached relay data failed: {e:?}").into(),
-            );
-            ok = false;
+        match db.clear_relay_scoped(&go_on).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                web_sys::console::warn_1(
+                    &format!("[relay-scope] clearing cached relay data failed: {e:?}").into(),
+                );
+                ok = false;
+            }
         }
+    }
+    if !go_on() {
+        return;
     }
     crate::utils::sealed_search::wipe();
     let n = storage.length().unwrap_or(0);
@@ -96,8 +119,14 @@ pub async fn enforce() {
             ok = false;
         }
     }
+    if ok && storage.set_item(SCOPE_KEY, &now).is_err() {
+        web_sys::console::warn_1(
+            &"[relay-scope] could not record the relay scope; the clear repeats on the next load"
+                .into(),
+        );
+        ok = false;
+    }
     if ok {
-        let _ = storage.set_item(SCOPE_KEY, &now);
         web_sys::console::log_1(
             &format!(
                 "[relay-scope] relay changed ({} -> {now}): cleared cached relay data",
@@ -154,14 +183,14 @@ mod tests {
         assert!(relay_scoped_local("nostrbbs_channel_cache"));
         use crate::stores::indexed_db::relay_scoped_kv;
         let o = "a".repeat(64);
+        use crate::zone_crypto::grant_ledger::{approved_id, ledger_id, ledger_id_v1};
         for cleared in [
             "processed_wraps".to_string(),
             format!("processed_wraps:{}", scope_of("wss://x", None)),
             format!("inbox_granted:{o}"),
-            format!("refused_keys:{o}"),
             format!("grant_cleanup_finished:v1:{o}"),
-            "grants_sent".into(),
-            "zone_approved_targets".into(),
+            ledger_id("zone2", 1),
+            ledger_id_v1("zone2", 1),
         ] {
             assert!(relay_scoped_kv(&cleared), "{cleared}");
         }
@@ -170,6 +199,9 @@ mod tests {
             format!("dm_accepted:v1:{o}"),
             format!("dm-foreign-consent/v1/{o}/{o}"),
             format!("public_inbox:v1:{o}"),
+            // Secrets and the first-grant gate are never relay data.
+            format!("refused_keys:{o}"),
+            approved_id("zone2"),
         ] {
             assert!(!relay_scoped_kv(&kept), "{kept}");
         }
