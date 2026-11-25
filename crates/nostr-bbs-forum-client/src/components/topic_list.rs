@@ -219,6 +219,29 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
     out
 }
 
+/// Fold the relay's per-topic stats into window-derived summaries: the
+/// reply count becomes the exact total when that is larger (the window may
+/// hold a fraction of the topic), and a newer reply than any held sets the
+/// last activity and last participant. Re-sorted, newest activity first.
+/// `stats` returns (exact total, newest reply as (created_at, author)).
+pub fn with_topic_stats(
+    mut topics: Vec<TopicSummary>,
+    mut stats: impl FnMut(&TopicSummary) -> (u32, Option<(u64, String)>),
+) -> Vec<TopicSummary> {
+    for t in &mut topics {
+        let (total, latest) = stats(t);
+        t.reply_count = t.reply_count.max(total);
+        if let Some((ts, pk)) = latest {
+            if ts > t.last_activity {
+                t.last_activity = ts;
+                t.last_pubkey = pk;
+            }
+        }
+    }
+    topics.sort_by_key(|b| std::cmp::Reverse(b.last_activity));
+    topics
+}
+
 /// Render the section as a list of topic rows.
 #[component]
 pub fn TopicList(
@@ -538,5 +561,55 @@ mod tests {
         assert_eq!(topic_title(""), "(untitled topic)");
         let long: String = "x".repeat(200);
         assert!(topic_title(&long).ends_with('\u{2026}'));
+    }
+
+    fn summary(id: &str, replies: u32, last: u64, last_pk: &str) -> TopicSummary {
+        TopicSummary {
+            id: id.into(),
+            pubkey: "root".into(),
+            content: id.into(),
+            created_at: 1,
+            reply_count: replies,
+            last_activity: last,
+            last_pubkey: last_pk.into(),
+        }
+    }
+
+    #[test]
+    fn exact_totals_and_newest_reply_replace_window_figures() {
+        // Wartracker: 26 replies held in the window, ~24k on the relay, its
+        // newest reply newer than anything held; a quiet topic is untouched.
+        let topics = vec![
+            summary("quiet", 3, 500, "ann"),
+            summary("wartracker", 26, 100, "bob"),
+        ];
+        let out = with_topic_stats(topics, |t| match t.id.as_str() {
+            "wartracker" => (24_013, Some((900, "cat".to_string()))),
+            _ => (3, Some((400, "old".to_string()))),
+        });
+        assert_eq!(out[0].id, "wartracker", "re-sorted by true activity");
+        assert_eq!(
+            (
+                out[0].reply_count,
+                out[0].last_activity,
+                out[0].last_pubkey.as_str()
+            ),
+            (24_013, 900, "cat")
+        );
+        assert_eq!(
+            (
+                out[1].reply_count,
+                out[1].last_activity,
+                out[1].last_pubkey.as_str()
+            ),
+            (3, 500, "ann"),
+            "an older relay answer never replaces a newer held reply"
+        );
+    }
+
+    #[test]
+    fn stats_not_in_yet_leave_the_window_figures() {
+        let out = with_topic_stats(vec![summary("t", 5, 50, "dan")], |_| (0, None));
+        assert_eq!((out[0].reply_count, out[0].last_activity), (5, 50));
     }
 }
