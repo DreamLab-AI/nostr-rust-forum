@@ -946,6 +946,23 @@ impl ForumDb {
     }
 }
 
+/// Whether `zone_kv` entry `id` records relay state, cleared when the relay
+/// changes: wraps unwrapped there, keys received through the inbox there,
+/// grants sent there (`grants_sent:…`; re-sending one repeats the same key),
+/// and the old-grant cleanup flag. Never anything holding a secret (the
+/// inbox key, refused and displaced keys), member choices (DM consents, the
+/// public-inbox choice), or the approved-targets sets: emptying those would
+/// re-open the first-grant confirmation gate to the new relay's whole roster.
+pub fn relay_scoped_kv(id: &str) -> bool {
+    id.starts_with("processed_wraps")
+        || id.starts_with("inbox_granted:")
+        || id.starts_with("grant_cleanup_finished:")
+        || id.starts_with(&format!(
+            "{}:",
+            crate::zone_crypto::grant_ledger::KV_GRANTS_SENT
+        ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,21 +1164,4 @@ mod tests {
             "a flag-off legacy row is already where it belongs: never moved"
         );
     }
-}
-
-/// Whether `zone_kv` entry `id` records relay state, cleared when the relay
-/// changes: wraps unwrapped there, keys received through the inbox there,
-/// grants sent there (`grants_sent:…`; re-sending one repeats the same key),
-/// and the old-grant cleanup flag. Never anything holding a secret (the
-/// inbox key, refused and displaced keys), member choices (DM consents, the
-/// public-inbox choice), or the approved-targets sets: emptying those would
-/// re-open the first-grant confirmation gate to the new relay's whole roster.
-pub fn relay_scoped_kv(id: &str) -> bool {
-    id.starts_with("processed_wraps")
-        || id.starts_with("inbox_granted:")
-        || id.starts_with("grant_cleanup_finished:")
-        || id.starts_with(&format!(
-            "{}:",
-            crate::zone_crypto::grant_ledger::KV_GRANTS_SENT
-        ))
 }
