@@ -35,10 +35,16 @@ use super::{is_zone_message, read_outcome, resolve_event, validate_grant, ZoneKe
 use crate::relay::{EventCallback, Filter, RelayConnection};
 use crate::stores::indexed_db::{ForumDb, MintPut, ZoneKeyPut};
 
-/// `zone_kv` id holding the ids of gift wraps already unwrapped here. Shared
-/// by every identity on the device: the relay serves a wrap only to its
-/// addressee, so one identity's entries never cover another's wraps.
-const KV_PROCESSED: &str = "processed_wraps";
+/// `zone_kv` id holding the ids of gift wraps already unwrapped here, for the
+/// current relay scope ([`crate::stores::relay_scope`]). Shared by every
+/// identity on the device: the relay serves a wrap only to its addressee, so
+/// one identity's entries never cover another's wraps. The scope in the id
+/// means a new relay re-reads its wraps; it also retires the unscoped set
+/// written before refused keys were kept, so grants refused then (marked
+/// processed, their key dropped) are unwrapped once more and recorded.
+fn kv_processed() -> String {
+    format!("processed_wraps:{}", crate::stores::relay_scope::current())
+}
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
@@ -699,7 +705,7 @@ impl ZoneKeyStore {
             web_sys::console::warn_1(&"[zone-key] store migration failed".into());
         }
         let rows = db.zone_key_rows().await;
-        let processed = db.get_zone_kv(KV_PROCESSED).await;
+        let processed = db.get_zone_kv(&kv_processed()).await;
         let inbox = db
             .get_zone_kv(&key_owner::inbox_granted_id(lease.owner()))
             .await;
@@ -1167,7 +1173,7 @@ impl ZoneKeyStore {
         });
         let ids: Vec<String> = self.processed.with_value(|s| s.iter().cloned().collect());
         if let (Ok(db), Ok(json)) = (ForumDb::open().await, serde_json::to_string(&ids)) {
-            let _ = db.put_zone_kv(KV_PROCESSED, &json).await;
+            let _ = db.put_zone_kv(&kv_processed(), &json).await;
         }
     }
 

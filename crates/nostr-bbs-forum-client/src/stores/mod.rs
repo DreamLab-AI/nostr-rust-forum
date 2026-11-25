@@ -20,6 +20,7 @@ pub mod profile_cache;
 pub mod reactions;
 pub mod read_position;
 pub mod receipts;
+pub mod relay_scope;
 pub mod signer_admin;
 pub mod tombstones;
 pub mod zone_access;

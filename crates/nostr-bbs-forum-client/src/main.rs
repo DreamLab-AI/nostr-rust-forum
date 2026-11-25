@@ -25,21 +25,45 @@ fn main() {
 
     web_sys::console::log_1(&"[nostr-bbs] WASM main() started".into());
 
-    leptos::mount::mount_to_body(App);
+    // Cached relay data from another relay is cleared before anything reads
+    // it (see `stores::relay_scope`); the app mounts once that is done.
+    wasm_bindgen_futures::spawn_local(async {
+        // Never let a stuck IndexedDB keep the app from mounting: after 3 s
+        // it mounts anyway, the scope stays unrecorded, and the clear is
+        // retried on the next load.
+        let enforce = wasm_bindgen_futures::future_to_promise(async {
+            stores::relay_scope::enforce().await;
+            Ok(wasm_bindgen::JsValue::TRUE)
+        });
+        let timeout = js_sys::Promise::new(&mut |resolve, _| {
+            if let Some(w) = web_sys::window() {
+                let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 3_000);
+            }
+        });
+        let first = js_sys::Promise::race(&js_sys::Array::of2(&enforce, &timeout));
+        if wasm_bindgen_futures::JsFuture::from(first)
+            .await
+            .map(|v| v.is_undefined())
+            .unwrap_or(true)
+        {
+            web_sys::console::warn_1(&"[relay-scope] storage check timed out; mounting".into());
+        }
+        leptos::mount::mount_to_body(App);
 
-    web_sys::console::log_1(&"[nostr-bbs] mount_to_body complete".into());
+        web_sys::console::log_1(&"[nostr-bbs] mount_to_body complete".into());
 
-    // Remove the static loading screen now that the Leptos app has mounted.
-    if let Some(el) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("loading-screen"))
-    {
-        el.remove();
-    }
+        // Remove the static loading screen now that the Leptos app has mounted.
+        if let Some(el) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("loading-screen"))
+        {
+            el.remove();
+        }
 
-    // Register service worker and run offline startup tasks.
-    register_service_worker();
-    run_offline_startup();
+        // Register service worker and run offline startup tasks.
+        register_service_worker();
+        run_offline_startup();
+    });
 }
 
 /// Register the service worker for offline caching.

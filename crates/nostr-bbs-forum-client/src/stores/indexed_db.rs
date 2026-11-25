@@ -773,6 +773,40 @@ impl ForumDb {
         Ok(!result.is_undefined() && !result.is_null())
     }
 
+    // -- Relay scope ------------------------------------------------------------
+
+    /// Drop everything here that came from, or was decided against, a
+    /// particular relay (see [`crate::stores::relay_scope`]): the message,
+    /// channel, profile and deletion caches, the outbox (events signed for
+    /// that relay are not sent to another), and the `zone_kv` bookkeeping in
+    /// [`relay_scoped_kv`]. Zone keys, the inbox key and member choices stay.
+    pub async fn clear_relay_scoped(&self) -> Result<(), JsValue> {
+        for name in [
+            STORE_MESSAGES,
+            STORE_CHANNELS,
+            STORE_PROFILES,
+            STORE_DELETIONS,
+            STORE_OUTBOX,
+        ] {
+            let tx = self
+                .db
+                .transaction_with_str_and_mode(name, IdbTransactionMode::Readwrite)?;
+            idb_request_result(&tx.object_store(name)?.clear()?).await?;
+        }
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KV, IdbTransactionMode::Readwrite)?;
+        let store = tx.object_store(STORE_ZONE_KV)?;
+        let keys = idb_request_result(&store.get_all_keys()?).await?;
+        let keys: js_sys::Array = keys.dyn_into().unwrap_or_else(|_| js_sys::Array::new());
+        for k in keys.iter() {
+            if k.as_string().is_some_and(|id| relay_scoped_kv(&id)) {
+                idb_request_result(&store.delete(&k)?).await?;
+            }
+        }
+        Ok(())
+    }
+
     // -- Eviction -----------------------------------------------------------
 
     /// Remove messages older than `max_age_secs` from the messages store.
@@ -1006,4 +1040,18 @@ mod tests {
             "a flag-off legacy row is already where it belongs: never moved"
         );
     }
+}
+
+/// Whether `zone_kv` entry `id` records relay state, cleared when the relay
+/// changes: wraps unwrapped there, keys refused or received through the inbox
+/// there, grants sent there, and the old-grant cleanup flag. Never the inbox
+/// key, DM consents, or the public-inbox choice (they are the member's, not
+/// the relay's).
+pub fn relay_scoped_kv(id: &str) -> bool {
+    id.starts_with("processed_wraps")
+        || id.starts_with("inbox_granted:")
+        || id.starts_with("refused_keys:")
+        || id.starts_with("grant_cleanup_finished:")
+        || id == crate::zone_crypto::grant_ledger::KV_GRANTS_SENT
+        || id == crate::zone_crypto::grant_ledger::KV_APPROVED_TARGETS
 }
