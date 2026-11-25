@@ -310,6 +310,23 @@ fn redirect_spinner() -> impl IntoView {
 
 #[component]
 pub fn App() -> impl IntoView {
+    // Sign-in link (sheet QR / tapped link, `utils::connect_link`): take the
+    // key FIRST, before any provider, effect or the router runs. The
+    // index.html script already scrubbed it from the address bar; this takes
+    // it from that one-shot hand-off (or scrubs `location.hash` itself), keeps
+    // it only on `<base>/` or `<base>/connect`, and parks it in a zeroising
+    // slot. The URL is then pointed at `/connect` so the router mounts the
+    // connect page rather than `HomeOrForums`, which would bounce a
+    // signed-out visitor to the login page.
+    if let Some(key) = crate::utils::connect_link::take_pending_key(&base_href("")) {
+        crate::utils::connect_link::stash(key);
+        if let Some(w) = web_sys::window() {
+            let _ = w.history().and_then(|h| {
+                h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&base_href("/connect")))
+            });
+        }
+    }
+
     // Defensive, no-op-safe capture of any `beforeinstallprompt` that fires on
     // the forum origin (the real prompt lives on the BBS page, ADR-109). Called
     // once, as early as possible per MDN (the event can originate from an
@@ -410,7 +427,13 @@ pub fn App() -> impl IntoView {
                 };
                 rebaked.set_value(true);
                 leptos::task::spawn_local(async move {
-                    if crate::utils::bake::is_baked().await {
+                    // Re-bake when there is no bake, or when the bake belongs
+                    // to another account (an in-app account switch): the next
+                    // launch must adopt the account signed in now.
+                    let current = auth.pubkey().get_untracked();
+                    if crate::utils::bake::is_baked().await
+                        && crate::utils::bake::baked_pubkey().is_none_or(|p| Some(p) == current)
+                    {
                         return;
                     }
                     let Some(secret) = auth.get_privkey_bytes() else {

@@ -14,6 +14,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::app::{base_href, safe_return_to};
 use crate::auth::nip07;
 use crate::auth::use_auth;
+use crate::components::sheet_scanner::SheetScanner;
 use crate::stores::preferences::use_preferences;
 
 #[component]
@@ -120,6 +121,8 @@ pub fn LoginPage() -> impl IntoView {
         }
     };
 
+    let standalone = crate::utils::pwa_install::is_standalone();
+
     view! {
         <div class="min-h-[80vh] flex items-center justify-center px-4">
             <div class="w-full max-w-md">
@@ -135,6 +138,17 @@ pub fn LoginPage() -> impl IntoView {
                             {move || error.get().unwrap_or_default()}
                         </div>
                     </Show>
+
+                    // Sign-in sheet: scan its QR (camera or photo). First and
+                    // most prominent in an installed app, where storage is
+                    // separate from the browser (iOS) and the sheet is the
+                    // usual way in.
+                    <div class=move || if standalone { "space-y-2" } else { "space-y-2 border-b border-gray-700/60 pb-5" }>
+                        <p class="text-sm text-gray-300 text-center">
+                            {if standalone { "Sign in to the app with your sign-in sheet" } else { "Have a sign-in sheet?" }}
+                        </p>
+                        <SheetScanner />
+                    </div>
 
                     // Smart primary auth: extension if detected, key input otherwise
                     <Show

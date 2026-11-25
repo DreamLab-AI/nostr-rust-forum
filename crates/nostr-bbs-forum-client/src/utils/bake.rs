@@ -134,7 +134,12 @@ pub async fn bake(secret: &[u8; 32], zone_id: &str) -> Result<(), BakeError> {
 
     // (5) BootProfile last — its presence in localStorage is the "installed"
     // signal the BBS boot and this crate's `is_baked()` key off.
-    let profile = BootProfile::new(zone_id.to_string(), js_now_secs());
+    // Bind the profile to the baked identity (public pubkey only) so an
+    // account switch is detectable (see [`baked_pubkey`]).
+    let mut profile = BootProfile::new(zone_id.to_string(), js_now_secs());
+    if let Ok(pk) = nostr_bbs_core::keys::pubkey_hex(secret) {
+        profile = profile.with_pubkey(pk);
+    }
     let json = serde_json::to_string(&profile).map_err(|e| BakeError::Storage(e.to_string()))?;
     LocalStorage::set(BOOTPROFILE_KEY, json).map_err(|e| BakeError::Storage(format!("{e:?}")))?;
 
@@ -172,6 +177,15 @@ pub async fn is_baked() -> bool {
         .ok()
         .and_then(|json| nostr_bbs_core::parse_boot_profile(&json))
         .is_some()
+}
+
+/// Pubkey the current bake is bound to, when the BootProfile records one.
+/// `None` for no bake, or a bake written before profiles carried a pubkey.
+pub fn baked_pubkey() -> Option<String> {
+    LocalStorage::get::<String>(BOOTPROFILE_KEY)
+        .ok()
+        .and_then(|json| nostr_bbs_core::parse_boot_profile(&json))
+        .and_then(|p| p.pubkey)
 }
 
 /// READ side for the forum's own `?pwa=1` one-shot boot: decrypt and return
