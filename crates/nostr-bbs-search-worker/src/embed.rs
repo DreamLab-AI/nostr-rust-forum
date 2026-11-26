@@ -155,7 +155,10 @@ pub fn parse_openai_embeddings(body: &str, n: usize) -> std::result::Result<Vec<
             return Err(format!("index {idx} out of range for {n} inputs"));
         }
         if item.embedding.len() != DIM {
-            return Err(format!("{}-dim vector, expected {DIM}", item.embedding.len()));
+            return Err(format!(
+                "{}-dim vector, expected {DIM}",
+                item.embedding.len()
+            ));
         }
         if slots[idx].is_some() {
             return Err(format!("duplicate index {idx}"));
@@ -241,9 +244,7 @@ pub async fn embed_texts(env: &Env, texts: &[String]) -> (Vec<Vec<f32>>, String)
         match run_openai(env, &cfg, texts).await {
             Ok(embeddings) => return (embeddings, cfg.label),
             Err(e) => {
-                worker::console_warn!(
-                    "EMBED_URL embedding failed ({e}); trying the next backend"
-                );
+                worker::console_warn!("EMBED_URL embedding failed ({e}); trying the next backend");
             }
         }
     }
@@ -349,7 +350,10 @@ mod tests {
     #[test]
     fn openai_config_requires_url() {
         assert_eq!(OpenAiEmbedConfig::from_vars(None, None, None), None);
-        assert_eq!(OpenAiEmbedConfig::from_vars(Some("  "), Some("m"), None), None);
+        assert_eq!(
+            OpenAiEmbedConfig::from_vars(Some("  "), Some("m"), None),
+            None
+        );
     }
 
     #[test]
@@ -360,8 +364,9 @@ mod tests {
         // Never the Workers AI label by default: pooling may differ.
         assert_eq!(c.label, "bge-small-en-v1.5@openai-compat");
         assert_ne!(c.label, MODEL_LABEL_SEMANTIC);
-        let c = OpenAiEmbedConfig::from_vars(Some("http://h/v1/embeddings"), Some("x"), Some("lbl"))
-            .unwrap();
+        let c =
+            OpenAiEmbedConfig::from_vars(Some("http://h/v1/embeddings"), Some("x"), Some("lbl"))
+                .unwrap();
         assert_eq!(c.endpoint, "http://h/v1/embeddings");
         assert_eq!(c.model, "x");
         assert_eq!(c.label, "lbl");
@@ -373,7 +378,10 @@ mod tests {
         let b = openai_request_body("m", &["a".into(), long]);
         assert_eq!(b["model"], "m");
         assert_eq!(b["input"][0], "a");
-        assert_eq!(b["input"][1].as_str().unwrap().chars().count(), EMBED_URL_MAX_CHARS);
+        assert_eq!(
+            b["input"][1].as_str().unwrap().chars().count(),
+            EMBED_URL_MAX_CHARS
+        );
     }
 
     #[test]
@@ -407,10 +415,15 @@ mod tests {
         // duplicate index
         assert!(parse_openai_embeddings(&format!(r#"{{"data":[{one},{one}]}}"#), 2).is_err());
         // out of range
-        let oor = format!(r#"{{"data":[{{"index":5,"embedding":{}}}]}}"#, vec_json(1.0));
+        let oor = format!(
+            r#"{{"data":[{{"index":5,"embedding":{}}}]}}"#,
+            vec_json(1.0)
+        );
         assert!(parse_openai_embeddings(&oor, 1).is_err());
         // wrong dim
-        assert!(parse_openai_embeddings(r#"{"data":[{"index":0,"embedding":[1,2,3]}]}"#, 1).is_err());
+        assert!(
+            parse_openai_embeddings(r#"{"data":[{"index":0,"embedding":[1,2,3]}]}"#, 1).is_err()
+        );
         // not JSON
         assert!(parse_openai_embeddings("nope", 1).is_err());
     }

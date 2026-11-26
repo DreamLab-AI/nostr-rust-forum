@@ -16,8 +16,8 @@
 //!
 //! All integers little-endian.
 
-use crate::DIM;
 use crate::quant::{CODE_BYTES, I8_ROW_BYTES};
+use crate::DIM;
 
 const MAGIC: &[u8; 4] = b"NBSS";
 /// Most rows one object may declare (checked before any allocation).
@@ -107,9 +107,13 @@ impl Header {
         };
         let scope_b = take(7, 1)?[0];
         let zl = take(8, 1)?[0] as usize;
-        let zone = std::str::from_utf8(take(9, zl)?).map_err(|_| "bad zone")?.to_string();
+        let zone = std::str::from_utf8(take(9, zl)?)
+            .map_err(|_| "bad zone")?
+            .to_string();
         let mut o = 9 + zl;
-        let u32_at = |o: usize| -> Result<u32, String> { Ok(u32::from_le_bytes(take(o, 4)?.try_into().unwrap())) };
+        let u32_at = |o: usize| -> Result<u32, String> {
+            Ok(u32::from_le_bytes(take(o, 4)?.try_into().unwrap()))
+        };
         let epoch = u32_at(o)?;
         let zone_pk: [u8; 32] = take(o + 4, 32)?.try_into().unwrap();
         o += 36;
@@ -133,7 +137,19 @@ impl Header {
             }
             _ => return Err("bad scope".into()),
         };
-        Ok((Self { kind, scope, zone, epoch, zone_pk, shard, index_version, count }, o))
+        Ok((
+            Self {
+                kind,
+                scope,
+                zone,
+                epoch,
+                zone_pk,
+                shard,
+                index_version,
+                count,
+            },
+            o,
+        ))
     }
 
     /// Body length the header implies.
@@ -220,7 +236,16 @@ mod tests {
     #[test]
     fn header_roundtrip_both_scopes() {
         for scope in [Scope::Base, Scope::Author([7u8; 32])] {
-            let h = Header { kind: Kind::Int8, scope, zone: "zone2".into(), epoch: 3, zone_pk: [5u8; 32], shard: 9, index_version: 42, count: 5 };
+            let h = Header {
+                kind: Kind::Int8,
+                scope,
+                zone: "zone2".into(),
+                epoch: 3,
+                zone_pk: [5u8; 32],
+                shard: 9,
+                index_version: 42,
+                count: 5,
+            };
             let b = h.encode();
             let (d, n) = Header::decode(&b).unwrap();
             assert_eq!(d, h);
@@ -232,8 +257,21 @@ mod tests {
 
     #[test]
     fn bin_layer_roundtrip_and_length_check() {
-        let h = Header { kind: Kind::Bin, scope: Scope::Base, zone: "z".into(), epoch: 1, zone_pk: [5u8; 32], shard: 0, index_version: 1, count: 2 };
-        let p = encode_bin(&h, &[[1u8; 32], [2u8; 32]], &[[3u8; CODE_BYTES], [4u8; CODE_BYTES]]);
+        let h = Header {
+            kind: Kind::Bin,
+            scope: Scope::Base,
+            zone: "z".into(),
+            epoch: 1,
+            zone_pk: [5u8; 32],
+            shard: 0,
+            index_version: 1,
+            count: 2,
+        };
+        let p = encode_bin(
+            &h,
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; CODE_BYTES], [4u8; CODE_BYTES]],
+        );
         let l = BinLayer::parse(&p).unwrap();
         assert_eq!(l.id(1), [2u8; 32]);
         assert_eq!(l.code(0), &[3u8; CODE_BYTES]);

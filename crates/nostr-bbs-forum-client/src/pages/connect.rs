@@ -15,7 +15,7 @@
 //! * **Never replace an account silently.** Before importing, the page checks
 //!   for ANY identity already on this device (live session, persisted session
 //!   of any kind, stored key, installed-app bake; see
-//!   [`AuthStore::prior_identity`]). If one belongs to another account, the
+//!   `AuthStore::prior_identity`). If one belongs to another account, the
 //!   member must confirm the switch. A scan usually opens a fresh tab whose
 //!   sessionStorage is empty, so a live-session check alone would miss it.
 //! * **Import through the existing path.** `login_with_local_key` does the

@@ -313,7 +313,10 @@ async fn v1_count(env: &Env, key: &str) -> Result<usize> {
     let obj = env
         .bucket("VECTORS")?
         .get(key)
-        .range(Range::OffsetWithLength { offset: 0, length: 64 })
+        .range(Range::OffsetWithLength {
+            offset: 0,
+            length: 64,
+        })
         .execute()
         .await?;
     let Some(body) = obj.as_ref().and_then(|o| o.body()) else {
@@ -330,11 +333,12 @@ async fn load_store_bytes(env: &Env) -> Result<Vec<u8>> {
         // return an object with no body (e.g. zero-length write race or
         // bucket inconsistency); surface a typed worker::Error instead so
         // the caller returns a 5xx rather than crashing the isolate.
-        Some(obj) => obj
-            .body()
-            .ok_or_else(|| worker::Error::RustError("R2 object missing body".into()))?
-            .bytes()
-            .await,
+        Some(obj) => {
+            obj.body()
+                .ok_or_else(|| worker::Error::RustError("R2 object missing body".into()))?
+                .bytes()
+                .await
+        }
         None => Ok(Vec::new()),
     }
 }
@@ -521,7 +525,11 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
             let candidates =
                 store::search_rvf(&store_bytes, &embedding, overfetch_k(k), body.min_score);
             drop(store_bytes);
-            (visible_top_k(&candidates, &public_labels, k), label_to_id, total_vectors)
+            (
+                visible_top_k(&candidates, &public_labels, k),
+                label_to_id,
+                total_vectors,
+            )
         }
     };
 
@@ -695,7 +703,10 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         vec.copy_from_slice(&entry.embedding);
         entries.push(index_v2::NewEntry {
             id: entry.id.clone(),
-            zone: entry.zone.clone().unwrap_or_else(|| shard::DEFAULT_ZONE.to_string()),
+            zone: entry
+                .zone
+                .clone()
+                .unwrap_or_else(|| shard::DEFAULT_ZONE.to_string()),
             public: entry.public,
             vec,
         });
@@ -722,7 +733,11 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         js_sys::Date::now() as u64,
         (js_sys::Math::random() * f64::from(u32::MAX)) as u32
     );
-    let outcome = match index_v2::ingest(env, &store_key, &ingest_model, entries, &nonce, || v1_rows(env)).await {
+    let outcome = match index_v2::ingest(env, &store_key, &ingest_model, entries, &nonce, || {
+        v1_rows(env)
+    })
+    .await
+    {
         Ok(o) => o,
         Err(index_v2::IngestError::ModelMismatch(indexed)) => {
             console_error!(
@@ -743,7 +758,6 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         }
         Err(index_v2::IngestError::Worker(e)) => return Err(e),
     };
-
 
     json_response(
         req,
@@ -854,7 +868,12 @@ async fn handle_purge(req: &Request, env: &Env) -> Result<Response> {
         kv.delete(&k).await?;
     }
     console_log!("Search worker: purged {deleted} R2 objects and KV mapping/snippets");
-    json_response(req, env, &serde_json::json!({ "purged": deleted, "kv": ["mapping", "snippets"] }), 200)
+    json_response(
+        req,
+        env,
+        &serde_json::json!({ "purged": deleted, "kv": ["mapping", "snippets"] }),
+        200,
+    )
 }
 
 async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
@@ -939,7 +958,11 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             // through the v2 index during this request. The counter is per
             // isolate, so concurrent requests on one isolate blur it.
             let ops = index_v2::take_r2_ops();
-            if env.var("SEARCH_DEBUG_OPS").map(|v| v.to_string() == "1").unwrap_or(false) {
+            if env
+                .var("SEARCH_DEBUG_OPS")
+                .map(|v| v.to_string() == "1")
+                .unwrap_or(false)
+            {
                 let _ = resp.headers_mut().set("X-Search-R2-Ops", &ops.to_string());
             }
             Ok(resp)
@@ -1156,4 +1179,3 @@ mod model_match_tests {
         assert!(!is_search_visible(&public, 8));
     }
 }
-

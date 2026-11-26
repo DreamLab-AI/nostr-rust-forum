@@ -121,7 +121,10 @@ impl VectorStore {
     /// either is what ran ingest out of the 256 MiB wasm memory first.
     pub fn from_rvf_bytes_with_spare(data: &[u8], spare: usize) -> Option<Self> {
         let mut store = Self::new();
-        let n = vec_payloads(data).iter().map(|p| p.len() / ENTRY_SIZE).sum::<usize>();
+        let n = vec_payloads(data)
+            .iter()
+            .map(|p| p.len() / ENTRY_SIZE)
+            .sum::<usize>();
         store.entries.reserve_exact(n.saturating_add(spare));
         store.index.reserve(n.saturating_add(spare));
         let mut offset = 0;
@@ -223,7 +226,10 @@ pub fn rvf_count_from_first_header(first: &[u8]) -> usize {
 
 /// Number of whole vectors in an RVF buffer, without decoding any of them.
 pub fn rvf_count(data: &[u8]) -> usize {
-    vec_payloads(data).iter().map(|p| p.len() / ENTRY_SIZE).sum()
+    vec_payloads(data)
+        .iter()
+        .map(|p| p.len() / ENTRY_SIZE)
+        .sum()
 }
 
 /// Cosine similarity of `query` against one packed little-endian entry body.
@@ -795,7 +801,9 @@ mod tests {
     fn lcg_vecs(n: usize, seed: u64) -> Vec<(u64, [f32; DIM])> {
         let mut x = seed;
         let mut next = || {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((x >> 33) as f32 / (1u64 << 31) as f32) - 0.5
         };
         (0..n)
@@ -810,7 +818,12 @@ mod tests {
     }
 
     /// The pre-change algorithm: score all, full sort, truncate.
-    fn reference_search(entries: &[(u64, [f32; DIM])], q: &[f32], k: usize, min: f32) -> Vec<(u64, f32)> {
+    fn reference_search(
+        entries: &[(u64, [f32; DIM])],
+        q: &[f32],
+        k: usize,
+        min: f32,
+    ) -> Vec<(u64, f32)> {
         let mut r: Vec<(usize, u64, f32)> = entries
             .iter()
             .enumerate()
@@ -862,13 +875,20 @@ mod tests {
         assert_eq!(rvf_count(&cut), 0);
         assert!(search_rvf(&cut, &entries[0].1, 3, -1.0).is_empty());
         assert!(search_rvf(&bytes, &[1.0; DIM / 2], 3, -1.0).is_empty());
-        assert_eq!(search_rvf(&bytes, &entries[2].1, 1, -1.0)[0].0, entries[2].0);
+        assert_eq!(
+            search_rvf(&bytes, &entries[2].1, 1, -1.0)[0].0,
+            entries[2].0
+        );
     }
 
     #[test]
     fn insert_replaces_first_duplicate_after_load() {
         // A file holding a label twice: both load, insert replaces the first.
-        let entries = vec![(5u64, unit_vec(0)), (5u64, unit_vec(1)), (6u64, unit_vec(2))];
+        let entries = vec![
+            (5u64, unit_vec(0)),
+            (5u64, unit_vec(1)),
+            (6u64, unit_vec(2)),
+        ];
         let bytes = build_rvf_bytes_for_test(&entries);
         let mut store = VectorStore::from_rvf_bytes(&bytes).unwrap();
         assert_eq!(store.count(), 3);
@@ -894,7 +914,11 @@ mod tests {
             store.insert(l + 1_000_000, &v);
         }
         assert_eq!(store.count(), 1_500);
-        assert_eq!(store.entries.capacity(), cap, "no reallocation within the spare");
+        assert_eq!(
+            store.entries.capacity(),
+            cap,
+            "no reallocation within the spare"
+        );
         // Same content as a plain decode.
         let plain = VectorStore::from_rvf_bytes(&bytes).unwrap();
         assert_eq!(plain.count(), 1_000);

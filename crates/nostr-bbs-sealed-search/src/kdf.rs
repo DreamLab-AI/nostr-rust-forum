@@ -47,9 +47,7 @@ impl SearchKey {
     pub fn bytes(&self) -> &[u8; 32] {
         &self.0
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -65,8 +63,14 @@ mod tests {
         assert_eq!(a.bytes(), key("zone2", 1).bytes());
         assert_ne!(a.bytes(), key("zone2", 2).bytes());
         assert_ne!(a.bytes(), key("zone3", 1).bytes());
-        assert_ne!(a.bytes(), SearchKey::derive(&[8u8; 32], "zone2", 1, &[1u8; 32]).bytes());
-        assert_ne!(a.bytes(), SearchKey::derive(&[9u8; 32], "zone2", 1, &[2u8; 32]).bytes());
+        assert_ne!(
+            a.bytes(),
+            SearchKey::derive(&[8u8; 32], "zone2", 1, &[1u8; 32]).bytes()
+        );
+        assert_ne!(
+            a.bytes(),
+            SearchKey::derive(&[9u8; 32], "zone2", 1, &[2u8; 32]).bytes()
+        );
         // okm is not the zone secret.
         assert_ne!(a.bytes(), &[9u8; 32]);
     }
@@ -78,8 +82,12 @@ mod tests {
         let salt: Vec<u8> = (0x00..=0x0c).collect();
         let info: Vec<u8> = (0xf0..=0xf9).collect();
         let mut okm = [0u8; 42];
-        Hkdf::<Sha256>::new(Some(&salt), &ikm).expand(&info, &mut okm).unwrap();
-        assert_eq!(hex::encode(okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+        Hkdf::<Sha256>::new(Some(&salt), &ikm)
+            .expand(&info, &mut okm)
+            .unwrap();
+        assert_eq!(
+            hex::encode(okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
     }
-
 }

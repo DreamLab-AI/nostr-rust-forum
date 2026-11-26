@@ -80,7 +80,12 @@ impl CodeCache {
         self.bytes += codes.bytes();
         self.map.insert(key, (etag, codes, self.tick));
         while self.bytes > CODE_CACHE_MAX_BYTES && self.map.len() > 1 {
-            let Some(lru) = self.map.iter().min_by_key(|(_, v)| v.2).map(|(k, _)| k.clone()) else {
+            let Some(lru) = self
+                .map
+                .iter()
+                .min_by_key(|(_, v)| v.2)
+                .map(|(k, _)| k.clone())
+            else {
                 break;
             };
             if let Some((_, c, _)) = self.map.remove(&lru) {
@@ -256,7 +261,10 @@ async fn shard_codes(env: &Env, s: &ShardInfo) -> Result<Option<Rc<ShardCodes>>>
     let Some(codes) = ShardCodes::from_hot_range(s.count, &bytes).map(Rc::new) else {
         return Ok(None);
     };
-    CODES.with(|c| c.borrow_mut().put(s.key.clone(), s.etag.clone(), codes.clone()));
+    CODES.with(|c| {
+        c.borrow_mut()
+            .put(s.key.clone(), s.etag.clone(), codes.clone())
+    });
     Ok(Some(codes))
 }
 
@@ -274,7 +282,11 @@ pub async fn search(
         let Some(m) = manifest(env, store, force).await? else {
             return Ok(None);
         };
-        let shards: Vec<&ShardInfo> = m.shards.iter().filter(|s| s.public > 0 && s.count > 0).collect();
+        let shards: Vec<&ShardInfo> = m
+            .shards
+            .iter()
+            .filter(|s| s.public > 0 && s.count > 0)
+            .collect();
         let loaded = join_all(shards.iter().map(|s| shard_codes(env, s))).await;
         let mut codes = Vec::with_capacity(shards.len());
         let mut stale = false;
@@ -312,7 +324,8 @@ pub async fn search(
             force = true;
             continue;
         }
-        let refs: Vec<((usize, usize), &[u8])> = rows.iter().map(|(p, b)| (*p, b.as_slice())).collect();
+        let refs: Vec<((usize, usize), &[u8])> =
+            rows.iter().map(|(p, b)| (*p, b.as_slice())).collect();
         return Ok(Some(SearchOutcome {
             hits: rescore(query, &refs, k, min_score),
             total: m.total(),
@@ -397,7 +410,8 @@ where
             }
             None => (Manifest::new(model), None, v1_rows().await?),
         };
-        if base.total() > 0 && base.model != model && base.model != "unknown" && model != "unknown" {
+        if base.total() > 0 && base.model != model && base.model != "unknown" && model != "unknown"
+        {
             return Err(IngestError::ModelMismatch(base.model.clone()));
         }
 
@@ -408,7 +422,16 @@ where
             migrated
                 .into_iter()
                 .map(|r| (shard::DEFAULT_ZONE.to_string(), r))
-                .chain(entries.iter().map(|e| (e.zone.clone(), Row { id: e.id.clone(), public: e.public, vec: e.vec }))),
+                .chain(entries.iter().map(|e| {
+                    (
+                        e.zone.clone(),
+                        Row {
+                            id: e.id.clone(),
+                            public: e.public,
+                            vec: e.vec,
+                        },
+                    )
+                })),
         );
 
         let generation = base.generation + 1;
@@ -416,7 +439,14 @@ where
         let mut replaced: Vec<usize> = Vec::new();
         let mut added: Vec<ShardInfo> = Vec::new();
         let mut failed = false;
-        for shard::ShardBatch { target, zone, depth, prefix, rows: batch } in groups {
+        for shard::ShardBatch {
+            target,
+            zone,
+            depth,
+            prefix,
+            rows: batch,
+        } in groups
+        {
             let mut rows = match target {
                 Some(t) => match get_full(env, &base.shards[t].key).await? {
                     Some((bytes, _)) => decode_shard(&bytes)
@@ -437,7 +467,15 @@ where
                     .await?
                     .ok_or_else(|| worker::Error::RustError("unconditional put refused".into()))?;
                 written.push(k.clone());
-                added.push(ShardInfo { zone: zone.clone(), depth: d, prefix: p, count, public, key: k, etag });
+                added.push(ShardInfo {
+                    zone: zone.clone(),
+                    depth: d,
+                    prefix: p,
+                    count,
+                    public,
+                    key: k,
+                    etag,
+                });
             }
             if let Some(t) = target {
                 replaced.push(t);
@@ -447,7 +485,10 @@ where
             delete_keys(env, &written).await;
             continue;
         }
-        let old_keys: Vec<String> = replaced.iter().map(|&t| base.shards[t].key.clone()).collect();
+        let old_keys: Vec<String> = replaced
+            .iter()
+            .map(|&t| base.shards[t].key.clone())
+            .collect();
         let next = shard::commit(&base, &replaced, added, generation, model, migrated_n > 0);
         // The commit only lands if nobody else committed since we read: the
         // first manifest only if none exists, later ones only on our etag.
@@ -459,7 +500,11 @@ where
             Some(_) => {
                 delete_keys(env, &old_keys).await;
                 MANIFEST.with(|m| *m.borrow_mut() = None);
-                return Ok(IngestOutcome { total: next.total(), shards: next.shards.len(), migrated: migrated_n });
+                return Ok(IngestOutcome {
+                    total: next.total(),
+                    shards: next.shards.len(),
+                    migrated: migrated_n,
+                });
             }
             None => {
                 delete_keys(env, &written).await;

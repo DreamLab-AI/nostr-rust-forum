@@ -41,8 +41,8 @@ mod native {
     use nostr_bbs_sealed_search::build::{build, BuildSpec, DocRow, KeyMap};
     use nostr_bbs_sealed_search::manifest::{Content, Manifest, KIND};
     use nostr_bbs_sealed_search::model::{to_gguf_q8, Bge, DIM};
-    use nostr_bbs_sealed_search::search::sha256_hex;
     use nostr_bbs_sealed_search::seal::SearchKey;
+    use nostr_bbs_sealed_search::search::sha256_hex;
     use nostr_bbs_zone_migrate::identity::{identity_from_env, IDENTITY_ENV};
     use nostr_bbs_zone_migrate::keys::{parse_key_file, KeyRing};
     use zeroize::Zeroizing;
@@ -86,7 +86,7 @@ mod native {
         #[arg(long)]
         pod: Option<String>,
         /// Comma-separated publisher pubkeys clients accept (e.g.
-        /// "<archivist>,<admin>"); this key must be one of them. Defaults to
+        /// "`<archivist>,<admin>`"); this key must be one of them. Defaults to
         /// this key alone. Used to verify the previously published manifest.
         #[arg(long)]
         publishers: Option<String>,
@@ -129,12 +129,16 @@ mod native {
     }
 
     fn req<T: Clone>(v: &Option<T>, name: &str) -> Result<T, Fail> {
-        v.clone().ok_or_else(|| Fail(format!("--{name} is required")))
+        v.clone()
+            .ok_or_else(|| Fail(format!("--{name} is required")))
     }
 
     pub fn main() -> ExitCode {
         let cli = Cli::parse();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
         match rt.block_on(run(cli)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(Fail(m)) => {
@@ -154,7 +158,8 @@ mod native {
 
     fn hex32(s: &str, what: &str) -> Result<[u8; 32], Fail> {
         let v = hex::decode(s).map_err(|_| Fail(format!("{what} is not hex")))?;
-        v.try_into().map_err(|_| Fail(format!("{what} is not 32 bytes")))
+        v.try_into()
+            .map_err(|_| Fail(format!("{what} is not 32 bytes")))
     }
 
     async fn load_keys(cli: &Cli, me: &SecretKey) -> Result<KeyRing, Fail> {
@@ -167,8 +172,10 @@ mod native {
         }
         if cli.fetch_grants {
             let url = req(&cli.relay, "relay")?;
-            let mut relay = nostr_bbs_zone_migrate::net::NetRelay::connect(&url, &cli.origin, me).await?;
-            let harvest = nostr_bbs_zone_migrate::grants::fetch_grants(&mut relay, me, None).await?;
+            let mut relay =
+                nostr_bbs_zone_migrate::net::NetRelay::connect(&url, &cli.origin, me).await?;
+            let harvest =
+                nostr_bbs_zone_migrate::grants::fetch_grants(&mut relay, me, None).await?;
             for r in &harvest.rejected {
                 eprintln!("refused grant {}: {}", r.wrap_id, r.reason);
             }
@@ -177,13 +184,18 @@ mod native {
             }
         }
         if ring.is_empty() {
-            return Err(Fail("no zone keys (use --keys-file or --fetch-grants)".into()));
+            return Err(Fail(
+                "no zone keys (use --keys-file or --fetch-grants)".into(),
+            ));
         }
         Ok(ring)
     }
 
     fn pod_url(pod: &str, publisher: &str, zone: &str, name: &str) -> String {
-        format!("{}/pods/{publisher}/media/zones/{zone}/search/{name}", pod.trim_end_matches('/'))
+        format!(
+            "{}/pods/{publisher}/media/zones/{zone}/search/{name}",
+            pod.trim_end_matches('/')
+        )
     }
 
     async fn pod_request(
@@ -199,7 +211,9 @@ mod native {
             method.as_str(),
             body.as_ref().map(|(b, _)| b.as_slice()),
         )?;
-        let mut r = http.request(method, url).header("Authorization", format!("Nostr {token}"));
+        let mut r = http
+            .request(method, url)
+            .header("Authorization", format!("Nostr {token}"));
         if let Some((b, ct)) = body {
             r = r.header("Content-Type", ct).body(b);
         }
@@ -214,26 +228,40 @@ mod native {
             let g = to_gguf_q8(&dir).map_err(Fail)?;
             std::fs::write(out.join("bge-small-en-v1.5-q8_0.gguf"), &g)?;
             std::fs::copy(dir.join("vocab.txt"), out.join("vocab.txt"))?;
-            println!("{{\"model_q8_mb\":{:.1},\"model_sha256\":\"{}\"}}", g.len() as f64 / 1048576.0, sha256_hex(&g));
+            println!(
+                "{{\"model_q8_mb\":{:.1},\"model_sha256\":\"{}\"}}",
+                g.len() as f64 / 1048576.0,
+                sha256_hex(&g)
+            );
             return Ok(());
         }
         let zone = req(&cli.zone, "zone")?;
         let relay_url = req(&cli.relay_url, "relay-url")?;
         let model_dir = req(&cli.model_dir, "model-dir")?;
         let model_q8 = req(&cli.model_q8, "model-q8")?;
-        let me = identity_from_env().map_err(|_| Fail(format!("set {IDENTITY_ENV} to the publisher key (hex or nsec)")))?;
+        let me = identity_from_env().map_err(|_| {
+            Fail(format!(
+                "set {IDENTITY_ENV} to the publisher key (hex or nsec)"
+            ))
+        })?;
         let publisher = me.public_key().to_hex();
         let publishers = match &cli.publishers {
             Some(l) => nostr_bbs_sealed_search::manifest::parse_publishers(l),
             None => vec![publisher.clone()],
         };
         if !publishers.contains(&publisher) {
-            return Err(Fail("this key is not in --publishers; clients would refuse its manifest".into()));
+            return Err(Fail(
+                "this key is not in --publishers; clients would refuse its manifest".into(),
+            ));
         }
 
         // Rows.
         let exclude: HashSet<String> = match &cli.exclude {
-            Some(p) => std::fs::read_to_string(p)?.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect(),
+            Some(p) => std::fs::read_to_string(p)?
+                .lines()
+                .map(|l| l.trim().to_lowercase())
+                .filter(|l| !l.is_empty())
+                .collect(),
             None => HashSet::new(),
         };
         let text = std::fs::read_to_string(req(&cli.input, "input")?)?;
@@ -256,27 +284,40 @@ mod native {
             if keys.contains_key(&(r.epoch, pk)) {
                 continue;
             }
-            let k = ring.get(&zone, r.epoch).ok_or_else(|| Fail(format!("no key for {zone} epoch {}", r.epoch)))?;
+            let k = ring
+                .get(&zone, r.epoch)
+                .ok_or_else(|| Fail(format!("no key for {zone} epoch {}", r.epoch)))?;
             if !k.pubkey().eq_ignore_ascii_case(&r.zone_pk) {
-                return Err(Fail(format!("row zone_pk does not match the held key for epoch {}", r.epoch)));
+                return Err(Fail(format!(
+                    "row zone_pk does not match the held key for epoch {}",
+                    r.epoch
+                )));
             }
-            keys.insert((r.epoch, pk), SearchKey::derive(k.secret(), &zone, r.epoch, &pk));
+            keys.insert(
+                (r.epoch, pk),
+                SearchKey::derive(k.secret(), &zone, r.epoch, &pk),
+            );
         }
 
         // Embed locally (FP32), batched by length.
         let model = Bge::load_fp32_dir(&model_dir).map_err(Fail)?;
         let t0 = Instant::now();
-        let mut order: Vec<(usize, Vec<u32>)> = rows_in.iter().enumerate().map(|(i, r)| (i, model.encode(&r.text))).collect();
+        let mut order: Vec<(usize, Vec<u32>)> = rows_in
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i, model.encode(&r.text)))
+            .collect();
         order.sort_by_key(|x| x.1.len());
         // Length-sorted batches, processed by several workers at once: the
         // per-op overhead of small GEMMs and single-threaded elementwise ops
         // dominates one forward pass, so concurrency is what scales.
         let batches: Vec<&[(usize, Vec<u32>)]> = order.chunks(cli.batch.max(1)).collect();
-        let workers = cli
-            .workers
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1)));
+        let workers = cli.workers.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1))
+        });
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let results: std::sync::Mutex<Vec<(usize, [f32; DIM])>> = std::sync::Mutex::new(Vec::with_capacity(rows_in.len()));
+        let results: std::sync::Mutex<Vec<(usize, [f32; DIM])>> =
+            std::sync::Mutex::new(Vec::with_capacity(rows_in.len()));
         let failure: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         std::thread::scope(|sc| {
             for _ in 0..workers {
@@ -311,13 +352,23 @@ mod native {
             if !cli.dry_run {
                 return Err(Fail("--dump-vectors requires --dry-run".into()));
             }
-            let bytes: Vec<u8> = vecs.iter().flat_map(|v| v.iter().flat_map(|x| x.to_le_bytes())).collect();
+            let bytes: Vec<u8> = vecs
+                .iter()
+                .flat_map(|v| v.iter().flat_map(|x| x.to_le_bytes()))
+                .collect();
             std::fs::write(p, bytes)?;
         }
         let rows: Vec<DocRow> = rows_in
             .iter()
             .zip(vecs)
-            .map(|(r, vec)| Ok(DocRow { id: hex32(&r.id, "id")?, epoch: r.epoch, zone_pk: hex32(&r.zone_pk, "zone_pk")?, vec }))
+            .map(|(r, vec)| {
+                Ok(DocRow {
+                    id: hex32(&r.id, "id")?,
+                    epoch: r.epoch,
+                    zone_pk: hex32(&r.zone_pk, "zone_pk")?,
+                    vec,
+                })
+            })
             .collect::<Result<_, Fail>>()?;
         drop(rows_in);
 
@@ -333,9 +384,16 @@ mod native {
                 previous = Some(m.content);
             }
         }
-        let version = cli.version.unwrap_or_else(|| previous.as_ref().map_or(1, |p| p.index_version + 1));
-        if previous.as_ref().is_some_and(|p| version <= p.index_version) {
-            return Err(Fail(format!("version {version} is not above the published one")));
+        let version = cli
+            .version
+            .unwrap_or_else(|| previous.as_ref().map_or(1, |p| p.index_version + 1));
+        if previous
+            .as_ref()
+            .is_some_and(|p| version <= p.index_version)
+        {
+            return Err(Fail(format!(
+                "version {version} is not above the published one"
+            )));
         }
 
         // Build + sign.
@@ -343,7 +401,14 @@ mod native {
         let vocab = std::fs::read(model_dir.join("vocab.txt"))?;
         let t1 = Instant::now();
         let built = build(
-            &BuildSpec { zone: &zone, version, model: "bge-small-en-v1.5", model_sha256: &sha256_hex(&q8), vocab_sha256: &sha256_hex(&vocab), shard_rows: cli.shard_rows },
+            &BuildSpec {
+                zone: &zone,
+                version,
+                model: "bge-small-en-v1.5",
+                model_sha256: &sha256_hex(&q8),
+                vocab_sha256: &sha256_hex(&vocab),
+                shard_rows: cli.shard_rows,
+            },
             &rows,
             &keys,
         )
@@ -352,7 +417,9 @@ mod native {
         let sk = nostr_bbs_core::keys::signing_key_from_bytes(me.as_bytes())?;
         let unsigned = UnsignedEvent {
             pubkey: publisher.clone(),
-            created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
             kind: KIND,
             tags: Manifest::tags(&built.content, &relay_url),
             content: serde_json::to_string(&built.content)?,
@@ -372,20 +439,43 @@ mod native {
             let pod = req(&cli.pod, "pod")?;
             for (name, b) in &built.objects {
                 let url = pod_url(&pod, &publisher, &zone, name);
-                let r = pod_request(&http, &me, reqwest::Method::PUT, &url, Some((b.clone(), "application/octet-stream"))).await?;
+                let r = pod_request(
+                    &http,
+                    &me,
+                    reqwest::Method::PUT,
+                    &url,
+                    Some((b.clone(), "application/octet-stream")),
+                )
+                .await?;
                 if !r.status().is_success() {
                     return Err(Fail(format!("PUT {name}: HTTP {}", r.status())));
                 }
             }
             let url = pod_url(&pod, &publisher, &zone, "m.json");
-            let r = pod_request(&http, &me, reqwest::Method::PUT, &url, Some((manifest_json.clone(), "application/json"))).await?;
+            let r = pod_request(
+                &http,
+                &me,
+                reqwest::Method::PUT,
+                &url,
+                Some((manifest_json.clone(), "application/json")),
+            )
+            .await?;
             if !r.status().is_success() {
                 return Err(Fail(format!("PUT m.json: HTTP {}", r.status())));
             }
             // Superseded objects go (review M5).
             if let Some(prev) = previous {
-                let keep: HashSet<&str> = built.content.objects.iter().map(|o| o.name.as_str()).collect();
-                for o in prev.objects.iter().filter(|o| !keep.contains(o.name.as_str())) {
+                let keep: HashSet<&str> = built
+                    .content
+                    .objects
+                    .iter()
+                    .map(|o| o.name.as_str())
+                    .collect();
+                for o in prev
+                    .objects
+                    .iter()
+                    .filter(|o| !keep.contains(o.name.as_str()))
+                {
                     let url = pod_url(&pod, &publisher, &zone, &o.name);
                     let _ = pod_request(&http, &me, reqwest::Method::DELETE, &url, None).await?;
                 }

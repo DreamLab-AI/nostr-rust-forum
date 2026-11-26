@@ -47,7 +47,10 @@ impl Lin {
             Lin::F(wt, b) => {
                 // (b, t, in) → (b·t, in) @ (in, out): one contiguous GEMM.
                 let (bsz, t, d) = x.dims3()?;
-                x.reshape((bsz * t, d))?.matmul(wt)?.reshape((bsz, t, wt.dim(1)?))?.broadcast_add(b)
+                x.reshape((bsz * t, d))?
+                    .matmul(wt)?
+                    .reshape((bsz, t, wt.dim(1)?))?
+                    .broadcast_add(b)
             }
             Lin::Q(m, b) => m.forward(x)?.broadcast_add(b),
         }
@@ -106,7 +109,10 @@ impl Bge {
         let word = get_f("embeddings.word_embeddings.weight")?;
         let pos = get_f("embeddings.position_embeddings.weight")?;
         let tok_type = get_f("embeddings.token_type_embeddings.weight")?;
-        let ln = Norm(get_f("embeddings.LayerNorm.weight")?, get_f("embeddings.LayerNorm.bias")?);
+        let ln = Norm(
+            get_f("embeddings.LayerNorm.weight")?,
+            get_f("embeddings.LayerNorm.bias")?,
+        );
         let mut layers = Vec::with_capacity(LAYERS);
         for i in 0..LAYERS {
             let n = layer_names(i);
@@ -124,24 +130,43 @@ impl Bge {
                 ln2: norm(&n[7], &mut get_f)?,
             });
         }
-        Ok(Self { word, pos, tok_type, ln, layers, tok, dev: Device::Cpu })
+        Ok(Self {
+            word,
+            pos,
+            tok_type,
+            ln,
+            layers,
+            tok,
+            dev: Device::Cpu,
+        })
     }
 
     /// FP32 model from the original checkpoint directory (`pytorch_model.bin`,
     /// `vocab.txt`). Native only (reads files).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_fp32_dir(dir: &std::path::Path) -> Res<Self> {
-        let tensors: HashMap<String, Tensor> = candle_core::pickle::read_all(dir.join("pytorch_model.bin"))
-            .map_err(e)?
-            .into_iter()
-            .collect();
-        let tok = WordPiece::from_vocab_txt(&std::fs::read_to_string(dir.join("vocab.txt")).map_err(e)?)?;
+        let tensors: HashMap<String, Tensor> =
+            candle_core::pickle::read_all(dir.join("pytorch_model.bin"))
+                .map_err(e)?
+                .into_iter()
+                .collect();
+        let tok =
+            WordPiece::from_vocab_txt(&std::fs::read_to_string(dir.join("vocab.txt")).map_err(e)?)?;
         let f = |n: &str| -> Res<Tensor> {
-            tensors.get(n).cloned().ok_or_else(|| format!("missing {n}"))?.to_dtype(DType::F32).map_err(e)
+            tensors
+                .get(n)
+                .cloned()
+                .ok_or_else(|| format!("missing {n}"))?
+                .to_dtype(DType::F32)
+                .map_err(e)
         };
         // Store each weight pre-transposed and contiguous: (out, in) → (in, out).
         let lin = |n: &str| -> Res<Lin> {
-            let wt = f(&format!("{n}.weight"))?.t().map_err(e)?.contiguous().map_err(e)?;
+            let wt = f(&format!("{n}.weight"))?
+                .t()
+                .map_err(e)?
+                .contiguous()
+                .map_err(e)?;
             Ok(Lin::F(wt, f(&format!("{n}.bias"))?))
         };
         Self::build(f, lin, tok)
@@ -161,7 +186,10 @@ impl Bge {
         let f = |n: &str| -> Res<Tensor> { qt(n)?.dequantize(&dev).map_err(e) };
         let lin = |n: &str| -> Res<Lin> {
             let w = qt(&format!("{n}.weight"))?;
-            Ok(Lin::Q(QMatMul::from_qtensor(w).map_err(e)?, f(&format!("{n}.bias"))?))
+            Ok(Lin::Q(
+                QMatMul::from_qtensor(w).map_err(e)?,
+                f(&format!("{n}.bias"))?,
+            ))
         };
         Self::build(f, lin, WordPiece::from_vocab_txt(vocab_txt)?)
     }
@@ -205,7 +233,13 @@ impl Bge {
         self.embed_ids(&ids)
     }
 
-    fn forward(&self, ids: &[u32], mask: &[f32], b: usize, t: usize) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        ids: &[u32],
+        mask: &[f32],
+        b: usize,
+        t: usize,
+    ) -> candle_core::Result<Tensor> {
         let ids_t = Tensor::from_slice(ids, (b * t,), &self.dev)?;
         let x = self.word.index_select(&ids_t, 0)?.reshape((b, t, DIM))?;
         let x = x.broadcast_add(&self.pos.narrow(0, 0, t)?)?;
@@ -216,13 +250,21 @@ impl Bge {
         let m = ((m - 1.0)? * 1e9)?;
         let scale = 1.0 / (HEAD_DIM as f64).sqrt();
         for l in &self.layers {
-            let heads = |y: Tensor| y.reshape((b, t, HEADS, HEAD_DIM))?.transpose(1, 2)?.contiguous();
+            let heads = |y: Tensor| {
+                y.reshape((b, t, HEADS, HEAD_DIM))?
+                    .transpose(1, 2)?
+                    .contiguous()
+            };
             let q = heads(l.q.fwd(&x)?)?;
             let k = heads(l.k.fwd(&x)?)?;
             let v = heads(l.v.fwd(&x)?)?;
             let att = (q.matmul(&k.t()?.contiguous()?)? * scale)?.broadcast_add(&m)?;
             let att = candle_nn::ops::softmax_last_dim(&att)?;
-            let ctx = att.matmul(&v)?.transpose(1, 2)?.contiguous()?.reshape((b, t, DIM))?;
+            let ctx = att
+                .matmul(&v)?
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((b, t, DIM))?;
             let h = l.ln1.fwd(&(l.o.fwd(&ctx)? + &x)?)?;
             let ff = l.down.fwd(&l.up.fwd(&h)?.gelu_erf()?)?;
             x = l.ln2.fwd(&(ff + h)?)?;
@@ -243,8 +285,16 @@ pub fn to_gguf_q8(dir: &std::path::Path) -> Res<Vec<u8>> {
             continue;
         }
         let t = t.to_dtype(DType::F32).map_err(e)?;
-        let is_lin_w = name.ends_with(".weight") && t.rank() == 2 && !name.contains("LayerNorm") && !name.contains("position_embeddings") && !name.contains("token_type");
-        let dt = if is_lin_w { GgmlDType::Q8_0 } else { GgmlDType::F32 };
+        let is_lin_w = name.ends_with(".weight")
+            && t.rank() == 2
+            && !name.contains("LayerNorm")
+            && !name.contains("position_embeddings")
+            && !name.contains("token_type");
+        let dt = if is_lin_w {
+            GgmlDType::Q8_0
+        } else {
+            GgmlDType::F32
+        };
         q.push((name, QTensor::quantize(&t, dt).map_err(e)?));
     }
     q.sort_by(|a, b| a.0.cmp(&b.0));

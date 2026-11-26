@@ -13,7 +13,7 @@ name = "nostr-bbs-sealed-search-worker"
 path = "src/main.rs"
 
 [dependencies]
-nostr-bbs-sealed-search = { path = "../nostr-bbs-sealed-search" }
+nostr-bbs-sealed-search = { path = "../nostr-bbs-sealed-search", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
