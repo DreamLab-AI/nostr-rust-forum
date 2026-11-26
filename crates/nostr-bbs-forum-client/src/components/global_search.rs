@@ -181,9 +181,16 @@ impl Hit {
             Self::Channel { id, .. } => base_href(&format!("/chat/{}", id)),
             // Messages open AT the message: `/go/:id` resolves the topic it
             // lives in and lands on it (pages/message_jump.rs), rather than
-            // dropping the reader one level up in the channel.
-            Self::Message { event_id, .. } | Self::SemanticMessage { event_id, .. } => {
-                base_href(&format!("/go/{}", event_id))
+            // dropping the reader one level up in the channel. The channel
+            // rides along as a hint, as in notifications: in an encrypted
+            // zone the post is found in its channel, not on the relay by id.
+            Self::Message {
+                event_id,
+                channel_id,
+                ..
+            } => base_href(&crate::pages::jump_link(event_id, Some(channel_id))),
+            Self::SemanticMessage { event_id, id, .. } => {
+                base_href(&crate::pages::jump_link(event_id, Some(id)))
             }
             Self::User { pubkey, .. } => base_href(&format!("/profile/{}", pubkey)),
         }
@@ -745,6 +752,34 @@ mod tests {
         assert_eq!(out.chars().count(), 80);
     }
     use super::*;
+
+    #[test]
+    fn message_hits_link_with_their_channel_hint() {
+        // As notifications do: in an encrypted zone the jump page resolves
+        // the post from its channel, not from the relay by id.
+        let m = Hit::Message {
+            event_id: "e1".into(),
+            content: String::new(),
+            author: String::new(),
+            channel_id: "chan".into(),
+        };
+        assert_eq!(m.href(), base_href("/go/e1?c=chan"));
+        let sm = Hit::SemanticMessage {
+            event_id: "e2".into(),
+            id: "chan".into(),
+            content: String::new(),
+            label: String::new(),
+            score: 0.5,
+        };
+        assert_eq!(sm.href(), base_href("/go/e2?c=chan"));
+        let unknown = Hit::Message {
+            event_id: "e3".into(),
+            content: String::new(),
+            author: String::new(),
+            channel_id: String::new(),
+        };
+        assert_eq!(unknown.href(), base_href("/go/e3"));
+    }
 
     // Pure tests only: the overlay itself is Leptos/wasm, but the wire contract
     // it depends on is pure, so it is pinned here on the host target.
