@@ -375,6 +375,79 @@ pub fn channel_count_target(filters: &[NostrFilter]) -> Option<(String, Option<u
     channel.map(|c| (c, f.since, f.until))
 }
 
+/// The `(kind, since, until)` of a COUNT filter set that asks for every kind-42
+/// (or kind-40) the relay holds: exactly one filter, `kinds` exactly `[42]` or `[40]`, and nothing else
+/// but `since`/`until` (`limit` is ignored by COUNT). This is the shape of the
+/// admin Overview's "Messages" figure. The caller must only take the exact
+/// path for a real administrator (see [`build_admin_kind_count`]).
+pub fn admin_global_count_target(
+    filters: &[NostrFilter],
+) -> Option<(u64, Option<u64>, Option<u64>)> {
+    let [f] = filters else {
+        return None;
+    };
+    if f.ids.is_some() || f.authors.is_some() || search_term(f).is_some() {
+        return None;
+    }
+    // Channels (40) and messages (42): the two Overview figures.
+    let kind = match f.kinds.as_deref() {
+        Some([k @ (40 | 42)]) => *k,
+        _ => return None,
+    };
+    // Any real tag filter (`#e`, `#p`, ...) is a different question that has
+    // its own path; so does a `#x` that matches nothing.
+    if f.extra
+        .iter()
+        .any(|(k, v)| !matches!(tag_filter_plan(k, v), TagFilterPlan::Ignore))
+    {
+        return None;
+    }
+    Some((kind, f.since, f.until))
+}
+
+/// Exact, unclamped count of every kind-42 (or kind-40) event for an ADMIN reader.
+///
+/// The generic COUNT path materialises matches and stops at the filter's
+/// `limit` (500 by default), so the admin Overview showed 500 for a forum of
+/// ~242k messages. `grouped` is one aggregate row (`ch` is a constant label,
+/// there is no per-channel grouping: an admin reads every zone, so no per-zone
+/// decision is needed); `exceptions` returns the events carrying an
+/// `expiration` tag, bounded by the caller, for NIP-40 filtering. Expiring
+/// events are told apart through `event_tags` (an index range scan collected
+/// once), not by re-parsing every row's JSON tags.
+pub fn build_admin_kind_count(
+    kind: u64,
+    since: Option<u64>,
+    until: Option<u64>,
+) -> ChannelCountQueries {
+    let mut b = Binds { params: Vec::new() };
+    let mut range = String::new();
+    if let Some(s) = since {
+        range.push_str(&format!(" AND events.created_at >= {}", b.int(s as i64)));
+    }
+    if let Some(u) = until {
+        range.push_str(&format!(" AND events.created_at <= {}", b.int(u as i64)));
+    }
+    let expiring = "SELECT event_id FROM event_tags WHERE name = 'expiration'";
+    let params = b.params;
+    ChannelCountQueries {
+        grouped: FilterQuery {
+            sql: format!(
+                "SELECT 'all' AS ch, COUNT(*) AS n FROM events \
+                 WHERE events.kind = {kind}{range} AND events.id NOT IN ({expiring})"
+            ),
+            params: params.clone(),
+        },
+        exceptions: FilterQuery {
+            sql: format!(
+                "SELECT {EVENT_COLUMNS} FROM events \
+                 WHERE events.kind = {kind}{range} AND events.id IN ({expiring})"
+            ),
+            params,
+        },
+    }
+}
+
 fn where_clause(conds: &[String]) -> String {
     if conds.is_empty() {
         String::new()
@@ -1604,6 +1677,100 @@ mod query_builder_tests {
         let q = build_filter_query(&f, 10);
         assert!(!q.sql.contains("UNION ALL"));
         assert_eq!(run(&c, &f, 10).0, reference(&events, &f, 10));
+    }
+
+    #[test]
+    fn admin_global_count_is_exact_beyond_the_row_limit_and_shape_gated() {
+        // The admin target accepts only `{"kinds":[42]}` (+ since/until).
+        assert_eq!(
+            admin_global_count_target(&[filter(serde_json::json!({"kinds": [42]}))]),
+            Some((42, None, None))
+        );
+        assert_eq!(
+            admin_global_count_target(&[filter(serde_json::json!({"kinds": [40]}))]),
+            Some((40, None, None))
+        );
+        assert_eq!(
+            admin_global_count_target(&[filter(
+                serde_json::json!({"kinds": [42], "since": 5, "until": 9, "limit": 1})
+            )]),
+            Some((42, Some(5), Some(9)))
+        );
+        for bad in [
+            serde_json::json!({"kinds": [42], "#e": ["a"]}),
+            serde_json::json!({"kinds": [42], "#p": ["a"]}),
+            serde_json::json!({"kinds": [42], "authors": ["a"]}),
+            serde_json::json!({"kinds": [42], "ids": ["a"]}),
+            serde_json::json!({"kinds": [42], "search": "x"}),
+            serde_json::json!({"kinds": [42, 7]}),
+            serde_json::json!({"kinds": [41]}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                admin_global_count_target(&[filter(bad.clone())]),
+                None,
+                "{bad}"
+            );
+        }
+        assert_eq!(admin_global_count_target(&[]), None);
+        let two = [
+            filter(serde_json::json!({"kinds": [42]})),
+            filter(serde_json::json!({"kinds": [42]})),
+        ];
+        assert_eq!(admin_global_count_target(&two), None);
+
+        // 1,500 messages over several channels (well past the 500 default
+        // limit and the 1,000 clamp), 3 expiring, 2 other kinds.
+        let mut events: Vec<NostrEvent> = (0..1_500)
+            .map(|i| {
+                let ch = format!("ch{}", i % 5);
+                ev(
+                    10_000 + i,
+                    42,
+                    1_000 + i as u64,
+                    vec![vec!["e", ch.as_str(), "", "root"]],
+                )
+            })
+            .collect();
+        for i in 0..3 {
+            events.push(ev(
+                20_000 + i,
+                42,
+                1_000 + i as u64,
+                vec![
+                    vec!["e", "ch0", "", "root"],
+                    vec!["expiration", "9999999999"],
+                ],
+            ));
+        }
+        events.push(ev(30_000, 7, 1_000, vec![vec!["e", "ch0"]]));
+        events.push(ev(30_001, 40, 1_000, vec![]));
+        let c = db();
+        store(&c, &events);
+        let count = |since, until| -> (i64, usize) {
+            let q = build_admin_kind_count(42, since, until);
+            let n: i64 = c
+                .query_row(
+                    &q.grouped.sql,
+                    rusqlite::params_from_iter(bind(&q.grouped.params).iter()),
+                    |r| r.get(1),
+                )
+                .unwrap();
+            let exc = c
+                .prepare(&q.exceptions.sql)
+                .unwrap()
+                .query_map(
+                    rusqlite::params_from_iter(bind(&q.exceptions.params).iter()),
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap()
+                .count();
+            (n, exc)
+        };
+        assert_eq!(count(None, None), (1_500, 3));
+        // since/until bound both statements: created_at 1_000..=1_099.
+        assert_eq!(count(Some(1_000), Some(1_099)), (100, 3));
+        assert_eq!(count(Some(5_000), None), (0, 0));
     }
 
     #[test]

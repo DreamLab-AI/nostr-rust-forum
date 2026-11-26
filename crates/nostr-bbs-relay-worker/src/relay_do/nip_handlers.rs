@@ -3351,6 +3351,37 @@ impl NostrRelayDO {
         // itself never selects a zone, so a topic root (which has no
         // channel_zones row) cannot open its replies. Expiring events go
         // through the per-event path as before.
+        // Admin Overview "Messages"/"Channels": every kind-42 (or kind-40) the
+        // relay holds, no `#e`.
+        // An administrator reads every zone, so no per-zone decision exists
+        // to apply and one aggregate is exact (the generic path below stops
+        // at the filter's row limit and reported 500 for ~242k messages).
+        // Strictly gated on a real whitelist admin (`ctx.is_admin`, not the
+        // zone-scoped `viewer_is_admin`): a non-admin keeps the zone-gated,
+        // row-capped generic path. One aggregate statement, so it is as
+        // bounded as the per-channel fast path, and COUNT stays behind the
+        // per-IP rate limit above.
+        if ctx.is_admin {
+            if let Some((kind, since, until)) = filter::admin_global_count_target(&filters) {
+                let q = filter::build_admin_kind_count(kind, since, until);
+                if let Some((groups, exceptions)) = self.count_channel_messages(&q).await {
+                    let mut count: u64 = groups.iter().map(|(_, n)| *n).sum();
+                    // Expiring events (rare): NIP-40-filtered in
+                    // `count_channel_messages`, then read-authorised per event.
+                    for event in &exceptions {
+                        if matches!(
+                            self.authorize_event(event, &ctx, &zones).await,
+                            ReadDecision::Deliver | ReadDecision::DeliverAs(_)
+                        ) {
+                            count += 1;
+                        }
+                    }
+                    Self::send_count(ws, sub_id, count);
+                    return;
+                }
+            }
+        }
+
         if let Some((value, since, until)) = filter::channel_count_target(&filters) {
             let q = filter::build_channel_count(&value, since, until);
             // More own channels than COUNT_MAX_GROUPS (one zone lookup each)
