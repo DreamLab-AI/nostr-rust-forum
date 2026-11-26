@@ -219,8 +219,9 @@ pub fn GlossaryPage() -> impl IntoView {
                 // Forums, zone, section and topic pages); keep it in step.
                 <Entry id="reporting" title="Finding your way around and reporting a problem">
                     <p>
-                        "The breadcrumb at the top of a page reads Home › Forums › zone › \
-                         section › topic. A "
+                        "The breadcrumb at the top of a page usually reads Home › Forums › zone › \
+                         section › topic (if you can reach only one zone, there is no Forums \
+                         step). A "
                         <em>"zone"</em>
                         " is a large area; it holds "
                         <em>"sections"</em>
