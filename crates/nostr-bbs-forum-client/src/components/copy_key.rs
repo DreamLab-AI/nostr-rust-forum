@@ -107,7 +107,7 @@ const ICON_GLYPH: &str = "\u{29c9}";
 /// What a [`CopyKey`] copies unless told otherwise.
 pub const DEFAULT_WHAT: &str = "public key";
 
-/// The accessible label of a [`CopyKey`]: "Copy <what> <display>", where
+/// The accessible label of a [`CopyKey`]: `Copy {what} {display}`, where
 /// `what` defaults to [`DEFAULT_WHAT`].
 pub fn copy_aria_label(what: Option<&str>, display: &str) -> String {
     let what = what
