@@ -13,7 +13,11 @@
 //! current key can also send the earlier keys this admin holds, so someone
 //! who joins after a rotation can read the zone's history.
 //! Both actions re-read the member roster from the relay first, so a tab left
-//! open across a cohort change never grants or rotates to a stale list.
+//! open across a cohort change never grants or rotates to a stale list. The
+//! roster only names candidates: each action sends the key to members this
+//! device has granted before or an admin approved, and holds anyone else for
+//! approval ([`crate::zone_crypto::auto_grant::gate_split`]), so a pubkey the
+//! relay adds to a cohort never receives a key from a click here.
 //! Grants also go out without this tab: on allocation and at an admin's
 //! sign-in ([`crate::zone_crypto::auto_grant`]).
 
@@ -31,8 +35,8 @@ use crate::relay::RelayConnection;
 use crate::stores::zones::{load_zones, Zone};
 use crate::utils::shorten_pubkey;
 use crate::zone_crypto::auto_grant::{
-    plan_grant_missing, plan_new_key, report_summary, send_grants, AutoGrant, GateRecords,
-    PendingReview, ZoneRule,
+    gate_split, plan_grant_missing, plan_new_key, report_summary, send_grants, tab_gate, AutoGrant,
+    GateRecords, PendingReview, ZoneRule,
 };
 use crate::zone_crypto::store::{try_use_zone_key_store, ZoneKeyStore};
 use crate::zone_crypto::{generate_zone_key, grant_targets, ZoneKey, AGENT_COHORT};
@@ -83,6 +87,10 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
             .into_any();
     };
 
+    // Bumped when a card's action holds members back, so the approval list
+    // re-checks and shows them.
+    let refresh = RwSignal::new(0u64);
+
     if zones.is_empty() {
         return view! {
             <p class="text-sm text-gray-400">
@@ -102,8 +110,8 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
                  when someone leaves so they cannot read anything posted afterwards. Agents get \
                  a key only in zones the operator configured with agent_keys."
             </p>
-            <PendingApprovals />
-            {zones.into_iter().map(|z| view! { <ZoneKeyCard zone=z keys=keys members_ready=members_ready /> }).collect_view()}
+            <PendingApprovals refresh=refresh />
+            {zones.into_iter().map(|z| view! { <ZoneKeyCard zone=z keys=keys members_ready=members_ready refresh=refresh /> }).collect_view()}
         </div>
     }
     .into_any()
@@ -123,7 +131,7 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
 /// listed apart as unverified (check again, or approve explicitly), and a
 /// failed check says so rather than showing an empty list.
 #[component]
-fn PendingApprovals() -> impl IntoView {
+fn PendingApprovals(refresh: RwSignal<u64>) -> impl IntoView {
     let Some(auto) = AutoGrant::capture() else {
         return ().into_any();
     };
@@ -139,7 +147,11 @@ fn PendingApprovals() -> impl IntoView {
             let _ = review.try_set(Some(r));
         });
     };
-    check();
+    // On mount, and again whenever a card's action held members back.
+    Effect::new(move |_| {
+        refresh.track();
+        check();
+    });
 
     let drop_rows = move |done: &[(String, String)]| {
         review.update(|r| {
@@ -269,6 +281,50 @@ fn PendingApprovals() -> impl IntoView {
     .into_any()
 }
 
+/// The confirmation shown before a new key is created (`rotate` false) or
+/// rotated in at `epoch`: how many members receive it now (`receiving`, the
+/// admin not counted), and how many are held back. Rotation always asks;
+/// creation asks only when someone is held back.
+fn new_key_confirmation(
+    rotate: bool,
+    epoch: u32,
+    receiving: usize,
+    pending: usize,
+    unverified: usize,
+) -> Option<String> {
+    if !rotate && pending + unverified == 0 {
+        return None;
+    }
+    let mut lines = vec![
+        if rotate {
+            format!("Rotate to key epoch {epoch}?")
+        } else {
+            format!("Create key epoch {epoch}?")
+        },
+        String::new(),
+        format!("{receiving} member(s) receive the key now (and you)."),
+        format!(
+            "{pending} member(s) are held for your approval and get nothing until you approve \
+             them under \"New members awaiting approval\"."
+        ),
+    ];
+    if unverified > 0 {
+        lines.push(format!(
+            "{unverified} member(s) get nothing for now: this zone's grant record could not be \
+             checked."
+        ));
+    }
+    if rotate {
+        lines.push(String::new());
+        lines.push(
+            "Anyone removed from the zone cannot read messages posted after this. Older \
+             messages stay readable with the keys members already hold."
+                .into(),
+        );
+    }
+    Some(lines.join("\n"))
+}
+
 #[derive(Clone, PartialEq)]
 struct MemberRow {
     pubkey: String,
@@ -280,7 +336,12 @@ struct MemberRow {
 }
 
 #[component]
-fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) -> impl IntoView {
+fn ZoneKeyCard(
+    zone: Zone,
+    keys: ZoneKeyStore,
+    members_ready: RwSignal<bool>,
+    refresh: RwSignal<u64>,
+) -> impl IntoView {
     let admin = use_admin();
     let auth = use_auth();
     let relay = expect_context::<RelayConnection>();
@@ -359,31 +420,38 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         })
     };
 
-    // Reload "granted from this device" whenever the current epoch changes.
+    // The first-grant gate for this zone (who this device knows, and whether
+    // the relay-held record was read), for the button's count. Every action
+    // reads it afresh before sending; this copy is only for display.
+    let gate: RwSignal<Option<GateRecords>> = RwSignal::new(None);
+
+    // Reload "granted from this device" and the gate whenever the current
+    // epoch changes, or an action asks.
     let relay_for_ledger = relay.clone();
     Effect::new(move |_| {
-        let Some(key) = latest() else {
+        refresh.track();
+        let latest_key = latest();
+        if latest_key.is_none() {
             sent.set(HashSet::new());
-            return;
-        };
+        }
         let relay = relay_for_ledger.clone();
         let signer = auth.get_signer();
+        let (zone_id, floor) = zone.with_value(|z| (z.id.clone(), z.history_from_epoch));
         spawn_local(async move {
             // Show what this device knows straight away, then fold in the
             // relay-held record (grants sent before site data was cleared, or
             // from another browser of this admin) and show that.
-            sent.set(keys.grants_sent(&key.zone, key.epoch).await);
-            if let Some(signer) = signer {
-                if let Ok(n) = crate::zone_crypto::grant_backup::pull(
-                    &relay, &*signer, keys, &key.zone, key.epoch,
-                )
-                .await
-                {
-                    if n > 0 {
-                        let _ = sent.try_set(keys.grants_sent(&key.zone, key.epoch).await);
-                    }
-                }
+            if let Some(key) = &latest_key {
+                let _ = sent.try_set(keys.grants_sent(&key.zone, key.epoch).await);
             }
+            let Some(signer) = signer else {
+                return;
+            };
+            let g = tab_gate(&relay, &*signer, keys, &zone_id, floor).await;
+            if let Some(key) = &latest_key {
+                let _ = sent.try_set(keys.grants_sent(&key.zone, key.epoch).await);
+            }
+            let _ = gate.try_set(Some(g));
         });
     });
 
@@ -462,11 +530,26 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             .collect::<Vec<_>>()
     };
 
+    // `missing`, split by the last gate read: `None` until it has loaded.
+    let missing_split = move || {
+        let m = missing();
+        let zone_id = zone.with_value(|z| z.id.clone());
+        let me = me();
+        gate.with(|g| g.as_ref().map(|g| gate_split(&zone_id, m, &me, g)))
+    };
+
+    // Ask the approval list (and this card's gate) to re-check: members were
+    // held back and should be listed.
+    let held_back = move || {
+        let _ = refresh.try_update(|n| *n = n.wrapping_add(1));
+    };
+
     // Send each `(key, recipients)` pair: one gift wrap per recipient, recorded
-    // once the relay accepts it.
+    // once the relay accepts it. `held` says who the action held back, so the
+    // outcome never reads as if everyone was reached.
     let grant = {
         let relay = relay.clone();
-        move |plan: Vec<(ZoneKey, Vec<String>)>| {
+        move |plan: Vec<(ZoneKey, Vec<String>)>, held: Option<String>| {
             let Some(signer) = auth.get_signer() else {
                 status.set(Some("Sign in again to grant keys.".into()));
                 return;
@@ -513,7 +596,10 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             // acks land after it signed out.
             let sender = me_pk.clone();
             if plan.iter().all(|(_, r)| r.is_empty()) {
-                status.set(Some("Everyone eligible already has this key.".into()));
+                status.set(Some(match &held {
+                    Some(h) => format!("Nothing was sent. {h}"),
+                    None => "Everyone eligible already has this key.".into(),
+                }));
                 return;
             }
             let members: HashSet<&String> = plan.iter().flat_map(|(_, r)| r.iter()).collect();
@@ -553,13 +639,17 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 });
                 let report = send_grants(keys, &relay, &*signer, plan, on_recorded).await;
                 let _ = busy.try_set(false);
-                let _ = status.try_set(Some(match report_summary(&report) {
+                let outcome = match report_summary(&report) {
                     Some(s) if !s.problem => format!(
                         "{} Members receive the key next time they open the forum.",
                         s.text
                     ),
                     Some(s) => s.text,
                     None => "Nothing was sent — try again.".to_string(),
+                };
+                let _ = status.try_set(Some(match &held {
+                    Some(h) => format!("{outcome} {h}"),
+                    None => outcome,
                 }));
             });
         }
@@ -568,6 +658,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
     let create_or_rotate = {
         let grant = grant.clone();
         let fresh_roster = fresh_roster.clone();
+        let relay = relay.clone();
         move |rotate: bool| {
             let plan = mint_plan();
             let crate::zone_crypto::keyset::MintPlan::Mint {
@@ -589,66 +680,79 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                     return;
                 }
             }
-            if rotate {
-                let ok = web_sys::window()
-                    .and_then(|w| {
-                        w.confirm_with_message(&format!(
-                            "Rotate to key epoch {next_epoch}? Everyone eligible gets the new key; \
-                             anyone removed from the zone cannot read messages posted after this. \
-                             Older messages stay readable with the keys members already hold."
-                        ))
-                        .ok()
-                    })
-                    .unwrap_or(false);
-                if !ok {
-                    return;
-                }
-            }
             let grant = grant.clone();
+            let relay = relay.clone();
             fresh_roster(Box::new(move || {
-                // Re-plan after the roster round trip: a key may have arrived.
-                let crate::zone_crypto::keyset::MintPlan::Mint { epoch, .. } = mint_plan() else {
-                    status.set(Some(
-                        "A key cannot be created yet: see the note on this card.".into(),
-                    ));
+                let Some(signer) = auth.get_signer() else {
+                    status.set(Some("Sign in again to create a key.".into()));
                     return;
                 };
-                if epoch != next_epoch {
-                    status.set(Some(format!(
-                        "Keys changed while loading members (now epoch {epoch} would be next). Nothing was created; try again."
-                    )));
-                    return;
-                }
                 let me = me();
-                let zone_id = zone.with_value(|z| z.id.clone());
-                match generate_zone_key(&zone_id, next_epoch, &me, now_secs()) {
-                    Ok(mut key) => {
-                        // Saved before anything is sent, and refused if this device
-                        // holds a different key for the epoch; not sent under until
-                        // its grants land (see `pending_delivery`).
-                        key.pending_delivery = true;
-                        let grant = grant.clone();
-                        spawn_local(async move {
-                            match keys.insert_local(key.clone()).await {
-                                // A new key goes to everyone eligible; they already
-                                // hold (or were offered) the earlier ones.
-                                Ok(()) => {
-                                    let rule = zone.with_value(rule_of);
-                                    let plan = plan_new_key(
-                                        &rule,
-                                        &roster(),
-                                        &me,
-                                        &key,
-                                        &GateRecords::default(),
-                                    );
-                                    grant(plan.grants)
-                                }
-                                Err(why) => status.set(Some(why)),
-                            }
-                        });
+                let rule = zone.with_value(rule_of);
+                let members = roster();
+                busy.set(true);
+                spawn_local(async move {
+                    // Who is known for the zone, read before the new key
+                    // exists (it has no grants yet): the same record the
+                    // sign-in sweep reads, never the roster.
+                    let g =
+                        tab_gate(&relay, &*signer, keys, &rule.id, rule.history_from_epoch).await;
+                    let _ = busy.try_set(false);
+                    // Re-plan after the round trips: a key may have arrived.
+                    let crate::zone_crypto::keyset::MintPlan::Mint { epoch, .. } = mint_plan()
+                    else {
+                        status.set(Some(
+                            "A key cannot be created yet: see the note on this card.".into(),
+                        ));
+                        return;
+                    };
+                    if epoch != next_epoch {
+                        status.set(Some(format!(
+                            "Keys changed while loading members (now epoch {epoch} would be next). Nothing was created; try again."
+                        )));
+                        return;
                     }
-                    Err(e) => status.set(Some(format!("Could not create a key: {e}"))),
-                }
+                    let mut key = match generate_zone_key(&rule.id, next_epoch, &me, now_secs()) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            status.set(Some(format!("Could not create a key: {e}")));
+                            return;
+                        }
+                    };
+                    // Saved before anything is sent, and refused if this
+                    // device holds a different key for the epoch; not sent
+                    // under until its grants land (see `pending_delivery`).
+                    key.pending_delivery = true;
+                    // The new key goes to every known member in one batch;
+                    // anyone else is held for approval.
+                    let plan = plan_new_key(&rule, &members, &me, &key, &g);
+                    let (pending, unverified) = plan.held();
+                    if let Some(ask) = new_key_confirmation(
+                        rotate,
+                        next_epoch,
+                        plan.receiving(&me),
+                        pending,
+                        unverified,
+                    ) {
+                        let ok = web_sys::window()
+                            .and_then(|w| w.confirm_with_message(&ask).ok())
+                            .unwrap_or(false);
+                        if !ok {
+                            return;
+                        }
+                    }
+                    let _ = gate.try_set(Some(g));
+                    match keys.insert_local(key).await {
+                        Ok(()) => {
+                            if pending + unverified > 0 {
+                                held_back();
+                            }
+                            let note = plan.held_note();
+                            grant(plan.grants, note)
+                        }
+                        Err(why) => status.set(Some(why)),
+                    }
+                });
             }));
         }
     };
@@ -694,7 +798,8 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                             <button
                                 class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-semibold disabled:opacity-50"
                                 disabled=move || busy.get() || !members_ready.get()
-                                    || (missing().is_empty() && !latest().is_some_and(|k| k.pending_delivery))
+                                    || (missing_split().map_or_else(|| missing().is_empty(), |s| s.send.is_empty())
+                                        && !latest().is_some_and(|k| k.pending_delivery))
                                 on:click=move |_| fresh_roster.with_value(|f| f(Box::new(move || {
                                     let recipients = missing();
                                     let history = include_history.get_untracked();
@@ -709,31 +814,58 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                                     }
                                     let held = crate::zone_crypto::grantable_keys(all, floor);
                                     let relay_btn = relay_btn.get_value();
-                                    let signer_btn = auth.get_signer();
+                                    let Some(signer_btn) = auth.get_signer() else {
+                                        status.set(Some("Sign in again to grant keys.".into()));
+                                        return;
+                                    };
                                     let me_now = me();
+                                    busy.set(true);
                                     spawn_local(async move {
+                                        // Restores the relay-held record of every
+                                        // grantable key, then says who is known.
+                                        let g = tab_gate(&relay_btn, &*signer_btn, keys, &zone_id, floor).await;
                                         let mut earlier = std::collections::HashMap::new();
-                                        if history {
-                                            for k in &held {
-                                                if let Some(sg) = &signer_btn {
-                                                    let _ = crate::zone_crypto::grant_backup::pull(&relay_btn, &**sg, keys, &k.zone, k.epoch).await;
-                                                }
-                                                earlier.insert(k.epoch, keys.grants_sent(&k.zone, k.epoch).await);
-                                            }
+                                        for k in &held {
+                                            earlier.insert(k.epoch, keys.grants_sent(&k.zone, k.epoch).await);
                                         }
+                                        // Members the restored record shows as
+                                        // granted the newest key are not missing.
+                                        let have = held
+                                            .iter()
+                                            .map(|k| k.epoch)
+                                            .max()
+                                            .and_then(|e| earlier.get(&e).cloned())
+                                            .unwrap_or_default();
+                                        let recipients: Vec<String> =
+                                            recipients.into_iter().filter(|pk| !have.contains(pk)).collect();
+                                        let _ = busy.try_set(false);
                                         let plan = plan_grant_missing(
                                             &zone_id,
                                             &recipients,
                                             &me_now,
                                             &held,
-                                            &GateRecords::default(),
+                                            &g,
                                             history,
                                             |e| earlier.get(&e).cloned().unwrap_or_default(),
                                         );
-                                        grant.with_value(|g| g(plan.grants));
+                                        let _ = gate.try_set(Some(g));
+                                        let (pending, unverified) = plan.held();
+                                        if pending + unverified > 0 {
+                                            held_back();
+                                        }
+                                        let note = plan.held_note();
+                                        grant.with_value(|f| f(plan.grants, note));
                                     });
                                 })))
-                            >{move || format!("Grant to members missing it ({})", missing().len())}</button>
+                            >{move || match missing_split() {
+                                Some(s) if !s.pending.is_empty() || !s.unverified.is_empty() => format!(
+                                    "Grant to members missing it ({}) · {} held for approval",
+                                    s.send.len(),
+                                    s.pending.len() + s.unverified.len()
+                                ),
+                                Some(s) => format!("Grant to members missing it ({})", s.send.len()),
+                                None => format!("Grant to members missing it ({})", missing().len()),
+                            }}</button>
                             <button
                                 class="px-3 py-1.5 rounded-lg border border-gray-600 text-gray-200 hover:bg-gray-700 text-sm disabled:opacity-50"
                                 disabled=move || busy.get() || !members_ready.get() || mint_waiting()
@@ -885,5 +1017,36 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 }}
             </ul>
         </section>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_rotation_confirmation_counts_who_receives_and_who_is_held() {
+        let ask = new_key_confirmation(true, 7, 3, 2, 0).expect("rotation always asks");
+        assert!(ask.contains("Rotate to key epoch 7?"), "{ask}");
+        assert!(ask.contains("3 member(s) receive the key now"), "{ask}");
+        assert!(
+            ask.contains("2 member(s) are held for your approval"),
+            "{ask}"
+        );
+        assert!(!ask.contains("could not be checked"), "{ask}");
+        let ask = new_key_confirmation(true, 7, 3, 0, 4).expect("rotation always asks");
+        assert!(
+            ask.contains("0 member(s) are held for your approval"),
+            "{ask}"
+        );
+        assert!(ask.contains("4 member(s) get nothing for now"), "{ask}");
+    }
+
+    #[test]
+    fn creating_a_key_asks_only_when_someone_is_held() {
+        assert_eq!(new_key_confirmation(false, 1, 5, 0, 0), None);
+        let ask = new_key_confirmation(false, 1, 0, 5, 0).expect("held members");
+        assert!(ask.contains("Create key epoch 1?"), "{ask}");
+        assert!(ask.contains("5 member(s) are held"), "{ask}");
     }
 }

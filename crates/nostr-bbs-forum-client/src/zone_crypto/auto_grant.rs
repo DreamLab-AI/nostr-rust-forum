@@ -5,8 +5,9 @@
 //! and the host never hold a zone key. Two triggers:
 //!
 //! - **On allocation.** When an admin gives a member a cohort (the Members
-//!   table, a section request, a registration), the admin's browser sends
-//!   that member the key of every encrypted zone the cohort opens.
+//!   table, a section request, a registration), the admin's browser approves
+//!   the member in, and sends them the key of, each encrypted zone that
+//!   cohort opens, and no other.
 //! - **On sign-in.** Once per page load, an admin's browser checks every key
 //!   it holds against the relay's roster and grants it to each eligible member
 //!   its ledger has no record of. This covers members who arrive with no admin
@@ -24,7 +25,11 @@
 //! sweep wraps a key only to `me` or to a pubkey that is "known" for the zone
 //! (this device's ledger has granted it a held epoch, or an admin approved it).
 //! Any other target is held pending for a one-time approval in Admin →
-//! Encryption. An explicit allocation grants immediately and records approval.
+//! Encryption. An explicit allocation approves the member only in the zones
+//! the cohorts it gave open ([`allocation_opened`]), then grants. The
+//! Encryption tab's Create, Rotate and "Grant to members missing it" apply
+//! the same gate ([`gate_split`]): known members get the key, anyone else is
+//! held for approval.
 //! An empty record approves nobody: a fresh browser sees every member as
 //! awaiting approval (the tab approves them in bulk), and a zone whose
 //! relay-held backup could not be read is reported unverified, its unknown
@@ -139,18 +144,13 @@ pub struct MissingPlan {
 /// A member is owed a zone's newest key when they are one of its
 /// [`grant_targets`] and the ledger has no record of it; with that grant go
 /// the earlier keys they were not sent ([`grant_plan`] with history), so a
-/// member who joins after a rotation can read the zone's older messages. A
-/// target that is `me`, or known for the zone, auto-grants; any other target
-/// lands in [`MissingPlan::pending`] (or [`MissingPlan::unverified`], in an
-/// unverified zone) instead — unless `auto_grant_new` is set (an explicit
-/// admin allocation), when new targets both auto-grant and are reported in
-/// `pending` so the caller can persist the approval. `only` narrows the
-/// recipients to those pubkeys (an allocation).
-// Each parameter is a distinct, named input (roster, identity, held keys,
-// ledger history, the known/approved set, the allocation flag and the `only`
-// filter); bundling them would hide rather than clarify, so the arg-count lint
-// is allowed here deliberately.
-#[allow(clippy::too_many_arguments)]
+/// member who joins after a rotation can read the zone's older messages.
+/// Each zone's owed targets are split by [`gate_split`]: `me` and known
+/// targets are granted, any other lands in [`MissingPlan::pending`] (or
+/// [`MissingPlan::unverified`], in an unverified zone). `only` narrows the
+/// recipients to those pubkeys (an allocation or approval). Nothing here
+/// approves anybody: an explicit admin action records its approvals first
+/// (see [`allocation_opened`]), and they reach this plan through `gate`.
 pub fn plan_missing(
     zones: &[ZoneRule],
     members: &[(String, Vec<String>)],
@@ -158,11 +158,9 @@ pub fn plan_missing(
     held: &HashMap<String, Vec<ZoneKey>>,
     sent: &HashMap<(String, u32), HashSet<String>>,
     gate: &GateRecords,
-    auto_grant_new: bool,
     only: Option<&HashSet<String>>,
 ) -> MissingPlan {
     let none = HashSet::new();
-    let me_lower = me.to_ascii_lowercase();
     let mut out = MissingPlan::default();
     for zone in zones {
         let Some(keys) = held.get(&zone.id).filter(|k| !k.is_empty()) else {
@@ -172,35 +170,92 @@ pub fn plan_missing(
             continue;
         };
         let have = sent.get(&(zone.id.clone(), newest)).unwrap_or(&none);
-        let known_z = gate.known.get(&zone.id).unwrap_or(&none);
-        let unverified = gate.unverified.contains(&zone.id);
         let recipients = grant_targets(members, &zone.required_cohorts, me, zone.agent_keys)
             .into_iter()
             .filter(|pk| only.is_none_or(|o| o.contains(pk)))
             .filter(|pk| !have.contains(pk));
-        let mut auto: Vec<String> = Vec::new();
-        for pk in recipients {
-            if pk == me_lower || known_z.contains(&pk) {
-                auto.push(pk);
-            } else if auto_grant_new {
-                out.pending.push((zone.id.clone(), pk.clone()));
-                auto.push(pk);
-            } else if unverified {
-                out.unverified.push((zone.id.clone(), pk));
-            } else {
-                out.pending.push((zone.id.clone(), pk));
-            }
-        }
-        if auto.is_empty() {
+        let split = gate_split(&zone.id, recipients, me, gate);
+        out.pending.extend(split.pending);
+        out.unverified.extend(split.unverified);
+        if split.send.is_empty() {
             continue;
         }
-        out.grants.extend(grant_plan(keys, &auto, true, |epoch| {
-            sent.get(&(zone.id.clone(), epoch))
-                .cloned()
-                .unwrap_or_default()
-        }));
+        out.grants
+            .extend(grant_plan(keys, &split.send, true, |epoch| {
+                sent.get(&(zone.id.clone(), epoch))
+                    .cloned()
+                    .unwrap_or_default()
+            }));
     }
     out
+}
+
+/// One zone's recipients, split by the first-grant gate (see [`gate_split`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GateSplit {
+    /// Recipients that may be sent the key now: `me`, or known for the zone.
+    pub send: Vec<String>,
+    /// `(zone, pubkey)` pairs never granted and never approved for the zone.
+    pub pending: Vec<(String, String)>,
+    /// `(zone, pubkey)` pairs not on this device's record, in a zone whose
+    /// relay-held record could not be read.
+    pub unverified: Vec<(String, String)>,
+}
+
+/// The first-grant gate for one zone: which of `recipients` may be wrapped
+/// the zone's key now, and which are held.
+///
+/// The single rule every grant path applies (the sign-in sweep, allocations
+/// and approvals through [`plan_missing`], and the Encryption tab's Create,
+/// Rotate and "Grant to members missing it"). A recipient is sent the key
+/// when it is `me` or in `gate.known` for `zone` (granted a held epoch by
+/// this device, or approved by an admin). Anyone else is held: in
+/// [`GateSplit::unverified`] when the zone's record was not read, otherwise
+/// in [`GateSplit::pending`]. The relay's roster decides who is a candidate,
+/// never who is trusted.
+pub fn gate_split(
+    zone: &str,
+    recipients: impl IntoIterator<Item = String>,
+    me: &str,
+    gate: &GateRecords,
+) -> GateSplit {
+    let none = HashSet::new();
+    let me_lower = me.to_ascii_lowercase();
+    let known = gate.known.get(zone).unwrap_or(&none);
+    let unverified = gate.unverified.contains(zone);
+    let mut out = GateSplit::default();
+    for pk in recipients {
+        let pk = pk.to_ascii_lowercase();
+        if pk == me_lower || known.contains(&pk) {
+            out.send.push(pk);
+        } else if unverified {
+            out.unverified.push((zone.to_string(), pk));
+        } else {
+            out.pending.push((zone.to_string(), pk));
+        }
+    }
+    out
+}
+
+/// The `(zone, pubkey)` pairs an admin's allocation opens: `pubkey` in each
+/// of `zones` whose required cohorts include one of `added`, the cohorts the
+/// admin actually gave or approved.
+///
+/// Recorded as approvals before the grants are planned, so the allocation
+/// grants exactly these zones. A zone the roster also places `pubkey` in
+/// through some other cohort is not opened by this action: unless `pubkey`
+/// is already known there, it stays pending for an explicit approval.
+pub fn allocation_opened(
+    zones: &[ZoneRule],
+    pubkey: &str,
+    added: &[String],
+) -> Vec<(String, String)> {
+    let pk = pubkey.to_ascii_lowercase();
+    zones
+        .iter()
+        .filter(|z| z.required_cohorts.iter().any(|c| added.contains(c)))
+        .map(|z| (z.id.clone(), pk.clone()))
+        .collect()
 }
 
 /// What one of the Encryption tab's key actions (Create, Rotate, "Grant to
@@ -216,37 +271,82 @@ pub struct TabPlan {
     pub unverified: Vec<(String, String)>,
 }
 
+impl TabPlan {
+    /// Distinct members, other than `me`, the plan sends a key to.
+    pub fn receiving(&self, me: &str) -> usize {
+        let me = me.to_ascii_lowercase();
+        self.grants
+            .iter()
+            .flat_map(|(_, r)| r.iter())
+            .filter(|pk| **pk != me)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Distinct members held back: awaiting approval, and unverified.
+    pub fn held(&self) -> (usize, usize) {
+        let distinct =
+            |v: &[(String, String)]| v.iter().map(|(_, pk)| pk).collect::<HashSet<_>>().len();
+        (distinct(&self.pending), distinct(&self.unverified))
+    }
+
+    /// The members held back, in words; `None` when nobody was.
+    pub fn held_note(&self) -> Option<String> {
+        let (pending, unverified) = self.held();
+        let mut parts = Vec::new();
+        if pending > 0 {
+            parts.push(format!(
+                "{pending} member(s) were not sent the key: they are awaiting your approval \
+                 under \"New members awaiting approval\""
+            ));
+        }
+        if unverified > 0 {
+            parts.push(format!(
+                "{unverified} member(s) were not sent the key because this zone's grant record \
+                 could not be checked"
+            ));
+        }
+        (!parts.is_empty()).then(|| format!("{}.", parts.join("; ")))
+    }
+}
+
 /// The grants of a newly created or rotated `key` for the zone `rule`, to the
-/// members of the roster `members`.
+/// members of the roster `members`, split by [`gate_split`]: every known
+/// member (and `me`) receives the key in one batch; anyone else is held.
 pub fn plan_new_key(
     rule: &ZoneRule,
     members: &[(String, Vec<String>)],
     me: &str,
     key: &ZoneKey,
-    _gate: &GateRecords,
+    gate: &GateRecords,
 ) -> TabPlan {
     let targets = grant_targets(members, &rule.required_cohorts, me, rule.agent_keys);
+    let split = gate_split(&rule.id, targets, me, gate);
     TabPlan {
-        grants: vec![(key.clone(), targets)],
-        ..TabPlan::default()
+        grants: vec![(key.clone(), split.send)],
+        pending: split.pending,
+        unverified: split.unverified,
     }
 }
 
 /// The grants "Grant to members missing it" sends for `zone`: the held keys
-/// to `missing` (with earlier epochs when `include_history`, skipping
-/// members `earlier(epoch)` records as already sent).
+/// to the members of `missing` that pass [`gate_split`] (with earlier epochs
+/// when `include_history`, skipping members `earlier(epoch)` records as
+/// already sent). The others are held.
 pub fn plan_grant_missing(
-    _zone: &str,
+    zone: &str,
     missing: &[String],
-    _me: &str,
+    me: &str,
     held: &[ZoneKey],
-    _gate: &GateRecords,
+    gate: &GateRecords,
     include_history: bool,
     earlier: impl Fn(u32) -> HashSet<String>,
 ) -> TabPlan {
+    let split = gate_split(zone, missing.iter().cloned(), me, gate);
     TabPlan {
-        grants: grant_plan(held, missing, include_history, earlier),
-        ..TabPlan::default()
+        grants: grant_plan(held, &split.send, include_history, earlier),
+        pending: split.pending,
+        unverified: split.unverified,
     }
 }
 
@@ -608,6 +708,91 @@ pub async fn send_grants(
     done.report()
 }
 
+/// What this device knows of one zone's grant record, for the first-grant
+/// gate (see [`zone_record`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ZoneRecord {
+    /// Pubkeys this device's ledger (with the relay-held backup merged in)
+    /// has granted any of the keys read, plus the zone's approved set.
+    pub known: HashSet<String>,
+    /// Whether the relay-held backup of every key read was read (see
+    /// [`super::grant_backup::backup_verified`]).
+    pub verified: bool,
+    /// `(zone, epoch)` ledgers held here whose backup the relay lacks (see
+    /// [`super::grant_backup::needs_repair`]).
+    pub repair: Vec<(String, u32)>,
+}
+
+/// Read `zone`'s grant record for the first-grant gate, over `keys` (the
+/// zone's grantable keys): restore this admin's relay-held backup of each
+/// into the local ledger (once per session once found), then collect the
+/// members ever granted one of them and the approved set.
+///
+/// No inbox-key lookups: who is known does not depend on where a member's
+/// grant would go, so the Encryption tab can read the gate without one
+/// signature prompt per member. The roster plays no part.
+pub async fn zone_record(
+    relay: &RelayConnection,
+    signer: &dyn Signer,
+    store: ZoneKeyStore,
+    zone: &str,
+    keys: &[ZoneKey],
+) -> ZoneRecord {
+    let mut verified = true;
+    let mut repair = Vec::new();
+    for k in keys {
+        // After clearing site data the local ledger is empty and everyone
+        // would otherwise look ungranted. A relay that cannot answer leaves
+        // the zone unverified.
+        let pulled =
+            super::grant_backup::pull_detailed(relay, signer, store, &k.zone, k.epoch).await;
+        let local = store.export_grant_backup(&k.zone, k.epoch).await.len();
+        let authed = relay.authenticated().get_untracked();
+        let read = pulled.as_ref().map_err(String::as_str).copied();
+        if !super::grant_backup::backup_verified(read, authed) {
+            if let Err(e) = &pulled {
+                web_sys::console::warn_1(
+                    &format!("[zone-key] grant backup {zone}/{}: {e}", k.epoch).into(),
+                );
+            }
+            verified = false;
+        }
+        if super::grant_backup::needs_repair(read, local, authed) {
+            repair.push((k.zone.clone(), k.epoch));
+        }
+    }
+    let epochs: Vec<u32> = keys.iter().map(|k| k.epoch).collect();
+    let mut known = store.members_ever_granted(zone, &epochs).await;
+    known.extend(store.approved_targets(zone).await);
+    ZoneRecord {
+        known,
+        verified,
+        repair,
+    }
+}
+
+/// The gate for one zone as the Encryption tab acts on it: its record read
+/// over the keys this device may grant (the same keys the sign-in sweep
+/// reads), as [`GateRecords`].
+pub async fn tab_gate(
+    relay: &RelayConnection,
+    signer: &dyn Signer,
+    store: ZoneKeyStore,
+    zone: &str,
+    floor: Option<u32>,
+) -> GateRecords {
+    let held = super::grantable_keys(store.all_for_zone(zone), floor);
+    let rec = zone_record(relay, signer, store, zone, &held).await;
+    GateRecords {
+        known: HashMap::from([(zone.to_string(), rec.known)]),
+        unverified: if rec.verified {
+            HashSet::new()
+        } else {
+            HashSet::from([zone.to_string()])
+        },
+    }
+}
+
 /// Publish this admin's backup of each `(zone, epoch)` in `which`, retrying
 /// a failure once. Best effort: the local ledger stays authoritative.
 pub async fn push_backups(
@@ -660,15 +845,13 @@ impl AutoGrant {
     }
 
     /// Work out the grants owed, from a fresh roster read, split by the
-    /// first-grant confirmation gate. `only` narrows them to those members;
-    /// `auto_grant_new` auto-grants (and reports) never-granted targets instead
-    /// of holding them pending — set for an explicit admin allocation, never
-    /// for the silent sweep.
+    /// first-grant confirmation gate. `only` narrows them to those members.
+    /// Nobody is approved here: an explicit admin action records its
+    /// approvals before planning.
     async fn plan(
         &self,
         signer: &dyn Signer,
         only: Option<&HashSet<String>>,
-        auto_grant_new: bool,
     ) -> Result<MissingPlan, String> {
         let zones = encrypted_zone_rules();
         let mut floor_blocked = Vec::new();
@@ -713,84 +896,41 @@ impl AutoGrant {
         let mut unread: HashSet<String> = HashSet::new();
         let mut repair: Vec<(String, u32)> = Vec::new();
         for (zone, keys) in &held {
+            // Restores the relay-held record first, so `sent` below sees it.
+            let rec = zone_record(&self.relay, signer, self.store, zone, keys).await;
+            if !rec.verified {
+                unread.insert(zone.clone());
+            }
+            repair.extend(rec.repair);
+            known.insert(zone.clone(), rec.known);
             for k in keys {
-                // Restore this admin's relay-held record first (once per
-                // session): after clearing site data the local ledger is empty
-                // and everyone would otherwise look ungranted. A relay that
-                // cannot answer leaves the zone unverified.
-                let pulled = super::grant_backup::pull_detailed(
-                    &self.relay,
-                    signer,
-                    self.store,
-                    &k.zone,
-                    k.epoch,
-                )
-                .await;
-                let local = self.store.export_grant_backup(&k.zone, k.epoch).await.len();
-                let authed = self.relay.authenticated().get_untracked();
-                let read = pulled.as_ref().map_err(String::as_str).copied();
-                if !super::grant_backup::backup_verified(read, authed) {
-                    if let Err(e) = &pulled {
-                        web_sys::console::warn_1(
-                            &format!("[zone-key] grant backup {zone}/{}: {e}", k.epoch).into(),
-                        );
-                    }
-                    unread.insert(zone.clone());
-                }
-                if super::grant_backup::needs_repair(read, local, authed) {
-                    repair.push((k.zone.clone(), k.epoch));
-                }
                 let s = self.store.grants_sent_to(&k.zone, k.epoch, &targets).await;
                 sent.insert((k.zone.clone(), k.epoch), s);
             }
-            let epochs: Vec<u32> = keys.iter().map(|k| k.epoch).collect();
-            let mut k = self.store.members_ever_granted(zone, &epochs).await;
-            k.extend(self.store.approved_targets(zone).await);
-            known.insert(zone.clone(), k);
         }
         let me = self.auth.pubkey().get_untracked().unwrap_or_default();
         // No first-run baseline: a device with no record approves nobody (see
         // `gate_records`). The relay could have injected a pubkey before this
         // device's first sweep as easily as after it.
         let gate = gate_records(&held, known, &unread);
-        let mut plan = plan_missing(
-            &zones,
-            &members,
-            &me,
-            &held,
-            &sent,
-            &gate,
-            auto_grant_new,
-            only,
-        );
+        let mut plan = plan_missing(&zones, &members, &me, &held, &sent, &gate, only);
         plan.repair = repair;
         plan.floor_blocked = floor_blocked;
         Ok(plan)
     }
 
-    /// Plan and send the grants owed to `only`. With `auto_grant_new` (an
-    /// allocation) never-granted targets are approved and granted; without
-    /// it only targets already known or approved are. Also returns the zones
-    /// blocked by their history floor, for the caller to scope and report.
+    /// Plan and send the grants owed to `only`: only targets already known
+    /// or approved are granted. Also returns the zones blocked by their
+    /// history floor, for the caller to scope and report.
     async fn run(
         &self,
         only: Option<&HashSet<String>>,
-        auto_grant_new: bool,
     ) -> Result<(GrantReport, Vec<super::FloorBlock>), String> {
         let signer = self
             .auth
             .get_signer()
             .ok_or_else(|| "Sign in again to grant zone keys.".to_string())?;
-        let plan = self.plan(&*signer, only, auto_grant_new).await?;
-        if auto_grant_new {
-            // An allocation is an explicit admin action on this pubkey, not
-            // a silent sweep: approve any never-granted target so it is
-            // granted now and remembered, rather than held for a second
-            // confirmation.
-            for (zone, pk) in &plan.pending {
-                self.store.approve_target(zone, pk).await;
-            }
-        }
+        let plan = self.plan(&*signer, only).await?;
         if plan.grants.is_empty() {
             return Ok((GrantReport::default(), plan.floor_blocked));
         }
@@ -828,15 +968,31 @@ impl AutoGrant {
         }
     }
 
-    /// After `pubkey` was given a cohort: send them the key of every
-    /// encrypted zone they now belong to that this device holds, and say so.
-    pub fn after_allocation(&self, pubkey: &str) {
+    /// After an admin gave `pubkey` the cohorts `added`: approve `pubkey` in
+    /// each encrypted zone those cohorts open ([`allocation_opened`]), then
+    /// send it the keys this device holds that it is owed, and say so.
+    ///
+    /// Only the zones `added` opens are approved. A zone the relay's roster
+    /// places `pubkey` in through another cohort is granted only if `pubkey`
+    /// is already known there; otherwise it stays pending for an explicit
+    /// approval in Admin → Encryption.
+    pub fn after_allocation(&self, pubkey: &str, added: &[String]) {
+        let opened = allocation_opened(&encrypted_zone_rules(), pubkey, added);
+        if opened.is_empty() {
+            // No encrypted zone in the cohorts given: nothing is approved,
+            // and nothing new is owed by this action.
+            return;
+        }
         let this = self.clone();
         let only: HashSet<String> = std::iter::once(pubkey.to_ascii_lowercase()).collect();
         spawn_local(async move {
+            // The admin's decision, recorded whatever the relay answers next.
+            for (zone, pk) in &opened {
+                this.store.approve_target(zone, pk).await;
+            }
             // Floor-blocked zones are not this member's to report: the sweep,
             // the Encryption tab and the console already name them.
-            match this.run(Some(&only), true).await.map(|(r, _)| r) {
+            match this.run(Some(&only)).await.map(|(r, _)| r) {
                 // Nothing owed (no encrypted zone in the new cohorts, or the
                 // member already holds the keys) is not worth a toast here.
                 Ok(r) if report_summary(&r).is_none() => {}
@@ -860,7 +1016,7 @@ impl AutoGrant {
                 return;
             };
             let extension = this.auth.state.with_untracked(|s| s.is_nip07);
-            let plan = match this.plan(&*signer, None, false).await {
+            let plan = match this.plan(&*signer, None).await {
                 Ok(p) => p,
                 Err(e) => {
                     web_sys::console::warn_1(&format!("[zone-key] sweep skipped: {e}").into());
@@ -972,7 +1128,7 @@ impl AutoGrant {
             .auth
             .get_signer()
             .ok_or_else(|| "Sign in again to check for members awaiting a key.".to_string())?;
-        let p = self.plan(&*signer, None, false).await?;
+        let p = self.plan(&*signer, None).await?;
         Ok(PendingReview {
             pending: p.pending,
             unverified: p.unverified,
@@ -1009,7 +1165,7 @@ impl AutoGrant {
                 .map(|(_, pk)| pk.to_ascii_lowercase())
                 .collect();
             let zones: HashSet<&String> = targets.iter().map(|(z, _)| z).collect();
-            let outcome = this.run(Some(&only), false).await.and_then(|(r, blocked)| {
+            let outcome = this.run(Some(&only)).await.and_then(|(r, blocked)| {
                 // A zone being approved that no key can be granted for is
                 // the reason nothing went: say so, not "nothing was owed".
                 let why: Vec<String> = blocked
@@ -1091,6 +1247,18 @@ mod tests {
         }
     }
 
+    /// The gate once each `(zone, pubkey)` in `pairs` has been approved.
+    fn approved(pairs: &[(String, String)]) -> GateRecords {
+        let mut known: HashMap<String, HashSet<String>> = HashMap::new();
+        for (z, pk) in pairs {
+            known.entry(z.clone()).or_default().insert(pk.clone());
+        }
+        GateRecords {
+            known,
+            unverified: HashSet::new(),
+        }
+    }
+
     #[test]
     fn grants_the_newest_key_to_every_eligible_member_not_on_record() {
         let zones = [rule("zone3", "family", false)];
@@ -1103,7 +1271,6 @@ mod tests {
             &held("zone3", &[1]),
             &sent,
             &known("zone3", &[pk('b')]),
-            false,
             None,
         );
         assert_eq!(plan.grants.len(), 1);
@@ -1123,7 +1290,6 @@ mod tests {
             &held("zone4", &[1]),
             &HashMap::new(),
             &known("zone4", &[pk('b'), pk('d')]),
-            false,
             None,
         );
         assert!(plan.grants[0].1.contains(&pk('d')));
@@ -1144,7 +1310,6 @@ mod tests {
             &held("zone3", &[1, 2]),
             &sent,
             &known("zone3", &[pk('b')]),
-            false,
             None,
         );
         let epochs: Vec<u32> = plan.grants.iter().map(|(k, _)| k.epoch).collect();
@@ -1164,7 +1329,6 @@ mod tests {
             &held("zone3", &[1]),
             &sent,
             &known("zone3", &[pk('b')]),
-            false,
             None,
         );
         assert!(plan.grants.is_empty());
@@ -1180,22 +1344,23 @@ mod tests {
         let mut keys = held("zone3", &[1]);
         keys.extend(held("zone2", &[1]));
         let only = HashSet::from([pk('c')]);
-        // An allocation (auto_grant_new) grants a brand-new target and reports
-        // it so the caller persists the approval.
+        // An allocation of the business cohort approves c in zone2 (the
+        // caller persists it), then grants through the gate.
+        let opened = allocation_opened(&zones, &pk('c'), &["business".to_string()]);
+        assert_eq!(opened, vec![("zone2".to_string(), pk('c'))]);
         let plan = plan_missing(
             &zones,
             &members(),
             ME,
             &keys,
             &HashMap::new(),
-            &GateRecords::default(),
-            true,
+            &approved(&opened),
             Some(&only),
         );
         assert_eq!(plan.grants.len(), 1);
         assert_eq!(plan.grants[0].0.zone, "zone2");
         assert_eq!(plan.grants[0].1, vec![pk('c')]);
-        assert_eq!(plan.pending, vec![("zone2".to_string(), pk('c'))]);
+        assert!(plan.pending.is_empty());
     }
 
     #[test]
@@ -1211,7 +1376,6 @@ mod tests {
             &held("zone3", &[1]),
             &HashMap::new(),
             &known("zone3", &[pk('b')]),
-            false,
             None,
         );
         assert!(plan.grants.iter().all(|(k, _)| k.zone == "zone3"));
@@ -1230,7 +1394,6 @@ mod tests {
             &held("zone3", &[1]),
             &HashMap::new(),
             &GateRecords::default(), // nothing known: b has never been granted
-            false,
             None,
         );
         // Only me (always known) is auto-granted; b is surfaced for approval.
@@ -1252,7 +1415,6 @@ mod tests {
             &held("zone3", &[1]),
             &sent,
             &known("zone3", &[pk('b')]), // b now approved
-            false,
             None,
         );
         assert_eq!(plan.grants.len(), 1);
@@ -1276,7 +1438,6 @@ mod tests {
             &held("zone3", &[1, 2]),
             &sent,
             &known("zone3", &[pk('b')]), // ever-granted epoch 1 -> known
-            false,
             None,
         );
         // Newest epoch 2 goes to b with no pending entry.
@@ -1297,7 +1458,6 @@ mod tests {
             &held("zone3", &[1]),
             &HashMap::new(),
             &GateRecords::default(),
-            false,
             None,
         );
         assert!(plan.grants.iter().any(|(_, r)| r.contains(&ME.to_string())));
@@ -1317,7 +1477,6 @@ mod tests {
             &held("zone3", &[1]),
             &HashMap::new(),
             &GateRecords::default(),
-            false,
             None,
         );
         assert!(plan.grants.iter().all(|(_, r)| !r.contains(&d)));
@@ -1338,16 +1497,7 @@ mod tests {
             .get("zone3")
             .is_none_or(|k| !k.contains(&pk('b'))));
         assert!(gate.unverified.is_empty(), "the relay answered: verified");
-        let plan = plan_missing(
-            &zones,
-            &members(),
-            ME,
-            &held,
-            &HashMap::new(),
-            &gate,
-            false,
-            None,
-        );
+        let plan = plan_missing(&zones, &members(), ME, &held, &HashMap::new(), &gate, None);
         assert_eq!(plan.pending, vec![("zone3".to_string(), pk('b'))]);
         assert!(plan.unverified.is_empty());
         assert!(plan.grants.iter().all(|(_, r)| r == &vec![ME.to_string()]));
@@ -1364,16 +1514,7 @@ mod tests {
         assert!(gate.known.get("zone3").is_none_or(HashSet::is_empty));
         assert_eq!(gate.unverified, unread);
         // Its members are neither granted nor called never granted.
-        let plan = plan_missing(
-            &zones,
-            &members(),
-            ME,
-            &held,
-            &HashMap::new(),
-            &gate,
-            false,
-            None,
-        );
+        let plan = plan_missing(&zones, &members(), ME, &held, &HashMap::new(), &gate, None);
         assert!(plan.pending.is_empty(), "not presented as never granted");
         assert_eq!(plan.unverified, vec![("zone3".to_string(), pk('b'))]);
         assert!(plan.grants.iter().all(|(_, r)| r == &vec![ME.to_string()]));
@@ -1392,16 +1533,7 @@ mod tests {
             HashMap::from([("zone3".to_string(), HashSet::from([pk('b')]))]),
             &HashSet::from(["zone3".to_string()]),
         );
-        let plan = plan_missing(
-            &zones,
-            &roster,
-            ME,
-            &held,
-            &HashMap::new(),
-            &gate,
-            false,
-            None,
-        );
+        let plan = plan_missing(&zones, &roster, ME, &held, &HashMap::new(), &gate, None);
         let epoch2 = plan.grants.iter().find(|(k, _)| k.epoch == 2).unwrap();
         assert!(epoch2.1.contains(&pk('b')));
         assert!(plan.grants.iter().all(|(_, r)| !r.contains(&pk('e'))));
@@ -1414,7 +1546,13 @@ mod tests {
         // The admin named this pubkey: the backup state does not bear on it.
         let zones = [rule("zone3", "family", false)];
         let held = held("zone3", &[1]);
-        let gate = gate_records(&held, HashMap::new(), &HashSet::from(["zone3".into()]));
+        let opened = allocation_opened(&zones, &pk('b'), &["family".to_string()]);
+        assert_eq!(opened, vec![("zone3".to_string(), pk('b'))]);
+        let gate = gate_records(
+            &held,
+            approved(&opened).known,
+            &HashSet::from(["zone3".into()]),
+        );
         let only = HashSet::from([pk('b')]);
         let plan = plan_missing(
             &zones,
@@ -1423,11 +1561,10 @@ mod tests {
             &held,
             &HashMap::new(),
             &gate,
-            true,
             Some(&only),
         );
         assert_eq!(plan.grants[0].1, vec![pk('b')]);
-        assert_eq!(plan.pending, vec![("zone3".to_string(), pk('b'))]);
+        assert!(plan.pending.is_empty());
         assert!(plan.unverified.is_empty());
     }
 
@@ -1536,15 +1673,17 @@ mod tests {
         let mut keys = held("zone_pub", &[1]);
         keys.extend(held("zone_priv", &[1]));
         let only = HashSet::from([p.clone()]);
-        // How `after_allocation` plans the grants for that allocation.
+        // How `after_allocation` plans the grants for that allocation: it
+        // records the opened pairs as approved, then plans through the gate.
+        let opened = allocation_opened(&zones, &p, &["public".to_string()]);
+        assert_eq!(opened, vec![("zone_pub".to_string(), p.clone())]);
         let plan = plan_missing(
             &zones,
             &roster,
             ME,
             &keys,
             &HashMap::new(),
-            &GateRecords::default(),
-            true,
+            &approved(&opened),
             Some(&only),
         );
         let granted: Vec<&str> = plan
@@ -1661,7 +1800,6 @@ mod tests {
             &held("zone3", &[1]),
             &sent,
             &known("zone3", &[pk('b')]),
-            false,
             None,
         );
         assert!(plan.grants[0].1.contains(&pk('b')));

@@ -195,22 +195,6 @@ async fn fetch_remote(
     Ok(pick(&found, &owner, zone, epoch).cloned())
 }
 
-/// Merge the relay-held backup of `(zone, epoch)` into this device's ledger
-/// (once per session once found). Returns the number of members newly marked
-/// granted; `Err` when the relay could not be asked, in which case the local
-/// ledger stands alone, as before.
-pub async fn pull(
-    relay: &RelayConnection,
-    identity: &dyn Signer,
-    store: ZoneKeyStore,
-    zone: &str,
-    epoch: u32,
-) -> Result<usize, String> {
-    Ok(pull_detailed(relay, identity, store, zone, epoch)
-        .await?
-        .added())
-}
-
 /// What [`pull_detailed`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pulled {
@@ -222,18 +206,11 @@ pub enum Pulled {
     Missing,
 }
 
-impl Pulled {
-    /// Entries newly marked granted.
-    pub fn added(self) -> usize {
-        match self {
-            Pulled::Merged(n) => n,
-            Pulled::Cached | Pulled::Missing => 0,
-        }
-    }
-}
-
-/// [`pull`], saying whether the relay held a backup at all, so a caller can
-/// publish one that is missing (see [`needs_repair`]).
+/// Merge the relay-held backup of `(zone, epoch)` into this device's ledger
+/// (once per session once found), saying whether the relay held a backup at
+/// all, so a caller can publish one that is missing (see [`needs_repair`]).
+/// `Err` when the relay could not be asked or the backup did not open, in
+/// which case the local ledger stands alone.
 pub async fn pull_detailed(
     relay: &RelayConnection,
     identity: &dyn Signer,
@@ -637,13 +614,6 @@ mod tests {
         assert!(!claim_repair(&owner, "zone2", 5));
         assert!(claim_repair(&owner, "zone2", 6));
         assert!(claim_repair(&owner, "zone4", 5));
-    }
-
-    #[test]
-    fn pulled_counts_only_merged_entries() {
-        assert_eq!(Pulled::Merged(4).added(), 4);
-        assert_eq!(Pulled::Missing.added(), 0);
-        assert_eq!(Pulled::Cached.added(), 0);
     }
 
     #[test]
