@@ -457,48 +457,124 @@ impl NostrRelayDO {
                 return Ok(s.clone());
             }
         }
-        // A full count or roll is needed. Join one already running.
-        if self.count_inflight.borrow().contains(key) {
-            return self.await_count_snapshot(key, current).await;
-        }
-        if self.count_full_running.get() >= super::read_cache::COUNT_FULL_MAX_CONCURRENT {
-            // Busy: an old snapshot still answers; none means retry later.
+        // A first build or a roll is needed. Never wait on one already
+        // running: an older snapshot answers, else "busy, try again".
+        if self.count_inflight.borrow().contains(key)
+            || self.count_full_running.get() >= super::read_cache::COUNT_FULL_MAX_CONCURRENT
+        {
             return current.ok_or_else(|| "count busy".to_string());
         }
         let _guard = InflightGuard::claim(&self.count_inflight, &self.count_full_running, key);
         let started = js_sys::Date::now();
-        let h = snapshot_horizon(now);
-        let from = current.as_ref().map(|s| s.as_of.saturating_add(1));
-        let (groups, rows, windows) = self
-            .windowed_count_n(value, from, h)
-            .await
-            .ok_or("count read failed")?;
         let snap = match current {
-            // Roll forward: fold in what arrived since, drop expired rows.
-            Some(old) => CountSnapshot {
-                as_of: h,
-                groups: merge_groups(&old.groups, &groups),
-                exceptions: old.exceptions.and_then(|mut base| {
-                    base.extend(rows);
-                    snapshot_exceptions(&drop_expired(base, now))
-                }),
-            },
-            None => CountSnapshot {
-                as_of: h,
-                groups,
-                exceptions: snapshot_exceptions(&rows),
+            Some(old) => {
+                // Roll forward: fold in what arrived since, drop expired rows.
+                let h = snapshot_horizon(now);
+                let (groups, rows, windows) = self
+                    .windowed_count_n(value, Some(old.as_of.saturating_add(1)), h)
+                    .await
+                    .ok_or("count read failed")?;
+                let snap = CountSnapshot {
+                    as_of: h,
+                    groups: merge_groups(&old.groups, &groups),
+                    exceptions: old.exceptions.and_then(|mut base| {
+                        base.extend(rows);
+                        snapshot_exceptions(&drop_expired(base, now))
+                    }),
+                };
+                console_log!(
+                    "count roll {}: {} windows, {} messages, {:.0} ms",
+                    &key[..8.min(key.len())],
+                    windows,
+                    snap.total(),
+                    js_sys::Date::now() - started
+                );
+                snap
+            }
+            None => match self.build_snapshot_paced(key, value, now).await? {
+                Some(snap) => snap,
+                None => return Err("count building".into()),
             },
         };
-        console_log!(
-            "count {} {}: {} windows, {} messages, {:.0} ms",
-            if from.is_some() { "roll" } else { "full" },
-            &key[..8.min(key.len())],
-            windows,
-            snap.total(),
-            js_sys::Date::now() - started
-        );
         self.keep_count_snapshot(key, &snap, now).await;
         Ok(snap)
+    }
+
+    /// Build the first snapshot of `key` in paced windows, resuming saved
+    /// progress and saving it after every window. `Ok(None)`: the request's
+    /// time budget ran out first (progress kept for the next request).
+    async fn build_snapshot_paced(
+        &self,
+        key: &str,
+        value: &str,
+        now: u64,
+    ) -> std::result::Result<Option<super::read_cache::CountSnapshot>, String> {
+        use super::read_cache::{
+            next_window, partial_storage_key, snapshot_horizon, CountPartial,
+            COUNT_BUILD_BUDGET_MS, COUNT_WINDOW_PAUSE_MS, COUNT_WINDOW_ROWS,
+        };
+        #[derive(Deserialize)]
+        struct Edge {
+            created_at: f64,
+        }
+        const FAILED: &str = "count read failed";
+        let storage = self.state.storage();
+        let pk = partial_storage_key(key);
+        let mut part = match storage.get::<String>(&pk).await {
+            Ok(Some(json)) => serde_json::from_str::<CountPartial>(&json)
+                .unwrap_or_else(|_| CountPartial::start(snapshot_horizon(now))),
+            _ => CountPartial::start(snapshot_horizon(now)),
+        };
+        let db = self.env.d1("DB").map_err(|e| e.to_string())?;
+        let started = js_sys::Date::now();
+        let mut windows = 0u32;
+        loop {
+            let edge: Option<Edge> = db
+                .prepare(filter::COUNT_WINDOW_EDGE_SQL)
+                .bind(&[
+                    JsValue::from_str(value),
+                    JsValue::from_f64(part.lo as f64),
+                    JsValue::from_f64(part.hi as f64),
+                    JsValue::from_f64(f64::from(COUNT_WINDOW_ROWS)),
+                ])
+                .map_err(|e| e.to_string())?
+                .first::<Edge>(None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let (w_lo, w_hi, next) =
+                next_window(part.lo, edge.map(|e| e.created_at as u64), part.hi);
+            let q = filter::build_channel_count(value, Some(w_lo), Some(w_hi));
+            let groups = self.run_count_groups(&q.grouped).await.ok_or(FAILED)?;
+            let rows = self.count_exception_rows(&q).await.ok_or(FAILED)?;
+            part.absorb(&groups, rows);
+            windows += 1;
+            let Some(n) = next else {
+                let _ = storage.delete(&pk).await;
+                let snap = part.finish();
+                console_log!(
+                    "count built {}: +{} windows, {} messages",
+                    &key[..8.min(key.len())],
+                    windows,
+                    snap.total()
+                );
+                return Ok(Some(snap));
+            };
+            part.lo = n;
+            if let Ok(json) = serde_json::to_string(&part) {
+                let _ = storage.put(&pk, json).await;
+            }
+            if js_sys::Date::now() - started > COUNT_BUILD_BUDGET_MS {
+                console_log!(
+                    "count building {}: +{} windows, at {} of {}",
+                    &key[..8.min(key.len())],
+                    windows,
+                    part.lo,
+                    part.hi
+                );
+                return Ok(None);
+            }
+            worker::Delay::from(std::time::Duration::from_millis(COUNT_WINDOW_PAUSE_MS)).await;
+        }
     }
 
     /// The snapshot persisted for `key`, if any (also put back in memory).
@@ -518,32 +594,6 @@ impl NostrRelayDO {
         let s = serde_json::from_str::<super::read_cache::CountSnapshot>(&json).ok()?;
         self.count_cache.insert(key, s.clone(), now);
         Some(s)
-    }
-
-    /// Wait for the full count or roll of `key` running in this isolate. On
-    /// timeout, an older snapshot still answers; with none, a retryable error.
-    async fn await_count_snapshot(
-        &self,
-        key: &str,
-        older: Option<super::read_cache::CountSnapshot>,
-    ) -> std::result::Result<super::read_cache::CountSnapshot, String> {
-        let mut waited = 0;
-        while waited < super::read_cache::COUNT_INFLIGHT_WAIT_MS {
-            worker::Delay::from(std::time::Duration::from_millis(250)).await;
-            waited += 250;
-            if !self.count_inflight.borrow().contains(key) {
-                break;
-            }
-        }
-        let now = auth::js_now_secs();
-        if let Some(s) = self.count_cache.get(key, now) {
-            return Ok(s);
-        }
-        // The memory cache may have been cleared: re-read DO storage.
-        if let Some(s) = self.load_count_snapshot(key, now).await {
-            return Ok(s);
-        }
-        older.ok_or_else(|| "count busy".to_string())
     }
 
     /// Keep `snap` in memory, and in DO storage when big enough to matter.
