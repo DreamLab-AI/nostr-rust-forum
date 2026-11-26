@@ -12,17 +12,21 @@ use sha2::{Digest, Sha256};
 
 use crate::format::{int8_row_offset, BinLayer, Header, Kind, Scope};
 use crate::manifest::{Content, ObjectRef};
-use crate::DIM;
 use crate::quant::{dot_i8, top_r, Candidate, QueryLut, I8_ROW_BYTES};
 use crate::seal::{self, header_len, open_range, ranges_for, SearchKey, SparseReader};
+use crate::DIM;
 
 /// Exactly one X25519 recipient stanza and no other real recipient (review
 /// H3/L4): refuses scrypt and multi-recipient files before age parses
 /// further. age writes random `*-grease` stanzas, which carry no key and are
 /// ignored here as age itself ignores them.
 pub fn single_x25519_stanza(prefix: &[u8]) -> bool {
-    let Some(hl) = header_len(prefix) else { return false };
-    let Ok(text) = std::str::from_utf8(&prefix[..hl]) else { return false };
+    let Some(hl) = header_len(prefix) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&prefix[..hl]) else {
+        return false;
+    };
     let types: Vec<&str> = text
         .lines()
         .filter_map(|l| l.strip_prefix("-> "))
@@ -48,13 +52,21 @@ fn check_header(h: &Header, o: &ObjectRef, c: &Content) -> Result<(), String> {
         || h.index_version != c.index_version
         || h.count != o.count
     {
-        return Err(format!("object {} header does not match the manifest", o.name));
+        return Err(format!(
+            "object {} header does not match the manifest",
+            o.name
+        ));
     }
     Ok(())
 }
 
 /// Verify a sealed object against its manifest entry (size, hash, stanza).
-pub fn check_sealed(o: &ObjectRef, sealed_prefix: &[u8], total: usize, full_sha: Option<&str>) -> Result<(), String> {
+pub fn check_sealed(
+    o: &ObjectRef,
+    sealed_prefix: &[u8],
+    total: usize,
+    full_sha: Option<&str>,
+) -> Result<(), String> {
     if total as u64 != o.size {
         return Err(format!("object {} size mismatch", o.name));
     }
@@ -112,7 +124,11 @@ impl Index {
     /// Start an index for a verified manifest with the keys the member holds
     /// (keyed by `(epoch, hex zone_pk)`).
     pub fn new(content: Content, keys: HashMap<(u32, String), SearchKey>) -> Self {
-        Self { content, keys, shards: Vec::new() }
+        Self {
+            content,
+            keys,
+            shards: Vec::new(),
+        }
     }
 
     /// Bin objects in the manifest whose key is held (others are skipped:
@@ -121,7 +137,9 @@ impl Index {
         self.content
             .objects
             .iter()
-            .filter(|o| o.kind == Kind::Bin && self.keys.contains_key(&(o.epoch, o.zone_pk.to_lowercase())))
+            .filter(|o| {
+                o.kind == Kind::Bin && self.keys.contains_key(&(o.epoch, o.zone_pk.to_lowercase()))
+            })
             .cloned()
             .collect()
     }
@@ -130,7 +148,12 @@ impl Index {
         self.content
             .objects
             .iter()
-            .find(|o| o.kind == Kind::Int8 && o.epoch == b.epoch && o.shard == b.shard && o.zone_pk == b.zone_pk)
+            .find(|o| {
+                o.kind == Kind::Int8
+                    && o.epoch == b.epoch
+                    && o.shard == b.shard
+                    && o.zone_pk == b.zone_pk
+            })
             .cloned()
     }
 
@@ -138,28 +161,47 @@ impl Index {
     /// authenticated header against the manifest, keeps ids + codes.
     pub fn add_bin(&mut self, o: &ObjectRef, sealed: &[u8]) -> Result<(), String> {
         check_sealed(o, sealed, sealed.len(), Some(&sha256_hex(sealed)))?;
-        let key = self.keys.get(&(o.epoch, o.zone_pk.to_lowercase())).ok_or("no key for object")?;
+        let key = self
+            .keys
+            .get(&(o.epoch, o.zone_pk.to_lowercase()))
+            .ok_or("no key for object")?;
         let bin = BinLayer::parse(&seal::open(key, sealed)?)?;
         check_header(&bin.header, o, &self.content)?;
-        let q = self.q_for(o).ok_or_else(|| format!("no int8 layer for {}", o.name))?;
-        self.shards.push(Shard { bin, q, q_geom: None });
+        let q = self
+            .q_for(o)
+            .ok_or_else(|| format!("no int8 layer for {}", o.name))?;
+        self.shards.push(Shard {
+            bin,
+            q,
+            q_geom: None,
+        });
         Ok(())
     }
 
     /// Rows resident.
     pub fn rows(&self) -> usize {
-        self.shards.iter().map(|s| s.bin.header.count as usize).sum()
+        self.shards
+            .iter()
+            .map(|s| s.bin.header.count as usize)
+            .sum()
     }
 
     /// Resident bytes (ids + codes).
     pub fn resident_bytes(&self) -> usize {
-        self.shards.iter().map(|s| s.bin.ids.len() + s.bin.codes.len()).sum()
+        self.shards
+            .iter()
+            .map(|s| s.bin.ids.len() + s.bin.codes.len())
+            .sum()
     }
 
     /// Names of `q-` objects whose geometry is not known yet (the caller
     /// supplies their first bytes and full length via [`Index::set_q_prefix`]).
     pub fn q_needing_prefix(&self) -> Vec<ObjectRef> {
-        self.shards.iter().filter(|s| s.q_geom.is_none()).map(|s| s.q.clone()).collect()
+        self.shards
+            .iter()
+            .filter(|s| s.q_geom.is_none())
+            .map(|s| s.q.clone())
+            .collect()
     }
 
     /// Record a `q-` object's geometry from its first bytes (at least the age
@@ -167,20 +209,37 @@ impl Index {
     /// authenticated NBSS header in chunk 0 (review L4).
     pub fn set_q_prefix(&mut self, name: &str, prefix: &[u8], total: usize) -> Result<(), String> {
         let content = self.content.clone();
-        let si = self.shards.iter().position(|s| s.q.name == name).ok_or("unknown q object")?;
+        let si = self
+            .shards
+            .iter()
+            .position(|s| s.q.name == name)
+            .ok_or("unknown q object")?;
         let o = self.shards[si].q.clone();
         check_sealed(&o, prefix, total, None)?;
-        let key = self.keys.get(&(o.epoch, o.zone_pk.to_lowercase())).ok_or("no key")?;
+        let key = self
+            .keys
+            .get(&(o.epoch, o.zone_pk.to_lowercase()))
+            .ok_or("no key")?;
         let hl = header_len(prefix).ok_or("no age header")?;
         // Header + nonce + chunk 0: reading from the start involves no
         // forward seek, so the final chunk is not needed here.
         let want = [(0, hl + 16), seal::chunk_range(hl, total, 0)];
         let parts: Vec<(usize, Vec<u8>)> = want
             .iter()
-            .map(|&(a, b)| prefix.get(a..b).map(|x| (a, x.to_vec())).ok_or("prefix too short"))
+            .map(|&(a, b)| {
+                prefix
+                    .get(a..b)
+                    .map(|x| (a, x.to_vec()))
+                    .ok_or("prefix too short")
+            })
             .collect::<Result<_, _>>()?;
-        let head = open_range(key, SparseReader::new(total, parts), 0, 256.min(o.count as usize * I8_ROW_BYTES + 128))
-            .map_err(|_| "cannot open int8 chunk 0".to_string())?;
+        let head = open_range(
+            key,
+            SparseReader::new(total, parts),
+            0,
+            256.min(o.count as usize * I8_ROW_BYTES + 128),
+        )
+        .map_err(|_| "cannot open int8 chunk 0".to_string())?;
         let (h, nb) = Header::decode(&head)?;
         check_header(&h, &o, &content)?;
         self.shards[si].q_geom = Some((hl, nb));
@@ -194,7 +253,8 @@ impl Index {
         top_r(
             self.shards.iter().enumerate().flat_map(|(si, s)| {
                 let lut = &lut;
-                (0..s.bin.header.count as usize).map(move |row| (si, row, lut.score(s.bin.code(row))))
+                (0..s.bin.header.count as usize)
+                    .map(move |row| (si, row, lut.score(s.bin.code(row))))
             }),
             r,
         )
@@ -216,7 +276,10 @@ impl Index {
             .map(|(si, mut v)| {
                 v.sort_unstable();
                 v.dedup();
-                RangeRequest { name: self.shards[si].q.name.clone(), ranges: v }
+                RangeRequest {
+                    name: self.shards[si].q.name.clone(),
+                    ranges: v,
+                }
             })
             .collect())
     }
@@ -224,7 +287,13 @@ impl Index {
     /// Rescore `cands` from fetched ranges (`name → [(offset, bytes)]`) and
     /// return the best `k`. One age decryptor per shard; rows are read by
     /// seeking, so each touched chunk is authenticated once.
-    pub fn rescore(&self, q: &[f32; DIM], cands: &[Candidate], fetched: &Fetched, k: usize) -> Result<Vec<Hit>, String> {
+    pub fn rescore(
+        &self,
+        q: &[f32; DIM],
+        cands: &[Candidate],
+        fetched: &Fetched,
+        k: usize,
+    ) -> Result<Vec<Hit>, String> {
         let mut by: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for &(si, row, _) in cands {
             by.entry(si).or_default().push(row);
@@ -235,21 +304,40 @@ impl Index {
             rows.dedup();
             let s = &self.shards[si];
             let (_, nb) = s.q_geom.ok_or("q geometry unknown")?;
-            let parts = fetched.get(&s.q.name).ok_or("missing fetched ranges")?.clone();
-            let key = self.keys.get(&(s.q.epoch, s.q.zone_pk.to_lowercase())).ok_or("no key")?;
-            let wanted: Vec<(usize, usize)> = rows.iter().map(|&r| (int8_row_offset(nb, r), I8_ROW_BYTES)).collect();
+            let parts = fetched
+                .get(&s.q.name)
+                .ok_or("missing fetched ranges")?
+                .clone();
+            let key = self
+                .keys
+                .get(&(s.q.epoch, s.q.zone_pk.to_lowercase()))
+                .ok_or("no key")?;
+            let wanted: Vec<(usize, usize)> = rows
+                .iter()
+                .map(|&r| (int8_row_offset(nb, r), I8_ROW_BYTES))
+                .collect();
             let got = seal::open_ranges(key, SparseReader::new(s.q.size as usize, parts), &wanted)?;
             for (row, bytes) in rows.iter().zip(got) {
                 scored.push((dot_i8(q, &bytes), si, *row));
             }
         }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+                .then(a.2.cmp(&b.2))
+        });
         Ok(scored
             .into_iter()
             .take(k)
             .map(|(score, si, row)| {
                 let s = &self.shards[si];
-                Hit { id: hex::encode(s.bin.id(row)), score, epoch: s.bin.header.epoch, zone_pk: hex::encode(s.bin.header.zone_pk) }
+                Hit {
+                    id: hex::encode(s.bin.id(row)),
+                    score,
+                    epoch: s.bin.header.epoch,
+                    zone_pk: hex::encode(s.bin.header.zone_pk),
+                }
             })
             .collect())
     }

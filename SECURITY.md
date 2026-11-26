@@ -16,7 +16,12 @@ mitigation within 7 days for critical issues.
 
 | Version | Supported |
 |---------|-----------|
-| 1.0.0-beta.3 | Yes (current) |
+| 1.0.0-beta.20 (`nostr-bbs-core`, `-config`, `-mesh`, `-rate-limit` on crates.io) and `main` | Yes (current) |
+
+The workspace `Cargo.toml` carries no single version. The four library crates
+above are published together at the version shown; the workers and the forum
+and BBS clients are not published and are built from source at a kit commit
+(latest tag `v1.0.0-beta.21-rc.3`).
 
 ## Past Security Fixes
 

@@ -688,13 +688,21 @@ async fn publish_topic_root(
         .ok_or_else(|| "Not authenticated".to_string())?;
 
     let now = (js_sys::Date::now() / 1000.0) as u64;
-    // NIP-10 root marker pointing at the section channel (kind-40) id.
-    let mut tags = vec![vec![
-        "e".to_string(),
-        section_channel_id.to_string(),
-        String::new(),
-        "root".to_string(),
-    ]];
+    // NIP-10 root marker pointing at the section channel (kind-40) id, and
+    // the topic marker that lists the root in the section's root list
+    // (`#t:["topic"]`), as sealed roots are.
+    let mut tags = vec![
+        vec![
+            "e".to_string(),
+            section_channel_id.to_string(),
+            String::new(),
+            "root".to_string(),
+        ],
+        vec![
+            "t".to_string(),
+            nostr_bbs_core::sealed::TOPIC_MARKER.to_string(),
+        ],
+    ];
     // @handles typed into the topic title/body get ["p", pubkey] tags so
     // mentioned users / agents (e.g. @junkiejarvis) are addressable and
     // reachable via the relay's #p-filtered subscriptions.

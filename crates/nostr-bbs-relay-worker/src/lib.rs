@@ -1215,7 +1215,7 @@ async fn ensure_schema(env: &Env) -> bool {
                 ok = false;
             }
         }
-        // Migration 0012: a database created before the `proof` column existed.
+        // Migration 0013: a database created before the `proof` column existed.
         // A duplicate-column error is the expected outcome everywhere else and
         // does not count against `ok`, like the other ALTERs in this function.
         let _ = db
@@ -1232,6 +1232,23 @@ async fn ensure_schema(env: &Env) -> bool {
             .await
         {
             console_error!("ensure_schema: zone_epoch_keys create failed: {e}");
+            ok = false;
+        }
+    }
+
+    // --- Kanban approval claims (migration 0015) ---
+    for (name, sql) in [
+        (
+            "kanban_move_approvals",
+            relay_do::KANBAN_MOVE_APPROVALS_CREATE_SQL,
+        ),
+        (
+            "idx_kanban_move_approvals_card",
+            relay_do::KANBAN_MOVE_APPROVALS_INDEX_SQL,
+        ),
+    ] {
+        if let Err(e) = db.prepare(sql).run().await {
+            console_error!("ensure_schema: {name} create failed: {e}");
             ok = false;
         }
     }

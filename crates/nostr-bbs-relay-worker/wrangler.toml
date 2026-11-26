@@ -14,6 +14,21 @@ JEV_MODEL = "jev-latest"
 JEV_API_KEY_NAME = "TYPESAFE_API_KEY"
 # Supply TYPESAFE_API_KEY as a Worker secret; never put its value in this file.
 
+# Kanban approval columns (see docs/security/known-findings.md KF-36).
+#   "warn"    (default; also for unset or unrecognised) — a non-admin card
+#             version that enters an approval column without an admin-approved,
+#             unspent request is logged ("kanban approval gate (warn): would
+#             refuse ...") and stored as before.
+#   "enforce" — the same card version is refused with "blocked: kanban_approval_*".
+# Admins bypass the gate in both modes. Switch to "enforce" only after the warn
+# logs show no honest divergence.
+KANBAN_APPROVAL_GATE = "warn"
+# How long an admin's approval stays usable, in seconds, counted from the
+# deciding 31403's created_at. Past it the entry is refused with
+# "kanban_approval_expired" and a new request is needed. Default 604800 (7 days);
+# unset, non-numeric and 0 mean the default.
+KANBAN_APPROVAL_TTL_SECS = "604800"
+
 RELAY_NAME = "Nostr BBS Relay"
 # NOTE: the relay sources admin status from D1 (whitelist.is_admin), not from
 # an env var — there is no ADMIN_PUBKEYS reader in src/. A dead ADMIN_PUBKEYS=""
@@ -31,7 +46,7 @@ DEVICE_KEYS_ENABLED = "false"
 # NIP-42 AUTH enforcement mode (PRD-010 G4). The escape hatch:
 #   "nip42"     (default) — NIP-42 AUTH is the universal write gate: every EVENT
 #               requires a completed AUTH handshake, and reads of the protected
-#               kinds {4,13,14,1059,30910-39916} require AUTH. The pubkey
+#               kinds {4,13,14,1059,30910-30916} require AUTH. The pubkey
 #               allowlist becomes the authorisation layer on the authed identity.
 #   "allowlist" — legacy behaviour: writes gated on the allowlist alone, no AUTH
 #               round-trip forced. Recover the pre-G4 model here if needed.
@@ -39,11 +54,13 @@ DEVICE_KEYS_ENABLED = "false"
 AUTH_MODE = "nip42"
 # The relay's own canonical URL, used to verify the NIP-42 `["relay", <url>]`
 # tag on AUTH responses so a malicious relay cannot replay a client's AUTH here.
-# REQUIRED in nip42 mode: set this to the exact wss:// URL clients connect to.
-# When BLANK the relay FAILS CLOSED and refuses every authenticated write (it
-# never derives its identity from the request, which would let an attacker's
-# Host poison the check). So set it BEFORE deploying, or the board stops
-# accepting writes. The relay logs an error on every AUTH while it is blank.
+# MUST be set to this relay's public wss:// URL (the exact URL clients connect
+# to), or no client can authenticate. While it is BLANK (and RELAY_URL_ALIASES
+# is blank too) the relay FAILS CLOSED: it refuses every NIP-42 AUTH with
+# "invalid: relay url unconfigured", so in nip42 mode every write and every
+# protected-kind read is refused. It never derives its identity from the
+# request, which would let an attacker's Host poison the check. Set it BEFORE
+# deploying; the relay logs an error on every AUTH while it is blank.
 RELAY_URL = ""
 # Optional: extra wss:// URLs this relay also answers to, comma-separated, for a
 # relay reachable at more than one hostname (e.g. a custom domain plus the

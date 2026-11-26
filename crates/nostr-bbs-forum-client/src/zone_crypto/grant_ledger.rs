@@ -43,6 +43,14 @@ pub fn ledger_id_v1(zone: &str, epoch: u32) -> String {
     format!("{KV_GRANTS_SENT}:{zone}:{epoch}")
 }
 
+/// Whether `e` is shaped like a v2 entry: two lowercase 64-hex keys joined by
+/// `:` (member, then the key the wrap was addressed to).
+pub fn valid_entry(e: &str) -> bool {
+    let hex64 =
+        |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    e.split_once(':').is_some_and(|(m, k)| hex64(m) && hex64(k))
+}
+
 /// A v2 entry.
 pub fn entry(member: &str, recipient_key: &str) -> String {
     format!("{member}:{recipient_key}")
@@ -208,6 +216,58 @@ impl GrantLedger {
         }
     }
 
+    /// The v2 entries (`"<member>:<recipient key>"`) of `(zone, epoch)`, for
+    /// the relay-held backup. v1 entries are not exported: they predate inbox
+    /// keys and are only ever read as a fallback.
+    pub async fn export<K: GrantKv>(&self, kv: &K, zone: &str, epoch: u32) -> Vec<String> {
+        let (v2, _) = self.load_both(kv, zone, epoch).await;
+        self.snapshot(&v2).into_iter().collect()
+    }
+
+    /// Union `entries` (from the relay-held backup) into the `(zone, epoch)`
+    /// ledger and persist it. Malformed entries are dropped, so a damaged
+    /// backup cannot mark anyone as granted by accident. Returns how many
+    /// entries were new to this device.
+    pub async fn merge<K: GrantKv>(
+        &self,
+        kv: &K,
+        zone: &str,
+        epoch: u32,
+        entries: &[String],
+    ) -> usize {
+        let id = ledger_id(zone, epoch);
+        self.ensure_loaded(kv, &id).await;
+        let added = self.with(|i| {
+            let set = i.sets.entry(id.clone()).or_default();
+            entries
+                .iter()
+                .filter(|e| valid_entry(e))
+                .filter(|e| set.insert((*e).clone()))
+                .count()
+        });
+        if added > 0 {
+            self.persist(kv, &id).await;
+        }
+        added
+    }
+
+    /// Write the in-memory set for `id` until the stored snapshot matches it.
+    async fn persist<K: GrantKv>(&self, kv: &K, id: &str) {
+        for _ in 0..MAX_PERSIST_ROUNDS {
+            let snap = self.snapshot(id);
+            let Ok(json) = serde_json::to_string(&snap) else {
+                return;
+            };
+            if !kv.put(id, &json).await {
+                return;
+            }
+            // The set only grows, so an equal length means an equal set.
+            if self.with(|i| i.sets.get(id).map_or(0, BTreeSet::len)) == snap.len() {
+                return;
+            }
+        }
+    }
+
     /// Record that `(zone, epoch)` reached each `(member, recipient key)`, and
     /// persist the set.
     pub async fn record<K: GrantKv>(
@@ -316,6 +376,58 @@ mod tests {
             .unwrap_or_default();
         all.insert(pk.to_string());
         kv.put(id, &serde_json::to_string(&all).unwrap()).await;
+    }
+
+    #[test]
+    fn a_relay_backup_restores_the_ledger_on_a_fresh_device() {
+        // Device A records grants; its export is what the relay holds.
+        let a = SlowKv::default();
+        let ledger_a = GrantLedger::default();
+        let all = pks(5);
+        futures::executor::block_on(ledger_a.record(&a, "zone2", 4, &ids(&all)));
+        let backup = futures::executor::block_on(ledger_a.export(&a, "zone2", 4));
+        assert_eq!(backup.len(), 5);
+        // Site data cleared: empty KV, empty memory. Nobody reads as granted.
+        let b = SlowKv::default();
+        let ledger_b = GrantLedger::default();
+        assert!(futures::executor::block_on(ledger_b.sent(&b, "zone2", 4)).is_empty());
+        // Merging the backup restores them, persists, and is idempotent.
+        assert_eq!(
+            futures::executor::block_on(ledger_b.merge(&b, "zone2", 4, &backup)),
+            5
+        );
+        assert_eq!(
+            futures::executor::block_on(ledger_b.merge(&b, "zone2", 4, &backup)),
+            0
+        );
+        let sent = futures::executor::block_on(ledger_b.sent(&b, "zone2", 4));
+        assert_eq!(sent, all.iter().cloned().collect::<HashSet<_>>());
+        assert_eq!(b.stored(&ledger_id("zone2", 4)).len(), 5);
+        // Another epoch is untouched.
+        assert!(futures::executor::block_on(ledger_b.sent(&b, "zone2", 5)).is_empty());
+    }
+
+    #[test]
+    fn malformed_backup_entries_never_mark_anyone_granted() {
+        let kv = SlowKv::default();
+        let ledger = GrantLedger::default();
+        let good = entry(&pks(1)[0], &pks(1)[0]);
+        let bad = vec![
+            "".to_string(),
+            "nocolon".to_string(),
+            format!("{}:{}", "AB".repeat(32), "ab".repeat(32)),
+            format!("{}:short", "ab".repeat(32)),
+            format!("{}:{}:extra", "ab".repeat(32), "ab".repeat(32)),
+            good.clone(),
+        ];
+        assert_eq!(
+            futures::executor::block_on(ledger.merge(&kv, "z", 1, &bad)),
+            1
+        );
+        assert_eq!(
+            futures::executor::block_on(ledger.export(&kv, "z", 1)),
+            vec![good]
+        );
     }
 
     #[test]

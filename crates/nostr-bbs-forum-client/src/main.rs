@@ -25,21 +25,46 @@ fn main() {
 
     web_sys::console::log_1(&"[nostr-bbs] WASM main() started".into());
 
-    leptos::mount::mount_to_body(App);
+    // Cached relay data from another relay is cleared before anything reads
+    // it (see `stores::relay_scope`); the app mounts once that is done.
+    wasm_bindgen_futures::spawn_local(async {
+        // Never let a stuck IndexedDB keep the app from mounting: after 3 s
+        // it mounts anyway, the scope stays unrecorded, and the clear is
+        // retried on the next load.
+        let enforce = wasm_bindgen_futures::future_to_promise(async {
+            stores::relay_scope::enforce().await;
+            Ok(wasm_bindgen::JsValue::TRUE)
+        });
+        let timeout = js_sys::Promise::new(&mut |resolve, _| {
+            if let Some(w) = web_sys::window() {
+                let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 3_000);
+            }
+        });
+        let first = js_sys::Promise::race(&js_sys::Array::of2(&enforce, &timeout));
+        if wasm_bindgen_futures::JsFuture::from(first)
+            .await
+            .map(|v| v.is_undefined())
+            .unwrap_or(true)
+        {
+            stores::relay_scope::abandon();
+            web_sys::console::warn_1(&"[relay-scope] storage check timed out; mounting".into());
+        }
+        leptos::mount::mount_to_body(App);
 
-    web_sys::console::log_1(&"[nostr-bbs] mount_to_body complete".into());
+        web_sys::console::log_1(&"[nostr-bbs] mount_to_body complete".into());
 
-    // Remove the static loading screen now that the Leptos app has mounted.
-    if let Some(el) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("loading-screen"))
-    {
-        el.remove();
-    }
+        // Remove the static loading screen now that the Leptos app has mounted.
+        if let Some(el) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("loading-screen"))
+        {
+            el.remove();
+        }
 
-    // Register service worker and run offline startup tasks.
-    register_service_worker();
-    run_offline_startup();
+        // Register service worker and run offline startup tasks.
+        register_service_worker();
+        run_offline_startup();
+    });
 }
 
 /// Register the service worker for offline caching.
@@ -158,10 +183,26 @@ fn install_foreground_update_check(reg: wasm_bindgen::JsValue) {
 /// Reload the page once when a new service worker takes control, so an open tab
 /// picks up the just-deployed build. A `window.__sw_reloaded__` sentinel
 /// prevents the reload loop that `controllerchange` can otherwise trigger.
+///
+/// Only an UPDATE reloads: on a first visit there is no controller at page
+/// load, and the first worker's `clients.claim()` fires `controllerchange`
+/// on a page that is already running the newest build (the HTML came from
+/// the network). Reloading then threw away in-memory UI state, notably the
+/// sheet sign-in welcome screen, which never survived a member's first scan.
+/// A page can also hold the reload by setting the sentinel itself
+/// (`/connect` does, for the life of the welcome screen).
 fn install_controllerchange_reload(sw_container: &web_sys::ServiceWorkerContainer) {
     use wasm_bindgen::JsCast;
 
+    // `controller` read by reflection: web-sys's typed getter needs the
+    // `ServiceWorker` feature, which nothing else here uses.
+    let had_controller_at_load = js_sys::Reflect::get(sw_container, &"controller".into())
+        .map(|c| !c.is_null() && !c.is_undefined())
+        .unwrap_or(false);
     let closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+        if !should_reload_on_controllerchange(had_controller_at_load) {
+            return;
+        }
         let Some(window) = web_sys::window() else {
             return;
         };
@@ -188,6 +229,12 @@ fn install_controllerchange_reload(sw_container: &web_sys::ServiceWorkerContaine
         .add_event_listener_with_callback("controllerchange", closure.as_ref().unchecked_ref());
     // Leak the closure: it must outlive this fn for the lifetime of the page.
     closure.forget();
+}
+
+/// A `controllerchange` reloads the page only when it replaces a worker that
+/// already controlled the page at load (a new deploy), never on first install.
+fn should_reload_on_controllerchange(had_controller_at_load: bool) -> bool {
+    had_controller_at_load
 }
 
 /// Run startup tasks: evict stale IndexedDB data, check storage quota.
@@ -236,7 +283,16 @@ fn run_offline_startup() {
 
 #[cfg(test)]
 mod tests {
-    use super::foreground_update_due;
+    use super::{foreground_update_due, should_reload_on_controllerchange};
+
+    #[test]
+    fn first_install_never_reloads() {
+        // First visit: no controller at load, the first worker's claim must
+        // not reload (it would drop the sheet sign-in welcome screen).
+        assert!(!should_reload_on_controllerchange(false));
+        // A deploy replacing a controlling worker still reloads once.
+        assert!(should_reload_on_controllerchange(true));
+    }
 
     #[test]
     fn foreground_update_is_throttled() {

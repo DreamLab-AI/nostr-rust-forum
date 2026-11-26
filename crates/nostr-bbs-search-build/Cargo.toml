@@ -13,8 +13,8 @@ name = "nostr-bbs-search-build"
 path = "src/main.rs"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-nostr-bbs-sealed-search = { path = "../nostr-bbs-sealed-search" }
-nostr-bbs-zone-migrate = { path = "../nostr-bbs-zone-migrate" }
+nostr-bbs-sealed-search = { path = "../nostr-bbs-sealed-search", version = "0.1.0" }
+nostr-bbs-zone-migrate = { path = "../nostr-bbs-zone-migrate", version = "1.0.0-beta.11" }
 nostr-bbs-core = { workspace = true }
 k256 = { workspace = true }
 serde = { workspace = true }

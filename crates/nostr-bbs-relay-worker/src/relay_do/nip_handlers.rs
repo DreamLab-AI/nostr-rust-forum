@@ -27,6 +27,7 @@ use crate::zone_config::ZoneConfig;
 use super::broadcast::{event_treatment, EventTreatment};
 use super::calendar_projection;
 use super::filter::{self, NostrFilter};
+use super::kanban_gate;
 use super::nip42::{self, AuthMode};
 use super::receipts::{self, ReceiptOutcome, ReceiptStore};
 use super::NostrRelayDO;
@@ -41,7 +42,7 @@ const MAX_CONTENT_SIZE: usize = 64 * 1024;
 const MAX_REGISTRATION_CONTENT_SIZE: usize = 8 * 1024;
 const MAX_TAG_COUNT: usize = 2000;
 const MAX_TAG_VALUE_SIZE: usize = 1024;
-const MAX_TIMESTAMP_DRIFT: u64 = 60 * 60 * 24 * 7;
+const MAX_TIMESTAMP_DRIFT: u64 = nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS;
 const MAX_SUBSCRIPTIONS: usize = 20;
 
 /// Whether a REQ must be refused for the per-session subscription cap. A REQ
@@ -1351,6 +1352,9 @@ impl NostrRelayDO {
         // column?" — so it is admitted from any whitelisted author (whitelist
         // admission already ran above). Decisions stay admin-only 31403; every
         // other 31402 remains agent-registry-gated.
+        // Admitting the *ask* is safe because the column ENTRY is checked
+        // separately: `kanban_approval_gate` below refuses a card version that
+        // enters an approval column without an admin-approved request.
         if governance::is_governance_kind(event.kind)
             && event.kind != governance::KIND_ACTION_RESPONSE
             && !nostr_bbs_core::is_kanban_approval_request(&event)
@@ -1646,6 +1650,53 @@ impl NostrRelayDO {
             }
         }
 
+        // Kanban approval columns: a non-admin card version that enters an
+        // approval column must follow a stored, admin-approved, unspent request
+        // (see `kanban_gate.rs`). `warn` (default) logs and admits; `enforce`
+        // refuses. An admitted entry is claimed just before the save below.
+        let gate_mode = self.kanban_approval_gate_mode();
+        if event.kind == 5 && !is_admin {
+            if let Some(reason) = self.kanban_deletion_gate(&event).await {
+                if gate_mode == kanban_gate::GateMode::Enforce {
+                    Self::send_ok(
+                        ws,
+                        &event.id,
+                        false,
+                        &format!("blocked: {}", reason.token()),
+                    );
+                    return;
+                }
+                console_warn!(
+                    "kanban approval gate (warn): would refuse {}: {}",
+                    &event.id,
+                    reason.token()
+                );
+            }
+        }
+        let mut approved_entry: Option<nostr_bbs_core::ApprovedEntry> = None;
+        if kanban_gate::kanban_gate_applies(event.kind, is_admin) {
+            match self.kanban_approval_gate(&event).await {
+                kanban_gate::KanbanGate::NotGated => {}
+                kanban_gate::KanbanGate::Admitted(entry) => approved_entry = Some(entry),
+                kanban_gate::KanbanGate::Refused(reason) => {
+                    if gate_mode == kanban_gate::GateMode::Enforce {
+                        Self::send_ok(
+                            ws,
+                            &event.id,
+                            false,
+                            &format!("blocked: {}", reason.token()),
+                        );
+                        return;
+                    }
+                    console_warn!(
+                        "kanban approval gate (warn): would refuse {}: {}",
+                        &event.id,
+                        reason.token()
+                    );
+                }
+            }
+        }
+
         // ADR-2028 decisions 4 and 6: the `zk` group hint and epoch uniqueness,
         // for the zone the event is bound to (the channel's bound zone for a
         // kind 42, the zone tag for kanban). A `zk` naming any other zone, or an
@@ -1702,8 +1753,46 @@ impl NostrRelayDO {
         // anyone a second time.
         let push_repeat = self.push_event_known(&event).await;
 
+        // Spend the approval that admitted this entry. The claim runs in every
+        // mode so `enforce` starts from a consistent table; only `enforce`
+        // acts on a lost race.
+        if let Some(entry) = approved_entry.as_ref() {
+            if let Err(reason) = self
+                .claim_kanban_approval(entry, &event.id, gate_mode)
+                .await
+            {
+                if gate_mode == kanban_gate::GateMode::Enforce {
+                    Self::send_ok(
+                        ws,
+                        &event.id,
+                        false,
+                        &format!("blocked: {}", reason.token()),
+                    );
+                    return;
+                }
+                console_warn!(
+                    "kanban approval gate (warn): would refuse {}: {}",
+                    &event.id,
+                    reason.token()
+                );
+            }
+        }
+
         // Save to D1
-        if self.save_event(&event, treatment).await {
+        let saved = self.save_event(&event, treatment).await;
+        if !saved {
+            if let Some(entry) = approved_entry.as_ref() {
+                // Two copies of one event can race: the duplicate's save may
+                // answer false while the other copy stored it. Only give the
+                // claim back when the event is really not stored.
+                let stored_after = self.kanban_event_known(&event.id).await;
+                if kanban_gate::should_release_claim(stored_after) {
+                    self.release_kanban_approval(&entry.request_id, &event.id)
+                        .await;
+                }
+            }
+        }
+        if saved {
             Self::send_ok(ws, &event.id, true, "");
             self.broadcast_event(&event).await;
             // Activity tracking: increment posts_created and update last_active
@@ -2275,7 +2364,8 @@ impl NostrRelayDO {
             self.relay_url_aliases().as_deref(),
         );
         // Loud when unconfigured: in nip42 mode an empty allowlist refuses every
-        // authenticated write. Operators must set RELAY_URL before deploy.
+        // AUTH, so no client can authenticate. Operators must set RELAY_URL
+        // before deploy.
         nip42::warn_if_relay_url_unconfigured(self.auth_mode(), &allowed);
         let now = auth::js_now_secs();
 
@@ -3351,6 +3441,37 @@ impl NostrRelayDO {
         // itself never selects a zone, so a topic root (which has no
         // channel_zones row) cannot open its replies. Expiring events go
         // through the per-event path as before.
+        // Admin Overview "Messages"/"Channels": every kind-42 (or kind-40) the
+        // relay holds, no `#e`.
+        // An administrator reads every zone, so no per-zone decision exists
+        // to apply and one aggregate is exact (the generic path below stops
+        // at the filter's row limit and reported 500 for ~242k messages).
+        // Strictly gated on a real whitelist admin (`ctx.is_admin`, not the
+        // zone-scoped `viewer_is_admin`): a non-admin keeps the zone-gated,
+        // row-capped generic path. One aggregate statement, so it is as
+        // bounded as the per-channel fast path, and COUNT stays behind the
+        // per-IP rate limit above.
+        if ctx.is_admin {
+            if let Some((kind, since, until)) = filter::admin_global_count_target(&filters) {
+                let q = filter::build_admin_kind_count(kind, since, until);
+                if let Some((groups, exceptions)) = self.count_channel_messages(&q).await {
+                    let mut count: u64 = groups.iter().map(|(_, n)| *n).sum();
+                    // Expiring events (rare): NIP-40-filtered in
+                    // `count_channel_messages`, then read-authorised per event.
+                    for event in &exceptions {
+                        if matches!(
+                            self.authorize_event(event, &ctx, &zones).await,
+                            ReadDecision::Deliver | ReadDecision::DeliverAs(_)
+                        ) {
+                            count += 1;
+                        }
+                    }
+                    Self::send_count(ws, sub_id, count);
+                    return;
+                }
+            }
+        }
+
         if let Some((value, since, until)) = filter::channel_count_target(&filters) {
             let q = filter::build_channel_count(&value, since, until);
             // More own channels than COUNT_MAX_GROUPS (one zone lookup each)
@@ -3522,8 +3643,10 @@ mod a_ref_target_tests {
 // ---------------------------------------------------------------------------
 //
 // Every forum client folds EVERY `e` tag of a stored or broadcast kind-5 into
-// its tombstones with no author check (forum-client `stores/channels.rs`
-// `fold_deletions`): it trusts this gate to have decided who may delete what.
+// its tombstones (forum-client `stores/tombstones.rs` `fold_deletion`), and for
+// an ordinary post it honours the tombstone with no author check: it trusts
+// this gate to have decided who may delete what. Only a restored sealed
+// original is also checked client-side (its author, or a relay-vouched admin).
 // So for a member (no delete-any privilege) the gate must vouch for each `e`
 // tag before the kind-5 is accepted. Ignoring a bad tag relay-side and
 // accepting the rest is not an option: the event is signed, the relay cannot

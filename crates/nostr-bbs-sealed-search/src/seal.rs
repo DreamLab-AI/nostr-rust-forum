@@ -73,7 +73,9 @@ fn decryptor<R: Read>(key: &SearchKey, r: R) -> Result<age::stream::StreamReader
 /// Open a whole sealed object.
 pub fn open(key: &SearchKey, sealed: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    decryptor(key, sealed)?.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    decryptor(key, sealed)?
+        .read_to_end(&mut out)
+        .map_err(|e| e.to_string())?;
     Ok(out)
 }
 
@@ -124,7 +126,11 @@ impl SparseReader {
     /// `parts` are `(offset, bytes)`; `total` is the full sealed length.
     pub fn new(total: usize, mut parts: Vec<(usize, Vec<u8>)>) -> Self {
         parts.sort_by_key(|p| p.0);
-        Self { total: total as u64, parts: parts.into_iter().map(|(o, b)| (o as u64, b)).collect(), pos: 0 }
+        Self {
+            total: total as u64,
+            parts: parts.into_iter().map(|(o, b)| (o as u64, b)).collect(),
+            pos: 0,
+        }
     }
 }
 
@@ -143,7 +149,10 @@ impl Read for SparseReader {
                 return Ok(n);
             }
         }
-        Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("byte {} not loaded", self.pos)))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("byte {} not loaded", self.pos),
+        ))
     }
 }
 
@@ -155,7 +164,10 @@ impl Seek for SparseReader {
             SeekFrom::Current(d) => self.pos as i128 + d as i128,
         };
         if p < 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before start"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
         }
         self.pos = p as u64;
         Ok(self.pos)
@@ -164,11 +176,16 @@ impl Seek for SparseReader {
 
 /// Read several plaintext ranges from one sparse sealed object with a single
 /// decryptor (one X25519 unwrap), seeking between them.
-pub fn open_ranges(key: &SearchKey, src: SparseReader, wanted: &[(usize, usize)]) -> Result<Vec<Vec<u8>>, String> {
+pub fn open_ranges(
+    key: &SearchKey,
+    src: SparseReader,
+    wanted: &[(usize, usize)],
+) -> Result<Vec<Vec<u8>>, String> {
     let mut r = decryptor(key, src)?;
     let mut out = Vec::with_capacity(wanted.len());
     for &(off, len) in wanted {
-        r.seek(SeekFrom::Start(off as u64)).map_err(|e| e.to_string())?;
+        r.seek(SeekFrom::Start(off as u64))
+            .map_err(|e| e.to_string())?;
         let mut b = vec![0u8; len];
         r.read_exact(&mut b).map_err(|e| e.to_string())?;
         out.push(b);
@@ -178,9 +195,15 @@ pub fn open_ranges(key: &SearchKey, src: SparseReader, wanted: &[(usize, usize)]
 
 /// Read plaintext `[off, off + len)` from a sparse sealed object (each chunk
 /// read is authenticated by age).
-pub fn open_range(key: &SearchKey, src: SparseReader, off: usize, len: usize) -> Result<Vec<u8>, String> {
+pub fn open_range(
+    key: &SearchKey,
+    src: SparseReader,
+    off: usize,
+    len: usize,
+) -> Result<Vec<u8>, String> {
     let mut r = decryptor(key, src)?;
-    r.seek(SeekFrom::Start(off as u64)).map_err(|e| e.to_string())?;
+    r.seek(SeekFrom::Start(off as u64))
+        .map_err(|e| e.to_string())?;
     let mut out = vec![0u8; len];
     r.read_exact(&mut out).map_err(|e| e.to_string())?;
     Ok(out)
@@ -222,7 +245,13 @@ mod tests {
         let plain: Vec<u8> = (0..2_000_000u32).map(|i| (i * 13 % 251) as u8).collect();
         let s = seal(&k, &plain).unwrap();
         let hl = header_len(&s).unwrap();
-        let wanted = [(1_500_000usize, 388usize), (70_000, 388), (1_999_000, 388), (0, 388), (900_123, 388)];
+        let wanted = [
+            (1_500_000usize, 388usize),
+            (70_000, 388),
+            (1_999_000, 388),
+            (0, 388),
+            (900_123, 388),
+        ];
         let mut parts: Vec<(usize, Vec<u8>)> = Vec::new();
         for &(o, l) in &wanted {
             for (a, b) in ranges_for(hl, s.len(), o, l) {
@@ -243,7 +272,12 @@ mod tests {
         let plain: Vec<u8> = (0..500_000u32).map(|i| (i * 7 % 253) as u8).collect();
         let s = seal(&k, &plain).unwrap();
         let hl = header_len(&s).unwrap();
-        for &(off, len) in &[(0usize, 10usize), (65_530, 20), (300_000, 388), (499_990, 10)] {
+        for &(off, len) in &[
+            (0usize, 10usize),
+            (65_530, 20),
+            (300_000, 388),
+            (499_990, 10),
+        ] {
             let parts: Vec<(usize, Vec<u8>)> = ranges_for(hl, s.len(), off, len)
                 .into_iter()
                 .map(|(a, b)| (a, s[a..b].to_vec()))

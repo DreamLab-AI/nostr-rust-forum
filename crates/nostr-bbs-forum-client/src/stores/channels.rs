@@ -150,6 +150,21 @@ pub struct ChannelStore {
     roots_targets: StoredValue<HashMap<String, String>>,
     /// Channels whose root list has been answered (reactive).
     roots_answered: RwSignal<HashSet<String>>,
+    /// Channels whose root list came back under its limit: every marked
+    /// topic root is held, so channel history paging lists no new topic.
+    roots_complete: RwSignal<HashSet<String>>,
+    /// Newest reply per topic as the relay answers it (`#e:[root]`,
+    /// `limit:1`): lower-case root id -> (created_at, author). Only opened
+    /// replies count (a still-locked envelope names the migrator, not the
+    /// author). Reactive; feeds the section list's "last by" / activity.
+    topic_latest: RwSignal<HashMap<String, (u64, String)>>,
+    /// Topic stats (exact reply COUNT + newest reply) already asked for or
+    /// queued, by lower-case root id: once per session.
+    topic_stats_asked: StoredValue<HashSet<String>>,
+    /// Topics waiting for their stats: (channel id, lower-case root, gated).
+    topic_stats_queue: StoredValue<std::collections::VecDeque<(String, String, bool)>>,
+    /// Whether a stats batch is in flight (batches go one at a time).
+    topic_stats_busy: StoredValue<bool>,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -200,6 +215,11 @@ impl ChannelStore {
             topic_targets: StoredValue::new(HashMap::new()),
             roots_targets: StoredValue::new(HashMap::new()),
             roots_answered: RwSignal::new(HashSet::new()),
+            roots_complete: RwSignal::new(HashSet::new()),
+            topic_latest: RwSignal::new(HashMap::new()),
+            topic_stats_asked: StoredValue::new(HashSet::new()),
+            topic_stats_queue: StoredValue::new(std::collections::VecDeque::new()),
+            topic_stats_busy: StoredValue::new(false),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -1041,20 +1061,30 @@ impl ChannelStore {
             return;
         }
         let mut newest: HashMap<String, u64> = HashMap::new();
-        let mut inserted: Vec<(String, String, u64)> = Vec::new();
+        let mut inserted: Vec<(String, String, u64, Option<String>)> = Vec::new();
         self.channel_messages.update(|m| {
             for (cid, ev) in events {
                 let ts = ev.created_at;
                 let id = ev.id.clone();
+                let topic = nostr_bbs_core::sealed::reply_root_of(&ev).map(str::to_lowercase);
                 if insert_message(m.entry(cid.clone()).or_default(), ev) {
-                    inserted.push((cid.clone(), id, ts));
+                    inserted.push((cid.clone(), id, ts, topic));
                     let n = newest.entry(cid).or_insert(0);
                     *n = (*n).max(ts);
                 }
             }
         });
-        for (cid, id, ts) in inserted {
+        for (cid, id, ts, topic) in inserted {
             self.note_inserted(&cid, &id, ts);
+            // A reply also grows its topic's exact total (the section list
+            // shows it), however it arrived: live, a channel page, or the
+            // topic's own list. `note_inserted` dedups by id.
+            if let Some(root) = topic {
+                let key = topic_key(&root);
+                if key != cid {
+                    self.note_inserted(&key, &id, ts);
+                }
+            }
         }
         if !newest.is_empty() {
             self.last_active.update(|m| {
@@ -1190,8 +1220,14 @@ impl ChannelStore {
                 ..Default::default()
             },
             wait_auth,
-            Box::new(move |events, _page| {
+            Box::new(move |events, page| {
+                let held = !events.is_empty();
                 store.apply_page(events);
+                if held && page.delivered < RELAY_FILTER_LIMIT {
+                    store.roots_complete.update(|s| {
+                        s.insert(channel.clone());
+                    });
+                }
                 store.roots_answered.update(|s| {
                     s.insert(channel);
                 });
@@ -1199,9 +1235,159 @@ impl ChannelStore {
         );
     }
 
+    /// Whether channel `cid`'s root list is complete: answered under its
+    /// limit with at least one root, so the section's topics are all listed
+    /// and paging the channel's history adds none. Reactive.
+    pub fn topic_roots_complete(&self, cid: &str) -> bool {
+        self.roots_complete.with(|s| s.contains(cid))
+    }
+
     /// Whether channel `cid`'s root list has been answered. Reactive.
     pub fn topic_roots_answered(&self, cid: &str) -> bool {
         self.roots_answered.with(|s| s.contains(cid))
+    }
+
+    /// Ask, once per session per topic, for the section list's per-topic
+    /// stats of channel `cid`'s topics `roots`: the exact reply total (the
+    /// relay's `#e:[root]` COUNT, as the thread page uses, kept current by
+    /// [`Self::note_inserted`]) and the newest reply (`#e:[root]`,
+    /// `limit:1`, into [`Self::topic_latest`]). Topics are taken in the
+    /// order given (the list's order) in batches of [`TOPIC_STATS_BATCH`]:
+    /// one REQ with one filter per topic plus
+    /// one COUNT per topic (a COUNT sums its filters, so topics cannot share
+    /// one), the next batch only once the previous REQ has answered.
+    pub fn request_topic_stats(
+        &self,
+        relay: &RelayConnection,
+        cid: &str,
+        roots: &[String],
+        gated: bool,
+    ) {
+        let mut added = false;
+        self.topic_stats_asked.update_value(|asked| {
+            self.topic_stats_queue.update_value(|q| {
+                for r in roots {
+                    let r = r.to_lowercase();
+                    if asked.insert(r.clone()) {
+                        q.push_back((cid.to_string(), r, gated));
+                        added = true;
+                    }
+                }
+            });
+        });
+        if added {
+            self.pump_topic_stats(relay);
+        }
+    }
+
+    /// Send the next batch of queued topic stats, unless one is in flight.
+    fn pump_topic_stats(&self, relay: &RelayConnection) {
+        if self.topic_stats_busy.get_value() {
+            return;
+        }
+        let batch: Vec<(String, String, bool)> = self
+            .topic_stats_queue
+            .try_update_value(|q| {
+                let n = q.len().min(TOPIC_STATS_BATCH);
+                q.drain(..n).collect()
+            })
+            .unwrap_or_default();
+        if batch.is_empty() {
+            return;
+        }
+        self.topic_stats_busy.set_value(true);
+        let wait_auth = batch.iter().any(|(_, _, g)| *g);
+        for (_, root, _) in &batch {
+            self.request_total_of(relay, &topic_key(root), root);
+        }
+        let store = *self;
+        let zone_keys = self.zone_store();
+        let wanted: HashMap<String, String> = batch
+            .iter()
+            .map(|(cid, root, _)| (root.clone(), cid.clone()))
+            .collect();
+        let on_event = Rc::new(move |ev: NostrEvent| {
+            let Some((cid, ev)) = store.ingest(zone_keys, ev, "") else {
+                return;
+            };
+            store.note_topic_latest(zone_keys, &wanted, &cid, &ev);
+        });
+        let sub: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let done = Rc::new(std::cell::Cell::new(false));
+        let on_receipt = {
+            let sub = sub.clone();
+            let relay = relay.clone();
+            Rc::new(move |authed: bool| {
+                if (!authed && wait_auth) || done.replace(true) {
+                    return;
+                }
+                if let Some(id) = sub.borrow_mut().take() {
+                    relay.unsubscribe(&id);
+                }
+                store.topic_stats_busy.set_value(false);
+                store.pump_topic_stats(&relay);
+            })
+        };
+        let filters = batch
+            .iter()
+            .map(|(_, root, _)| Filter {
+                kinds: Some(vec![42]),
+                e_tags: Some(vec![root.clone()]),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .collect();
+        let id = relay.subscribe_with_receipt(filters, on_event, on_receipt);
+        *sub.borrow_mut() = Some(id);
+    }
+
+    /// Record `ev` as topic `root`'s newest reply if it is one: in the
+    /// topic's channel (`cid`, from its root-marked tag, like the relay's
+    /// gate), replying to a topic in `wanted`, and opened (not a sealed or
+    /// encrypted placeholder, whose author would be the migrator). The
+    /// decrypt state of an event no list holds is dropped again.
+    fn note_topic_latest(
+        &self,
+        zone_keys: Option<ZoneKeyStore>,
+        wanted: &HashMap<String, String>,
+        cid: &str,
+        ev: &NostrEvent,
+    ) {
+        let root = nostr_bbs_core::sealed::reply_root_of(ev).map(str::to_lowercase);
+        let opened = nostr_bbs_core::sealed::parse_sealed(&ev.tags).is_none()
+            && ev.content != crate::zone_crypto::PLACEHOLDER_MISSING_KEY
+            && ev.content != crate::zone_crypto::PLACEHOLDER_UNDECRYPTABLE;
+        if let Some(root) = root.filter(|r| opened && wanted.get(r).is_some_and(|c| c == cid)) {
+            let newer = self
+                .topic_latest
+                .with_untracked(|m| m.get(&root).is_none_or(|(ts, _)| ev.created_at > *ts));
+            if newer {
+                self.topic_latest.update(|m| {
+                    m.insert(root, (ev.created_at, ev.pubkey.clone()));
+                });
+            }
+        }
+        let held = self.channel_messages.with_untracked(|m| {
+            m.values().any(|v| {
+                let at = v.partition_point(|e| e.created_at < ev.created_at);
+                v[at..]
+                    .iter()
+                    .take_while(|e| e.created_at == ev.created_at)
+                    .any(|e| e.id == ev.id)
+            })
+        });
+        if !held {
+            if let Some(z) = zone_keys {
+                z.forget(std::slice::from_ref(&ev.id));
+            }
+        }
+    }
+
+    /// Topic `root`'s newest reply as the relay answered it, as
+    /// (created_at, author). Reactive.
+    pub fn topic_latest(&self, root: &str) -> Option<(u64, String)> {
+        self.topic_latest
+            .with(|m| m.get(&root.to_lowercase()).cloned())
     }
 
     /// The events of list `key` (a channel id or a [`topic_key`]). Reactive.
@@ -1954,6 +2140,12 @@ impl ChannelTotal {
         self.counted.map(|n| n + self.newer_ids.len() as u64)
     }
 }
+
+/// Topics per section-list stats batch (one REQ + one COUNT each, so 6
+/// frames): under the relay's 10-filter cap, and small enough that the
+/// client's own send pacing (`relay.rs` MAX_SENDS_PER_SECOND, 8/s) never
+/// holds a reader's REQ behind more than a second of stats frames.
+pub const TOPIC_STATS_BATCH: usize = 5;
 
 /// The list key of channel `cid`'s topic roots.
 pub fn roots_key(cid: &str) -> String {

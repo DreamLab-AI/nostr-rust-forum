@@ -8,11 +8,15 @@
 //!
 //! ## /connect magic-link QR (primary mobile path — ADR-098)
 //!
-//! The 📱 block encodes `{origin}{FORUM_BASE}/connect#k=<nsec1…>`, computed
-//! from the LIVE browser origin so the printed/scanned link points at the same
-//! deployment the user signed up on. The nsec rides in the URL *fragment*
-//! (after `#`) — fragments are never transmitted to the server. `/connect`
-//! strips the fragment from history before importing the key. This QR IS the
+//! The 📱 block encodes the root-form link `{origin}{FORUM_BASE}/#k=<nsec1…>`
+//! ([`crate::utils::connect_link::connect_url`]), computed from the LIVE
+//! browser origin so the printed/scanned link points at the same deployment
+//! the user signed up on. The nsec rides in the URL *fragment* (after `#`),
+//! which is never transmitted to the server, and the path is the forum root,
+//! which every static host serves directly: a `/connect` deep link would go
+//! through a GitHub-Pages-style 404 redirect that can copy the fragment into
+//! a query string. The `index.html` capture script scrubs the fragment from
+//! history before the app imports the key. This QR IS the
 //! account (bearer credential), hence the red warning. It is the recommended
 //! mobile path because it lands the user in the full forum surface, not a
 //! third-party client.
@@ -279,15 +283,15 @@ pub(crate) fn RecoverySheet(
     // Created date (UTC, YYYY-MM-DD) for the sheet header. Best-effort.
     let created = created_date_utc();
 
-    // --- /connect magic-link URL (ADR-098) -----------------------------------
+    // --- Sign-in link (ADR-098, root form) -----------------------------------
     // Computed from the LIVE origin so the printed link targets the exact
     // deployment the user signed up on. The nsec rides in the URL *fragment*
-    // (after `#`) — never a query string — so it is never transmitted to the
-    // server. `base_href("/connect")` applies the FORUM_BASE prefix (e.g.
-    // `/community/connect`) when the forum is mounted in a sub-directory.
+    // (after `#`), never a query string, so it is never transmitted to the
+    // server; the path is the forum root (`base_href("")`, e.g. `/community`),
+    // which a static host serves without a 404 redirect.
     let connect_url = web_sys::window()
         .and_then(|w| w.location().origin().ok())
-        .map(|origin| format!("{origin}{}#k={nsec}", base_href("/connect")));
+        .map(|origin| crate::utils::connect_link::connect_url(&origin, &base_href(""), &nsec));
 
     // --- QR SVGs (generated once at mount) -----------------------------------
     let connect_qr = connect_url.as_deref().map(qr_svg).unwrap_or_default();

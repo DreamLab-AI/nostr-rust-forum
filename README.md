@@ -117,11 +117,11 @@ sequenceDiagram
 
 The operator's task-property declaration sets the escalation boundary; a request can tighten it. Role and delegation policy govern admission of a response. High/critical cases require the configured human-response path. A cryptographic event alone cannot establish who physically controlled a signing key.
 
-See [ADR-2011](docs/adr/ADR-2011-operator-task-properties-set-the-escalation-boundary.md) and [governance flows](docs/diagrams/auth-governance-flows.md). The documented estate consumer is VisionClaw's ontology-review workflow; universal production use is not established. Application receipts belong to the system that performs the mutation.
+See [ADR-2011](docs/adr/ADR-2011-operator-task-properties-set-the-escalation-boundary.md) and the governance flow diagrams in VisionFlow's estate corpus ([NF-06](https://github.com/DreamLab-AI/VisionFlow/blob/main/docs/diagrams/nostr-rust-forum/06-agent-control-surface-31400-31405.md); this repository's diagrams live there, see [`docs/diagrams/`](docs/diagrams/README.md)). The documented estate consumer is VisionClaw's ontology-review workflow; universal production use is not established. Application receipts belong to the system that performs the mutation.
 
 ## Interoperability and deployment profiles
 
-**Main and the upgrade branch differ.** The main branch contains the interop design documents; the implementation described for NIP-17 and NIP-171 below is on [`feat/upgrade-phase-0-1`](https://github.com/DreamLab-AI/nostr-rust-forum/tree/feat/upgrade-phase-0-1), not merged into main. Cloning the quick-start command above does not include that implementation.
+**The NIP-17 and NIP-171 work is on main, switched off.** The upgrade branch `feat/upgrade-phase-0-1` merged into main at `a80c572` (2026-11-16). Its NIP-17 overlay and inbox keys ship dormant behind `RECIPIENT_KEYS_ENABLED`, and its NIP-171 zone key plane dormant behind `ZONE_GROUPS_ENABLED`; both are off unless an operator sets them to `"true"`.
 
 Standard event formats do not guarantee that any client can join every restricted community. Admission, channel dialect, encryption, key delivery and relay discovery must agree.
 
@@ -129,17 +129,27 @@ Standard event formats do not guarantee that any client can join every restricte
 |---|---|---|
 | NIP-42 relay admission | Implemented; example worker selects `AUTH_MODE=nip42` | Configure the relay's own URL/aliases and membership policy |
 | Mesh transport | Concrete transport and delegation validation exist | Peer configuration and a live cross-node run are separate evidence |
-| NIP-17 overlay | Implemented on the upgrade branch under [ADR-2027](docs/adr/ADR-2027-nip17-overlay-for-nostr-chat-interop.md) | `RECIPIENT_KEYS_ENABLED` is off by default |
-| NIP-171 zone key plane | Implemented on the upgrade branch behind a flag; design remains proposed in [ADR-2028](docs/adr/ADR-2028-zones-adopt-nip171-key-plane.md) | `ZONE_GROUPS_ENABLED` is off; pre-activation blockers remain |
+| NIP-17 overlay | Implemented on main under [ADR-2027](docs/adr/ADR-2027-nip17-overlay-for-nostr-chat-interop.md), flagged off | `RECIPIENT_KEYS_ENABLED` is off by default |
+| NIP-171 zone key plane | Partly implemented on main behind a flag; design remains proposed in [ADR-2028](docs/adr/ADR-2028-zones-adopt-nip171-key-plane.md) | `ZONE_GROUPS_ENABLED` is off; pre-activation blockers remain |
 | `room` profile | Configuration and roadmap described by [ADR-2029](docs/adr/ADR-2029-room-profile-deployment-type.md) | Channel-dialect implementation is not built |
 
 The implemented `forum` profile uses the existing channel dialect. Consult [deployment profiles](docs/deployment-profiles.md) and [interop assessments](docs/interop/) for the transition and recovery constraints. A proposed interoperability layer is not a claim of a completed acceptance session with another app.
 
 ## Working status
 
-**Publication checked 21 October 2026 against main `7096903` and the upgrade branch.** Main's core manifest declares **1.0.0-beta.18**. The reviewed upgrade worktree at `c1657fc` declares **1.0.0-beta.20**; its public branch was at `053f734` when this page was published. Other crates and consumers have independent versions/pins. The later local migration-ordering and time-bounded NIP-26 fixes remain unpublished work, not main-branch guarantees.
+**Checked 23 November 2026 against main `4a73a7a`.** The four published library crates (`nostr-bbs-core`, `-config`,
+`-mesh`, `-rate-limit`) are at **1.0.0-beta.20** on crates.io, released together on 22 November. The newest kit tag is
+`v1.0.0-beta.21-rc.3` (`fd31193`); the workers and the forum and BBS clients are not published and are built from source
+at a kit commit, and the other crates keep their own manifest versions. The upgrade branch `feat/upgrade-phase-0-1`
+merged at `a80c572` (16 November); its NIP-17 overlay and NIP-171 zone key plane ship switched off (see below).
 
-This documentation update does not merge the upgrade branch or activate its flags. The review inspected source and existing evidence; it did not deploy a fresh D1 database, run the full workspace suite or verify a live federation session. Current uncommitted zone-crypto/example-config changes were preserved. The [decision ledger](docs/adr/README.md) records decisions, implementation and activation on independent axes.
+Since 1.0.0-beta.20, main has added relay NIP-09 tombstones and a member deletion gate, incremental deleter-scoped
+deletion sync in the client, per-identity zone keys, drafts and bookmarks, and cold deep links that report "not found"
+only after an authenticated relay answer and, in an encrypted zone, after the zone keys arrive. The [changelog](CHANGELOG.md)
+`[Unreleased]` section lists them; open follow-ups are in [known findings](docs/security/known-findings.md). The operator
+has exercised the encrypted-zone cold link live on a deployment of `fd31193`; the rest of that work has not been
+re-verified live for this page. The [decision ledger](docs/adr/README.md) records decisions, implementation and
+activation on independent axes.
 
 ## Where it sits in VisionFlow
 

@@ -2398,7 +2398,9 @@ async fn zone_media_gate(
             if content_length.is_some_and(|n| n > zone_media::MAX_SEARCH_OBJECT_BYTES) {
                 return json_error(env, "Search object exceeds 32 MB", 413).map(Some);
             }
-            let known = zones.as_deref().is_some_and(|zs| zs.iter().any(|z| z.id == *zone));
+            let known = zones
+                .as_deref()
+                .is_some_and(|zs| zs.iter().any(|z| z.id == *zone));
             if !known {
                 return json_error(env, "Unknown zone", 400).map(Some);
             }

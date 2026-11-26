@@ -266,7 +266,9 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
                         zone.id
                     ));
                 }
-                if zone.visibility == crate::schema::ZoneVisibility::Public && mode != SearchMode::Off {
+                if zone.visibility == crate::schema::ZoneVisibility::Public
+                    && mode != SearchMode::Off
+                {
                     return Err(format!(
                         "zone '{}' is public; public zones get no search (search must be \"off\")",
                         zone.id
@@ -343,8 +345,14 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
     }
 
     for pk in &cfg.search_archivists {
-        if pk.len() != 64 || !pk.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-            return Err(format!("search_archivists entry '{pk}' is not 64-char lowercase hex"));
+        if pk.len() != 64
+            || !pk
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!(
+                "search_archivists entry '{pk}' is not 64-char lowercase hex"
+            ));
         }
     }
     Ok(())
@@ -852,12 +860,20 @@ operator = "tier-2"
         // Defaults: encrypted locked → sealed, public → off.
         let enc = zone_for_encryption(ZoneVisibility::Locked, true);
         assert_eq!(enc.effective_search(), SearchMode::Sealed);
-        assert_eq!(zone_for_encryption(ZoneVisibility::Public, false).effective_search(), SearchMode::Off);
-        assert_eq!(zone_for_encryption(ZoneVisibility::Locked, false).effective_search(), SearchMode::Server);
+        assert_eq!(
+            zone_for_encryption(ZoneVisibility::Public, false).effective_search(),
+            SearchMode::Off
+        );
+        assert_eq!(
+            zone_for_encryption(ZoneVisibility::Locked, false).effective_search(),
+            SearchMode::Server
+        );
         let mut bad = enc.clone();
         bad.search = Some(SearchMode::Server);
         cfg.zones = vec![bad];
-        assert!(validate_config(&cfg).unwrap_err().contains("expose the zone's plaintext"));
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .contains("expose the zone's plaintext"));
         let mut sealed_plain = zone_for_encryption(ZoneVisibility::Locked, false);
         sealed_plain.search = Some(SearchMode::Sealed);
         cfg.zones = vec![sealed_plain];

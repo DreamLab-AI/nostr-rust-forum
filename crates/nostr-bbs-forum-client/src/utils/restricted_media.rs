@@ -111,6 +111,41 @@ pub fn is_restricted_media_url(url: &str) -> bool {
     is_restricted_media_url_for(url, POD_API)
 }
 
+/// Most bytes a sealed search manifest (`m.json`) may hold.
+pub const SEALED_MANIFEST_MAX_BYTES: u64 = 256 * 1024;
+
+/// Most bytes one sealed search shard (`*.age`) may hold: the pod's own upload
+/// limit (`nostr-bbs-pod-worker` `zone_media::MAX_SEARCH_OBJECT_BYTES`).
+pub const SEALED_SHARD_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// If `url` is a sealed search object on THIS deployment's pod
+/// (`{pod_base}/pods/<owner>/media/zones/<zone>/search/<name>`, `name` being
+/// `m.json` or a `*.age` shard), the most bytes it may hold; otherwise `None`.
+/// Applies every rule of [`is_restricted_media_url_for`] first.
+pub fn sealed_search_object_cap(url: &str, pod_base: &str) -> Option<u64> {
+    if !is_restricted_media_url_for(url, pod_base) {
+        return None;
+    }
+    let path = url.strip_prefix(pod_base.trim_end_matches('/'))?;
+    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    // ["pods", owner, "media", "zones", zone, "search", name]
+    let [_, _, _, _, zone, "search", name] = segs.as_slice() else {
+        return None;
+    };
+    if !is_valid_zone_segment(zone) {
+        return None;
+    }
+    if *name == "m.json" {
+        return Some(SEALED_MANIFEST_MAX_BYTES);
+    }
+    let stem = name.strip_suffix(".age")?;
+    let stem_ok = !stem.is_empty()
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    stem_ok.then_some(SEALED_SHARD_MAX_BYTES)
+}
+
 /// A small LRU keyed by URL and scoped to one signed-in identity, bounded by
 /// entry count and total weight (bytes). Generic so it is testable natively.
 #[derive(Debug)]
@@ -262,13 +297,27 @@ pub fn classify_status(status: u16) -> Result<(), RestrictedFetchError> {
     }
 }
 
-/// GET a zone-restricted image with a fresh NIP-98 token bound to this exact
+/// The served media type sealed search objects (`m.json`, `*.age`) carry: the
+/// pod always serves them as opaque bytes and as an attachment
+/// (`nostr-bbs-pod-worker` `zone_media::served_content_type`).
+pub const SEALED_OBJECT_TYPE: &str = "application/octet-stream";
+
+/// Whether a served `Content-Type` is the sealed-object type (parameters and
+/// case ignored). Anything else, images included, is refused.
+pub fn is_sealed_object_type(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|c| c.split(';').next())
+        .map(|m| m.trim().eq_ignore_ascii_case(SEALED_OBJECT_TYPE))
+        .unwrap_or(false)
+}
+
+/// GET a zone-restricted pod URL with a fresh NIP-98 token bound to this exact
 /// URL. CORS mode, no credentials (the token is the only credential), no HTTP
-/// cache (the pod answers `no-store` anyway).
-pub async fn fetch_restricted_blob(
+/// cache (the pod answers `no-store` anyway), redirects refused.
+async fn fetch_restricted_response(
     url: &str,
     signer: &dyn nostr_bbs_core::signer::Signer,
-) -> Result<web_sys::Blob, RestrictedFetchError> {
+) -> Result<web_sys::Response, RestrictedFetchError> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
@@ -297,20 +346,80 @@ pub async fn fetch_restricted_blob(
         .dyn_into()
         .map_err(fail)?;
     classify_status(resp.status())?;
+    Ok(resp)
+}
+
+async fn response_blob(resp: &web_sys::Response) -> Result<web_sys::Blob, RestrictedFetchError> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let fail = |e: wasm_bindgen::JsValue| RestrictedFetchError::Failed(format!("{e:?}"));
+    JsFuture::from(resp.blob().map_err(fail)?)
+        .await
+        .map_err(fail)?
+        .dyn_into()
+        .map_err(fail)
+}
+
+/// GET a zone-restricted image (see [`fetch_restricted_response`]). Only an
+/// allow-listed raster type is accepted; the blob is re-typed to exactly it.
+pub async fn fetch_restricted_blob(
+    url: &str,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+) -> Result<web_sys::Blob, RestrictedFetchError> {
+    let resp = fetch_restricted_response(url, signer).await?;
     let served = resp.headers().get("content-type").ok().flatten();
     let Some(mime) = renderable_image_type(served.as_deref()) else {
         return Err(RestrictedFetchError::Failed(
             "not a renderable image".into(),
         ));
     };
-    let blob: web_sys::Blob = JsFuture::from(resp.blob().map_err(fail)?)
-        .await
-        .map_err(fail)?
-        .dyn_into()
-        .map_err(fail)?;
+    let blob = response_blob(&resp).await?;
     // Re-type the bytes as exactly the allow-listed raster type (no copy).
     blob.slice_with_f64_and_f64_and_content_type(0.0, blob.size(), mime)
-        .map_err(fail)
+        .map_err(|e| RestrictedFetchError::Failed(format!("{e:?}")))
+}
+
+/// GET a zone-restricted sealed search object (`m.json` or a `*.age` shard; see
+/// [`fetch_restricted_response`]). Only [`SEALED_OBJECT_TYPE`] is accepted; the
+/// caller verifies the bytes against the signed manifest.
+pub async fn fetch_restricted_object(
+    url: &str,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+) -> Result<web_sys::Blob, RestrictedFetchError> {
+    let pod = crate::utils::relay_url::pod_api_base();
+    let Some(cap) = sealed_search_object_cap(url, &pod) else {
+        return Err(RestrictedFetchError::Failed(
+            "not a sealed search object URL".into(),
+        ));
+    };
+    let resp = fetch_restricted_response(url, signer).await?;
+    let served = resp.headers().get("content-type").ok().flatten();
+    if !is_sealed_object_type(served.as_deref()) {
+        return Err(RestrictedFetchError::Failed(format!(
+            "not a sealed search object ({})",
+            served.as_deref().unwrap_or("no content-type")
+        )));
+    }
+    // Refuse an oversize object before reading it when the length is declared,
+    // and in any case once read.
+    let declared = resp
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > cap) {
+        return Err(RestrictedFetchError::Failed(format!(
+            "sealed search object over {cap} bytes"
+        )));
+    }
+    let blob = response_blob(&resp).await?;
+    if blob.size() as u64 > cap {
+        return Err(RestrictedFetchError::Failed(format!(
+            "sealed search object over {cap} bytes"
+        )));
+    }
+    Ok(blob)
 }
 
 #[cfg(test)]
@@ -319,6 +428,61 @@ mod tests {
 
     const POD: &str = "https://pods.example.com";
     const PK: &str = "75876d9075c15bda6d724511ab9edcaabd53ebfa69ace15f918527e89e077968";
+
+    #[test]
+    fn sealed_search_object_paths_and_caps() {
+        let base = format!("{POD}/pods/{PK}/media/zones/zone2/search");
+        assert_eq!(
+            sealed_search_object_cap(&format!("{base}/m.json"), POD),
+            Some(SEALED_MANIFEST_MAX_BYTES)
+        );
+        assert_eq!(
+            sealed_search_object_cap(&format!("{base}/b-5-0-v2.age"), POD),
+            Some(SEALED_SHARD_MAX_BYTES)
+        );
+        assert_eq!(
+            sealed_search_object_cap(&format!("{base}/q-5-4-v2.age"), "https://pods.example.com/"),
+            Some(SEALED_SHARD_MAX_BYTES)
+        );
+        // Not a search object: zone images, other names, other depths.
+        for bad in [
+            format!("{POD}/pods/{PK}/media/zones/zone2/1-a.webp"),
+            format!("{base}/x.webp"),
+            format!("{base}/m.json.age.webp"),
+            format!("{base}/.age"),
+            format!("{base}/"),
+            format!("{base}/sub/b-1-0-v1.age"),
+            format!("{POD}/pods/{PK}/media/zones/zone2/search"),
+            format!("{POD}/pods/{PK}/media/public/search/m.json"),
+            format!("{POD}/pods/{PK}/media/zones//search/m.json"),
+            format!("{POD}/pods/{PK}/media/zones/zo%2Fne/search/m.json"),
+            format!("{base}/m.json?x=1"),
+            format!("{base}/../search/m.json"),
+            format!("https://evil.example.com/pods/{PK}/media/zones/zone2/search/m.json"),
+            format!("{POD}.evil/pods/{PK}/media/zones/zone2/search/m.json"),
+            format!("{POD}/pods/nothex/media/zones/zone2/search/m.json"),
+            format!("{POD}/pods/{PK}/media/zones/Zone2/search/m.json"),
+        ] {
+            assert_eq!(sealed_search_object_cap(&bad, POD), None, "{bad}");
+        }
+        assert_eq!(
+            sealed_search_object_cap(&format!("{base}/m.json"), ""),
+            None
+        );
+        const { assert!(SEALED_SHARD_MAX_BYTES >= 13 * 1024 * 1024) };
+    }
+
+    #[test]
+    fn sealed_objects_accept_only_octet_stream() {
+        assert!(is_sealed_object_type(Some("application/octet-stream")));
+        assert!(is_sealed_object_type(Some(
+            "Application/Octet-Stream; charset=binary"
+        )));
+        assert!(!is_sealed_object_type(Some("application/json")));
+        assert!(!is_sealed_object_type(Some("image/webp")));
+        assert!(!is_sealed_object_type(Some("")));
+        assert!(!is_sealed_object_type(None));
+    }
 
     #[test]
     fn restricted_only_on_our_pod_origin_and_zone_prefix() {

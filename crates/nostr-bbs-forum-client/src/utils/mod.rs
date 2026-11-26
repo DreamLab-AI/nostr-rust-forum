@@ -3,6 +3,7 @@
 pub mod bake;
 pub mod bootstrap;
 pub mod clipboard;
+pub mod connect_link;
 pub mod devices;
 pub mod freshness;
 pub mod governance_view;
@@ -12,6 +13,7 @@ pub mod paths;
 pub mod pod_client;
 pub mod push;
 pub mod pwa_install;
+pub mod qr_scan;
 pub mod reconcile;
 pub mod relay_url;
 pub mod restricted_media;

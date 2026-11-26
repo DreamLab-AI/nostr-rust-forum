@@ -612,24 +612,56 @@ pub async fn handle_report_action(
 // GET /api/moderation/reports — NIP-1984 (kind-1984) standard report queue
 // ---------------------------------------------------------------------------
 
-/// D1 row for a stored kind-1984 event.
+/// Row of the relay's `reports` table (kind-1984 reports), as read through
+/// the `RELAY_DB` binding.
 #[derive(Deserialize)]
 struct Nip1984Row {
-    event_id: String,
-    pubkey: String,
+    report_event_id: String,
+    reporter_pubkey: String,
+    reported_event_id: String,
+    reported_pubkey: String,
+    reason: String,
+    reason_text: Option<String>,
+    status: String,
     created_at: i64,
-    content: String,
-    tags_json: String,
 }
 
-/// Return the most recent 50 kind-1984 report events stored in D1.
+/// Newest kind-1984 reports from the relay's `reports` table.
+const SQL_NIP1984_REPORTS: &str = "SELECT report_event_id, reporter_pubkey, reported_event_id, \
+     reported_pubkey, reason, reason_text, status, created_at \
+     FROM reports ORDER BY created_at DESC LIMIT 50";
+
+/// Render a relay `reports` row in the NIP-56 event-like shape this endpoint
+/// has always returned, plus the structured fields the relay stores.
 ///
-/// These are standard NIP-56 report events submitted by any user via the
-/// relay (kind 1984). The relay stores them as `Regular` events. This
-/// endpoint surfaces them to admins for review.
+/// The relay keeps the parsed report rather than the raw tag list, so `tags`
+/// is rebuilt as the NIP-56 `e` / `p` pair carrying the report type.
+fn nip1984_report_json(r: Nip1984Row) -> serde_json::Value {
+    json!({
+        "kind": KIND_REPORT_NIP56,
+        "id": r.report_event_id,
+        "pubkey": r.reporter_pubkey,
+        "created_at": r.created_at,
+        "content": r.reason_text.unwrap_or_default(),
+        "tags": [
+            ["e", r.reported_event_id, r.reason],
+            ["p", r.reported_pubkey],
+        ],
+        "reason": r.reason,
+        "reported_event_id": r.reported_event_id,
+        "reported_pubkey": r.reported_pubkey,
+        "status": r.status,
+    })
+}
+
+/// Return the most recent 50 kind-1984 report events.
 ///
-/// The query reads from a `nip1984_reports` table populated by the relay-worker
-/// when it receives kind-1984 events. This table is created by `ensure_schema`.
+/// Standard NIP-56 reports are written by the relay worker into the `reports`
+/// table of its own D1 (`relay-worker/src/moderation.rs::insert_report`).
+/// The auth worker reaches that database through its `RELAY_DB` binding, the
+/// same cross-worker path used for the whitelist and device registry. The
+/// auth worker's own `mod_reports` table holds the separate kind-30913
+/// reports and is served by `GET /api/mod/reports`.
 pub async fn handle_nip1984_reports(
     auth_header: Option<&str>,
     env: &Env,
@@ -640,43 +672,21 @@ pub async fn handle_nip1984_reports(
         return json_response(env, &body, status);
     }
 
-    let db = match env.d1("DB") {
+    let db = match env.d1("RELAY_DB") {
         Ok(db) => db,
-        Err(_) => return error_json(env, "Database unavailable", 500),
+        Err(_) => return error_json(env, "Relay database unavailable", 500),
     };
 
-    let result = match db
-        .prepare(
-            "SELECT event_id, pubkey, created_at, content, tags_json \
-             FROM nip1984_reports \
-             ORDER BY created_at DESC \
-             LIMIT 50",
-        )
-        .all()
-        .await
-    {
+    let result = match db.prepare(SQL_NIP1984_REPORTS).all().await {
         Ok(r) => r,
         Err(e) => return error_json(env, &format!("Query failed: {e}"), 500),
     };
 
-    let rows: Vec<Nip1984Row> = result.results().unwrap_or_default();
-
-    let reports: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| {
-            // Parse tags_json back to a Value; fall back to empty array on error.
-            let tags: serde_json::Value =
-                serde_json::from_str(&r.tags_json).unwrap_or(serde_json::Value::Array(vec![]));
-            json!({
-                "kind": KIND_REPORT_NIP56,
-                "id": r.event_id,
-                "pubkey": r.pubkey,
-                "created_at": r.created_at,
-                "content": r.content,
-                "tags": tags,
-            })
-        })
-        .collect();
+    let rows: Vec<Nip1984Row> = match result.results() {
+        Ok(rows) => rows,
+        Err(e) => return error_json(env, &format!("Report decode failed: {e}"), 500),
+    };
+    let reports: Vec<serde_json::Value> = rows.into_iter().map(nip1984_report_json).collect();
 
     json_response(
         env,
@@ -705,6 +715,69 @@ fn first_tag<'a>(event: &'a NostrEvent, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- NIP-1984 report queue (NF-02.2 / NF-08.13) ----------------------------
+
+    /// The relay's `reports` DDL (relay-worker `lib.rs`), the table that
+    /// `insert_report` populates.
+    const RELAY_REPORTS_DDL: &str = "CREATE TABLE reports (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT, report_event_id TEXT NOT NULL UNIQUE, \
+        reporter_pubkey TEXT NOT NULL, reporter_trust_level INTEGER NOT NULL DEFAULT 0, \
+        reported_event_id TEXT NOT NULL, reported_pubkey TEXT NOT NULL, \
+        reason TEXT NOT NULL, reason_text TEXT, status TEXT NOT NULL DEFAULT 'pending', \
+        resolved_by TEXT, resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER)";
+
+    fn read_reports(db: &rusqlite::Connection) -> Vec<serde_json::Value> {
+        let mut stmt = db.prepare(SQL_NIP1984_REPORTS).expect("prepare");
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Nip1984Row {
+                    report_event_id: r.get("report_event_id")?,
+                    reporter_pubkey: r.get("reporter_pubkey")?,
+                    reported_event_id: r.get("reported_event_id")?,
+                    reported_pubkey: r.get("reported_pubkey")?,
+                    reason: r.get("reason")?,
+                    reason_text: r.get("reason_text")?,
+                    status: r.get("status")?,
+                    created_at: r.get("created_at")?,
+                })
+            })
+            .expect("query");
+        rows.map(|r| nip1984_report_json(r.expect("row"))).collect()
+    }
+
+    #[test]
+    fn nip1984_query_returns_reports_the_relay_wrote() {
+        let db = rusqlite::Connection::open_in_memory().expect("sqlite");
+        db.execute_batch(RELAY_REPORTS_DDL).expect("ddl");
+        db.execute_batch(
+            "INSERT INTO reports(report_event_id, reporter_pubkey, reported_event_id, \
+             reported_pubkey, reason, reason_text, created_at) VALUES \
+             ('r1','rep','ev1','bad','spam','buy now',100), \
+             ('r2','rep','ev2','bad2','abuse',NULL,200);",
+        )
+        .expect("seed");
+
+        let out = read_reports(&db);
+        assert_eq!(out.len(), 2, "both relay-written reports are returned");
+        // Newest first.
+        assert_eq!(out[0]["id"], "r2");
+        assert_eq!(out[0]["content"], "");
+        assert_eq!(out[1]["id"], "r1");
+        assert_eq!(out[1]["kind"], KIND_REPORT_NIP56);
+        assert_eq!(out[1]["pubkey"], "rep");
+        assert_eq!(out[1]["created_at"], 100);
+        assert_eq!(out[1]["content"], "buy now");
+        assert_eq!(out[1]["status"], "pending");
+        assert_eq!(out[1]["tags"][0], json!(["e", "ev1", "spam"]));
+        assert_eq!(out[1]["tags"][1], json!(["p", "bad"]));
+    }
+
+    #[test]
+    fn nip1984_query_does_not_read_the_dead_table() {
+        assert!(!SQL_NIP1984_REPORTS.contains("nip1984_reports"));
+        assert!(SQL_NIP1984_REPORTS.contains("FROM reports"));
+    }
     use k256::schnorr::SigningKey;
     use nostr_bbs_core::event::{sign_event_deterministic, UnsignedEvent};
     use nostr_bbs_core::{build_ban, build_mute, build_report, build_unban, build_unmute};

@@ -45,7 +45,7 @@ use crate::components::access_denied::AccessDenied;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use crate::components::message_input::MessageInput;
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::topic_list::{classify_topics, TopicList, TopicSummary};
+use crate::components::topic_list::{classify_topics, with_topic_stats, TopicList, TopicSummary};
 use crate::components::zone_hero::ZoneHero;
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{use_channel_store, ChannelMeta};
@@ -273,6 +273,33 @@ pub fn SectionPage() -> impl IntoView {
             classify_topics(&cid, &all)
         })
     });
+    // The window holds a fraction of a long topic: take the relay's exact
+    // reply total and newest reply where they are in. A separate Memo, so a
+    // stats answer re-folds the summaries without re-classifying the window.
+    let classified = topics_memo;
+    let topics_memo = Memo::new(move |_| {
+        with_topic_stats(classified.get(), |t| {
+            let total = store.total_for(&crate::stores::channels::topic_key(&t.id));
+            (total, store.topic_latest(&t.id))
+        })
+    });
+
+    // Ask for those stats for the listed topics (top of the list first),
+    // in batches, once per topic per session.
+    {
+        let relay_for_stats = expect_context::<RelayConnection>();
+        Effect::new(move |_| {
+            let Some(ch) = resolved_channel.get() else {
+                return;
+            };
+            let gated = zone_is_gated(&category_slug(), &load_zones());
+            if !store.history_receipt(&ch.id).settles(gated) {
+                return;
+            }
+            let ids: Vec<String> = topics_memo.with(|ts| ts.iter().map(|t| t.id.clone()).collect());
+            store.request_topic_stats(&relay_for_stats, &ch.id, &ids, gated);
+        });
+    }
     let topics: Signal<Vec<TopicSummary>> = topics_memo.into();
 
     // Fetch the section's topic roots once (decision ii: sealed roots carry
@@ -630,6 +657,13 @@ pub fn SectionPage() -> impl IntoView {
                     // back until the start of the channel.
                     let history_cid = Signal::derive(move || resolved_channel.get().map(|c| c.id));
                     let history_gated = Signal::derive(move || zone_is_gated(&category_slug(), &load_zones()));
+                    // The complete root list already lists every topic:
+                    // channel paging (older or newer) would add none.
+                    let topics_complete = Signal::derive(move || {
+                        resolved_channel
+                            .get()
+                            .is_some_and(|c| store.topic_roots_complete(&c.id))
+                    });
                     // Bounded window: once older pages have evicted the
                     // newest topics, a loader above the list brings them back.
                     view! {
@@ -638,6 +672,7 @@ pub fn SectionPage() -> impl IntoView {
                             gated=history_gated
                             label="Load newer topics"
                             direction=crate::components::history_loader::HistoryDirection::Newer
+                            exhausted=topics_complete
                         />
                         <TopicList
                             channel_id=ch_id
@@ -648,6 +683,7 @@ pub fn SectionPage() -> impl IntoView {
                             channel_id=history_cid
                             gated=history_gated
                             label="Load older topics"
+                            exhausted=topics_complete
                         />
                     }.into_any()
                 } else {
@@ -710,12 +746,21 @@ async fn publish_topic_root(
         .ok_or_else(|| "Not authenticated".to_string())?;
 
     let now = (js_sys::Date::now() / 1000.0) as u64;
-    let mut tags = vec![vec![
-        "e".to_string(),
-        section_channel_id.to_string(),
-        String::new(),
-        "root".to_string(),
-    ]];
+    // The topic marker lists the root in the section's root list
+    // (`#t:["topic"]`), as sealed roots are, so it is never only reachable
+    // by paging the channel's history.
+    let mut tags = vec![
+        vec![
+            "e".to_string(),
+            section_channel_id.to_string(),
+            String::new(),
+            "root".to_string(),
+        ],
+        vec![
+            "t".to_string(),
+            nostr_bbs_core::sealed::TOPIC_MARKER.to_string(),
+        ],
+    ];
     // @handles get ["p", pubkey] tags so mentioned users / agents (e.g.
     // @junkiejarvis) are addressable and reachable via the relay's #p-filtered
     // subscriptions. Two sources, de-duped: the pubkeys the user picked from the

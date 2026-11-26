@@ -40,7 +40,11 @@ fn is_whitespace(c: char) -> bool {
 
 fn is_punct(c: char) -> bool {
     let u = c as u32;
-    if (33..=47).contains(&u) || (58..=64).contains(&u) || (91..=96).contains(&u) || (123..=126).contains(&u) {
+    if (33..=47).contains(&u)
+        || (58..=64).contains(&u)
+        || (91..=96).contains(&u)
+        || (123..=126).contains(&u)
+    {
         return true;
     }
     matches!(
@@ -75,8 +79,19 @@ impl WordPiece {
             .enumerate()
             .map(|(i, t)| (t.to_string(), i as u32))
             .collect();
-        let id = |t: &str| vocab.get(t).copied().ok_or_else(|| format!("vocab lacks {t}"));
-        Ok(Self { cls: id("[CLS]")?, sep: id("[SEP]")?, unk: id("[UNK]")?, vocab, max_len: 512 })
+        let id = |t: &str| {
+            vocab
+                .get(t)
+                .copied()
+                .ok_or_else(|| format!("vocab lacks {t}"))
+        };
+        Ok(Self {
+            cls: id("[CLS]")?,
+            sep: id("[SEP]")?,
+            unk: id("[UNK]")?,
+            vocab,
+            max_len: 512,
+        })
     }
 
     /// Basic tokenisation: the word list before WordPiece.

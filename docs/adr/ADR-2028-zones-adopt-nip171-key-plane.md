@@ -3,11 +3,11 @@ id: ADR-2028
 title: Zones adopt the NIP-171 key plane and ticket format; board transport stays signed kind 42; one owner per zone
 date: 2026-10-20
 decision_status: proposed
-implementation_status: none
+implementation_status: partial
 activation_status: inactive
 supersedes: [ADR-2026]
 superseded_by: []
-verified_commit: fb9ef30 plus the uncommitted ADR-2025 working tree (design only; nothing implemented to verify)
+verified_commit: fd31193 (source presence of Phase 4 steps 1 to 3 behind ZONE_GROUPS_ENABLED, read 2026-11-22; tests not run)
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: NIP-171 merging or changing its derivation; a zone owner leaving; a request to open a zone to Anagram or nostr.chat members; any proposal to move zone posts off kind 42
 repo: nostr-rust-forum
@@ -32,6 +32,19 @@ signed over their ciphertext, so re-sealing them is impossible; the ADR-2017 mig
 inner event that carries `zk`.
 
 ## Decision
+
+> Note 2026-11-22: `implementation_status` moves from `none` to `partial`. Phase 4 steps 1 to 3 are on `main`, flagged
+> off: `7df61ae` (Phase 4, NIP-171 zone key plane) is an ancestor of `main` through the `a80c572` merge. Present in source:
+> the NIP-171 derivation with the draft's test vector (`crates/nostr-bbs-forum-client/src/zone_crypto/nip171.rs`),
+> kind 1014 tickets beside the 21453 grant path (`crates/nostr-bbs-forum-client/src/zone_crypto/tickets.rs`), and the
+> relay's zone-group binding and first-write epoch uniqueness (`crates/nostr-bbs-relay-worker/src/zone_groups.rs`,
+> `migrations/0014_zone_epoch_keys.sql`). The relay reads `ZONE_GROUPS_ENABLED` as a worker var and the forum client from
+> `window.__ENV__`, both only on the exact string `"true"`; no wrangler template in this repository declares it, so it is
+> off. The hard blocker below is still open (the relay comment at `relay_do/nip_handlers.rs:1571` records that a cohort
+> member can still first-write-win future epochs), so the owner-only epoch binding of step 4 has not landed; this note does
+> not establish the state of the rest of step 4.
+> `decision_status` stays `proposed` and `activation_status` `inactive`. Checked by reading source at `fd31193`; no test
+> was run for this note.
 
 Proposed:
 
@@ -88,6 +101,9 @@ Proposed:
 
 ## Verification
 
+> Note 2026-11-22: "None: no implementation" below predates Phase 4; see the 2026-11-22 note under Decision for what
+> is on `main`. Whether each adoption test listed here exists and passes was not checked for that note.
+
 None: no implementation. Adoption requires, in order: the NIP-171 test vector green in the client
 crate; a relay test that a `zk` with a second pubkey for a stored zone and epoch is refused; a
 client test that a ticket sealed by a key other than the bound group identity is rejected even
@@ -133,6 +149,15 @@ step 4): add an `epoch` column to the admin epoch-registration, have the relay a
 `zk` at epoch E only when the owner has registered epoch E's key, and bound claimable epochs to
 `current+1`. `ZONE_GROUPS_ENABLED` MUST NOT be enabled on any deployment until that lands. Until
 then the flag stays off and the squat is unreachable (the gate only runs with the flag on).
+
+> Note 2026-11-24: a second prerequisite, from the security re-review of kit PR #95, recorded as KF-34 in
+> `docs/security/known-findings.md`. A ticket whose signer the session's bindings bind to no zone
+> (`TicketVerdict::Unbound`, `crates/nostr-bbs-forum-client/src/zone_crypto/tickets.rs:580`) is left unmarked without
+> holding the grant backlog, so a forged ticket cannot force a full walk every session; but a genuine ticket whose
+> binding becomes visible only later (a Hidden zone omitted from NIP-11, a stale cache, a binding published after the
+> ticket) is then lost on a warm device. Before `ZONE_GROUPS_ENABLED` is turned on, Unbound ticket wraps must be kept
+> (a small capped per-owner store) and re-judged when bindings load. Not live: the flag defaults off and the owner
+> flow has no caller. No front-matter status changes.
 
 Interim defence-in-depth shipped flagged-off: a per-event cap on honoured `zk` tags, and an
 admin reset path for `zone_epoch_keys`.

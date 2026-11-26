@@ -106,7 +106,8 @@ pub fn valid_zone(z: &str) -> bool {
     z == DEFAULT_ZONE
         || (!z.is_empty()
             && z.len() <= 32
-            && z.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+            && z.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +212,14 @@ pub fn manifest_key(store_key: &str) -> String {
 /// manifest compute the same generation; without the nonce they would write
 /// the same key, and the loser's cleanup would delete the object the
 /// winner's manifest points at.
-pub fn shard_key(store_key: &str, zone: &str, depth: u8, prefix: u64, generation: u64, nonce: &str) -> String {
+pub fn shard_key(
+    store_key: &str,
+    zone: &str,
+    depth: u8,
+    prefix: u64,
+    generation: u64,
+    nonce: &str,
+) -> String {
     format!("{store_key}.v2/{zone}/{depth}-{prefix:016x}-g{generation}-{nonce}.rvf")
 }
 
@@ -358,12 +366,16 @@ pub fn encode_shard(rows: &[Row], zone: &str, depth: u8, prefix: u64) -> Vec<u8>
         "row_bytes": ROW_BYTES, "zone": zone, "depth": depth, "prefix": prefix,
     });
     let meta = serde_json::to_vec(&meta).unwrap_or_default();
-    let mut out = Vec::with_capacity(layout.rows_off + align64(hot.len()) + 2 * SEGMENT_HEADER_SIZE + 256);
+    let mut out =
+        Vec::with_capacity(layout.rows_off + align64(hot.len()) + 2 * SEGMENT_HEADER_SIZE + 256);
     push_segment(&mut out, SegmentType::Quant, 0, QUANT_SIGN_V1, &codes);
     push_segment(&mut out, SegmentType::Membership, 1, 0, &bitmap);
     push_segment(&mut out, SegmentType::Hot, 2, 0, &hot);
     push_segment(&mut out, SegmentType::Meta, 3, 0, &meta);
-    debug_assert_eq!(out[layout.rows_off - SEGMENT_HEADER_SIZE + 5], SegmentType::Hot as u8);
+    debug_assert_eq!(
+        out[layout.rows_off - SEGMENT_HEADER_SIZE + 5],
+        SegmentType::Hot as u8
+    );
     out
 }
 
@@ -378,19 +390,31 @@ pub fn decode_row(b: &[u8]) -> Option<Row> {
     for (i, c) in b[ID_SLOT..ROW_BYTES].chunks_exact(4).enumerate() {
         vec[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
     }
-    Some(Row { id, public: false, vec })
+    Some(Row {
+        id,
+        public: false,
+        vec,
+    })
 }
 
 /// Decode a whole shard object into rows (ingest path).
 pub fn decode_shard(data: &[u8]) -> Option<Vec<Row>> {
     let segs = segments(data);
-    let quant = segs.iter().find(|(h, _)| h.seg_type == SegmentType::Quant as u8)?;
+    let quant = segs
+        .iter()
+        .find(|(h, _)| h.seg_type == SegmentType::Quant as u8)?;
     if quant.0.flags != QUANT_SIGN_V1 {
         return None;
     }
     let n = quant.1.len() / CODE_BYTES;
-    let bitmap = segs.iter().find(|(h, _)| h.seg_type == SegmentType::Membership as u8)?.1;
-    let hot = segs.iter().find(|(h, _)| h.seg_type == SegmentType::Hot as u8)?.1;
+    let bitmap = segs
+        .iter()
+        .find(|(h, _)| h.seg_type == SegmentType::Membership as u8)?
+        .1;
+    let hot = segs
+        .iter()
+        .find(|(h, _)| h.seg_type == SegmentType::Hot as u8)?
+        .1;
     if bitmap.len() < n.div_ceil(8) || hot.len() < n * ROW_BYTES {
         return None;
     }
@@ -410,7 +434,11 @@ pub fn decode_shard(data: &[u8]) -> Option<Vec<Row>> {
 /// Insert or replace `new` rows (by id) into `rows`. Order of existing rows is
 /// kept; new ids append in input order. Returns how many were new.
 pub fn upsert(rows: &mut Vec<Row>, new: Vec<Row>) -> usize {
-    let mut at: HashMap<String, usize> = rows.iter().enumerate().map(|(i, r)| (r.id.clone(), i)).collect();
+    let mut at: HashMap<String, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.id.clone(), i))
+        .collect();
     let mut added = 0;
     for r in new {
         if let Some(&i) = at.get(&r.id) {
@@ -427,7 +455,12 @@ pub fn upsert(rows: &mut Vec<Row>, new: Vec<Row>) -> usize {
 /// Split `rows` of shard `(depth, prefix)` until every part has at most `cap`
 /// rows. Returns `(depth, prefix, rows)` parts covering exactly the parent's
 /// hash range, each preserving the parent's row order.
-pub fn split_until_fits(rows: Vec<Row>, depth: u8, prefix: u64, cap: usize) -> Vec<(u8, u64, Vec<Row>)> {
+pub fn split_until_fits(
+    rows: Vec<Row>,
+    depth: u8,
+    prefix: u64,
+    cap: usize,
+) -> Vec<(u8, u64, Vec<Row>)> {
     if rows.len() <= cap || depth >= MAX_DEPTH {
         return vec![(depth, prefix, rows)];
     }
@@ -462,7 +495,10 @@ pub struct ShardBatch {
 }
 
 /// Route `(zone, row)` pairs to their shards in `m`, in first-seen order.
-pub fn group_by_shard(m: &Manifest, rows: impl IntoIterator<Item = (String, Row)>) -> Vec<ShardBatch> {
+pub fn group_by_shard(
+    m: &Manifest,
+    rows: impl IntoIterator<Item = (String, Row)>,
+) -> Vec<ShardBatch> {
     let mut out: Vec<ShardBatch> = Vec::new();
     for (zone, row) in rows {
         let target = m.shard_for(&zone, id_hash(&row.id));
@@ -473,8 +509,16 @@ pub fn group_by_shard(m: &Manifest, rows: impl IntoIterator<Item = (String, Row)
         match slot {
             Some(i) => out[i].rows.push(row),
             None => {
-                let (depth, prefix) = target.map(|t| (m.shards[t].depth, m.shards[t].prefix)).unwrap_or((0, 0));
-                out.push(ShardBatch { target, zone, depth, prefix, rows: vec![row] });
+                let (depth, prefix) = target
+                    .map(|t| (m.shards[t].depth, m.shards[t].prefix))
+                    .unwrap_or((0, 0));
+                out.push(ShardBatch {
+                    target,
+                    zone,
+                    depth,
+                    prefix,
+                    rows: vec![row],
+                });
             }
         }
     }
@@ -483,7 +527,14 @@ pub fn group_by_shard(m: &Manifest, rows: impl IntoIterator<Item = (String, Row)
 
 /// The manifest after replacing the shards at `replaced` with `added`, at
 /// `generation`. Untouched shards keep their order; new ones follow.
-pub fn commit(base: &Manifest, replaced: &[usize], added: Vec<ShardInfo>, generation: u64, model: &str, migrated: bool) -> Manifest {
+pub fn commit(
+    base: &Manifest,
+    replaced: &[usize],
+    added: Vec<ShardInfo>,
+    generation: u64,
+    model: &str,
+    migrated: bool,
+) -> Manifest {
     let mut next = base.clone();
     if base.total() == 0 {
         next.model = model.to_string();
@@ -564,7 +615,11 @@ impl ShardCodes {
         let codes = bytes[..count * CODE_BYTES].to_vec();
         let b0 = l.bitmap_off - start;
         let bitmap = bytes[b0..b0 + count.div_ceil(8)].to_vec();
-        Some(Self { count, codes, bitmap })
+        Some(Self {
+            count,
+            codes,
+            bitmap,
+        })
     }
 
     /// Heap bytes held.
@@ -609,7 +664,11 @@ pub fn first_stage(lut: &QueryLut, shards: &[&ShardCodes], r: usize) -> Vec<Cand
     for (si, s) in shards.iter().enumerate() {
         for i in 0..s.count {
             if s.is_public(i) {
-                v.push((si, i, lut.score(&s.codes[i * CODE_BYTES..(i + 1) * CODE_BYTES])));
+                v.push((
+                    si,
+                    i,
+                    lut.score(&s.codes[i * CODE_BYTES..(i + 1) * CODE_BYTES]),
+                ));
                 if v.len() == cap {
                     cut(&mut v);
                 }
@@ -626,7 +685,12 @@ pub fn first_stage(lut: &QueryLut, shards: &[&ShardCodes], r: usize) -> Vec<Cand
 ///
 /// `rows` pairs each candidate's `(shard, pos)` with its fetched row bytes.
 /// Scores use the v1 arithmetic, so they are bit-identical to v1's.
-pub fn rescore(query: &[f32], rows: &[((usize, usize), &[u8])], k: usize, min_score: f32) -> Vec<(String, f32)> {
+pub fn rescore(
+    query: &[f32],
+    rows: &[((usize, usize), &[u8])],
+    k: usize,
+    min_score: f32,
+) -> Vec<(String, f32)> {
     let mut v: Vec<((usize, usize), String, f32)> = rows
         .iter()
         .filter_map(|((s, p), b)| {
@@ -662,7 +726,9 @@ mod tests {
     fn lcg_rows(n: usize, seed: u64, public_every: usize) -> Vec<Row> {
         let mut x = seed;
         let mut next = || {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((x >> 33) as f32 / (1u64 << 31) as f32) - 0.5
         };
         (0..n)
@@ -671,7 +737,11 @@ mod tests {
                 for s in vec.iter_mut() {
                     *s = next();
                 }
-                Row { id: format!("{:064x}", (i as u128 + 1) * 0x9e3779b97f4a7c15), public: i % public_every != 1, vec }
+                Row {
+                    id: format!("{:064x}", (i as u128 + 1) * 0x9e3779b97f4a7c15),
+                    public: i % public_every != 1,
+                    vec,
+                }
             })
             .collect()
     }
@@ -686,7 +756,10 @@ mod tests {
         let (a, b) = l.hot_range();
         let sc = ShardCodes::from_hot_range(rows.len(), &buf[a..b]).unwrap();
         for (i, r) in rows.iter().enumerate() {
-            assert_eq!(&sc.codes[i * CODE_BYTES..(i + 1) * CODE_BYTES], &sign_code(&r.vec));
+            assert_eq!(
+                &sc.codes[i * CODE_BYTES..(i + 1) * CODE_BYTES],
+                &sign_code(&r.vec)
+            );
             assert_eq!(sc.is_public(i), r.public);
             let row = decode_row(&buf[l.row_off(i)..l.row_off(i) + ROW_BYTES]).unwrap();
             assert_eq!(row.id, r.id);
@@ -706,7 +779,15 @@ mod tests {
     #[test]
     fn manifest_roundtrip_and_rejects_others() {
         let mut m = Manifest::new("bge-small-en-v1.5@openai-compat");
-        m.shards.push(ShardInfo { zone: "_".into(), depth: 1, prefix: 1, count: 5, public: 4, key: "k".into(), etag: "e".into() });
+        m.shards.push(ShardInfo {
+            zone: "_".into(),
+            depth: 1,
+            prefix: 1,
+            count: 5,
+            public: 4,
+            key: "k".into(),
+            etag: "e".into(),
+        });
         assert_eq!(Manifest::from_rvf(&m.to_rvf()).unwrap(), m);
         assert!(Manifest::from_rvf(&encode_shard(&[], "_", 0, 0)).is_none());
         assert!(Manifest::from_rvf(&[]).is_none());
@@ -731,7 +812,13 @@ mod tests {
         assert_eq!(seen, 5000);
         // Prefix-free cover: every hash is owned by exactly one part.
         for r in &rows {
-            assert_eq!(parts.iter().filter(|(d, p, _)| owns(*d, *p, id_hash(&r.id))).count(), 1);
+            assert_eq!(
+                parts
+                    .iter()
+                    .filter(|(d, p, _)| owns(*d, *p, id_hash(&r.id)))
+                    .count(),
+                1
+            );
         }
     }
 
@@ -742,7 +829,10 @@ mod tests {
         upd.public = false;
         upd.vec[0] = 9.0;
         let fresh = lcg_rows(12, 5, 1).pop().unwrap();
-        let fresh = Row { id: "new".into(), ..fresh };
+        let fresh = Row {
+            id: "new".into(),
+            ..fresh
+        };
         assert_eq!(upsert(&mut rows, vec![upd.clone(), fresh.clone()]), 1);
         assert_eq!(rows.len(), 11);
         assert_eq!(rows[3], upd);
@@ -756,7 +846,15 @@ mod tests {
         let lut = QueryLut::new(&q);
         for r in &rows {
             let c = sign_code(&r.vec);
-            let direct: f32 = (0..DIM).map(|i| if c[i / 8] >> (i % 8) & 1 == 1 { q[i] } else { -q[i] }).sum();
+            let direct: f32 = (0..DIM)
+                .map(|i| {
+                    if c[i / 8] >> (i % 8) & 1 == 1 {
+                        q[i]
+                    } else {
+                        -q[i]
+                    }
+                })
+                .sum();
             assert!((lut.score(&c) - direct).abs() < 1e-4);
         }
     }
@@ -783,7 +881,10 @@ mod tests {
             r.public = true; // v1's search_rvf has no visibility filter
         }
         let parts = split_until_fits(rows.clone(), 0, 0, 600);
-        let bufs: Vec<Vec<u8>> = parts.iter().map(|(d, p, rs)| encode_shard(rs, "_", *d, *p)).collect();
+        let bufs: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|(d, p, rs)| encode_shard(rs, "_", *d, *p))
+            .collect();
         let codes: Vec<ShardCodes> = parts
             .iter()
             .zip(&bufs)
@@ -794,9 +895,17 @@ mod tests {
             .collect();
         let refs: Vec<&ShardCodes> = codes.iter().collect();
         // v1 store of the same vectors (labels = index + 1).
-        let entries: Vec<(u64, [f32; DIM])> = rows.iter().enumerate().map(|(i, r)| (i as u64 + 1, r.vec)).collect();
+        let entries: Vec<(u64, [f32; DIM])> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as u64 + 1, r.vec))
+            .collect();
         let v1 = crate::store::build_rvf_bytes_for_test(&entries);
-        let id_of: HashMap<u64, &str> = rows.iter().enumerate().map(|(i, r)| (i as u64 + 1, r.id.as_str())).collect();
+        let id_of: HashMap<u64, &str> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as u64 + 1, r.id.as_str()))
+            .collect();
         for qi in 0..5 {
             let q = lcg_rows(1, 100 + qi, 1)[0].vec;
             for &(k, min) in &[(10usize, -1.0f32), (40, 0.05)] {
@@ -809,24 +918,45 @@ mod tests {
                     .iter()
                     .map(|(s, p, _)| {
                         let l = ShardLayout::new(parts[*s].2.len());
-                        ((*s, *p), &bufs[*s][l.row_off(*p)..l.row_off(*p) + ROW_BYTES])
+                        (
+                            (*s, *p),
+                            &bufs[*s][l.row_off(*p)..l.row_off(*p) + ROW_BYTES],
+                        )
                     })
                     .collect();
                 let got = rescore(&q, &fetched, k, min);
                 if got != want {
                     let i = got.iter().zip(&want).position(|(a, b)| a != b);
-                    panic!("k={k} min={min} len {} vs {} first diff {:?}: {:?} vs {:?}", got.len(), want.len(), i, i.map(|i| &got[i]), i.map(|i| &want[i]));
+                    panic!(
+                        "k={k} min={min} len {} vs {} first diff {:?}: {:?} vs {:?}",
+                        got.len(),
+                        want.len(),
+                        i,
+                        i.map(|i| &got[i]),
+                        i.map(|i| &want[i])
+                    );
                 }
             }
         }
     }
 
     /// Simulate ingest rounds natively: group, upsert, split, encode, commit.
-    fn ingest_round(m: &Manifest, objects: &mut HashMap<String, Vec<u8>>, rows: Vec<(String, Row)>, cap: usize) -> Manifest {
+    fn ingest_round(
+        m: &Manifest,
+        objects: &mut HashMap<String, Vec<u8>>,
+        rows: Vec<(String, Row)>,
+        cap: usize,
+    ) -> Manifest {
         ingest_round_n(m, objects, rows, cap, "n")
     }
 
-    fn ingest_round_n(m: &Manifest, objects: &mut HashMap<String, Vec<u8>>, rows: Vec<(String, Row)>, cap: usize, nonce: &str) -> Manifest {
+    fn ingest_round_n(
+        m: &Manifest,
+        objects: &mut HashMap<String, Vec<u8>>,
+        rows: Vec<(String, Row)>,
+        cap: usize,
+        nonce: &str,
+    ) -> Manifest {
         let gen = m.generation + 1;
         let mut replaced = Vec::new();
         let mut added = Vec::new();
@@ -839,7 +969,15 @@ mod tests {
             for (d, p, part) in split_until_fits(cur, g.depth, g.prefix, cap) {
                 let key = shard_key("t.rvf", &g.zone, d, p, gen, nonce);
                 objects.insert(key.clone(), encode_shard(&part, &g.zone, d, p));
-                added.push(ShardInfo { zone: g.zone.clone(), depth: d, prefix: p, count: part.len(), public: part.iter().filter(|r| r.public).count(), key, etag: format!("e{gen}") });
+                added.push(ShardInfo {
+                    zone: g.zone.clone(),
+                    depth: d,
+                    prefix: p,
+                    count: part.len(),
+                    public: part.iter().filter(|r| r.public).count(),
+                    key,
+                    etag: format!("e{gen}"),
+                });
             }
             if let Some(t) = g.target {
                 replaced.push(t);
@@ -848,7 +986,13 @@ mod tests {
         commit(m, &replaced, added, gen, "m", false)
     }
 
-    fn search_all(m: &Manifest, objects: &HashMap<String, Vec<u8>>, q: &[f32], k: usize, r: usize) -> Vec<(String, f32)> {
+    fn search_all(
+        m: &Manifest,
+        objects: &HashMap<String, Vec<u8>>,
+        q: &[f32],
+        k: usize,
+        r: usize,
+    ) -> Vec<(String, f32)> {
         let shards: Vec<&ShardInfo> = m.shards.iter().filter(|s| s.public > 0).collect();
         let codes: Vec<ShardCodes> = shards
             .iter()
@@ -877,20 +1021,48 @@ mod tests {
         // returns exactly what v1 returns over the same final vectors.
         let all = lcg_rows(1500, 21, 1);
         let all: Vec<Row> = all.into_iter().map(|r| Row { public: true, ..r }).collect();
-        let v1_entries: Vec<(u64, [f32; DIM])> = all[..900].iter().enumerate().map(|(i, r)| (i as u64 + 1, r.vec)).collect();
+        let v1_entries: Vec<(u64, [f32; DIM])> = all[..900]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as u64 + 1, r.vec))
+            .collect();
         let v1 = crate::store::build_rvf_bytes_for_test(&v1_entries);
-        let label_to_id: HashMap<u64, String> = all[..900].iter().enumerate().map(|(i, r)| (i as u64 + 1, r.id.clone())).collect();
+        let label_to_id: HashMap<u64, String> = all[..900]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as u64 + 1, r.id.clone()))
+            .collect();
         let migrated: Vec<(String, Row)> = crate::store::rvf_entries(&v1)
-            .map(|(l, vec)| (DEFAULT_ZONE.to_string(), Row { id: label_to_id[&l].clone(), public: true, vec }))
+            .map(|(l, vec)| {
+                (
+                    DEFAULT_ZONE.to_string(),
+                    Row {
+                        id: label_to_id[&l].clone(),
+                        public: true,
+                        vec,
+                    },
+                )
+            })
             .collect();
         assert_eq!(migrated.len(), 900);
         let mut objects = HashMap::new();
         let mut m = ingest_round(&Manifest::new("m"), &mut objects, migrated, 256);
-        m = ingest_round(&m, &mut objects, all[900..1200].iter().map(|r| (DEFAULT_ZONE.to_string(), r.clone())).collect(), 256);
+        m = ingest_round(
+            &m,
+            &mut objects,
+            all[900..1200]
+                .iter()
+                .map(|r| (DEFAULT_ZONE.to_string(), r.clone()))
+                .collect(),
+            256,
+        );
         // Round 3: new rows plus an upsert of row 5 to row 1300's vector.
         let mut moved = all[5].clone();
         moved.vec = all[1300].vec;
-        let mut third: Vec<(String, Row)> = all[1200..].iter().map(|r| (DEFAULT_ZONE.to_string(), r.clone())).collect();
+        let mut third: Vec<(String, Row)> = all[1200..]
+            .iter()
+            .map(|r| (DEFAULT_ZONE.to_string(), r.clone()))
+            .collect();
         third.push((DEFAULT_ZONE.to_string(), moved.clone()));
         m = ingest_round(&m, &mut objects, third, 256);
         assert_eq!(m.total(), 1500);
@@ -899,58 +1071,122 @@ mod tests {
         // Reference: v1 over the final vector set.
         let mut finals = all.clone();
         finals[5] = moved;
-        let entries: Vec<(u64, [f32; DIM])> = finals.iter().enumerate().map(|(i, r)| (i as u64 + 1, r.vec)).collect();
+        let entries: Vec<(u64, [f32; DIM])> = finals
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as u64 + 1, r.vec))
+            .collect();
         let v1_final = crate::store::build_rvf_bytes_for_test(&entries);
-        let ids: HashMap<u64, String> = finals.iter().enumerate().map(|(i, r)| (i as u64 + 1, r.id.clone())).collect();
+        let ids: HashMap<u64, String> = finals
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as u64 + 1, r.id.clone()))
+            .collect();
         for qi in 0..4 {
             let q = lcg_rows(1, 300 + qi, 1)[0].vec;
-            let want: Vec<(String, f32)> = crate::store::search_rvf(&v1_final, &q, 10, -1.0).into_iter().map(|(l, s)| (ids[&l].clone(), s)).collect();
+            let want: Vec<(String, f32)> = crate::store::search_rvf(&v1_final, &q, 10, -1.0)
+                .into_iter()
+                .map(|(l, s)| (ids[&l].clone(), s))
+                .collect();
             let got = search_all(&m, &objects, &q, 10, 1500);
             let same_scores = got.iter().zip(&want).all(|(a, b)| a.1 == b.1);
             assert!(same_scores && got.len() == want.len(), "scores differ");
-            assert_eq!(got.iter().map(|x| &x.0).collect::<HashSet<_>>(), want.iter().map(|x| &x.0).collect::<HashSet<_>>());
+            assert_eq!(
+                got.iter().map(|x| &x.0).collect::<HashSet<_>>(),
+                want.iter().map(|x| &x.0).collect::<HashSet<_>>()
+            );
         }
         // The upserted id exists once, in the shard its hash routes to.
         let owner = m.shard_for(DEFAULT_ZONE, id_hash(&all[5].id)).unwrap();
-        assert!(decode_shard(&objects[&m.shards[owner].key]).unwrap().iter().any(|r| r.id == all[5].id));
+        assert!(decode_shard(&objects[&m.shards[owner].key])
+            .unwrap()
+            .iter()
+            .any(|r| r.id == all[5].id));
     }
 
     #[test]
     fn retract_by_reingest_as_private_hides_the_row() {
-        let rows: Vec<Row> = lcg_rows(50, 31, 1).into_iter().map(|r| Row { public: true, ..r }).collect();
+        let rows: Vec<Row> = lcg_rows(50, 31, 1)
+            .into_iter()
+            .map(|r| Row { public: true, ..r })
+            .collect();
         let mut objects = HashMap::new();
-        let m = ingest_round(&Manifest::new("m"), &mut objects, rows.iter().map(|r| ("_".into(), r.clone())).collect(), 8192);
+        let m = ingest_round(
+            &Manifest::new("m"),
+            &mut objects,
+            rows.iter().map(|r| ("_".into(), r.clone())).collect(),
+            8192,
+        );
         let q = rows[7].vec;
         assert_eq!(search_all(&m, &objects, &q, 1, 50)[0].0, rows[7].id);
-        let hidden = Row { public: false, ..rows[7].clone() };
+        let hidden = Row {
+            public: false,
+            ..rows[7].clone()
+        };
         let m = ingest_round(&m, &mut objects, vec![("_".into(), hidden)], 8192);
         assert_eq!(m.total(), 50);
-        assert!(search_all(&m, &objects, &q, 50, 50).iter().all(|(id, _)| id != &rows[7].id));
+        assert!(search_all(&m, &objects, &q, 50, 50)
+            .iter()
+            .all(|(id, _)| id != &rows[7].id));
     }
 
     #[test]
     fn zones_get_separate_shards() {
         let rows = lcg_rows(20, 41, 1);
         let mut objects = HashMap::new();
-        let input = rows.iter().enumerate().map(|(i, r)| (if i % 2 == 0 { "zone1".to_string() } else { "_".to_string() }, r.clone()));
+        let input = rows.iter().enumerate().map(|(i, r)| {
+            (
+                if i % 2 == 0 {
+                    "zone1".to_string()
+                } else {
+                    "_".to_string()
+                },
+                r.clone(),
+            )
+        });
         let m = ingest_round(&Manifest::new("m"), &mut objects, input.collect(), 8192);
         assert_eq!(m.shards.len(), 2);
         assert!(m.shards.iter().all(|s| s.count == 10));
-        assert!(m.shards.iter().any(|s| s.zone == "zone1" && s.key.contains("/zone1/")));
+        assert!(m
+            .shards
+            .iter()
+            .any(|s| s.zone == "zone1" && s.key.contains("/zone1/")));
     }
 
     #[test]
     fn commit_keeps_untouched_shards_and_sets_model_once() {
         let mut m = Manifest::new("old");
         for p in 0..3u64 {
-            m.shards.push(ShardInfo { zone: "_".into(), depth: 2, prefix: p, count: 1, public: 1, key: format!("k{p}"), etag: "e".into() });
+            m.shards.push(ShardInfo {
+                zone: "_".into(),
+                depth: 2,
+                prefix: p,
+                count: 1,
+                public: 1,
+                key: format!("k{p}"),
+                etag: "e".into(),
+            });
         }
-        let add = ShardInfo { zone: "_".into(), depth: 3, prefix: 9, count: 2, public: 2, key: "n".into(), etag: "f".into() };
+        let add = ShardInfo {
+            zone: "_".into(),
+            depth: 3,
+            prefix: 9,
+            count: 2,
+            public: 2,
+            key: "n".into(),
+            etag: "f".into(),
+        };
         let n = commit(&m, &[1], vec![add.clone()], 4, "new", true);
-        assert_eq!(n.shards.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(), vec!["k0", "k2", "n"]);
+        assert_eq!(
+            n.shards.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            vec!["k0", "k2", "n"]
+        );
         assert_eq!(n.model, "old"); // non-empty index keeps its model
         assert!(n.migrated_from_v1 && n.generation == 4);
-        assert_eq!(commit(&Manifest::new("x"), &[], vec![add], 1, "new", false).model, "new");
+        assert_eq!(
+            commit(&Manifest::new("x"), &[], vec![add], 1, "new", false).model,
+            "new"
+        );
     }
 
     #[test]
@@ -971,11 +1207,20 @@ mod tests {
         for (si, s) in refs.iter().enumerate() {
             for i in 0..s.count {
                 if s.is_public(i) {
-                    full.push((si, i, lut.score(&s.codes[i * CODE_BYTES..(i + 1) * CODE_BYTES])));
+                    full.push((
+                        si,
+                        i,
+                        lut.score(&s.codes[i * CODE_BYTES..(i + 1) * CODE_BYTES]),
+                    ));
                 }
             }
         }
-        full.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+        full.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap()
+                .then(a.0.cmp(&b.0))
+                .then(a.1.cmp(&b.1))
+        });
         for r in [1usize, 7, 80, 300, 10_000] {
             let want: Vec<Candidate> = full.iter().take(r).copied().collect();
             assert_eq!(first_stage(&lut, &refs, r), want, "r={r}");
@@ -987,13 +1232,38 @@ mod tests {
         // Two ingests read the same base and touch the same (only) shard.
         let rows: Vec<Row> = lcg_rows(40, 61, 1);
         let mut objects = HashMap::new();
-        let base = ingest_round(&Manifest::new("m"), &mut objects, rows[..20].iter().map(|r| ("_".into(), r.clone())).collect(), 8192);
+        let base = ingest_round(
+            &Manifest::new("m"),
+            &mut objects,
+            rows[..20].iter().map(|r| ("_".into(), r.clone())).collect(),
+            8192,
+        );
         let before: std::collections::HashSet<String> = objects.keys().cloned().collect();
-        let winner = ingest_round_n(&base, &mut objects, rows[20..30].iter().map(|r| ("_".into(), r.clone())).collect(), 8192, "w1");
-        let loser = ingest_round_n(&base, &mut objects, rows[30..].iter().map(|r| ("_".into(), r.clone())).collect(), 8192, "l1");
+        let winner = ingest_round_n(
+            &base,
+            &mut objects,
+            rows[20..30]
+                .iter()
+                .map(|r| ("_".into(), r.clone()))
+                .collect(),
+            8192,
+            "w1",
+        );
+        let loser = ingest_round_n(
+            &base,
+            &mut objects,
+            rows[30..].iter().map(|r| ("_".into(), r.clone())).collect(),
+            8192,
+            "l1",
+        );
         assert_eq!(winner.generation, loser.generation);
         let wk: std::collections::HashSet<&String> = winner.shards.iter().map(|s| &s.key).collect();
-        let lk: Vec<&String> = loser.shards.iter().map(|s| &s.key).filter(|k| !before.contains(*k)).collect();
+        let lk: Vec<&String> = loser
+            .shards
+            .iter()
+            .map(|s| &s.key)
+            .filter(|k| !before.contains(*k))
+            .collect();
         // The loser's cleanup set (what it wrote) never intersects the winner's committed keys.
         assert!(lk.iter().all(|k| !wk.contains(k)));
         for k in &lk {
@@ -1008,11 +1278,19 @@ mod tests {
     #[test]
     fn zone_and_hash_helpers() {
         assert!(valid_zone("_") && valid_zone("zone1") && valid_zone("a-b"));
-        assert!(!valid_zone("") && !valid_zone("Zone") && !valid_zone("../x") && !valid_zone(&"a".repeat(33)));
+        assert!(
+            !valid_zone("")
+                && !valid_zone("Zone")
+                && !valid_zone("../x")
+                && !valid_zone(&"a".repeat(33))
+        );
         let h = id_hash("abc");
         assert!(owns(0, 0, h));
         assert!(owns(1, h >> 63, h) && !owns(1, (h >> 63) ^ 1, h));
         assert_eq!(id_hash("abc"), h);
-        assert_eq!(shard_key("s.rvf", "_", 3, 5, 7, "ab"), "s.rvf.v2/_/3-0000000000000005-g7-ab.rvf");
+        assert_eq!(
+            shard_key("s.rvf", "_", 3, 5, 7, "ab"),
+            "s.rvf.v2/_/3-0000000000000005-g7-ab.rvf"
+        );
     }
 }

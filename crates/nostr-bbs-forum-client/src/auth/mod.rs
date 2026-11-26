@@ -21,7 +21,9 @@ use std::rc::Rc;
 use zeroize::Zeroize;
 
 use self::passkey::{PasskeyAuthResult, PasskeyRegistrationResult};
-use self::session::{clear_privkey_session, save_privkey_session, StoredSession};
+use self::session::{
+    clear_privkey_session, read_privkey_session, save_privkey_session, StoredSession,
+};
 use crate::app::base_href;
 use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::{NostrEvent, UnsignedEvent};
@@ -432,10 +434,50 @@ impl AuthStore {
         }
     }
 
+    /// What identity, if any, this device already holds, compared with the
+    /// account `new_pubkey` that a scanned or tapped sign-in code would
+    /// import. Looks at the persisted session (local key, passkey or NIP-07),
+    /// a stored private key and an installed-app bake, not only a live
+    /// session: a scan usually opens a fresh tab whose sessionStorage is empty.
+    pub async fn prior_identity(&self, new_pubkey: &str) -> PriorIdentity {
+        let mut known: Vec<String> = Vec::new();
+        let mut unknown = false;
+        if let Some(pk) = self.state.get_untracked().pubkey {
+            known.push(pk);
+        }
+        if let Some(pk) = self.stored_session_pubkey() {
+            known.push(pk);
+        }
+        if let Some(hex_sk) = read_privkey_session().map(zeroize::Zeroizing::new) {
+            match hex::decode(hex_sk.as_str())
+                .ok()
+                .map(zeroize::Zeroizing::new)
+                .and_then(|b| {
+                    let arr: [u8; 32] = b.as_slice().try_into().ok()?;
+                    let arr = zeroize::Zeroizing::new(arr);
+                    nostr_bbs_core::keys::pubkey_hex(&arr).ok()
+                }) {
+                Some(pk) => known.push(pk),
+                None => unknown = true,
+            }
+        }
+        if crate::utils::bake::is_baked().await {
+            match crate::utils::bake::baked_pubkey() {
+                Some(pk) => known.push(pk),
+                None => unknown = true,
+            }
+        }
+        classify_prior(&known, unknown, new_pubkey)
+    }
+
     /// Login with a local nsec/hex private key.
     ///
     /// Accepts either a 64-character hex string or an nsec1... bech32 key.
     pub fn login_with_local_key(&self, key_input: &str) -> Result<(), String> {
+        // Tolerate a key typed from a sheet in groups ("nsec1 abcd efgh …"):
+        // no valid key contains whitespace.
+        let compact = zeroize::Zeroizing::new(key_input.split_whitespace().collect::<String>());
+        let key_input = compact.as_str();
         let bytes = if key_input.starts_with("nsec1") {
             decode_nsec(key_input)?
         } else {
@@ -466,7 +508,9 @@ impl AuthStore {
         let signer: Rc<dyn Signer> = Rc::new(nostr_bbs_core::signer::PrfSigner::new(keypair));
         self.signer.set_value(Some(SendWrapper::new(signer)));
 
-        let (nickname, avatar, account_status, _nsec_backed_up) = self.read_existing_metadata();
+        // Reuse cached profile fields only for the SAME account (never bleed
+        // another identity's name into this one).
+        let (nickname, avatar, account_status, _nsec_backed_up) = self.read_metadata_for(&pubkey);
 
         let stored = StoredSession {
             version: 2,
@@ -696,6 +740,14 @@ impl AuthStore {
         self.state.set(AuthState::default());
         LocalStorage::delete(STORAGE_KEY);
         clear_privkey_session();
+        // Signing out also forgets the installed-app bake: otherwise the next
+        // `?pwa=1` launch would silently adopt this account again (a shared
+        // phone would open someone else's account).
+        leptos::task::spawn_local(async {
+            if let Err(e) = crate::utils::bake::unbake().await {
+                web_sys::console::warn_1(&format!("[logout] unbake failed: {e}").into());
+            }
+        });
 
         if let Some(window) = web_sys::window() {
             if let Ok(location) = window.location().pathname() {
@@ -828,6 +880,32 @@ fn decode_nsec(nsec: &str) -> Result<Vec<u8>, String> {
 // -- Context providers --------------------------------------------------------
 
 /// Create and provide the auth context. Call once at the app root.
+/// Result of [`AuthStore::prior_identity`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PriorIdentity {
+    /// Nothing on this device: import without asking.
+    None,
+    /// Only the same account: import without asking.
+    Same,
+    /// Another account (pubkey when known): ask before replacing it.
+    Other(Option<String>),
+}
+
+/// Pure decision behind [`AuthStore::prior_identity`].
+pub(crate) fn classify_prior(known: &[String], unknown: bool, new_pubkey: &str) -> PriorIdentity {
+    if let Some(other) = known.iter().find(|k| !k.eq_ignore_ascii_case(new_pubkey)) {
+        return PriorIdentity::Other(Some(other.clone()));
+    }
+    if unknown {
+        return PriorIdentity::Other(None);
+    }
+    if known.is_empty() {
+        PriorIdentity::None
+    } else {
+        PriorIdentity::Same
+    }
+}
+
 pub fn provide_auth() {
     let store = AuthStore::new();
     store.restore_session();
@@ -845,6 +923,37 @@ pub fn use_auth() -> AuthStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── classify_prior (account-switch confirmation) ─────────────────────
+
+    #[test]
+    fn prior_identity_matrix() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        assert_eq!(classify_prior(&[], false, &a), PriorIdentity::None);
+        assert_eq!(
+            classify_prior(std::slice::from_ref(&a), false, &a),
+            PriorIdentity::Same
+        );
+        assert_eq!(
+            classify_prior(&[a.to_uppercase()], false, &a),
+            PriorIdentity::Same
+        );
+        assert_eq!(
+            classify_prior(std::slice::from_ref(&b), false, &a),
+            PriorIdentity::Other(Some(b.clone()))
+        );
+        assert_eq!(
+            classify_prior(&[a.clone(), b.clone()], false, &a),
+            PriorIdentity::Other(Some(b))
+        );
+        // A bake or stored key whose owner can't be read counts as another account.
+        assert_eq!(classify_prior(&[], true, &a), PriorIdentity::Other(None));
+        assert_eq!(
+            classify_prior(std::slice::from_ref(&a), true, &a),
+            PriorIdentity::Other(None)
+        );
+    }
 
     // ── decode_nsec ─────────────────────────────────────────────────────
 

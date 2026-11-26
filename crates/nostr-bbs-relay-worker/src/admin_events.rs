@@ -13,11 +13,13 @@
 //!
 //! A NIP-09 kind-5 cannot do that. The relay stores the kind-5 itself
 //! (`relay_do/nip_handlers.rs` `process_deletion`), every forum client
-//! receives it through its unbounded `kinds:[5,40,41]` subscription
-//! (`crates/nostr-bbs-forum-client/src/stores/channels.rs`), and
-//! `fold_deletions` in the same file tombstones every id it names. That id is
-//! also the id of the restored inner event, so a kind-5 purge would hide the
-//! very history the envelope preserves, on every client, for good.
+//! receives it through the kind-5 filter of its channel-list subscription
+//! (`crates/nostr-bbs-forum-client/src/stores/channels.rs`
+//! `channel_sync_filters`), and `tombstones::fold_deletion`
+//! (`crates/nostr-bbs-forum-client/src/stores/tombstones.rs`) tombstones every
+//! id it names. That id is also the id of the restored inner event, so a
+//! kind-5 purge signed by the migrating admin would hide the very history the
+//! envelope preserves, on every client, for good.
 //!
 //! This endpoint therefore deletes the D1 rows directly: it emits **no kind-5
 //! and no broadcast**, and it writes one `events.delete` row to the admin

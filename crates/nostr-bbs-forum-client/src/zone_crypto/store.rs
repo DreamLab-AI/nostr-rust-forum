@@ -12,9 +12,12 @@
 //! This keeps accounts that share a browser profile apart in the UI; it is not
 //! access control (see the module docs of `key_owner`).
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 
 use leptos::prelude::*;
 use nostr_bbs_core::signer::Signer;
@@ -22,23 +25,90 @@ use nostr_bbs_core::NostrEvent;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
-use super::grant_backlog::{GrantBacklog, KeyPhase};
+use super::grant_backlog::{
+    unwrap_failure_outcome, Attempt, GrantBacklog, KeyPhase, SignerKind, WrapOutcome,
+};
 use super::grant_ledger::{GrantKv, GrantLedger};
+use super::grant_paging::{parse_marker, warm_marker, GrantScope, Marker, PagerAction, ScopePager};
 use super::inbox_key::{
-    deletion_for_wrap, ensure_inbox_key, grant_sweep_enabled, recipient_keys_enabled,
-    subscription_targets, sweep_targets, unwrap_inbox_then_identity, LivePort, SweepCandidate,
+    deletion_for_wrap, ensure_inbox_key, grant_sweep_enabled, open_for_sync,
+    recipient_keys_enabled, signer_kind_for, subscription_targets, sweep_targets, LivePort, Opener,
+    SweepCandidate,
 };
 use super::key_owner::{self, Lease, Owner, Session, Switch};
 use super::keyset::{self, SendKeyError};
 use super::read_cache::ReadCache;
+use super::wrap_queue::{Slot, Started, WrapQueue};
 use super::{is_zone_message, read_outcome, resolve_event, validate_grant, ZoneKey};
 use crate::relay::{EventCallback, Filter, RelayConnection};
 use crate::stores::indexed_db::{ForumDb, MintPut, ZoneKeyPut};
 
-/// `zone_kv` id holding the ids of gift wraps already unwrapped here. Shared
-/// by every identity on the device: the relay serves a wrap only to its
-/// addressee, so one identity's entries never cover another's wraps.
-const KV_PROCESSED: &str = "processed_wraps";
+/// `zone_kv` id holding the ids of gift wraps already unwrapped here, for the
+/// current relay scope ([`crate::stores::relay_scope`]). Shared by every
+/// identity on the device: the relay serves a wrap only to its addressee, so
+/// one identity's entries never cover another's wraps. The scope in the id
+/// means a new relay re-reads its wraps; it also retires the unscoped set
+/// written before refused keys were kept, so grants refused then (marked
+/// processed, their key dropped) are unwrapped once more and recorded.
+/// Most post ids kept per `(zone, epoch, key)` as opening evidence: enough
+/// to pass [`key_owner::MIN_SWAP_EVIDENCE`], bounded however much loads.
+const OPEN_EVIDENCE_CAP: usize = 8;
+
+/// Wait before an automatic re-check, so the normal grant sync lands first.
+const RECHECK_DELAY_MS: u32 = 8_000;
+
+fn kv_processed() -> String {
+    format!("processed_wraps:{}", crate::stores::relay_scope::current())
+}
+
+/// Coalescing window for writing the processed-wrap set (see
+/// [`ZoneKeyStore::mark_processed`]).
+const PROCESSED_FLUSH_MS: i32 = 1_000;
+
+/// How long one wrap may hold an unwrap slot (see [`super::wrap_queue`])
+/// before the slot is given to the next wrap; not applied to a refusable
+/// signer's single slot before its first success (see `pump_wraps`). The wrap itself is not
+/// abandoned: it is accounted for when it finishes, and holds the backlog
+/// open until then. One minute is three stall windows
+/// ([`super::grant_backlog::KEYS_STALL_MS`]), long enough for a person to
+/// answer a NIP-07 prompt, short enough that a hung fetch does not idle a
+/// quarter of the queue for the session.
+const UNWRAP_SLOT_TIMEOUT_MS: i32 = 60_000;
+
+/// How long the sealer's admin check may take before it counts as
+/// unanswered (a grant then ends in [`WrapOutcome::Retry`]). The fetch has no
+/// timeout of its own. Ten seconds is half the stall window.
+const ADMIN_CHECK_TIMEOUT_MS: i32 = 10_000;
+
+/// One wrap waiting in [`ZoneKeyStore::wrap_queue`].
+struct WrapJob {
+    lease: Lease,
+    ev: NostrEvent,
+    signer: Rc<dyn Signer>,
+    /// Whether that sign-in's identity signer can refuse, fixed when the
+    /// wrap was queued (not read from the queue, which a switch resets).
+    kind: SignerKind,
+    relay: RelayConnection,
+}
+
+/// A page held back until the unwrap queue has room for it.
+struct DeferredPage {
+    ctx: Rc<ScopeCtx>,
+    page: u32,
+    until: u64,
+}
+
+/// One grant scope's paging context, shared by its page subscriptions.
+struct ScopeCtx {
+    relay: RelayConnection,
+    lease: Lease,
+    scope: GrantScope,
+    /// The scope's backfill marker id ([`GrantScope::marker_id`]).
+    marker: String,
+    targets: Vec<String>,
+    handler: EventCallback,
+    pager: RefCell<ScopePager>,
+}
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
@@ -68,6 +138,25 @@ pub struct ZoneKeyStore {
     /// identity it belongs to. Tracked, so pages re-judge "are this member's
     /// keys still arriving?" as it advances.
     grant_backlog: RwSignal<Option<(Owner, GrantBacklog)>>,
+    /// The persisted "backfill complete" markers loaded for the signed-in
+    /// identity: marker id to completion time in seconds (see
+    /// [`super::grant_paging`]).
+    backfill_done: StoredValue<HashMap<String, Marker>>,
+    /// Pages waiting for room in the unwrap queue
+    /// ([`WrapQueue::has_page_room`]).
+    deferred_pages: StoredValue<Vec<DeferredPage>, LocalStorage>,
+    /// Each running grant scope's marker id, for `try_write_markers`.
+    scope_markers: StoredValue<HashMap<GrantScope, String>>,
+    /// The processed-wrap set changed since it was last written to
+    /// IndexedDB, and a flush is scheduled.
+    processed_flush_pending: StoredValue<bool>,
+    /// Wraps waiting to be processed, and the slots running them (see
+    /// [`super::wrap_queue`]).
+    wrap_queue: StoredValue<WrapQueue<WrapJob>, LocalStorage>,
+    /// Wrap ids handed to the wrap handler this sign-in. Paging re-delivers
+    /// the inclusive `until` boundary row, and a reconnect replays the
+    /// long-lived subscriptions; neither should process a wrap twice.
+    seen_wraps: StoredValue<HashSet<String>>,
     /// Every epoch held per zone by any row on this device, whatever its
     /// owner (epoch numbers only), so a mint never reuses an epoch another
     /// account on this browser holds but has not delivered.
@@ -108,10 +197,31 @@ pub struct ZoneKeyStore {
     /// Always `None` with `RECIPIENT_KEYS_ENABLED` off.
     inbox_sk: StoredValue<Option<String>>,
     /// Keys refused because the signed-in identity's view holds a different
-    /// key for the same `(zone, epoch)` (see
-    /// [`ForumDb::put_zone_key_unless_conflicting`]): `(zone, epoch,
-    /// granted_by)`, for the Encryption card to show.
-    pub conflicts: RwSignal<Vec<(String, u32, String)>>,
+    /// key for the same slot (see
+    /// [`ForumDb::put_zone_key_unless_conflicting`]), and keys a resolution
+    /// displaced: kept whole, and in `zone_kv`
+    /// ([`key_owner::refused_keys_id`]), so a conflict can be resolved
+    /// ([`Self::use_refused`]) without the grant being delivered again. The
+    /// Encryption card lists them.
+    pub conflicts: RwSignal<Vec<key_owner::RefusedKey>>,
+    /// Posts that actually opened, per `(zone, epoch, epoch pubkey)` (ids,
+    /// at most [`OPEN_EVIDENCE_CAP`] each): under the held key on the normal
+    /// read path, and under a refused key in the zone's own channels while
+    /// its slot is in conflict. The evidence for
+    /// [`key_owner::grant_supersedes`]; a `zk` tag alone proves nothing.
+    /// Dropped on every identity switch.
+    opened: StoredValue<HashMap<(String, u32, String), HashSet<String>>>,
+    /// Slots with an automatic resolution in flight: evidence arriving
+    /// meanwhile must not start a second (its compare-and-swap would refuse).
+    resolving: StoredValue<HashSet<(String, u32)>>,
+    /// Automatic grant re-checks per `(zone, epoch)` this session
+    /// ([`keyset::recheck_due`]).
+    rechecks: StoredValue<HashMap<(String, u32), keyset::RecheckState>>,
+    /// Automatic re-checks started this session, across all slots.
+    recheck_total: StoredValue<u32>,
+    /// The signed-in identity's signer, kept while its grant sync runs so a
+    /// re-check can open wraps again. Cleared with the sync.
+    grant_signer: StoredValue<Option<Rc<dyn Signer>>, leptos::prelude::LocalStorage>,
     /// Highest `zk` epoch seen per `(zone named in the tag, channel)`, with the
     /// post id. The Encryption card counts only channels that resolve to the
     /// zone, so a tag in some other channel cannot steer a rotation. Kept
@@ -132,6 +242,12 @@ impl ZoneKeyStore {
             encrypted_ids: RwSignal::new(HashSet::new()),
             loaded_for: RwSignal::new(None),
             grant_backlog: RwSignal::new(None),
+            backfill_done: StoredValue::new(HashMap::new()),
+            deferred_pages: StoredValue::new_local(Vec::new()),
+            scope_markers: StoredValue::new(HashMap::new()),
+            processed_flush_pending: StoredValue::new(false),
+            wrap_queue: StoredValue::new_local(WrapQueue::new()),
+            seen_wraps: StoredValue::new(HashSet::new()),
             device_epochs: RwSignal::new(HashMap::new()),
             session: StoredValue::new(Session::default()),
             cache: StoredValue::new(ReadCache::default()),
@@ -146,6 +262,11 @@ impl ZoneKeyStore {
             app_relay: StoredValue::new(None),
             inbox_sk: StoredValue::new(None),
             conflicts: RwSignal::new(Vec::new()),
+            opened: StoredValue::new(HashMap::new()),
+            resolving: StoredValue::new(HashSet::new()),
+            rechecks: StoredValue::new(HashMap::new()),
+            recheck_total: StoredValue::new(0),
+            grant_signer: StoredValue::new_local(None),
             epochs_seen: RwSignal::new(HashMap::new()),
         }
     }
@@ -236,10 +357,22 @@ impl ZoneKeyStore {
             return;
         };
         self.stop_grant_sync();
+        // A new identity starts with a fresh re-check budget and no stale slots.
+        self.rechecks.set_value(HashMap::new());
+        self.recheck_total.set_value(0);
         let _ = self.loaded_for.try_set(None);
         let _ = self.grant_backlog.try_set(None);
+        self.backfill_done.set_value(HashMap::new());
+        self.deferred_pages.set_value(Vec::new());
+        self.scope_markers.set_value(HashMap::new());
+        // Queued and parked wraps belong to the old sign-in; ones already
+        // running finish and are ignored (their lease is no longer current),
+        // and their slots belong to the old generation.
+        self.wrap_queue.update_value(WrapQueue::reset);
+        self.seen_wraps.set_value(HashSet::new());
         let _ = self.keys.try_set(HashMap::new());
         let _ = self.conflicts.try_set(Vec::new());
+        self.opened.set_value(HashMap::new());
         self.inbox_granted.set_value(HashSet::new());
         self.inbox_sk.set_value(None);
         super::tickets::clear_group_identities();
@@ -265,6 +398,7 @@ impl ZoneKeyStore {
 
     fn stop_grant_sync(&self) {
         self.sync_for.set_value(None);
+        self.grant_signer.set_value(None);
         let subs = self
             .grant_subs
             .try_update_value(std::mem::take)
@@ -367,12 +501,236 @@ impl ZoneKeyStore {
         if !self.is_current(lease) {
             return;
         }
-        let entry = (key.zone.clone(), key.epoch, key.granted_by.clone());
-        self.conflicts.update(|v| {
-            if !v.contains(&entry) {
-                v.push(entry);
+        let entry = key_owner::RefusedKey {
+            key: key.clone(),
+            displaced: false,
+        };
+        let mut changed = false;
+        self.conflicts
+            .update(|v| changed = key_owner::note_refused(v, entry.clone()));
+        if changed {
+            let store = *self;
+            let lease = lease.clone();
+            spawn_local(async move {
+                store.save_refused(&lease, entry).await;
+            });
+        }
+    }
+
+    /// Merge `entry` into the lease's identity's stored refused list (one
+    /// transaction, so tabs never overwrite each other) and adopt the merged
+    /// list while that identity is signed in.
+    async fn save_refused(&self, lease: &Lease, entry: key_owner::RefusedKey) {
+        let Ok(db) = ForumDb::open().await else {
+            return;
+        };
+        match db.add_refused_key(lease.owner(), entry).await {
+            Ok(list) if self.is_current(lease) => {
+                let _ = self.conflicts.try_set(list);
+            }
+            Ok(_) => {}
+            Err(_) => web_sys::console::warn_1(&"[zone-key] refused key not saved".into()),
+        }
+    }
+
+    /// Record which key `raw` (a zone-encrypted post) opened under: `shown`
+    /// is what the normal read path made of it with the held keys. While its
+    /// slot is in conflict, also try the slot's refused keys, but only for a
+    /// post in a channel of that zone, so a post elsewhere cannot vouch for a
+    /// key. New evidence re-judges the slot.
+    fn note_evidence(&self, raw: &NostrEvent, shown: &NostrEvent) {
+        let Some(zk) = super::parse_zk(&raw.tags) else {
+            return;
+        };
+        let pk = zk.pubkey.to_ascii_lowercase();
+        let opened_held = shown.id != raw.id
+            || (shown.content != super::PLACEHOLDER_MISSING_KEY
+                && shown.content != super::PLACEHOLDER_UNDECRYPTABLE);
+        let mut news = false;
+        if opened_held {
+            news |= self.note_open(&zk.zone, zk.epoch, &pk, &raw.id);
+        }
+        let candidates: Vec<ZoneKey> = self.conflicts.with_untracked(|v| {
+            v.iter()
+                .map(|r| &r.key)
+                .filter(|k| k.zone == zk.zone && k.epoch == zk.epoch)
+                .filter(|k| k.pubkey.eq_ignore_ascii_case(&pk))
+                .cloned()
+                .collect()
+        });
+        if !candidates.is_empty() && self.in_zone(raw, &zk.zone) {
+            for k in candidates {
+                let opened = matches!(
+                    read_outcome(raw, |_, _| Some(k.clone())),
+                    super::ReadOutcome::Decrypted(_) | super::ReadOutcome::Sealed(_)
+                );
+                if opened {
+                    news |= self.note_open(&zk.zone, zk.epoch, &pk, &raw.id);
+                }
+            }
+        }
+        if news {
+            self.maybe_resolve(&zk.zone, zk.epoch);
+        }
+    }
+
+    /// Whether `ev`'s channel belongs to `zone`.
+    fn in_zone(&self, ev: &NostrEvent, zone: &str) -> bool {
+        super::root_channel(&ev.tags)
+            .and_then(|c| channel_zone(self.channels, &c))
+            .is_some_and(|(z, _, _)| z == zone)
+    }
+
+    /// Note that post `id` opened under `(zone, epoch, pubkey)`. Returns
+    /// whether that is news.
+    fn note_open(&self, zone: &str, epoch: u32, pubkey: &str, id: &str) -> bool {
+        self.opened
+            .try_update_value(|m| {
+                let ids = m
+                    .entry((zone.to_string(), epoch, pubkey.to_string()))
+                    .or_default();
+                ids.len() < OPEN_EVIDENCE_CAP && ids.insert(id.to_string())
+            })
+            .unwrap_or(false)
+    }
+
+    fn opens(&self, zone: &str, epoch: u32, pubkey: &str) -> usize {
+        self.opened.with_value(|m| {
+            m.get(&(zone.to_string(), epoch, pubkey.to_ascii_lowercase()))
+                .map_or(0, HashSet::len)
+        })
+    }
+
+    /// Resolve `(zone, epoch)`'s conflict in favour of a refused grant when
+    /// [`key_owner::grant_supersedes`] says the held key is the stale one.
+    /// The sender's admin status is re-checked by [`Self::use_refused`].
+    fn maybe_resolve(&self, zone: &str, epoch: u32) {
+        let Some(lease) = self.current_lease() else {
+            return;
+        };
+        let candidate = self.conflicts.with_untracked(|v| {
+            v.iter()
+                .filter(|r| !r.displaced && r.key.zone == zone && r.key.epoch == epoch)
+                .find(|r| {
+                    self.keys
+                        .with_untracked(|m| m.get(&r.key.store_id()).cloned())
+                        .is_some_and(|held| {
+                            key_owner::grant_supersedes(
+                                &held,
+                                &r.key,
+                                self.opens(zone, epoch, &held.pubkey),
+                                self.opens(zone, epoch, &r.key.pubkey),
+                            )
+                        })
+                })
+                .cloned()
+        });
+        let Some(entry) = candidate else {
+            return;
+        };
+        let slot = (zone.to_string(), epoch);
+        let first = self
+            .resolving
+            .try_update_value(|s| s.insert(slot.clone()))
+            .unwrap_or(false);
+        if !first {
+            return;
+        }
+        let store = *self;
+        spawn_local(async move {
+            let result = if store.is_current(&lease) {
+                Some(store.use_refused(&entry).await)
+            } else {
+                None
+            };
+            store.resolving.update_value(|s| {
+                s.remove(&slot);
+            });
+            let Some(result) = result else {
+                return;
+            };
+            let k = &entry.key;
+            match result {
+                Ok(()) => web_sys::console::log_1(
+                    &format!(
+                        "[zone-key] {} epoch {}: replaced a held key that opened no post with the key an admin granted, which opened {} or more",
+                        k.zone, k.epoch, key_owner::MIN_SWAP_EVIDENCE
+                    )
+                    .into(),
+                ),
+                Err(e) => web_sys::console::warn_1(
+                    &format!("[zone-key] {} epoch {}: not replaced: {e}", k.zone, k.epoch).into(),
+                ),
             }
         });
+    }
+
+    /// Resolve a conflict in favour of `entry`, one of [`Self::conflicts`]:
+    /// its key replaces the key the signed-in identity holds for the slot,
+    /// which is kept in the list as displaced so the choice can be reversed.
+    /// The swap and that record are one IndexedDB transaction.
+    ///
+    /// Refused when `entry` is not listed, when the held key is this
+    /// device's own key still awaiting delivery (displacing it could strand
+    /// posts only it opens), when a refused grant's sender is no longer an
+    /// admin (a displaced key was held already, so it is restored without
+    /// that check, keeping its own delivery state), or when storage no
+    /// longer holds the key memory holds. On success every post is decrypted
+    /// again at once, with conversation keys and the sealed-search index
+    /// derived from the replaced secret dropped.
+    pub async fn use_refused(&self, entry: &key_owner::RefusedKey) -> Result<(), String> {
+        let lease = self.current_lease().ok_or("Not signed in.")?;
+        let listed = self.conflicts.with_untracked(|v| v.contains(entry));
+        if !listed {
+            return Err("That key is no longer offered.".into());
+        }
+        let key = &entry.key;
+        let id = key.store_id();
+        let held = self
+            .keys
+            .with_untracked(|m| m.get(&id).cloned())
+            .ok_or("No key is held for that epoch.")?;
+        if !super::conflicts(&held, key) {
+            return Err("That key is already the one in use.".into());
+        }
+        if held.pending_delivery {
+            return Err(
+                "The key in use is this device's own new key and has not reached anyone yet; grant it first."
+                    .into(),
+            );
+        }
+        let mut new = key.clone();
+        if !entry.displaced {
+            match self.sealer_is_admin(&key.granted_by).await {
+                Some(true) => {}
+                Some(false) => return Err("Its sender is no longer an admin.".into()),
+                None => return Err("Could not check its sender's admin status; try again.".into()),
+            }
+            new.pending_delivery = false;
+        }
+        let db = ForumDb::open()
+            .await
+            .map_err(|_| "Browser storage is unavailable.".to_string())?;
+        let list = match db.swap_zone_key(lease.owner(), &held, &new).await {
+            Ok(Some(list)) => list,
+            Ok(None) => {
+                self.adopt_stored(&lease, &id).await;
+                return Err("The stored key changed meanwhile; review and try again.".into());
+            }
+            Err(_) => return Err("Could not write to browser storage.".into()),
+        };
+        if !self.is_current(&lease) {
+            return Ok(());
+        }
+        let _ = self.conflicts.try_set(list);
+        self.keys.update(|m| {
+            m.insert(id, new);
+        });
+        // The replaced secret must stop opening anything at once.
+        super::conversation_keys::clear();
+        crate::utils::sealed_search::wipe();
+        self.redecrypt();
+        Ok(())
     }
 
     /// `key`, still pending when the slot holds the same secret as a key
@@ -481,6 +839,7 @@ impl ZoneKeyStore {
             super::zk_zone_epoch(&ev.tags),
             super::root_channel(&ev.tags),
         ) {
+            let zone_for_check = zone.clone();
             let slot = (zone, channel);
             if !self
                 .epochs_seen
@@ -490,12 +849,19 @@ impl ZoneKeyStore {
                 self.epochs_seen.update(|m| {
                     m.entry(slot).or_default().insert(epoch, id);
                 });
+                // A post at a key this device does not hold: ask the relay for
+                // this identity's grant wraps again, whatever was marked done.
+                if self.lookup(&zone_for_check, epoch).is_none() {
+                    self.schedule_recheck();
+                }
             }
         }
+        let raw = ev;
         let ev = self
             .cache
-            .try_update_value(|c| c.prepare(&ev, |z, e| self.lookup(z, e)))
-            .unwrap_or_else(|| without_keys(&ev));
+            .try_update_value(|c| c.prepare(&raw, |z, e| self.lookup(z, e)))
+            .unwrap_or_else(|| without_keys(&raw));
+        self.note_evidence(&raw, &ev);
         let id = ev.id.clone();
         if !self.encrypted_ids.with_untracked(|s| s.contains(&id)) {
             self.encrypted_ids.update(|s| {
@@ -503,6 +869,110 @@ impl ZoneKeyStore {
             });
         }
         ev
+    }
+
+    // -- Grant re-check ---------------------------------------------------
+
+    /// The epochs of `zone` that posts name but this device holds no key for,
+    /// ascending. Reactive (reads `epochs_seen` and the keys).
+    pub fn unheld_epochs(&self, zone: &str) -> Vec<u32> {
+        let held = self.keys.get();
+        let seen = self.epochs_seen.get();
+        let slots = keyset::unheld_slots(
+            seen.iter()
+                .filter(|((z, _), _)| z == zone)
+                .flat_map(|((z, _), eps)| eps.keys().map(move |e| (z.as_str(), *e))),
+            |z, e| held.values().any(|k| k.zone == z && k.epoch == e),
+        );
+        slots.into_iter().map(|(_, e)| e).collect()
+    }
+
+    /// After a short delay (so the normal grant sync can land first), re-check
+    /// the grants if any post names an epoch not held and a re-check is due.
+    fn schedule_recheck(&self) {
+        let store = *self;
+        gloo::timers::callback::Timeout::new(RECHECK_DELAY_MS, move || store.recheck_unheld())
+            .forget();
+    }
+
+    fn recheck_unheld(&self) {
+        let held = |z: &str, e: u32| self.lookup(z, e).is_some();
+        let slots = self.epochs_seen.with_untracked(|m| {
+            keyset::unheld_slots(
+                m.iter()
+                    .flat_map(|((z, _), eps)| eps.keys().map(move |e| (z.as_str(), *e))),
+                held,
+            )
+        });
+        let now = js_sys::Date::now();
+        let due = self.rechecks.with_value(|r| {
+            slots
+                .iter()
+                .any(|s| keyset::recheck_due(r.get(s).copied(), now))
+        });
+        if slots.is_empty() || !due || !keyset::recheck_budget_left(self.recheck_total.get_value())
+        {
+            return;
+        }
+        if self.recheck_grants() {
+            self.recheck_total.update_value(|n| *n += 1);
+            self.rechecks.update_value(|r| {
+                for s in slots {
+                    let e = r.entry(s).or_default();
+                    e.attempts += 1;
+                    e.last_ms = now;
+                }
+            });
+        }
+    }
+
+    /// Ask the relay for every kind-1059 wrap addressed to the signed-in
+    /// identity (and its inbox key) again, with no `since`, and process each
+    /// one even if it was marked processed or refused: an earlier pass may
+    /// have settled a grant while the sealer's admin check said no (a stale or
+    /// different relay), or while an older client could not adopt it. Admin
+    /// answers cached as "not an admin" are dropped first. A key found is
+    /// adopted through the normal path, which re-decrypts what is on screen.
+    /// Returns false when no grant sync is running (nothing was asked).
+    pub fn recheck_grants(&self) -> bool {
+        let (Some(relay), Some(signer), Some(lease)) = (
+            self.grant_relay.get_value(),
+            self.grant_signer.get_value(),
+            self.current_lease(),
+        ) else {
+            return false;
+        };
+        if self.sync_for.with_value(|l| l.as_ref() != Some(&lease)) {
+            return false;
+        }
+        self.admin_cache.update_value(|m| m.retain(|_, v| *v));
+        let me = lease.owner().as_str().to_string();
+        let inbox_pk = self
+            .inbox_sk
+            .get_value()
+            .and_then(|sk| super::inbox_key::inbox_signer(&sk).ok())
+            .map(|s| s.public_key().to_string());
+        let handler = self.wrap_handler(&relay, signer, lease, false, true);
+        let sub: Rc<RefCell<Option<String>>> = Rc::default();
+        let (done_sub, done_relay, store) = (sub.clone(), relay.clone(), *self);
+        let eose = Rc::new(move || {
+            if let Some(id) = done_sub.borrow_mut().take() {
+                done_relay.unsubscribe(&id);
+                store.grant_subs.update_value(|v| v.retain(|s| s != &id));
+            }
+        });
+        let id = relay.subscribe(
+            vec![wrap_filter(
+                subscription_targets(&me, inbox_pk.as_deref()),
+                None,
+            )],
+            handler,
+            Some(eose),
+        );
+        // Tracked so an identity switch tears it down (and drops its signer).
+        self.grant_subs.update_value(|v| v.push(id.clone()));
+        *sub.borrow_mut() = Some(id);
+        true
     }
 
     /// Re-run decryption over every zone-encrypted message already in the
@@ -699,13 +1169,23 @@ impl ZoneKeyStore {
             web_sys::console::warn_1(&"[zone-key] store migration failed".into());
         }
         let rows = db.zone_key_rows().await;
-        let processed = db.get_zone_kv(KV_PROCESSED).await;
+        let processed = db.get_zone_kv(&kv_processed()).await;
         let inbox = db
             .get_zone_kv(&key_owner::inbox_granted_id(lease.owner()))
             .await;
+        let refused = db.refused_keys(lease.owner()).await;
+        // The identity scope's marker; the inbox scope's is loaded once its
+        // key is known (`start_grant_sync`).
+        let mut markers = HashMap::new();
+        let owner = lease.owner().as_str();
+        let id = GrantScope::Identity.marker_id(owner, owner);
+        if let Some(marker) = parse_marker(db.get_zone_kv(&id).await.ok().flatten().as_deref()) {
+            markers.insert(id, marker);
+        }
         if !self.is_current(lease) {
             return;
         }
+        self.backfill_done.set_value(markers);
         if let Ok(rows) = rows {
             let floor = key_owner::device_epochs(&rows);
             let _ = self.device_epochs.try_update(|m| {
@@ -734,6 +1214,21 @@ impl ZoneKeyStore {
                 self.inbox_granted.update_value(|s| s.extend(ids));
             }
         }
+        // After the keys: each slot is judged against the key held for it.
+        if let Ok(list) = refused {
+            let mut slots = Vec::new();
+            self.conflicts.update(|v| {
+                for r in list {
+                    let slot = (r.key.zone.clone(), r.key.epoch);
+                    if key_owner::note_refused(v, r) {
+                        slots.push(slot);
+                    }
+                }
+            });
+            for (zone, epoch) in slots {
+                self.maybe_resolve(&zone, epoch);
+            }
+        }
     }
 
     // -- Grant sync -------------------------------------------------------
@@ -743,7 +1238,16 @@ impl ZoneKeyStore {
     /// unwrapped at most once per device (ids remembered in IndexedDB), so
     /// ordinary DMs are not re-decrypted on every visit. Runs once per
     /// sign-in; `me` must be the identity the store has switched to.
-    pub fn start_grant_sync(&self, relay: &RelayConnection, signer: Rc<dyn Signer>, me: String) {
+    /// `signer_can_refuse` marks a signer whose decrypt can fail without the
+    /// wrap being unreadable (a NIP-07 extension); see
+    /// [`unwrap_failure_outcome`].
+    pub fn start_grant_sync(
+        &self,
+        relay: &RelayConnection,
+        signer: Rc<dyn Signer>,
+        me: String,
+        signer_can_refuse: bool,
+    ) {
         let Some(lease) = self.current_lease() else {
             return;
         };
@@ -754,29 +1258,30 @@ impl ZoneKeyStore {
         }
         self.sync_for.set_value(Some(lease.clone()));
         self.grant_relay.set_value(Some(relay.clone()));
+        self.grant_signer.set_value(Some(signer.clone()));
+        // Posts already on screen may name an epoch this device lacks, and the
+        // normal sync above may have refused or skipped its wraps.
+        self.schedule_recheck();
+        self.wrap_queue.update_value(|q| {
+            q.set_signer(if signer_can_refuse {
+                SignerKind::CanRefuse
+            } else {
+                SignerKind::Local
+            })
+        });
         let _ = self.grant_backlog.try_set(Some((
             lease.owner().clone(),
             GrantBacklog::new(recipient_keys_enabled(), js_sys::Date::now()),
         )));
         let me = lease.owner().as_str().to_string();
         let store = *self;
-        // The end of stored events on the identity subscription settles the
-        // old-grant cleanup flag the public-inbox opt-in waits for.
-        let eose = {
-            let (lease, me) = (lease.clone(), me.clone());
-            Rc::new(move || {
-                if store.is_current(&lease) {
-                    super::public_inbox::sweep_eose(&me);
-                }
-                store.note_backlog(&lease, GrantBacklog::identity_eose);
-            })
-        };
-        let id = relay.subscribe(
-            vec![wrap_filter(subscription_targets(&me, None))],
-            self.wrap_handler(relay, signer.clone(), lease.clone(), false),
-            Some(eose),
+        self.run_scope(
+            relay,
+            &lease,
+            GrantScope::Identity,
+            subscription_targets(&me, None),
+            self.wrap_handler(relay, signer.clone(), lease.clone(), false, false),
         );
-        self.grant_subs.update_value(|v| v.push(id));
         if !recipient_keys_enabled() {
             return;
         }
@@ -797,20 +1302,203 @@ impl ZoneKeyStore {
             match ensure_inbox_key(&port, &*signer, now_secs()).await {
                 Ok(key) if store.is_current(&lease) => {
                     store.inbox_sk.set_value(Some(key.sk_hex));
-                    let handler = store.wrap_handler(&relay, signer.clone(), lease.clone(), true);
+                    let handler =
+                        store.wrap_handler(&relay, signer.clone(), lease.clone(), true, false);
                     store.note_backlog(&lease, GrantBacklog::inbox_opened);
-                    let eose = {
-                        let lease = lease.clone();
-                        Rc::new(move || store.note_backlog(&lease, GrantBacklog::inbox_eose))
-                    };
-                    let id =
-                        relay.subscribe(vec![wrap_filter(vec![key.pubkey])], handler, Some(eose));
-                    store.grant_subs.update_value(|v| v.push(id));
+                    // This inbox key's own backfill marker.
+                    let marker = GrantScope::Inbox.marker_id(lease.owner().as_str(), &key.pubkey);
+                    if let Ok(db) = ForumDb::open().await {
+                        let raw = db.get_zone_kv(&marker).await.ok().flatten();
+                        if let Some(stored) = parse_marker(raw.as_deref()) {
+                            store.backfill_done.update_value(|m| {
+                                m.insert(marker.clone(), stored);
+                            });
+                        }
+                    }
+                    if !store.is_current(&lease) {
+                        return;
+                    }
+                    store.run_scope(&relay, &lease, GrantScope::Inbox, vec![key.pubkey], handler);
                 }
                 Ok(_) => {}
                 Err(e) => {
                     store.note_backlog(&lease, GrantBacklog::inbox_failed);
                     web_sys::console::warn_1(&format!("[zone-key] inbox key: {e}").into());
+                }
+            }
+        });
+    }
+
+    /// Fetch every stored wrap for one grant scope, paging past the relay's
+    /// row cap, then stay subscribed for live wraps. The paging decisions are
+    /// [`ScopePager`]'s (see [`super::grant_paging`]); this only opens and
+    /// closes the subscriptions it asks for. The long-lived subscription is
+    /// page 0; each further page is its own subscription, opened only after
+    /// the previous one's EOSE and closed at its own, so a scope holds at
+    /// most two relay subscriptions at once. The scope counts as delivered
+    /// only when the last page is in.
+    fn run_scope(
+        &self,
+        relay: &RelayConnection,
+        lease: &Lease,
+        scope: GrantScope,
+        targets: Vec<String>,
+        handler: EventCallback,
+    ) {
+        let owner = lease.owner().as_str();
+        let target = targets.first().map_or(owner, String::as_str);
+        let marker = scope.marker_id(owner, target);
+        self.scope_markers.update_value(|m| {
+            m.insert(scope, marker.clone());
+        });
+        let ctx = Rc::new(ScopeCtx {
+            relay: relay.clone(),
+            lease: lease.clone(),
+            scope,
+            marker,
+            targets,
+            handler,
+            pager: RefCell::new(ScopePager::new()),
+        });
+        self.open_page(&ctx, 0, None);
+    }
+
+    /// Subscribe page `page` of a scope (`until` inclusive; none for page 0).
+    /// Recorded with the grant subscriptions, so a sign-out mid-page closes
+    /// it rather than leaving it to be replayed under the next sign-in.
+    fn open_page(&self, ctx: &Rc<ScopeCtx>, page: u32, until: Option<u64>) {
+        let store = *self;
+        let sub_id: Rc<RefCell<Option<String>>> = Rc::default();
+        let on_event = {
+            let ctx = ctx.clone();
+            Rc::new(move |ev: NostrEvent| {
+                let processed = store.processed.with_value(|s| s.contains(&ev.id));
+                ctx.pager
+                    .borrow_mut()
+                    .observe(page, &ev.id, ev.created_at, processed);
+                (ctx.handler)(ev);
+            })
+        };
+        let on_eose = {
+            let (ctx, sub_id) = (ctx.clone(), sub_id.clone());
+            Rc::new(move || store.after_page(&ctx, page, &sub_id))
+        };
+        let id = ctx.relay.subscribe(
+            vec![wrap_filter(ctx.targets.clone(), until)],
+            on_event,
+            Some(on_eose),
+        );
+        self.grant_subs.update_value(|v| v.push(id.clone()));
+        *sub_id.borrow_mut() = Some(id);
+    }
+
+    /// Act on page `page` of a scope reaching EOSE (its subscription id in
+    /// `sub_id`).
+    fn after_page(&self, ctx: &Rc<ScopeCtx>, page: u32, sub_id: &RefCell<Option<String>>) {
+        let lease = &ctx.lease;
+        if !self.is_current(lease) {
+            return;
+        }
+        let stored = self
+            .backfill_done
+            .with_value(|m| m.get(&ctx.marker).copied());
+        let warm = warm_marker(stored, grant_sweep_enabled());
+        // `None`: a replayed or stale EOSE, not the current page's first.
+        let Some(end) = ctx.pager.borrow_mut().eose(page, warm) else {
+            return;
+        };
+        if end.close {
+            if let Some(id) = sub_id.borrow_mut().take() {
+                ctx.relay.unsubscribe(&id);
+                // Closed: `stop_grant_sync` need not CLOSE it again.
+                let _ = self.grant_subs.try_update_value(|v| v.retain(|s| s != &id));
+            }
+        }
+        match end.then {
+            // Only while the queue has room for a page; otherwise held until
+            // it drains (`open_deferred_pages`).
+            PagerAction::Fetch { page, until } => {
+                if self.wrap_queue.with_value(WrapQueue::has_page_room) {
+                    self.open_page(ctx, page, Some(until));
+                } else {
+                    self.deferred_pages.update_value(|d| {
+                        d.push(DeferredPage {
+                            ctx: ctx.clone(),
+                            page,
+                            until,
+                        })
+                    });
+                }
+            }
+            PagerAction::Done { verified } => {
+                if ctx.scope == GrantScope::Identity {
+                    // The end of stored events on the identity scope settles
+                    // the old-grant cleanup flag the public-inbox opt-in
+                    // waits for. With the sweep on there is no warm stop, so
+                    // this follows a full walk of the scope.
+                    super::public_inbox::sweep_eose(lease.owner().as_str());
+                }
+                let scope = ctx.scope;
+                self.note_backlog(lease, |b, now| b.scope_delivered(scope, verified, now));
+                self.try_write_markers(lease);
+            }
+            PagerAction::GiveUp => {
+                web_sys::console::warn_1(
+                    &format!(
+                        "[zone-key] {:?} grant paging stopped at page {page}",
+                        ctx.scope
+                    )
+                    .into(),
+                );
+                self.note_backlog(lease, GrantBacklog::paging_gave_up);
+            }
+        }
+    }
+
+    /// Persist the completion time of every scope whose marker has come due
+    /// ([`GrantBacklog::take_due_markers`]: a verified walk, every wrap of
+    /// this sign-in finished, none waiting for a retry). Called when a scope
+    /// finishes paging and whenever a wrap finishes. A session closed before
+    /// then writes nothing, so the next one pages fully.
+    fn try_write_markers(&self, lease: &Lease) {
+        if !self.is_current(lease) {
+            return;
+        }
+        // Untracked: taking the due set changes nothing a page renders.
+        let (due, floor) = self
+            .grant_backlog
+            .try_update_untracked(|b| match b {
+                Some((owner, backlog)) if owner == lease.owner() => {
+                    (backlog.take_due_markers(), backlog.marker_floor())
+                }
+                _ => (Vec::new(), None),
+            })
+            .unwrap_or_default();
+        if due.is_empty() {
+            return;
+        }
+        let marker = Marker {
+            done_at: now_secs(),
+            floor,
+        };
+        let ids: Vec<String> = self.scope_markers.with_value(|m| {
+            due.iter()
+                .filter_map(|scope| m.get(scope).cloned())
+                .collect()
+        });
+        self.backfill_done.update_value(|m| {
+            for id in &ids {
+                m.insert(id.clone(), marker);
+            }
+        });
+        let store = *self;
+        spawn_local(async move {
+            // The processed set first, so the next session's warm stop sees
+            // every wrap this one handled.
+            store.flush_processed().await;
+            if let Ok(db) = ForumDb::open().await {
+                for id in ids {
+                    let _ = db.put_zone_kv(&id, &marker.encode()).await;
                 }
             }
         });
@@ -827,43 +1515,201 @@ impl ZoneKeyStore {
         signer: Rc<dyn Signer>,
         lease: Lease,
         inbox: bool,
+        force: bool,
     ) -> EventCallback {
         let store = *self;
         let relay = relay.clone();
+        // Set by `start_grant_sync` before any handler is made.
+        let kind = self.wrap_queue.with_value(WrapQueue::signer);
         Rc::new(move |ev: NostrEvent| {
             if ev.kind != nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP || !store.is_current(&lease) {
+                return;
+            }
+            // Once per sign-in, whichever subscription or page delivered it
+            // (a transient failure removes it again, so a replay retries).
+            // A forced re-check (`force`) looks again even at one already seen.
+            let first = store
+                .seen_wraps
+                .try_update_value(|s| s.insert(ev.id.clone()))
+                .unwrap_or(false);
+            if !first && !force {
                 return;
             }
             let me = lease.owner().as_str();
             // With the sweep on, wraps already handled are looked at again
             // when addressed to the identity (an old grant is deleted once its
             // key is safe here) or to its inbox key (see above).
-            let revisit = grant_sweep_enabled() && (inbox || p_tags(&ev).any(|p| p == me));
+            let revisit =
+                force || (grant_sweep_enabled() && (inbox || p_tags(&ev).any(|p| p == me)));
             if !revisit && store.processed.with_value(|s| s.contains(&ev.id)) {
                 return;
             }
-            let (relay, signer, lease) = (relay.clone(), signer.clone(), lease.clone());
             super::public_inbox::sweep_wrap_started();
+            // Counted as backlog from the moment it is queued; progress is
+            // when it finishes (see `GrantBacklog`).
             store.note_backlog(&lease, |b, _| b.wrap_started());
-            spawn_local(async move {
-                store.process_wrap(&lease, &ev, &*signer, &relay).await;
-                store.note_backlog(&lease, GrantBacklog::wrap_done);
-                // A switch reset the tracker: an earlier identity's wrap no
-                // longer counts towards the new one's cleanup.
-                if store.is_current(&lease) {
-                    super::public_inbox::sweep_wrap_done(lease.owner().as_str());
-                }
+            store.enqueue_wrap(WrapJob {
+                lease: lease.clone(),
+                ev,
+                signer: signer.clone(),
+                kind,
+                relay: relay.clone(),
             });
         })
     }
 
-    async fn process_wrap(
-        &self,
-        lease: &Lease,
-        wrap: &NostrEvent,
-        signer: &dyn Signer,
-        relay: &RelayConnection,
-    ) {
+    /// Queue a wrap for processing and start as many as the queue allows.
+    fn enqueue_wrap(&self, job: WrapJob) {
+        self.wrap_queue.update_value(|q| q.push(job));
+        self.pump_wraps();
+    }
+
+    /// Start queued wraps while the queue has free slots, then open any page
+    /// that was waiting for the queue to drain.
+    fn pump_wraps(&self) {
+        self.start_wraps();
+        self.open_deferred_pages();
+    }
+
+    /// Open the held pages once the queue has room for a page.
+    fn open_deferred_pages(&self) {
+        if !self.wrap_queue.with_value(WrapQueue::has_page_room) {
+            return;
+        }
+        let ready = self
+            .deferred_pages
+            .try_update_value(std::mem::take)
+            .unwrap_or_default();
+        for d in ready {
+            if self.is_current(&d.ctx.lease) {
+                self.open_page(&d.ctx, d.page, Some(d.until));
+            }
+        }
+    }
+
+    /// Start queued wraps while the queue has free slots. Each slot is given
+    /// back when its wrap finishes or after [`UNWRAP_SLOT_TIMEOUT_MS`],
+    /// whichever comes first.
+    fn start_wraps(&self) {
+        loop {
+            let Some(started) = self
+                .wrap_queue
+                .try_update_value(WrapQueue::start_next)
+                .flatten()
+            else {
+                return;
+            };
+            let slot = Rc::new(Cell::new(Some(started.slot)));
+            let store = *self;
+            // Not while a refusable signer has yet to succeed: its one slot is
+            // then waiting on a permission prompt (the admin check has its own
+            // bound), and releasing it would raise another prompt every minute
+            // for a person who has walked away.
+            let refusable_unproven =
+                started.successes_at_start == 0 && started.job.kind == SignerKind::CanRefuse;
+            if !refusable_unproven {
+                let slot = slot.clone();
+                crate::utils::set_timeout_once(
+                    move || store.release_slot(&slot),
+                    UNWRAP_SLOT_TIMEOUT_MS,
+                );
+            }
+            spawn_local(async move {
+                store.run_wrap(started).await;
+                store.release_slot(&slot);
+            });
+        }
+    }
+
+    /// Give a slot back once (the wrap finished, or it timed out first).
+    fn release_slot(&self, slot: &Cell<Option<Slot>>) {
+        if let Some(s) = slot.take() {
+            let _ = self.wrap_queue.try_update_value(|q| q.release(s));
+            self.pump_wraps();
+        }
+    }
+
+    /// The refusable signer decrypted a wrap in the job holding `slot`: queue
+    /// the wraps it refused earlier once more (see [`super::wrap_queue`]).
+    /// Nothing for a sign-in that has since switched.
+    fn note_signer_success(&self, lease: &Lease, slot: Slot) {
+        if !self.is_current(lease) {
+            return;
+        }
+        let requeued = self
+            .wrap_queue
+            .try_update_value(|q| q.signer_succeeded(slot))
+            .unwrap_or(0);
+        for _ in 0..requeued {
+            self.note_backlog(lease, |b, _| b.wrap_started());
+        }
+        if requeued > 0 {
+            self.pump_wraps();
+        }
+    }
+
+    /// Process one queued wrap and account for it.
+    async fn run_wrap(&self, started: Started<WrapJob>) {
+        let Started {
+            job,
+            slot,
+            attempt,
+            successes_at_start,
+        } = started;
+        if !self.is_current(&job.lease) {
+            return; // its sign-in is over; the backlog was reset
+        }
+        let outcome = self.process_wrap(&job, attempt, slot).await;
+        let lease = job.lease.clone();
+        let id = job.ev.id.clone();
+        let created_at = job.ev.created_at;
+        self.note_backlog(&lease, |b, now| b.wrap_done(now, &id, created_at, outcome));
+        match outcome {
+            WrapOutcome::Refused => {
+                // Held for the signer's next success. Still seen, so a replay
+                // does not queue it twice; still counted by the sweep.
+                if self.is_current(&lease) {
+                    let requeued = self
+                        .wrap_queue
+                        .try_update_value(|q| q.park(job, successes_at_start))
+                        .unwrap_or(false);
+                    if requeued {
+                        self.note_backlog(&lease, |b, _| b.wrap_started());
+                        self.pump_wraps();
+                    }
+                }
+                return;
+            }
+            WrapOutcome::Retry => {
+                // Left unmarked to be retried: let a reconnect's replay of the
+                // same wrap in this session try again.
+                self.seen_wraps.update_value(|s| {
+                    s.remove(&id);
+                });
+            }
+            WrapOutcome::Settled => {
+                // Settled wraps are in the processed set, which turns a
+                // re-delivery away, so `seen_wraps` need not keep them
+                // (with the sweep on, processed wraps are revisited, so it
+                // does).
+                if !grant_sweep_enabled() {
+                    self.seen_wraps.update_value(|s| {
+                        s.remove(&id);
+                    });
+                }
+            }
+            WrapOutcome::Unreadable | WrapOutcome::UnreadableBySigner => {}
+        }
+        // A switch reset the tracker: an earlier identity's wrap no longer
+        // counts towards the new one's cleanup.
+        if self.is_current(&lease) {
+            super::public_inbox::sweep_wrap_done(lease.owner().as_str());
+        }
+        self.try_write_markers(&lease);
+    }
+
+    async fn process_wrap(&self, job: &WrapJob, attempt: Attempt, slot: Slot) -> WrapOutcome {
+        let (lease, wrap, signer, relay) = (&job.lease, &job.ev, &*job.signer, &job.relay);
         let me = lease.owner().as_str();
         let inbox = self
             .inbox_sk
@@ -871,26 +1717,29 @@ impl ZoneKeyStore {
             .filter(|_| self.is_current(lease))
             .and_then(|sk| super::inbox_key::inbox_signer(&sk).ok());
         let inbox_ref = inbox.as_ref().map(|s| s as &dyn Signer);
-        let inbox_pk = inbox.as_ref().map(|s| s.public_key().to_string());
-        let via_inbox = inbox_pk
-            .as_deref()
-            .is_some_and(|ipk| p_tags(wrap).any(|p| p == ipk));
-        let (sealer, rumor) = match unwrap_inbox_then_identity(wrap, inbox_ref, signer).await {
-            Ok(v) => v,
-            // Not for us to read (or the signer cannot NIP-44): leave it
-            // unmarked so a later session with a capable signer retries.
-            Err(_) => return,
-        };
+        let identity_kind = job.kind;
+        let (sealer, rumor, opener) =
+            match open_for_sync(wrap, inbox_ref, signer, identity_kind, attempt).await {
+                Ok(v) => v,
+                // Left unmarked so a later session with a capable signer
+                // retries; the outcome says whether it holds this one.
+                Err(outcome) => return outcome,
+            };
+        if opener == Opener::Identity && identity_kind == SignerKind::CanRefuse {
+            self.note_signer_success(lease, slot);
+        }
+        let via_inbox = opener == Opener::Inbox;
+        let kind = signer_kind_for(wrap, inbox_ref, signer, identity_kind);
         match super::tickets::route(rumor.kind, super::tickets::zone_groups_enabled()) {
             super::tickets::Route::Grant => {}
             super::tickets::Route::Ignore => {
                 self.mark_processed(&wrap.id).await;
-                return;
+                return WrapOutcome::Settled;
             }
             super::tickets::Route::Ticket => {
-                self.process_ticket(lease, wrap, inbox_ref, signer, via_inbox)
+                return self
+                    .process_ticket(lease, wrap, inbox_ref, signer, via_inbox, (kind, attempt))
                     .await;
-                return;
             }
         }
         // A grant is marked processed only once its outcome is final. An
@@ -898,8 +1747,8 @@ impl ZoneKeyStore {
         // the wrap unmarked, so the next session retries instead of losing the
         // key for good.
         let admin = self.sealer_is_admin(&sealer).await;
-        let (valid, persisted, grant_id) = match admin {
-            None => (false, false, None),
+        let (valid, persisted, stored, grant_id) = match admin {
+            None => (false, false, false, None),
             Some(is_admin) => match validate_grant(&rumor, &sealer, is_admin, now_secs()) {
                 Ok(key) => {
                     let id =
@@ -910,22 +1759,30 @@ impl ZoneKeyStore {
                     if via_inbox && outcome == Persisted::Stored {
                         self.mark_inbox_granted(lease, &id).await;
                     }
-                    (true, outcome.settled(), Some(id))
+                    (
+                        true,
+                        outcome.settled(),
+                        outcome == Persisted::Stored,
+                        Some(id),
+                    )
                 }
                 Err(e) => {
                     web_sys::console::warn_1(&format!("[zone-key] grant refused: {e}").into());
-                    (false, false, None)
+                    (false, false, false, None)
                 }
             },
         };
-        if super::grant_settled(admin, valid, persisted) {
+        let outcome = if super::grant_settled(admin, valid, persisted) {
             self.mark_processed(&wrap.id).await;
-        }
+            WrapOutcome::Settled
+        } else {
+            WrapOutcome::Retry
+        };
         // Nothing below runs once the identity has signed out: it publishes
         // deletions signed by that identity, and reports to the cleanup
         // tracker the next identity owns.
         if !self.is_current(lease) {
-            return;
+            return outcome;
         }
         // Deleting the identity copy is safe only once the SAME (zone, epoch)
         // key has also arrived addressed to the inbox key on this device, so a
@@ -938,7 +1795,9 @@ impl ZoneKeyStore {
             wrap_id: wrap.id.clone(),
             to_identity: p_tags(wrap).any(|p| p == me),
             is_grant: true,
-            key_safe: valid && persisted && replacement_exists,
+            // Only a grant whose key this device stored: a refused grant's
+            // key lives nowhere else, so its wrap must never be swept.
+            key_safe: valid && stored && replacement_exists,
         };
         let doomed = sweep_targets(grant_sweep_enabled(), std::slice::from_ref(&candidate));
         if candidate.to_identity
@@ -956,6 +1815,7 @@ impl ZoneKeyStore {
                 }
             }
         }
+        outcome
     }
 
     /// An NIP-171 epoch ticket (ADR-2028 decision 2): opened with its
@@ -963,6 +1823,8 @@ impl ZoneKeyStore {
     /// and stored as the same [`ZoneKey`] a 21453 grant yields. No admin
     /// check: the group identity is not an admin. Unloaded bindings leave the
     /// wrap unmarked so the next session retries; any other refusal is final.
+    /// `failure` (the signer kind and attempt) classifies a ticket whose own
+    /// decrypt failed (see [`unwrap_failure_outcome`]).
     async fn process_ticket(
         &self,
         lease: &Lease,
@@ -970,7 +1832,8 @@ impl ZoneKeyStore {
         inbox: Option<&dyn Signer>,
         identity: &dyn Signer,
         via_inbox: bool,
-    ) {
+        failure: (SignerKind, Attempt),
+    ) -> WrapOutcome {
         use super::tickets::{
             ensure_bindings_loaded, loaded_bindings, ticket_verdict, TicketVerdict,
         };
@@ -980,10 +1843,16 @@ impl ZoneKeyStore {
         let opened = super::tickets::open_ticket(wrap, inbox, identity).await;
         let me = lease.owner().as_str();
         match ticket_verdict(opened, me, loaded_bindings().as_ref(), now_secs()) {
-            TicketVerdict::Retry => {}
+            TicketVerdict::Retry => WrapOutcome::Retry,
+            // Left unmarked for a later session's bindings; holds nothing now.
+            TicketVerdict::Unbound => WrapOutcome::Unreadable,
+            // The outer unwrap opened, but the ticket's own decrypt did not: a
+            // NIP-07 refusal is held and retried, never a final refusal.
+            TicketVerdict::SignerFailed(e) => unwrap_failure_outcome(&e, failure.0, failure.1),
             TicketVerdict::Refuse(why) => {
                 web_sys::console::warn_1(&format!("[zone-key] ticket refused: {why}").into());
                 self.mark_processed(&wrap.id).await;
+                WrapOutcome::Settled
             }
             TicketVerdict::Accept(key) => {
                 let key = *key;
@@ -995,6 +1864,9 @@ impl ZoneKeyStore {
                 }
                 if outcome.settled() {
                     self.mark_processed(&wrap.id).await;
+                    WrapOutcome::Settled
+                } else {
+                    WrapOutcome::Retry
                 }
             }
         }
@@ -1161,13 +2033,43 @@ impl ZoneKeyStore {
         Ok(())
     }
 
+    /// Mark a wrap processed. Memory changes at once; the IndexedDB copy is
+    /// written at most once a second ([`PROCESSED_FLUSH_MS`]) and when a
+    /// scope's backfill completes. Writing the whole set per wrap made a
+    /// paged backfill quadratic (thousands of wraps, each rewriting every id
+    /// before it), inside the time the page waits for keys. A flush lost to a
+    /// closed tab only means those wraps are retried next session, which the
+    /// unmarked-wrap design already allows.
     async fn mark_processed(&self, wrap_id: &str) {
         self.processed.update_value(|s| {
             s.insert(wrap_id.to_string());
         });
-        let ids: Vec<String> = self.processed.with_value(|s| s.iter().cloned().collect());
+        if self.processed_flush_pending.try_get_value().unwrap_or(true) {
+            return;
+        }
+        self.processed_flush_pending.set_value(true);
+        let store = *self;
+        crate::utils::set_timeout_once(
+            move || {
+                spawn_local(async move {
+                    store.flush_processed().await;
+                });
+            },
+            PROCESSED_FLUSH_MS,
+        );
+    }
+
+    /// Write the processed-wrap set to IndexedDB now.
+    async fn flush_processed(&self) {
+        let _ = self.processed_flush_pending.try_set_value(false);
+        let Some(ids) = self
+            .processed
+            .try_with_value(|s| s.iter().cloned().collect::<Vec<String>>())
+        else {
+            return;
+        };
         if let (Ok(db), Ok(json)) = (ForumDb::open().await, serde_json::to_string(&ids)) {
-            let _ = db.put_zone_kv(KV_PROCESSED, &json).await;
+            let _ = db.put_zone_kv(&kv_processed(), &json).await;
         }
     }
 
@@ -1214,7 +2116,11 @@ impl ZoneKeyStore {
         if let Some(v) = self.admin_cache.with_value(|m| m.get(pubkey).copied()) {
             return Some(v);
         }
-        let v = fetch_is_admin(pubkey).await?;
+        // Bounded: the fetch has no timeout of its own, and a hung check
+        // would hold an unwrap slot (finding 4).
+        let v = with_timeout(fetch_is_admin(pubkey), ADMIN_CHECK_TIMEOUT_MS)
+            .await
+            .flatten()?;
         self.admin_cache.update_value(|m| {
             m.insert(pubkey.to_string(), v);
         });
@@ -1238,6 +2144,20 @@ impl ZoneKeyStore {
     ) -> HashSet<String> {
         let ledger = self.grants.get_value();
         ledger.sent_to(&IdbGrantKv, zone, epoch, targets).await
+    }
+
+    /// The ledger entries of `(zone, epoch)`, for the relay-held backup
+    /// ([`super::grant_backup`]).
+    pub async fn export_grant_backup(&self, zone: &str, epoch: u32) -> Vec<String> {
+        let ledger = self.grants.get_value();
+        ledger.export(&IdbGrantKv, zone, epoch).await
+    }
+
+    /// Merge entries restored from the relay-held backup into the ledger;
+    /// returns how many were new to this device.
+    pub async fn merge_grant_backup(&self, zone: &str, epoch: u32, entries: &[String]) -> usize {
+        let ledger = self.grants.get_value();
+        ledger.merge(&IdbGrantKv, zone, epoch, entries).await
     }
 
     /// Record that `(zone, epoch)` was granted to each `(member, recipient
@@ -1293,11 +2213,6 @@ impl GrantKv for IdbGrantKv {
 }
 
 /// The grant-sync filter: kind-1059 wraps to `p`, at most
-/// [`RELAY_FILTER_LIMIT`](crate::stores::channels::RELAY_FILTER_LIMIT) rows,
-/// the relay's maximum. Without an explicit limit the relay applies its
-/// default of 500, newest first, and DMs share the kind with grants. An
-/// account with more wraps than the limit still misses its oldest (often
-/// its grants) on a cold device; paging the backlog is separate work.
 /// Envelopes opened per slice of a chunked re-decryption: ~25 × ~0.6 ms
 /// (cached conversation key, inner verify) keeps each slice near 15 ms in
 /// desktop wasm, under one frame.
@@ -1318,10 +2233,15 @@ async fn yield_to_event_loop() {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
-fn wrap_filter(p: Vec<String>) -> Filter {
+/// The grant-sync filter: kind-1059 wraps to `p`, at most
+/// [`RELAY_FILTER_LIMIT`](crate::stores::channels::RELAY_FILTER_LIMIT) rows
+/// (an explicit limit: the relay's default is 500), at or before `until`
+/// when paging.
+fn wrap_filter(p: Vec<String>, until: Option<u64>) -> Filter {
     Filter {
         kinds: Some(vec![nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP]),
         p_tags: Some(p),
+        until,
         limit: Some(crate::stores::channels::RELAY_FILTER_LIMIT),
         ..Default::default()
     }
@@ -1339,6 +2259,33 @@ fn latest_in(m: &HashMap<String, ZoneKey>, zone: &str) -> Option<ZoneKey> {
         .filter(|k| k.zone == zone)
         .max_by_key(|k| k.epoch)
         .cloned()
+}
+
+/// Resolve after `ms` milliseconds.
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(win) = web_sys::window() {
+            let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+/// `fut`'s output, or `None` if `ms` milliseconds pass first. The future is
+/// dropped on timeout; a fetch it started runs on and is ignored.
+async fn with_timeout<F: Future>(fut: F, ms: i32) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut timer = std::pin::pin!(sleep_ms(ms));
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(v));
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 async fn fetch_is_admin(pubkey: &str) -> Option<bool> {

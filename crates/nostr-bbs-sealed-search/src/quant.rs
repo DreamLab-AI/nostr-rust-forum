@@ -47,7 +47,11 @@ impl QueryLut {
     /// Approximate score of one code (higher = closer).
     #[inline]
     pub fn score(&self, code: &[u8]) -> f32 {
-        code.iter().take(CODE_BYTES).enumerate().map(|(j, &b)| self.0[j * 256 + b as usize]).sum()
+        code.iter()
+            .take(CODE_BYTES)
+            .enumerate()
+            .map(|(j, &b)| self.0[j * 256 + b as usize])
+            .sum()
     }
 }
 
@@ -116,7 +120,9 @@ mod tests {
         let mut x = seed;
         let mut v = [0f32; DIM];
         for s in v.iter_mut() {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *s = ((x >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
         }
         let n = v.iter().map(|a| a * a).sum::<f32>().sqrt();
@@ -130,7 +136,15 @@ mod tests {
         let lut = QueryLut::new(&q);
         for s in 2..30 {
             let c = sign_code(&unit(s));
-            let d: f32 = (0..DIM).map(|i| if c[i / 8] >> (i % 8) & 1 == 1 { q[i] } else { -q[i] }).sum();
+            let d: f32 = (0..DIM)
+                .map(|i| {
+                    if c[i / 8] >> (i % 8) & 1 == 1 {
+                        q[i]
+                    } else {
+                        -q[i]
+                    }
+                })
+                .sum();
             assert!((lut.score(&c) - d).abs() < 1e-4);
         }
     }
@@ -146,11 +160,16 @@ mod tests {
 
     #[test]
     fn top_r_matches_full_sort() {
-        let all: Vec<Candidate> = (0..5000).map(|i| (i % 7, i, ((i * 7919) % 10007) as f32)).collect();
+        let all: Vec<Candidate> = (0..5000)
+            .map(|i| (i % 7, i, ((i * 7919) % 10007) as f32))
+            .collect();
         let mut full = all.clone();
         full.sort_by(cand_cmp);
         for r in [1, 10, 80, 999, 6000] {
-            assert_eq!(top_r(all.iter().copied(), r), full.iter().take(r).copied().collect::<Vec<_>>());
+            assert_eq!(
+                top_r(all.iter().copied(), r),
+                full.iter().take(r).copied().collect::<Vec<_>>()
+            );
         }
     }
 }

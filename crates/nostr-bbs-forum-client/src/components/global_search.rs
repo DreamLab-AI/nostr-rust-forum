@@ -22,7 +22,6 @@ use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
-
 /// A raw message search hit before relay hydration: `(event_id, score, content, label)`.
 /// Bodies are absent until the id→event hydration pass fills them in.
 /// Truncate `text` to at most `max_chars` characters, appending an ellipsis
@@ -246,7 +245,9 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                     match crate::utils::sealed_search::ensure_zone(&zone, &store, &*signer).await {
                         Ok(n) if n > 0 => any = true,
                         Ok(_) => {}
-                        Err(e) => web_sys::console::warn_1(&format!("[sealed-search] {zone}: {e}").into()),
+                        Err(e) => {
+                            web_sys::console::warn_1(&format!("[sealed-search] {zone}: {e}").into())
+                        }
                     }
                 }
                 api_online.set(any);
@@ -317,7 +318,6 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 // event bodies are NOT included, so hits must be hydrated
                 // id→event via the relay below (QA HIGH bug #4: blank rows).
 
-
                 // Text search goes to the RELAY (NIP-50 `search` on kind-42),
                 // not to the vector worker. The worker's index is fed only by
                 // the posting client's `/ingest` call, which is admin-gated —
@@ -343,7 +343,8 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 // Sealed per-zone search over the encrypted zones this member
                 // holds keys for: verified, decrypted events only.
                 if let Some(store) = zone_store.filter(|_| crate::utils::sealed_search::ready()) {
-                    match crate::utils::sealed_search::search(&relay, &store, &q, SEMANTIC_K).await {
+                    match crate::utils::sealed_search::search(&relay, &store, &q, SEMANTIC_K).await
+                    {
                         Ok(hits) => {
                             for h in hits {
                                 if !seen.insert(h.event.id.clone()) {
@@ -351,7 +352,8 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                                 }
                                 out.push(Hit::SemanticMessage {
                                     event_id: h.event.id.clone(),
-                                    id: channel_id_of(&h.event).unwrap_or_else(|| h.event.id.clone()),
+                                    id: channel_id_of(&h.event)
+                                        .unwrap_or_else(|| h.event.id.clone()),
                                     content: h.event.content.clone(),
                                     label: h.event.pubkey.clone(),
                                     score: h.score,
@@ -766,5 +768,4 @@ mod tests {
         let plain = serde_json::to_string(&Filter::default()).unwrap();
         assert!(!plain.contains("search"), "was {plain}");
     }
-
 }
