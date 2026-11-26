@@ -1431,6 +1431,136 @@ mod tests {
         assert!(plan.unverified.is_empty());
     }
 
+    /// A family zone's roster: the admin, two members this device has
+    /// granted before (b, e), two the relay lists but nobody approved (c, f),
+    /// and one outside the zone (g).
+    fn family_roster() -> Vec<(String, Vec<String>)> {
+        vec![
+            (ME.into(), vec!["admin".into(), "family".into()]),
+            (pk('b'), vec!["family".into()]),
+            (pk('c'), vec!["family".into()]),
+            (pk('e'), vec!["family".into()]),
+            (pk('f'), vec!["family".into()]),
+            (pk('g'), vec!["business".into()]),
+        ]
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_rotation_sends_the_new_key_to_known_members_only() {
+        // The relay added c and f to the cohort; the admin clicks Rotate.
+        // N = 2 known members (b, e) plus the admin receive epoch 2; M = 2
+        // unknown members are held for approval and receive nothing.
+        let zone = rule("zone3", "family", false);
+        let gate = known("zone3", &[pk('b'), pk('e')]);
+        let new_key = key("zone3", 2);
+        let plan = plan_new_key(&zone, &family_roster(), ME, &new_key, &gate);
+        assert_eq!(plan.grants.len(), 1, "one key, one batch");
+        assert_eq!(plan.grants[0].0.epoch, 2);
+        assert_eq!(
+            sorted(plan.grants[0].1.clone()),
+            sorted(vec![ME.to_string(), pk('b'), pk('e')])
+        );
+        assert_eq!(
+            plan.pending,
+            vec![
+                ("zone3".to_string(), pk('c')),
+                ("zone3".to_string(), pk('f'))
+            ]
+        );
+        assert!(plan.unverified.is_empty());
+    }
+
+    #[test]
+    fn a_rotation_in_an_unverified_zone_still_reaches_known_members() {
+        let zone = rule("zone3", "family", false);
+        let mut gate = known("zone3", &[pk('b'), pk('e')]);
+        gate.unverified.insert("zone3".into());
+        let plan = plan_new_key(&zone, &family_roster(), ME, &key("zone3", 2), &gate);
+        assert_eq!(
+            sorted(plan.grants[0].1.clone()),
+            sorted(vec![ME.to_string(), pk('b'), pk('e')])
+        );
+        assert!(plan.pending.is_empty(), "not presented as never granted");
+        assert_eq!(
+            plan.unverified,
+            vec![
+                ("zone3".to_string(), pk('c')),
+                ("zone3".to_string(), pk('f'))
+            ]
+        );
+    }
+
+    #[test]
+    fn grant_missing_sends_to_known_members_only() {
+        // Everyone but the admin is missing epoch 2; only b and e are known.
+        let gate = known("zone3", &[pk('b'), pk('e')]);
+        let missing = vec![pk('b'), pk('c'), pk('e'), pk('f')];
+        let held = held("zone3", &[1, 2]);
+        let plan = plan_grant_missing("zone3", &missing, ME, &held["zone3"], &gate, true, |_| {
+            HashSet::new()
+        });
+        // Epoch 2 and, with history, epoch 1: both to the known pair only.
+        let epochs: Vec<u32> = plan.grants.iter().map(|(k, _)| k.epoch).collect();
+        assert_eq!(epochs, vec![2, 1]);
+        for (_, r) in &plan.grants {
+            assert_eq!(sorted(r.clone()), sorted(vec![pk('b'), pk('e')]));
+        }
+        assert_eq!(
+            plan.pending,
+            vec![
+                ("zone3".to_string(), pk('c')),
+                ("zone3".to_string(), pk('f'))
+            ]
+        );
+        assert!(plan.unverified.is_empty());
+    }
+
+    #[test]
+    fn approving_for_one_cohort_opens_only_that_cohorts_zone() {
+        // The admin adds p to the public cohort. The relay also reports p in
+        // the private cohort. Only the public zone may be approved and sent.
+        let zones = [
+            rule("zone_pub", "public", false),
+            rule("zone_priv", "private", false),
+        ];
+        let p = pk('p');
+        let roster = vec![
+            (ME.to_string(), vec!["admin".into()]),
+            (p.clone(), vec!["public".into(), "private".into()]),
+        ];
+        let mut keys = held("zone_pub", &[1]);
+        keys.extend(held("zone_priv", &[1]));
+        let only = HashSet::from([p.clone()]);
+        // How `after_allocation` plans the grants for that allocation.
+        let plan = plan_missing(
+            &zones,
+            &roster,
+            ME,
+            &keys,
+            &HashMap::new(),
+            &GateRecords::default(),
+            true,
+            Some(&only),
+        );
+        let granted: Vec<&str> = plan
+            .grants
+            .iter()
+            .filter(|(_, r)| r.contains(&p))
+            .map(|(k, _)| k.zone.as_str())
+            .collect();
+        assert_eq!(granted, vec!["zone_pub"], "the private zone's key went out");
+        assert_eq!(
+            plan.pending,
+            vec![("zone_priv".to_string(), p.clone())],
+            "p stays pending in the zone the admin did not open"
+        );
+    }
+
     #[test]
     fn no_grant_below_the_floor_leaves_send_grants() {
         let plan = vec![
