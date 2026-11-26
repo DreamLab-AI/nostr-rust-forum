@@ -2319,11 +2319,10 @@ mod tests {
         assert!(l.grow(1_000.0 + LANDING_MAX_MS - 1.0));
         assert!(!l.grow(1_000.0 + LANDING_MAX_MS + 1.0));
         assert!(l.done);
-        assert!(
-            LANDING_MAX_MS >= 30_000.0,
-            "ceiling must outlast a cold load"
-        );
     }
+
+    // The ceiling must outlast a cold load of a long topic.
+    const _: () = assert!(LANDING_MAX_MS >= 30_000.0);
 
     #[test]
     fn history_settles_on_both_receipts() {
