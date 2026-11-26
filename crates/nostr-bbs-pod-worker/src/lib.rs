@@ -145,6 +145,20 @@ fn post_write_policy(target_is_container: bool, agent_has_write: bool) -> Existi
     }
 }
 
+/// Whether an agent WITHOUT `acl:Write` may create `path` through a POST to
+/// a non-container path.
+///
+/// Append-only creation is held to the same naming rule as a container
+/// `Slug` ([`container::accepted_slug`]): the created name (final segment)
+/// must not be a dot-file, any case variant of an ACL/meta sidecar, or
+/// contain bytes outside `[A-Za-z0-9._-]`. Agents with `acl:Write` keep the
+/// unrestricted behaviour; sidecar paths themselves are already routed to the
+/// `.acl` handler or elevated to `acl:Control`.
+fn append_only_name_allowed(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or_default();
+    container::accepted_slug(Some(name)).is_some()
+}
+
 /// R2 condition that makes a put succeed only when no object exists at the
 /// key. workerd maps an `etagDoesNotMatch` of `"*"` to a wildcard etag, so
 /// R2 evaluates the existence check atomically with the write (no
@@ -1711,6 +1725,13 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                     &resource_path,
                     AccessMode::Write,
                 );
+                if !agent_has_write && !append_only_name_allowed(&resource_path) {
+                    return json_error(
+                        &env,
+                        "acl:Append cannot create a dot-file or sidecar-named resource",
+                        403,
+                    );
+                }
                 let put = bucket.put(&r2_key, data).http_metadata(HttpMetadata {
                     content_type: Some(content_type),
                     ..Default::default()
@@ -2871,6 +2892,21 @@ mod tests {
         assert_eq!(c.etag_does_not_match.as_deref(), Some("*"));
         assert!(c.etag_matches.is_none());
         assert!(c.uploaded_before.is_none() && c.uploaded_after.is_none());
+    }
+
+    #[test]
+    fn append_only_post_names_follow_slug_rules() {
+        for bad in [
+            "/inbox/X.ACL",
+            "/inbox/x.meta.json",
+            "/inbox/.hidden",
+            "/inbox/x.Meta",
+            "/inbox/a b",
+        ] {
+            assert!(!append_only_name_allowed(bad), "{bad}");
+        }
+        assert!(append_only_name_allowed("/inbox/note.jsonld"));
+        assert!(append_only_name_allowed("/inbox/sub/msg-1"));
     }
 
     #[test]
