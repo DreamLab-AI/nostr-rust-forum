@@ -30,12 +30,25 @@ use crate::components::copy_key::CopyKey;
 use crate::relay::RelayConnection;
 use crate::stores::zones::{load_zones, Zone};
 use crate::utils::shorten_pubkey;
-use crate::zone_crypto::auto_grant::{report_summary, send_grants, AutoGrant, PendingReview};
+use crate::zone_crypto::auto_grant::{
+    plan_grant_missing, plan_new_key, report_summary, send_grants, AutoGrant, GateRecords,
+    PendingReview, ZoneRule,
+};
 use crate::zone_crypto::store::{try_use_zone_key_store, ZoneKeyStore};
-use crate::zone_crypto::{generate_zone_key, grant_plan, grant_targets, ZoneKey, AGENT_COHORT};
+use crate::zone_crypto::{generate_zone_key, grant_targets, ZoneKey, AGENT_COHORT};
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
+}
+
+/// The parts of `z` that decide who holds its key.
+fn rule_of(z: &Zone) -> ZoneRule {
+    ZoneRule {
+        id: z.id.clone(),
+        required_cohorts: z.required_cohorts.clone(),
+        agent_keys: z.agent_keys,
+        history_from_epoch: z.history_from_epoch,
+    }
 }
 
 /// The Encryption tab.
@@ -421,20 +434,24 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         })
     };
 
-    let targets = move || {
-        let required = zone.with_value(|z| z.required_cohorts.clone());
+    // The roster as `(pubkey, cohorts)`, as last read from the relay.
+    let roster = move || {
         admin.state.users.with(|users| {
-            let members: Vec<(String, Vec<String>)> = users
+            users
                 .iter()
                 .map(|u| (u.pubkey.clone(), u.cohorts.clone()))
-                .collect();
-            grant_targets(
-                &members,
-                &required,
-                &me(),
-                zone.with_value(|z| z.agent_keys),
-            )
+                .collect::<Vec<(String, Vec<String>)>>()
         })
+    };
+
+    let targets = move || {
+        let required = zone.with_value(|z| z.required_cohorts.clone());
+        grant_targets(
+            &roster(),
+            &required,
+            &me(),
+            zone.with_value(|z| z.agent_keys),
+        )
     };
 
     let missing = move || {
@@ -615,7 +632,17 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                             match keys.insert_local(key.clone()).await {
                                 // A new key goes to everyone eligible; they already
                                 // hold (or were offered) the earlier ones.
-                                Ok(()) => grant(vec![(key, targets())]),
+                                Ok(()) => {
+                                    let rule = zone.with_value(rule_of);
+                                    let plan = plan_new_key(
+                                        &rule,
+                                        &roster(),
+                                        &me,
+                                        &key,
+                                        &GateRecords::default(),
+                                    );
+                                    grant(plan.grants)
+                                }
                                 Err(why) => status.set(Some(why)),
                             }
                         });
@@ -683,6 +710,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                                     let held = crate::zone_crypto::grantable_keys(all, floor);
                                     let relay_btn = relay_btn.get_value();
                                     let signer_btn = auth.get_signer();
+                                    let me_now = me();
                                     spawn_local(async move {
                                         let mut earlier = std::collections::HashMap::new();
                                         if history {
@@ -693,10 +721,16 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                                                 earlier.insert(k.epoch, keys.grants_sent(&k.zone, k.epoch).await);
                                             }
                                         }
-                                        let plan = grant_plan(&held, &recipients, history, |e| {
-                                            earlier.get(&e).cloned().unwrap_or_default()
-                                        });
-                                        grant.with_value(|g| g(plan));
+                                        let plan = plan_grant_missing(
+                                            &zone_id,
+                                            &recipients,
+                                            &me_now,
+                                            &held,
+                                            &GateRecords::default(),
+                                            history,
+                                            |e| earlier.get(&e).cloned().unwrap_or_default(),
+                                        );
+                                        grant.with_value(|g| g(plan.grants));
                                     });
                                 })))
                             >{move || format!("Grant to members missing it ({})", missing().len())}</button>

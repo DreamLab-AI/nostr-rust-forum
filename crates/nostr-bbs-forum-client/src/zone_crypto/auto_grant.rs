@@ -203,6 +203,53 @@ pub fn plan_missing(
     out
 }
 
+/// What one of the Encryption tab's key actions (Create, Rotate, "Grant to
+/// members missing it") will do: the grants to send now, and the members it
+/// holds back.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TabPlan {
+    /// `(key, recipients)` pairs to send now.
+    pub grants: Vec<(ZoneKey, Vec<String>)>,
+    /// `(zone, pubkey)` pairs held for an explicit admin approval.
+    pub pending: Vec<(String, String)>,
+    /// `(zone, pubkey)` pairs not sent because the zone's record was not read.
+    pub unverified: Vec<(String, String)>,
+}
+
+/// The grants of a newly created or rotated `key` for the zone `rule`, to the
+/// members of the roster `members`.
+pub fn plan_new_key(
+    rule: &ZoneRule,
+    members: &[(String, Vec<String>)],
+    me: &str,
+    key: &ZoneKey,
+    _gate: &GateRecords,
+) -> TabPlan {
+    let targets = grant_targets(members, &rule.required_cohorts, me, rule.agent_keys);
+    TabPlan {
+        grants: vec![(key.clone(), targets)],
+        ..TabPlan::default()
+    }
+}
+
+/// The grants "Grant to members missing it" sends for `zone`: the held keys
+/// to `missing` (with earlier epochs when `include_history`, skipping
+/// members `earlier(epoch)` records as already sent).
+pub fn plan_grant_missing(
+    _zone: &str,
+    missing: &[String],
+    _me: &str,
+    held: &[ZoneKey],
+    _gate: &GateRecords,
+    include_history: bool,
+    earlier: impl Fn(u32) -> HashSet<String>,
+) -> TabPlan {
+    TabPlan {
+        grants: grant_plan(held, missing, include_history, earlier),
+        ..TabPlan::default()
+    }
+}
+
 /// What this device's own records allow the first-grant gate to treat as
 /// known, per zone, before [`plan_missing`] splits the owed grants.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
