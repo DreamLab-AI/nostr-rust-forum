@@ -1,33 +1,24 @@
-//! Retro ASCII/BBS terminal client for the nostr-rust-forum kit.
+//! Modern retro ASCII/BBS terminal client for the nostr-rust-forum kit.
 //!
-//! A Leptos CSR/WASM app served at `/community/bbs/` and driven entirely by
-//! `forum.toml` (projected to `window.__ENV__`). It is a faithful BBS *face*
-//! over the kit's real infrastructure — config-driven zones, did:nostr identity,
-//! Solid pods (via `solid-pod-rs`), and the agent-governance control-panel plane
-//! (`nostr_bbs_core::governance`) — not a standalone reimplementation.
-//!
-//! Pure logic (`config`, `theme`, `menu`, `agent`, `identity`) is unit-tested on
-//! the native target; `chrome`, `screens`, and `app` render the Leptos UI.
+//! A responsive Leptos CSR/WASM application served at `/community/bbs/` that
+//! shares the headless [`nostr_bbs_client_core`] engine with the main forum
+//! client (zero drift across auth, relay, encrypted zones, governance, DMs,
+//! Kanban, Calendar, Colloquy, Poker, and Sidestr wallets) while presenting a
+//! retro phosphor TUI aesthetic tuned for both desktop keyboards and mobile
+//! phone surfaces.
 
-pub mod agent;
 pub mod ascii_img;
-pub mod chrome;
+pub mod components;
 pub mod config;
-pub mod dm;
 pub mod identity;
-pub mod menu;
-pub mod nip07;
-pub mod notifications;
-pub mod outbox;
-pub mod passkey;
 pub mod pod;
+pub mod prefs;
 pub mod pwa;
-pub mod relay;
-pub mod screens;
-pub mod search;
-pub mod signer;
+pub mod router;
+pub mod shell;
 pub mod theme;
 pub mod upload;
+pub mod views;
 
 mod app;
 pub use app::App;

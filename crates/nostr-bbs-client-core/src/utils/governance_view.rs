@@ -1,0 +1,1841 @@
+//! Pure view logic for the Agent Control Surface decision card (PRD
+//! *Augmentation Conditions* FR2, FR4, FR6; ADR-2011).
+//!
+//! Everything in this module is a total function over plain data. Nothing here
+//! touches `web_sys`, `js_sys` or a Leptos signal, so the rules that decide
+//! **what a reviewer is shown and when they are allowed to act** are unit-tested
+//! on the host target rather than asserted by eye in a WASM bundle. The Leptos
+//! components behind `pages::GovernancePage` are a rendering shell over
+//! these functions: they choose no ordering, no gate and no label of their own.
+//!
+//! The rules, and the invariants they discharge (DDD §6):
+//!
+//! - **Invariant 1 — no fabricated judgement.** [`decision_content`] writes the
+//!   reviewer's typed text and nothing else. There is no template anywhere in
+//!   this crate; an empty rationale publishes an empty `reasoning`.
+//! - **Invariant 3 — effective tier is authoritative.** [`compute_boundary`]
+//!   mirrors the relay's `plan_request_boundary` in everything **except
+//!   calibration selection**: the tier, the merged triple and the probe
+//!   recognition are computed here from the same `nostr-bbs-core` functions
+//!   over the same inputs, so both sides necessarily agree, while whether a
+//!   case is a calibration sample is **relay-authoritative** and passed in.
+//!   Selection is now `HMAC-SHA256(selection_key, request_id)` under a secret
+//!   only the relay holds, precisely so the requesting agent — which chooses
+//!   its own `d` tag — cannot grind its way out of being sampled. A client
+//!   that recomputed it would need that key, and a key in a WASM bundle is a
+//!   published key.
+//! - **Invariant 6 — delegation is scoped.** [`is_decidable_by`] admits a
+//!   non-admin only for the one case an admin delegated to them.
+//! - **Invariant 7 — probes are blind until decided.** [`visible_probe`] is the
+//!   only path by which a probe digest may reach the DOM, and it yields `None`
+//!   for every undecided case.
+
+use nostr_bbs_core::governance::{
+    self, broker::DecisionOutcome, PanelPolicy, RiskTier, TaskProperties,
+};
+use nostr_bbs_core::ontology_governance::{PANEL_ONTOLOGY_GOVERNANCE, TAG_CONTEXT_URL};
+
+// ── Rationale gate (FR2.2, EXP-AC-002) ──────────────────────────────────────
+
+/// Minimum trimmed rationale length before a `high`/`critical` case may be
+/// decided (PRD FR2.2).
+pub const MIN_RATIONALE_LEN: usize = 20;
+
+/// Whether the effective tier makes a typed rationale mandatory.
+///
+/// `high` and `critical` only. A `low`/`medium` case still *collects* a
+/// rationale — it simply does not withhold the controls for one.
+pub fn rationale_required(effective: RiskTier) -> bool {
+    matches!(effective, RiskTier::High | RiskTier::Critical)
+}
+
+/// Whether the reviewer's controls (Approve / Reject / Amend / Delegate) are
+/// enabled for this tier and this rationale text.
+///
+/// The length test is on the **trimmed** text so a reviewer cannot satisfy a
+/// `critical` gate with twenty spaces; what gets published is the untrimmed
+/// text ([`decision_content`]), because the reviewer's bytes are the record.
+pub fn rationale_satisfied(effective: RiskTier, typed: &str) -> bool {
+    !rationale_required(effective) || typed.trim().chars().count() >= MIN_RATIONALE_LEN
+}
+
+/// Characters still needed before a mandatory rationale satisfies the gate.
+/// `0` when the gate is already satisfied or does not apply.
+pub fn rationale_remaining(effective: RiskTier, typed: &str) -> usize {
+    if !rationale_required(effective) {
+        return 0;
+    }
+    MIN_RATIONALE_LEN.saturating_sub(typed.trim().chars().count())
+}
+
+/// The signed 31403 content for a decision.
+///
+/// The outcome is serialised by `nostr-bbs-core` (internally tagged on
+/// `action`), then the reviewer's text is attached **verbatim and untrimmed**
+/// as `reasoning`. DDD §6 invariant 1: this function has no fallback, no
+/// template and no default — if the reviewer typed nothing, `reasoning` is the
+/// empty string, which is the honest record of "they gave no reason".
+pub fn decision_content(outcome: &DecisionOutcome, typed_rationale: &str) -> String {
+    let mut value = serde_json::to_value(outcome)
+        .unwrap_or_else(|_| serde_json::json!({ "action": outcome.action_str() }));
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "reasoning".to_string(),
+            serde_json::Value::String(typed_rationale.to_string()),
+        );
+    }
+    governance::canonical_json_string(&value)
+}
+
+// ── Panel resolution + boundary (FR3.2, invariant 3) ────────────────────────
+
+/// How a 31402 names the 31400 whose operator declaration governs it.
+///
+/// Mirrors the relay's `resolve_panel_tags` resolution order exactly, so the
+/// client and the relay agree on which panel bounds a request: the NIP-33 `a`
+/// tag, then a plain `panel` tag naming the `d`, then the most recent panel the
+/// same agent published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PanelRef {
+    /// `a` = `31400:<pubkey>:<d>`.
+    Addressed { pubkey: String, d_tag: String },
+    /// `panel` = `<d>`, on the requesting agent's own panels.
+    Named { pubkey: String, d_tag: String },
+    /// Neither tag: the newest panel published by the requesting agent.
+    LatestFromAgent { pubkey: String },
+}
+
+/// Resolve the panel a request belongs to from its tags.
+pub fn resolve_panel_ref(request_tags: &[Vec<String>], request_pubkey: &str) -> PanelRef {
+    if let Some(a) = governance::extract_tag(request_tags, "a") {
+        let mut parts = a.splitn(3, ':');
+        if let (Some(kind), Some(pubkey), Some(d)) = (parts.next(), parts.next(), parts.next()) {
+            if kind.parse::<u64>().ok() == Some(governance::KIND_PANEL_DEFINITION) {
+                return PanelRef::Addressed {
+                    pubkey: pubkey.to_string(),
+                    d_tag: d.to_string(),
+                };
+            }
+        }
+    }
+    if let Some(d) = governance::extract_tag(request_tags, "panel") {
+        return PanelRef::Named {
+            pubkey: request_pubkey.to_string(),
+            d_tag: d.to_string(),
+        };
+    }
+    PanelRef::LatestFromAgent {
+        pubkey: request_pubkey.to_string(),
+    }
+}
+
+/// The operator declaration a panel contributes to a request's boundary.
+///
+/// A panel publisher may carry the triple and the policy either on the 31400's
+/// **tags** (what agentbox stamps and what the relay reads) or inside the
+/// `PanelDefinition` **content** (what this client's own types carry). Reading
+/// both means neither publisher has to change to be understood; tags win where
+/// both are present, matching the relay.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PanelContext {
+    pub task_properties: Option<TaskProperties>,
+    pub policy: PanelPolicy,
+}
+
+impl PanelContext {
+    /// Build the context from a 31400's tags and its parsed definition.
+    pub fn from_panel(
+        tags: &[Vec<String>],
+        definition: Option<&governance::PanelDefinition>,
+    ) -> Self {
+        let from_tags = TaskProperties::from_tags(tags);
+        let from_content = definition.and_then(|d| d.task_properties);
+        // Tag declaration wins; where only the content declares, use it. Where
+        // both do, they are merged tightening-only rather than one silently
+        // overriding the other — two declarations by the same operator can only
+        // raise the boundary between them.
+        let task_properties = match (from_tags, from_content) {
+            (Some(t), Some(c)) => Some(TaskProperties::merge(t, c)),
+            (Some(t), None) => Some(t),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+        // A tag-declared policy wins for the same reason; otherwise the
+        // definition's own optional fields, each falling back independently.
+        let tag_policy = PanelPolicy::from_tags(tags);
+        let policy = if tags_declare_policy(tags) {
+            tag_policy
+        } else {
+            definition.map(|d| d.policy()).unwrap_or_default()
+        };
+        Self {
+            task_properties,
+            policy,
+        }
+    }
+}
+
+fn tags_declare_policy(tags: &[Vec<String>]) -> bool {
+    [
+        governance::TAG_CALIBRATION_SAMPLE_RATE,
+        governance::TAG_MAX_PENDING_HOURS,
+        governance::TAG_PROBE_AGENT,
+    ]
+    .iter()
+    .any(|t| governance::extract_tag(tags, t).is_some())
+}
+
+/// The whole boundary for one 31402, as the client sees it.
+///
+/// Field-for-field the relay's `RequestBoundary`. The client computes it from
+/// the signed events with the same pure `nostr-bbs-core::effective_tier`, then
+/// [`CaseBoundary::with_relay_tier`] replaces the tier with the relay's stored
+/// `broker_cases.effective_tier` wherever the authenticated case projection
+/// carries one, because the relay folds in rules (the ADR-2013 ontology floor)
+/// that the client does not compute.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseBoundary {
+    /// The agent's own declaration. Telemetry only — never used for gating.
+    pub declared: Option<RiskTier>,
+    /// The tier that governs the case. The only tier rendered or gated on.
+    pub effective: RiskTier,
+    /// The merged operator/agent triple, where anything was declared.
+    pub props: Option<TaskProperties>,
+    /// Deterministically selected to be shown despite being suppressible.
+    pub calibration_sample: bool,
+    /// The seeded-probe digest, honoured only from the panel's probe agent.
+    /// Holding it is not rendering it — see [`visible_probe`].
+    pub probe_digest: Option<String>,
+    /// Hours past which the case is escalated on age.
+    pub max_pending_hours: u32,
+}
+
+/// Compute a request's boundary (ADR-2011 §2).
+///
+/// `calibration_sample` is **not computed here**. Selection is
+/// `HMAC-SHA256(selection_key, request_id)` under a relay-held secret, because
+/// the request id is the 31402's `d` tag and a NIP-33 publisher chooses that
+/// freely: unkeyed selection let the requesting agent grind `d` tags offline
+/// until it found one sampling never picks, opting itself out of the very
+/// oversight FR6.3 exists to impose. The client has no key, must not have one,
+/// and so takes the flag from the relay's own projection of the case
+/// (`broker_cases.calibration_sample`, served by
+/// `GET /api/governance/cases`). Unknown — a legacy case, a logged-out viewer,
+/// or a projection not yet fetched — is `false`: a case is shown as a
+/// calibration sample only when the relay says it is one, and otherwise falls
+/// back to plain effective-tier suppression.
+pub fn compute_boundary(
+    request_pubkey: &str,
+    request_tags: &[Vec<String>],
+    request: &governance::ActionRequest,
+    panel: Option<&PanelContext>,
+    advertised_default: RiskTier,
+    calibration_sample: bool,
+) -> CaseBoundary {
+    let panel_props = panel.and_then(|p| p.task_properties);
+    // The triple may ride tags (agentbox) or the request body (this client).
+    let request_props = TaskProperties::from_tags(request_tags).or(request.task_properties);
+    let merged = TaskProperties::merge_opt(panel_props.as_ref(), request_props.as_ref());
+    let declared = governance::extract_tag(request_tags, "risk-tier")
+        .map(RiskTier::parse)
+        .or(request.risk_tier);
+    let effective = governance::effective_tier(
+        panel_props.as_ref(),
+        request_props.as_ref(),
+        declared,
+        advertised_default,
+    );
+
+    let policy = panel.map(|p| p.policy.clone()).unwrap_or_default();
+
+    // A `probe` tag is honoured ONLY from the panel's registered probe agent
+    // (FR6.4); from anyone else it is noise that would corrupt the catch rate.
+    let probe_digest = governance::extract_tag(request_tags, governance::TAG_PROBE)
+        .map(str::to_string)
+        .or_else(|| request.probe.clone())
+        .filter(|_| policy.is_probe_agent(request_pubkey));
+
+    CaseBoundary {
+        declared,
+        effective,
+        props: merged,
+        calibration_sample,
+        probe_digest,
+        max_pending_hours: policy.max_pending_hours,
+    }
+}
+
+impl CaseBoundary {
+    /// Adopt the relay's stored `broker_cases.effective_tier` (ADR-2011 §3,
+    /// PRD FR3.2: "the client reads only the effective tier").
+    ///
+    /// The relay computes the boundary once, at projection, and folds in rules
+    /// this client does not see — the ADR-2013 ontology `level` floor among
+    /// them — so where the relay has spoken its tier governs the card. Where it
+    /// has not (a logged-out viewer, a case outside the projection page, a
+    /// case projected before migration 0006) the client keeps the tier it
+    /// computed from the same signed events. An unrecognised value is ignored
+    /// rather than parsed, because `RiskTier::parse` maps anything unknown to
+    /// `Medium` and a garbled column must not loosen a high case.
+    pub fn with_relay_tier(mut self, relay_tier: Option<&str>) -> Self {
+        if let Some(tier) = relay_tier
+            .map(RiskTier::parse)
+            .filter(|t| Some(t.as_str()) == relay_tier)
+        {
+            self.effective = tier;
+        }
+        self
+    }
+
+    /// Whether the member surface shows this case (FR3.2, FR6.3).
+    ///
+    /// Reads the **effective** tier, never `declared`. A calibration sample is
+    /// shown by construction: it exists precisely to be seen.
+    pub fn is_member_visible(&self) -> bool {
+        !governance::is_member_suppressed_effective(
+            self.props.as_ref(),
+            self.effective,
+            self.calibration_sample,
+        )
+    }
+}
+
+// ── Probe blindness (FR6.4, invariant 7) ────────────────────────────────────
+
+/// The probe digest as it may be rendered for a case.
+///
+/// DDD §6 invariant 7: a reviewer who can see that a request is a seeded probe
+/// is not being tested, they are being told the answer. The digest is withheld
+/// from every undecided case and revealed once a 31403 exists, at which point
+/// it is audit evidence rather than a hint.
+///
+/// The raw signed 31402 still carries the tag — stripping it would invalidate
+/// the signature this client verifies strictly — so blindness is this client's
+/// job, and this function is the only place the client may take it.
+pub fn visible_probe(decided: bool, probe_digest: Option<&str>) -> Option<&str> {
+    probe_digest.filter(|_| decided)
+}
+
+// ── Ageing (FR4.3) ──────────────────────────────────────────────────────────
+
+/// A coarse relative age label for a pending case, from the case's `created_at`
+/// (or the relay's `accepted_at` where a caller has one) and the current time.
+///
+/// Pure over both timestamps so the label is testable; the caller supplies
+/// `now`. A `created_at` in the future (clock skew between the publishing agent
+/// and this browser) reads as "just now" rather than a negative age.
+pub fn relative_age_label(created_at: u64, now: u64) -> String {
+    if created_at == 0 {
+        return "age unknown".to_string();
+    }
+    let secs = now.saturating_sub(created_at);
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    if secs < 3600 {
+        return format!("{}m old", secs / 60);
+    }
+    if secs < 86_400 {
+        return format!("{}h old", secs / 3600);
+    }
+    format!("{}d old", secs / 86_400)
+}
+
+/// Whether a still-pending case has passed the panel's `max_pending_hours`.
+///
+/// This is the client's own reading of the clock, shown so a member without an
+/// authenticated receipts read still sees a stalled case as stalled. It is
+/// advisory: the authoritative statement is the relay's `escalated-on-age`
+/// receipt ([`crate::stores::receipts`]), which is what the badge cites when it
+/// is available.
+pub fn is_overdue(created_at: u64, now: u64, max_pending_hours: u32) -> bool {
+    if created_at == 0 || max_pending_hours == 0 {
+        return false;
+    }
+    now.saturating_sub(created_at) >= (max_pending_hours as u64) * 3600
+}
+
+// ── Delegation (FR6.2, invariant 6) ─────────────────────────────────────────
+
+/// A 64-character lowercase hex pubkey, or `None`.
+///
+/// The Delegate control will not publish anything else: a mistyped target would
+/// mint a delegation to a pubkey nobody holds, which the relay would accept as
+/// a well-formed 31403 and which would park the case in `Delegated` with no
+/// delegatee able to move it.
+pub fn normalise_delegate_pubkey(input: &str) -> Option<String> {
+    let t = input.trim();
+    (t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())).then(|| t.to_ascii_lowercase())
+}
+
+/// One observed decision, reduced to what the view rules need.
+///
+/// Mirrors `stores::panel_registry::DecisionEntry` but owns no store types, so
+/// the delegation and decided-ness rules are testable in isolation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainStep {
+    pub event_id: String,
+    pub signer_pubkey: String,
+    pub outcome: String,
+    /// `Delegate { delegate_to }`'s target, where the outcome was a delegation.
+    pub delegate_to: Option<String>,
+    pub superseded: bool,
+    pub effective: bool,
+}
+
+/// Whether a case has reached a decision — used both to reveal a probe and to
+/// stop offering controls on a closed case.
+///
+/// A delegation is *not* a decision: it hands the case to someone else, and the
+/// case stays open until that delegatee decides it. Only a non-superseded,
+/// non-delegation outcome closes a case.
+pub fn chain_is_decided(chain: &[ChainStep]) -> bool {
+    chain
+        .iter()
+        .any(|s| !s.superseded && s.outcome != "delegate")
+}
+
+/// Whether a case has left the inbox for the archive: it is decided, or a
+/// panel-level "Acknowledge all alerts" has dismissed it. A delegated case is
+/// neither (see [`chain_is_decided`]) and stays in the inbox for its delegatee.
+pub fn is_settled(decided: bool, acknowledged: bool) -> bool {
+    decided || acknowledged
+}
+
+/// The pubkey an admin delegated this case to, if the delegation still stands.
+///
+/// Only the *effective* (non-superseded) delegation counts: an admin who
+/// supersedes their own delegation has withdrawn it, and the delegatee loses
+/// the case with it.
+pub fn delegated_to(chain: &[ChainStep]) -> Option<&str> {
+    chain
+        .iter()
+        .rev()
+        .find(|s| !s.superseded && s.outcome == "delegate")
+        .and_then(|s| s.delegate_to.as_deref())
+}
+
+/// Whether `viewer` may publish a 31403 on this case from this client.
+///
+/// Admins always may. A non-admin may only when an admin's standing delegation
+/// names them — invariant 6, "a delegatee may decide only the delegated case".
+/// Nobody may decide a case that already carries an effective decision; the
+/// supersession path is a separate, admin-only affordance.
+///
+/// This is a *view* gate mirroring the relay's admission gate, not a
+/// replacement for it: the relay rejects an unauthorised 31403 regardless. Its
+/// job is that a reviewer is shown the controls exactly when using them will
+/// work.
+pub fn is_decidable_by(chain: &[ChainStep], viewer_pubkey: Option<&str>, is_admin: bool) -> bool {
+    if chain_is_decided(chain) {
+        return false;
+    }
+    let Some(viewer) = viewer_pubkey else {
+        return false;
+    };
+    if is_admin {
+        return true;
+    }
+    delegated_to(chain).is_some_and(|d| d.eq_ignore_ascii_case(viewer))
+}
+
+// ── Ontology cases (ADR-2013) ───────────────────────────────────────────────
+
+/// Which decision buttons a writable card offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionControls {
+    /// Approve / Reject — every case that is not a decidable ontology case.
+    ApproveReject,
+    /// Promote / Demote / Reject on an `ontology-governance` case, carrying the
+    /// subject IRI the signed `promote`/`demote` must name.
+    PromoteDemote { iri: String },
+}
+
+/// Whether a 31402 belongs to the `ontology-governance` panel.
+///
+/// Read from the request's own `a`/`panel` tag, or — for a request that names
+/// neither — from the `d` of the panel the registry resolved it to.
+pub fn is_ontology_case(request_tags: &[Vec<String>], resolved_panel_d_tag: Option<&str>) -> bool {
+    let named = match resolve_panel_ref(request_tags, "") {
+        PanelRef::Addressed { d_tag, .. } | PanelRef::Named { d_tag, .. } => Some(d_tag),
+        PanelRef::LatestFromAgent { .. } => None,
+    };
+    named.as_deref() == Some(PANEL_ONTOLOGY_GOVERNANCE)
+        || resolved_panel_d_tag == Some(PANEL_ONTOLOGY_GOVERNANCE)
+}
+
+/// The subject IRI an ontology case's `promote`/`demote` must sign.
+///
+/// The request's own `iri` field first — that is the profile's subject. The
+/// `context_url` tag is a fallback only when it is a `urn:` IRI: the tag is
+/// also a reviewer link, and an `https://` page is not a corpus subject. A
+/// blank value, or one carrying a control character, is no IRI at all; it is
+/// otherwise passed through byte for byte, because the applier matches it
+/// against the corpus exactly. `None` for a non-ontology case.
+pub fn ontology_subject_iri(
+    request_tags: &[Vec<String>],
+    fields: &serde_json::Value,
+    resolved_panel_d_tag: Option<&str>,
+) -> Option<String> {
+    if !is_ontology_case(request_tags, resolved_panel_d_tag) {
+        return None;
+    }
+    let usable = |s: &&str| !s.trim().is_empty() && !s.chars().any(char::is_control);
+    fields
+        .get("iri")
+        .and_then(|v| v.as_str())
+        .filter(usable)
+        .or_else(|| {
+            governance::extract_tag(request_tags, TAG_CONTEXT_URL)
+                .filter(usable)
+                .filter(|s| s.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("urn:")))
+        })
+        .map(str::to_string)
+}
+
+/// The decision buttons for a card. An ontology case with no recoverable IRI
+/// keeps Approve / Reject: a subjectless `promote` is refused by the relay, and
+/// inventing a subject would write to the wrong page.
+pub fn decision_controls(
+    request_tags: &[Vec<String>],
+    fields: &serde_json::Value,
+    resolved_panel_d_tag: Option<&str>,
+) -> DecisionControls {
+    match ontology_subject_iri(request_tags, fields, resolved_panel_d_tag) {
+        Some(iri) => DecisionControls::PromoteDemote { iri },
+        None => DecisionControls::ApproveReject,
+    }
+}
+
+// ── Panel-level acknowledgement ─────────────────────────────────────────────
+
+/// The panel action that acknowledges every open alert at once. Mirrors the
+/// dream engine's `ACK_ALERTS_ACTION`; its planner dismisses each open alert
+/// published at or before the acknowledging 31403's `created_at`.
+pub const ACK_ALERTS_ACTION: &str = "acknowledge-alerts";
+
+/// Whether a request is an alert, read from the engine's `fields.kind`.
+pub fn is_alert_request(fields: &serde_json::Value) -> bool {
+    fields.get("kind").and_then(|k| k.as_str()) == Some("alert")
+}
+
+/// The panel a card resolved to, reduced to what binds a panel-level 31403.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelTarget<'a> {
+    pub agent_pubkey: &'a str,
+    pub d_tag: &'a str,
+    /// The 31400 event currently held for that panel address.
+    pub event_id: &'a str,
+}
+
+/// One 31403 filed under a panel's `d` tag, reduced to what the rule needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelDecision {
+    pub d_tag: String,
+    pub event_id: String,
+    pub signer_pubkey: String,
+    /// The raw `action` string from the content (panel actions are not
+    /// `DecisionOutcome`s, so the parsed outcome cannot carry them).
+    pub action: String,
+    pub created_at: u64,
+    /// Its plain `e` tag: the panel definition event the button was on.
+    pub bound_event_id: Option<String>,
+    /// Its `a` tag, `31400:<pubkey>:<d>`, which survives a panel republish.
+    pub bound_address: Option<String>,
+}
+
+/// The panel-level decision that acknowledged a card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelAck {
+    pub event_id: String,
+    pub signer_pubkey: String,
+    pub created_at: u64,
+}
+
+/// Whether a panel-level 31403 acknowledges this alert card, and by whom.
+///
+/// Every condition must hold:
+/// - the card is an alert;
+/// - the card resolved to a panel owned by the card's own agent;
+/// - the decision is filed under that panel's `d` **and bound to that panel**
+///   — its `e` names the panel event held, or its `a` names the panel's
+///   address. `d` alone is chosen by the publisher, so a stranger's 31400 on
+///   a colliding `d` would otherwise borrow (or lend) the acknowledgement;
+/// - the content's action is [`ACK_ALERTS_ACTION`];
+/// - the signer is an admin by `is_admin` and is **never** the agent (no
+///   self-review, whatever the agent's own role);
+/// - the card was published at or before the decision.
+///
+/// Where several qualify, the earliest is returned: it is the one that
+/// dismissed the alert in the engine.
+///
+/// This does not make the case *decided* in the chain sense, so it reveals no
+/// probe ([`visible_probe`] still reads only the case's own chain) and it
+/// grants nobody the controls: it only withdraws them.
+pub fn panel_acknowledgement(
+    card_agent_pubkey: &str,
+    card_created_at: u64,
+    card_is_alert: bool,
+    panel: Option<&PanelTarget<'_>>,
+    decisions: &[PanelDecision],
+    is_admin: impl Fn(&str) -> bool,
+) -> Option<PanelAck> {
+    if !card_is_alert {
+        return None;
+    }
+    let panel = panel?;
+    if !panel.agent_pubkey.eq_ignore_ascii_case(card_agent_pubkey) {
+        return None;
+    }
+    let bound_to_panel = |d: &PanelDecision| {
+        d.bound_event_id.as_deref() == Some(panel.event_id)
+            || d.bound_address.as_deref().is_some_and(|a| {
+                let mut parts = a.splitn(3, ':');
+                matches!(
+                    (parts.next(), parts.next(), parts.next()),
+                    (Some(kind), Some(pk), Some(dt))
+                        if kind.parse::<u64>().ok() == Some(governance::KIND_PANEL_DEFINITION)
+                            && pk.eq_ignore_ascii_case(panel.agent_pubkey)
+                            && dt == panel.d_tag
+                )
+            })
+    };
+    decisions
+        .iter()
+        .filter(|d| d.d_tag == panel.d_tag)
+        .filter(|d| d.action == ACK_ALERTS_ACTION)
+        .filter(|d| !d.signer_pubkey.eq_ignore_ascii_case(card_agent_pubkey))
+        .filter(|d| card_created_at <= d.created_at)
+        .filter(|d| bound_to_panel(d))
+        .filter(|d| is_admin(&d.signer_pubkey))
+        .min_by(|a, b| (a.created_at, &a.event_id).cmp(&(b.created_at, &b.event_id)))
+        .map(|d| PanelAck {
+            event_id: d.event_id.clone(),
+            signer_pubkey: d.signer_pubkey.clone(),
+            created_at: d.created_at,
+        })
+}
+
+// ── Card section order (FR2.1, EXP-AC-002) ──────────────────────────────────
+
+/// One rendered region of a decision card, in the order it appears.
+///
+/// The ordering rule is the whole point of FR2.1 and is a *counter-example* in
+/// EXP-AC-002 ("Tier/confidence rendered above the controls"): the reviewer
+/// must meet the proposal and form a judgement before they meet the agent's
+/// framing of it. Making the order data means the rule is asserted by a test
+/// instead of by reading a `view!` macro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardSection {
+    /// Title, requesting agent, ageing badges, calibration marker.
+    Header,
+    /// The agent's own `reasoning` prose, verbatim.
+    AgentReasoning,
+    /// `ActionRequest.fields`, pretty-printed in full.
+    Proposal,
+    /// `ActionRequest.context_url` as a link.
+    ContextLink,
+    /// Rationale textarea + Approve / Reject / Amend / Delegate.
+    ReviewerControls,
+    /// The agent's declared tier, its confidence, and the effective tier.
+    AgentFraming,
+    /// Receipt-stage decision chain.
+    DecisionChain,
+}
+
+/// The section order for a decision card.
+///
+/// `ReviewerControls` precedes `AgentFraming` unconditionally. `ContextLink` is
+/// omitted where the request carried no `context_url`, and `AgentReasoning`
+/// where the agent wrote none — absence renders as absence (PRD NFR), never as
+/// an empty box or a stand-in.
+pub fn card_sections(has_context_url: bool, has_agent_reasoning: bool) -> Vec<CardSection> {
+    let mut v = vec![CardSection::Header];
+    if has_agent_reasoning {
+        v.push(CardSection::AgentReasoning);
+    }
+    v.push(CardSection::Proposal);
+    if has_context_url {
+        v.push(CardSection::ContextLink);
+    }
+    v.push(CardSection::ReviewerControls);
+    v.push(CardSection::AgentFraming);
+    v.push(CardSection::DecisionChain);
+    v
+}
+
+/// Pretty-print `ActionRequest.fields` for display, in full and untruncated.
+///
+/// EXP-AC-002 scopes "`fields` of arbitrary JSON shape rendered (pretty-printed)
+/// without truncation" — the reviewer is judging this payload, so eliding any
+/// of it reintroduces exactly the vacuous verification the PRD is about. The
+/// card scrolls; the text does not shorten. A `fields` that is a bare string
+/// prints as that string rather than as a quoted JSON scalar.
+pub fn pretty_fields(fields: &serde_json::Value) -> String {
+    match fields {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// The `context_url` of a request, as it may safely be bound into an `href`.
+///
+/// `ActionRequest.context_url` is **attacker-controlled**: the governance
+/// subscription carries no `authors` filter, so any event the relay delivers on
+/// kinds 31400–31405 lands in the panel registry, and a `javascript:` or
+/// `data:` URI bound into an anchor is stored XSS against every reviewer —
+/// including the admins whose keys decide cases. Leptos escapes the attribute
+/// value but does not restrict the scheme, and `target="_blank"` does not make
+/// a `javascript:` URI inert.
+///
+/// So only `http://` and `https://` survive, the scheme matched
+/// case-insensitively (`JaVaScRiPt:` is a scheme too), and any string carrying
+/// an ASCII control character is rejected outright rather than trimmed —
+/// browsers strip embedded tabs and newlines before resolving a scheme, so
+/// `java\tscript:alert(1)` is a `javascript:` URI wearing a disguise, and the
+/// honest answer to a URL with control characters in it is "no".
+///
+/// Applied at BOTH ends: the store never keeps an unsafe value, and the view
+/// re-checks before binding. Either alone would be enough; both means a future
+/// ingest path cannot reopen the sink.
+pub fn safe_context_url(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")).then(|| t.to_string())
+}
+
+/// Shorten an identifier for display without ever slicing mid-character.
+///
+/// A pubkey or event id from a hostile event is only guaranteed to be a string:
+/// the relay checks a 31403's signature, not that every field it carries is
+/// ASCII hex. Byte-slicing one at a fixed offset panics on a multi-byte
+/// boundary, and a panic in WASM aborts the whole reactive render — the entire
+/// forum goes blank. Character-slicing cannot ([`crate::utils::Abbrev::Id`]).
+pub fn short_id(id: &str) -> String {
+    crate::utils::Abbrev::Id.apply(id)
+}
+
+/// Whether there is a proposal to render at all.
+pub fn has_proposal(fields: &serde_json::Value) -> bool {
+    !matches!(fields, serde_json::Value::Null) && !pretty_fields(fields).is_empty()
+}
+
+/// The relay's advertised `ESCALATION_DEFAULT_TIER` as this client understands
+/// it: a runtime `window.__ENV__` override, else `RiskTier`'s own default —
+/// which is what an unconfigured relay also falls back to, so the two agree.
+#[cfg(target_arch = "wasm32")]
+pub fn advertised_default_tier() -> RiskTier {
+    crate::utils::relay_url::env_override("ESCALATION_DEFAULT_TIER")
+        .map(|v| RiskTier::parse(&v))
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn advertised_default_tier() -> RiskTier {
+    RiskTier::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_bbs_core::governance::{Reversibility, Stakes, Verifiability};
+
+    fn tag(k: &str, v: &str) -> Vec<String> {
+        vec![k.to_string(), v.to_string()]
+    }
+
+    fn request(fields: serde_json::Value) -> governance::ActionRequest {
+        governance::ActionRequest {
+            fields,
+            reasoning: None,
+            context_url: None,
+            risk_tier: None,
+            confidence: None,
+            task_properties: None,
+            probe: None,
+        }
+    }
+
+    fn step(id: &str, outcome: &str, to: Option<&str>, superseded: bool) -> ChainStep {
+        ChainStep {
+            event_id: id.into(),
+            signer_pubkey: "admin".into(),
+            outcome: outcome.into(),
+            delegate_to: to.map(str::to_string),
+            superseded,
+            effective: !superseded,
+        }
+    }
+
+    // ── Rationale gate ──────────────────────────────────────────────────
+
+    #[test]
+    fn low_and_medium_never_require_a_rationale() {
+        for tier in [RiskTier::Low, RiskTier::Medium] {
+            assert!(!rationale_required(tier));
+            assert!(rationale_satisfied(tier, ""));
+            assert_eq!(rationale_remaining(tier, ""), 0);
+        }
+    }
+
+    #[test]
+    fn high_and_critical_require_twenty_trimmed_characters() {
+        for tier in [RiskTier::High, RiskTier::Critical] {
+            assert!(rationale_required(tier));
+            assert!(!rationale_satisfied(tier, ""));
+            assert!(!rationale_satisfied(tier, "too short"));
+            // Nineteen characters is still short; twenty passes.
+            assert!(!rationale_satisfied(tier, &"x".repeat(19)));
+            assert!(rationale_satisfied(tier, &"x".repeat(20)));
+        }
+    }
+
+    #[test]
+    fn whitespace_does_not_satisfy_a_mandatory_rationale() {
+        // EXP-AC-002 counter-example: "Approve button enabled on a `critical`
+        // case with an empty rationale" — padding is empty.
+        assert!(!rationale_satisfied(RiskTier::Critical, &" ".repeat(50)));
+        assert_eq!(rationale_remaining(RiskTier::Critical, "   "), 20);
+    }
+
+    #[test]
+    fn rationale_remaining_counts_down_to_zero() {
+        assert_eq!(rationale_remaining(RiskTier::High, "abc"), 17);
+        assert_eq!(rationale_remaining(RiskTier::High, &"x".repeat(25)), 0);
+    }
+
+    // ── Verbatim reasoning ──────────────────────────────────────────────
+
+    #[test]
+    fn published_reasoning_is_the_typed_text_byte_for_byte() {
+        let typed = "  I checked the diff against the migration and it is reversible.\n\n— jj  ";
+        let content = decision_content(&DecisionOutcome::Approve, typed);
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["reasoning"].as_str().unwrap(), typed);
+        assert_eq!(v["action"].as_str().unwrap(), "approve");
+    }
+
+    #[test]
+    fn an_empty_rationale_publishes_an_empty_reasoning_not_a_template() {
+        // DDD §6 invariant 1. The removed template was
+        // `format!("Human {action} via governance UI")`; absence must render
+        // and publish as absence.
+        let content = decision_content(&DecisionOutcome::Reject, "");
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["reasoning"].as_str().unwrap(), "");
+        assert!(!content.contains("via governance UI"));
+        assert!(!content.to_lowercase().contains("human reject"));
+    }
+
+    #[test]
+    fn decision_content_round_trips_through_the_core_parser() {
+        for (outcome, detail) in [
+            (DecisionOutcome::Approve, None),
+            (DecisionOutcome::Reject, None),
+            (
+                DecisionOutcome::Amend {
+                    diff: "-a\n+b".into(),
+                },
+                Some("-a\n+b"),
+            ),
+            (
+                DecisionOutcome::Delegate {
+                    delegate_to: "f".repeat(64),
+                },
+                Some("f".repeat(64)).as_deref(),
+            ),
+        ] {
+            let content = decision_content(&outcome, "reviewed carefully enough");
+            let parsed = DecisionOutcome::from_response_content(&content)
+                .expect("core must parse what the client publishes");
+            assert_eq!(parsed, outcome);
+            assert_eq!(parsed.detail(), detail);
+        }
+    }
+
+    #[test]
+    fn no_decision_surface_carries_a_rationale_template() {
+        // EXP-AC-002: the string `"Human {action} via governance UI"` and any
+        // equivalent template no longer exist. Asserted over the sources that
+        // build a 31403 rather than left to a reviewer's grep, because a
+        // template is exactly the kind of thing that grows back.
+        //
+        // This module is excluded by construction: it names the removed
+        // template in prose so the next reader knows what was removed and why.
+        for (name, src) in [
+            (
+                "pages/governance.rs",
+                include_str!("../../../nostr-bbs-forum-client/src/pages/governance.rs"),
+            ),
+            (
+                "stores/panel_registry.rs",
+                include_str!("../stores/panel_registry.rs"),
+            ),
+            ("stores/receipts.rs", include_str!("../stores/receipts.rs")),
+        ] {
+            assert!(
+                !src.contains("via governance UI"),
+                "{name} still carries the fabricated rationale template"
+            );
+            // The shape, not just that one string: nothing there may build a
+            // `reasoning` value out of the action name.
+            assert!(
+                !src.contains("Human {"),
+                "{name} builds a rationale from the action name"
+            );
+        }
+    }
+
+    // ── Panel resolution ────────────────────────────────────────────────
+
+    #[test]
+    fn panel_ref_prefers_the_addressed_a_tag() {
+        let tags = vec![tag("a", "31400:aaa:panel-1"), tag("panel", "panel-2")];
+        assert_eq!(
+            resolve_panel_ref(&tags, "agent"),
+            PanelRef::Addressed {
+                pubkey: "aaa".into(),
+                d_tag: "panel-1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn panel_ref_ignores_an_a_tag_for_another_kind() {
+        let tags = vec![tag("a", "30023:aaa:article"), tag("panel", "panel-2")];
+        assert_eq!(
+            resolve_panel_ref(&tags, "agent"),
+            PanelRef::Named {
+                pubkey: "agent".into(),
+                d_tag: "panel-2".into()
+            }
+        );
+    }
+
+    #[test]
+    fn panel_ref_falls_back_to_the_agents_latest_panel() {
+        assert_eq!(
+            resolve_panel_ref(&[], "agent"),
+            PanelRef::LatestFromAgent {
+                pubkey: "agent".into()
+            }
+        );
+    }
+
+    // ── Boundary (invariant 3) ──────────────────────────────────────────
+
+    #[test]
+    fn an_unlabelled_request_folds_to_the_advertised_default() {
+        let b = compute_boundary(
+            "agent",
+            &[],
+            &request(serde_json::json!({})),
+            None,
+            RiskTier::Medium,
+            false,
+        );
+        assert_eq!(b.declared, None);
+        assert_eq!(b.effective, RiskTier::Medium);
+        assert_eq!(b.props, None);
+    }
+
+    #[test]
+    fn an_irreversible_panel_floors_a_low_declaring_agent_at_high() {
+        // The whole point of ADR-2011: the party with the strongest incentive
+        // to under-tier its own work cannot lower the boundary.
+        let panel = PanelContext {
+            task_properties: Some(TaskProperties::new(
+                Verifiability::Inspectable,
+                Reversibility::Irreversible,
+                Stakes::Bounded,
+            )),
+            policy: PanelPolicy::default(),
+        };
+        let mut req = request(serde_json::json!({"drop": "table"}));
+        req.risk_tier = Some(RiskTier::Low);
+        let b = compute_boundary("agent", &[], &req, Some(&panel), RiskTier::Low, false);
+        assert_eq!(b.declared, Some(RiskTier::Low));
+        assert_eq!(b.effective, RiskTier::High);
+        // And the effective tier — not the declaration — drives the gate.
+        assert!(rationale_required(b.effective));
+        assert!(b.is_member_visible());
+    }
+
+    #[test]
+    fn a_request_may_tighten_but_never_loosen_the_panel() {
+        let panel = PanelContext {
+            task_properties: Some(TaskProperties::new(
+                Verifiability::Opaque,
+                Reversibility::Compensable,
+                Stakes::Significant,
+            )),
+            policy: PanelPolicy::default(),
+        };
+        // The agent claims the loosest triple on every leg.
+        let tags = vec![
+            tag("tp-verifiability", "inspectable"),
+            tag("tp-reversibility", "reversible"),
+            tag("tp-stakes", "bounded"),
+        ];
+        let b = compute_boundary(
+            "agent",
+            &tags,
+            &request(serde_json::json!({})),
+            Some(&panel),
+            RiskTier::Low,
+            false,
+        );
+        let props = b.props.expect("a declared triple survives");
+        assert_eq!(props.verifiability, Verifiability::Opaque);
+        assert_eq!(props.reversibility, Reversibility::Compensable);
+        assert_eq!(props.stakes, Stakes::Significant);
+    }
+
+    #[test]
+    fn a_tag_declared_risk_tier_is_read_like_the_relay_reads_it() {
+        let tags = vec![tag("risk-tier", "critical")];
+        let b = compute_boundary(
+            "agent",
+            &tags,
+            &request(serde_json::json!({})),
+            None,
+            RiskTier::Low,
+            false,
+        );
+        assert_eq!(b.effective, RiskTier::Critical);
+    }
+
+    #[test]
+    fn opaque_work_is_never_member_suppressed() {
+        let panel = PanelContext {
+            task_properties: Some(TaskProperties::new(
+                Verifiability::Opaque,
+                Reversibility::Reversible,
+                Stakes::Bounded,
+            )),
+            policy: PanelPolicy::default(),
+        };
+        let mut req = request(serde_json::json!({}));
+        req.risk_tier = Some(RiskTier::Low);
+        let b = compute_boundary("agent", &[], &req, Some(&panel), RiskTier::Low, false);
+        assert!(b.is_member_visible());
+    }
+
+    #[test]
+    fn a_plain_low_case_is_suppressed_unless_the_relay_says_it_is_a_sample() {
+        // FR6.3. The client does not decide this: selection is HMAC'd under a
+        // relay-held secret so the requesting agent cannot grind its
+        // freely-chosen `d` tag out of being sampled. The client reads the
+        // relay's answer and nothing else.
+        let mut req = request(serde_json::json!({}));
+        req.risk_tier = Some(RiskTier::Low);
+        let panel = PanelContext {
+            task_properties: None,
+            policy: PanelPolicy::default(),
+        };
+
+        // The relay said nothing: suppressed by effective tier, as before.
+        let b = compute_boundary("agent", &[], &req, Some(&panel), RiskTier::Low, false);
+        assert!(!b.calibration_sample);
+        assert!(!b.is_member_visible());
+
+        // The relay said yes: shown, whatever the tier says.
+        let b = compute_boundary("agent", &[], &req, Some(&panel), RiskTier::Low, true);
+        assert!(b.calibration_sample);
+        assert!(b.is_member_visible());
+    }
+
+    #[test]
+    fn a_legacy_case_the_relay_says_nothing_about_is_not_a_sample() {
+        // A case projected before migration 0006 carries no flag. Silence is
+        // not a claim: it falls back to plain effective-tier suppression rather
+        // than being shown as something the relay never said it was.
+        let mut low = request(serde_json::json!({}));
+        low.risk_tier = Some(RiskTier::Low);
+        let b = compute_boundary("agent", &[], &low, None, RiskTier::Low, false);
+        assert!(!b.calibration_sample);
+        assert!(!b.is_member_visible());
+
+        // And a legacy case that is NOT suppressible is still shown — absence
+        // of the flag suppresses nothing on its own.
+        let mut high = request(serde_json::json!({}));
+        high.risk_tier = Some(RiskTier::High);
+        let b = compute_boundary("agent", &[], &high, None, RiskTier::Low, false);
+        assert!(!b.calibration_sample);
+        assert!(b.is_member_visible());
+    }
+
+    #[test]
+    fn the_client_never_derives_the_calibration_flag_from_anything_it_holds() {
+        // The regression this guards: an agent chooses its own `d` tag, so any
+        // client-side selection function keyed on data the agent controls is
+        // grindable. The flag must depend ONLY on the relay's answer — the same
+        // inputs with the flag flipped must flip the result, and nothing else
+        // about the request may change it.
+        let panel = PanelContext {
+            task_properties: None,
+            policy: PanelPolicy {
+                calibration_sample_rate: 1.0,
+                max_pending_hours: 72,
+                probe_agent: None,
+            },
+        };
+        let mut req = request(serde_json::json!({}));
+        req.risk_tier = Some(RiskTier::Low);
+        // A panel rate of 1.0 would have sampled everything under the old
+        // unkeyed scheme; it now selects nothing on its own.
+        let b = compute_boundary("agent", &[], &req, Some(&panel), RiskTier::Low, false);
+        assert!(!b.calibration_sample);
+        // And no source in this crate calls the core selection function at
+        // all. The needle is assembled at runtime from two halves so this
+        // assertion does not match itself.
+        let needle = format!("{}{}", "governance::is_calibration", "_sample(");
+        for (name, src) in [
+            (
+                "utils/governance_view.rs",
+                include_str!("./governance_view.rs"),
+            ),
+            (
+                "stores/panel_registry.rs",
+                include_str!("../stores/panel_registry.rs"),
+            ),
+            (
+                "pages/governance.rs",
+                include_str!("../../../nostr-bbs-forum-client/src/pages/governance.rs"),
+            ),
+            (
+                "stores/case_projection.rs",
+                include_str!("../stores/case_projection.rs"),
+            ),
+        ] {
+            assert!(
+                !src.contains(&needle),
+                "{name} computes calibration selection; only the relay may"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_context_reads_the_triple_from_tags_or_from_content() {
+        let from_tags = PanelContext::from_panel(
+            &[
+                tag("tp-verifiability", "opaque"),
+                tag("max-pending-hours", "12"),
+            ],
+            None,
+        );
+        assert_eq!(
+            from_tags.task_properties.unwrap().verifiability,
+            Verifiability::Opaque
+        );
+        assert_eq!(from_tags.policy.max_pending_hours, 12);
+
+        // No tags at all: the policy is the documented default.
+        let bare = PanelContext::from_panel(&[], None);
+        assert!(bare.task_properties.is_none());
+        assert_eq!(
+            bare.policy.max_pending_hours,
+            governance::DEFAULT_MAX_PENDING_HOURS
+        );
+    }
+
+    // ── Probe blindness (invariant 7) ───────────────────────────────────
+
+    #[test]
+    fn a_probe_is_hidden_until_the_case_is_decided() {
+        // EXP-AC-006 counter-example: "Probe tag visible on a pending card".
+        assert_eq!(visible_probe(false, Some("deadbeef")), None);
+        assert_eq!(visible_probe(true, Some("deadbeef")), Some("deadbeef"));
+        assert_eq!(visible_probe(true, None), None);
+    }
+
+    #[test]
+    fn a_probe_tag_on_a_pending_fixture_event_never_reaches_the_view() {
+        // The fixture is a real 31402 carrying the tag, exactly as it arrives
+        // over REQ: the relay cannot strip it without invalidating the
+        // signature, so blindness is this client's job.
+        let probe_tags = vec![
+            tag("d", "case-probe-1"),
+            tag("probe", &"ab".repeat(32)),
+            tag("risk-tier", "low"),
+        ];
+        let probe_agent = "c".repeat(64);
+        let panel = PanelContext {
+            task_properties: None,
+            policy: PanelPolicy {
+                calibration_sample_rate: 0.0,
+                max_pending_hours: 72,
+                probe_agent: Some(probe_agent.clone()),
+            },
+        };
+        let b = compute_boundary(
+            &probe_agent,
+            &probe_tags,
+            &request(serde_json::json!({"x": 1})),
+            Some(&panel),
+            RiskTier::Low,
+            false,
+        );
+        // The digest is recognised (it is from the registered probe agent) …
+        assert_eq!(b.probe_digest.as_deref(), Some(&*"ab".repeat(32)));
+        // … and still not renderable while the case is undecided.
+        let chain: Vec<ChainStep> = Vec::new();
+        assert!(!chain_is_decided(&chain));
+        assert_eq!(
+            visible_probe(chain_is_decided(&chain), b.probe_digest.as_deref()),
+            None
+        );
+        // Once a 31403 exists it may be shown.
+        let decided = vec![step("dec-1", "approve", None, false)];
+        assert_eq!(
+            visible_probe(chain_is_decided(&decided), b.probe_digest.as_deref()),
+            Some(&*"ab".repeat(32))
+        );
+    }
+
+    #[test]
+    fn a_probe_tag_from_an_unregistered_agent_is_not_a_probe() {
+        let tags = vec![tag("probe", "deadbeef")];
+        let panel = PanelContext {
+            task_properties: None,
+            policy: PanelPolicy {
+                calibration_sample_rate: 0.0,
+                max_pending_hours: 72,
+                probe_agent: Some("c".repeat(64)),
+            },
+        };
+        let b = compute_boundary(
+            "someone-else",
+            &tags,
+            &request(serde_json::json!({})),
+            Some(&panel),
+            RiskTier::Low,
+            false,
+        );
+        assert_eq!(b.probe_digest, None);
+    }
+
+    // ── Ageing (FR4.3) ──────────────────────────────────────────────────
+
+    #[test]
+    fn relative_age_labels_read_in_the_largest_whole_unit() {
+        assert_eq!(relative_age_label(1_000, 1_030), "just now");
+        assert_eq!(relative_age_label(1_000, 1_000 + 300), "5m old");
+        assert_eq!(relative_age_label(1_000, 1_000 + 7_200), "2h old");
+        assert_eq!(relative_age_label(1_000, 1_000 + 259_200), "3d old");
+    }
+
+    #[test]
+    fn a_future_created_at_reads_as_just_now_not_as_a_negative_age() {
+        assert_eq!(relative_age_label(9_000, 1_000), "just now");
+    }
+
+    #[test]
+    fn a_missing_created_at_says_so_rather_than_claiming_an_age() {
+        assert_eq!(relative_age_label(0, 1_000), "age unknown");
+        assert!(!is_overdue(0, 10_000_000, 72));
+    }
+
+    #[test]
+    fn overdue_trips_exactly_at_the_panel_deadline() {
+        let created = 1_000_000u64;
+        let deadline = created + 72 * 3600;
+        assert!(!is_overdue(created, deadline - 1, 72));
+        assert!(is_overdue(created, deadline, 72));
+        // A tighter panel deadline trips sooner.
+        assert!(is_overdue(created, created + 12 * 3600, 12));
+    }
+
+    // ── Delegation (invariant 6) ────────────────────────────────────────
+
+    #[test]
+    fn delegate_target_must_be_hex64() {
+        assert_eq!(
+            normalise_delegate_pubkey(&"A".repeat(64)),
+            Some("a".repeat(64))
+        );
+        assert_eq!(
+            normalise_delegate_pubkey(&format!("  {}  ", "b".repeat(64))),
+            Some("b".repeat(64))
+        );
+        assert_eq!(normalise_delegate_pubkey(""), None);
+        assert_eq!(normalise_delegate_pubkey(&"a".repeat(63)), None);
+        assert_eq!(normalise_delegate_pubkey(&"a".repeat(65)), None);
+        assert_eq!(normalise_delegate_pubkey(&"z".repeat(64)), None);
+        assert_eq!(normalise_delegate_pubkey("npub1abc"), None);
+    }
+
+    #[test]
+    fn an_admin_may_decide_an_open_case_and_a_stranger_may_not() {
+        let chain: Vec<ChainStep> = Vec::new();
+        assert!(is_decidable_by(&chain, Some("admin"), true));
+        assert!(!is_decidable_by(&chain, Some("stranger"), false));
+        // Logged out: nothing to sign with.
+        assert!(!is_decidable_by(&chain, None, true));
+    }
+
+    #[test]
+    fn a_delegatee_may_decide_only_the_delegated_case() {
+        // EXP-AC-006 counter-example: "A reviewer deciding a case not
+        // delegated to them".
+        let reviewer = "d".repeat(64);
+        let delegated = vec![step("dec-1", "delegate", Some(&reviewer), false)];
+        assert!(is_decidable_by(&delegated, Some(&reviewer), false));
+        assert!(!is_decidable_by(&delegated, Some(&"e".repeat(64)), false));
+        // A different case, with no delegation, stays read-only for them.
+        assert!(!is_decidable_by(&[], Some(&reviewer), false));
+    }
+
+    #[test]
+    fn a_delegation_is_not_itself_a_decision() {
+        let reviewer = "d".repeat(64);
+        let chain = vec![step("dec-1", "delegate", Some(&reviewer), false)];
+        assert!(!chain_is_decided(&chain));
+        assert_eq!(delegated_to(&chain), Some(&*reviewer));
+    }
+
+    #[test]
+    fn a_superseded_delegation_withdraws_the_reviewers_authority() {
+        let reviewer = "d".repeat(64);
+        let chain = vec![
+            step("dec-1", "delegate", Some(&reviewer), true),
+            step("dec-2", "delegate", Some(&"e".repeat(64)), false),
+        ];
+        assert_eq!(delegated_to(&chain), Some(&*"e".repeat(64)));
+        assert!(!is_decidable_by(&chain, Some(&reviewer), false));
+    }
+
+    #[test]
+    fn a_decided_case_offers_controls_to_nobody() {
+        let chain = vec![step("dec-1", "approve", None, false)];
+        assert!(!is_decidable_by(&chain, Some("admin"), true));
+    }
+
+    // ── Card order (FR2.1) ──────────────────────────────────────────────
+
+    #[test]
+    fn reviewer_controls_always_precede_the_agents_framing() {
+        for (ctx, reasoning) in [(false, false), (true, false), (false, true), (true, true)] {
+            let s = card_sections(ctx, reasoning);
+            let controls = s.iter().position(|x| *x == CardSection::ReviewerControls);
+            let framing = s.iter().position(|x| *x == CardSection::AgentFraming);
+            assert!(
+                controls < framing,
+                "tier/confidence must never render above Approve (sections: {s:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_proposal_precedes_the_controls_so_it_is_in_view_when_judging() {
+        let s = card_sections(true, true);
+        let proposal = s.iter().position(|x| *x == CardSection::Proposal).unwrap();
+        let controls = s
+            .iter()
+            .position(|x| *x == CardSection::ReviewerControls)
+            .unwrap();
+        assert!(proposal < controls);
+    }
+
+    #[test]
+    fn absent_optional_sections_are_omitted_not_emptied() {
+        let s = card_sections(false, false);
+        assert!(!s.contains(&CardSection::ContextLink));
+        assert!(!s.contains(&CardSection::AgentReasoning));
+        assert!(s.contains(&CardSection::Proposal));
+    }
+
+    // ── Proposal rendering ──────────────────────────────────────────────
+
+    #[test]
+    fn fields_are_pretty_printed_in_full_without_truncation() {
+        let big: serde_json::Value = serde_json::json!({
+            "migration": "0007_drop_legacy",
+            "statements": (0..200).map(|i| format!("DROP TABLE legacy_{i}")).collect::<Vec<_>>(),
+        });
+        let out = pretty_fields(&big);
+        assert!(out.contains("DROP TABLE legacy_0"));
+        assert!(out.contains("DROP TABLE legacy_199"), "no truncation");
+        assert!(!out.contains('…'));
+        assert!(out.contains('\n'), "pretty-printed, not minified");
+    }
+
+    #[test]
+    fn a_bare_string_payload_prints_as_itself() {
+        assert_eq!(
+            pretty_fields(&serde_json::json!("rm -rf /var/lib/pods")),
+            "rm -rf /var/lib/pods"
+        );
+    }
+
+    // ── href safety ─────────────────────────────────────────────────────
+
+    #[test]
+    fn only_http_and_https_context_urls_survive() {
+        assert_eq!(
+            safe_context_url("https://example.org/pr/1"),
+            Some("https://example.org/pr/1".to_string())
+        );
+        assert_eq!(
+            safe_context_url("  http://example.org/x  "),
+            Some("http://example.org/x".to_string())
+        );
+        // Scheme matching is case-insensitive in both directions.
+        assert_eq!(
+            safe_context_url("HTTPS://example.org"),
+            Some("HTTPS://example.org".to_string())
+        );
+    }
+
+    #[test]
+    fn a_script_bearing_context_url_never_reaches_an_href() {
+        for hostile in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "  javascript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+            "//evil.example/x",
+            "",
+            "   ",
+        ] {
+            assert_eq!(safe_context_url(hostile), None, "accepted {hostile:?}");
+        }
+    }
+
+    #[test]
+    fn control_characters_are_rejected_rather_than_trimmed_out() {
+        // Browsers strip embedded tabs and newlines before resolving a scheme,
+        // so this is a `javascript:` URI in disguise.
+        assert_eq!(safe_context_url("java\tscript:alert(1)"), None);
+        assert_eq!(safe_context_url("java\nscript:alert(1)"), None);
+        assert_eq!(safe_context_url("https://example.org/\u{0}x"), None);
+    }
+
+    #[test]
+    fn short_id_never_slices_mid_character() {
+        // A hostile 31403 can carry any string as a delegate target; a
+        // byte-slice at a fixed offset would panic and blank the whole client.
+        assert_eq!(short_id("abcdefghijklmnop"), "abcdefgh…mnop");
+        assert_eq!(short_id("short"), "short");
+        // Multi-byte characters straddling byte offsets 6, 8 and len-4.
+        let multi = "日本語テキストの長い文字列です";
+        let out = short_id(multi);
+        assert!(out.contains('…'));
+        assert!(out.starts_with("日本語テキストの"));
+        // Emoji (4-byte) at every boundary.
+        let emoji = "😀😀😀😀😀😀😀😀😀😀😀😀😀😀";
+        assert_eq!(short_id(emoji), "😀😀😀😀😀😀😀😀…😀😀😀😀");
+    }
+
+    #[test]
+    fn a_null_payload_is_absent_rather_than_the_word_null() {
+        assert_eq!(pretty_fields(&serde_json::Value::Null), "");
+        assert!(!has_proposal(&serde_json::Value::Null));
+        assert!(has_proposal(&serde_json::json!({"a": 1})));
+    }
+
+    // ── Panel-level acknowledgement (dream-machine `acknowledge-alerts`) ──
+
+    const AGENT: &str = "2de44d5622eef7952de44d5622eef7952de44d5622eef7952de44d5622eef795";
+    const ADMIN: &str = "b41654017f6850b13857d19d8ae0e3f88f1365600cab0321e8101c9e92682f7a";
+    const MEMBER: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const STRANGER: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const PANEL_EVENT: &str = "f24a7e5870093863472fd57dbc69e56752a32399ab9941e0216fb2c8df0b0a85";
+    const STRANGER_PANEL_EVENT: &str =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    fn our_panel() -> PanelTarget<'static> {
+        PanelTarget {
+            agent_pubkey: AGENT,
+            d_tag: "dream-machine",
+            event_id: PANEL_EVENT,
+        }
+    }
+
+    /// A panel-level 31403 as the forum's own panel button publishes it: `d` =
+    /// the panel's d-tag, plain `e` = the panel definition's event id.
+    fn ack(id: &str, signer: &str, at: u64, bound_to: &str) -> PanelDecision {
+        PanelDecision {
+            d_tag: "dream-machine".into(),
+            event_id: id.into(),
+            signer_pubkey: signer.into(),
+            action: ACK_ALERTS_ACTION.into(),
+            created_at: at,
+            bound_event_id: Some(bound_to.into()),
+            bound_address: None,
+        }
+    }
+
+    fn only_admin(pk: &str) -> bool {
+        pk == ADMIN
+    }
+
+    fn alert_ack(card_at: u64, decisions: &[PanelDecision]) -> Option<PanelAck> {
+        panel_acknowledgement(
+            AGENT,
+            card_at,
+            true,
+            Some(&our_panel()),
+            decisions,
+            only_admin,
+        )
+    }
+
+    #[test]
+    fn an_alert_is_recognised_from_the_engines_kind_field() {
+        assert!(is_alert_request(
+            &serde_json::json!({"kind": "alert", "repo": "r"})
+        ));
+        assert!(!is_alert_request(&serde_json::json!({"kind": "question"})));
+        assert!(!is_alert_request(&serde_json::json!({"repo": "r"})));
+        assert!(!is_alert_request(&serde_json::json!("alert")));
+    }
+
+    #[test]
+    fn an_admin_ack_after_the_alert_acknowledges_it() {
+        let got = alert_ack(1_000, &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)]);
+        assert_eq!(
+            got,
+            Some(PanelAck {
+                event_id: "ack-1".into(),
+                signer_pubkey: ADMIN.into(),
+                created_at: 2_000,
+            })
+        );
+        // The engine's rule is `published <= ack.created_at`: same second counts.
+        assert!(alert_ack(2_000, &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)]).is_some());
+    }
+
+    #[test]
+    fn an_ack_bound_by_panel_address_counts_across_a_panel_republish() {
+        let mut d = ack("ack-1", ADMIN, 2_000, "an-older-panel-event");
+        assert_eq!(alert_ack(1_000, &[d.clone()]), None);
+        d.bound_address = Some(format!("31400:{AGENT}:dream-machine"));
+        assert!(alert_ack(1_000, &[d.clone()]).is_some());
+        // An address naming someone else's panel binds to nothing of ours.
+        d.bound_address = Some(format!("31400:{STRANGER}:dream-machine"));
+        assert_eq!(alert_ack(1_000, &[d]), None);
+    }
+
+    #[test]
+    fn an_ack_before_the_alert_does_not_acknowledge_it() {
+        assert_eq!(
+            alert_ack(3_000, &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)]),
+            None
+        );
+    }
+
+    #[test]
+    fn the_earliest_qualifying_ack_is_the_one_shown() {
+        let got = alert_ack(
+            1_000,
+            &[
+                ack("ack-late", ADMIN, 5_000, PANEL_EVENT),
+                ack("ack-early", ADMIN, 2_000, PANEL_EVENT),
+                ack("ack-stale", ADMIN, 500, PANEL_EVENT),
+            ],
+        );
+        assert_eq!(got.map(|a| a.event_id), Some("ack-early".to_string()));
+    }
+
+    #[test]
+    fn a_non_admin_ack_does_not_count() {
+        assert_eq!(
+            alert_ack(1_000, &[ack("ack-1", MEMBER, 2_000, PANEL_EVENT)]),
+            None
+        );
+    }
+
+    #[test]
+    fn the_agent_cannot_acknowledge_its_own_alerts() {
+        // Even if the agent's key were (mis)configured as an admin: no
+        // self-review, the same rule the engine's planner applies.
+        let agent_is_admin = |pk: &str| pk == AGENT || pk == ADMIN;
+        let upper = AGENT.to_ascii_uppercase();
+        for signer in [AGENT, upper.as_str()] {
+            let got = panel_acknowledgement(
+                AGENT,
+                1_000,
+                true,
+                Some(&our_panel()),
+                &[ack("ack-self", signer, 2_000, PANEL_EVENT)],
+                agent_is_admin,
+            );
+            assert_eq!(got, None, "signer {signer}");
+        }
+    }
+
+    #[test]
+    fn a_non_alert_card_is_unaffected_by_an_ack() {
+        let got = panel_acknowledgement(
+            AGENT,
+            1_000,
+            false,
+            Some(&our_panel()),
+            &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)],
+            only_admin,
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn some_other_panel_action_is_not_an_ack() {
+        let mut d = ack("act-1", ADMIN, 2_000, PANEL_EVENT);
+        d.action = "approve".into();
+        assert_eq!(alert_ack(1_000, &[d]), None);
+    }
+
+    #[test]
+    fn an_ack_on_a_strangers_colliding_panel_does_not_count() {
+        // A stranger publishes their own 31400 with our d-tag; an admin
+        // pressing "Acknowledge all alerts" on THAT panel binds to its event.
+        assert_eq!(
+            alert_ack(1_000, &[ack("ack-x", ADMIN, 2_000, STRANGER_PANEL_EVENT)]),
+            None
+        );
+        // And a stranger's alert, resolving to the stranger's panel, is not
+        // acknowledged by an ack on ours.
+        let theirs = PanelTarget {
+            agent_pubkey: STRANGER,
+            d_tag: "dream-machine",
+            event_id: STRANGER_PANEL_EVENT,
+        };
+        let got = panel_acknowledgement(
+            STRANGER,
+            1_000,
+            true,
+            Some(&theirs),
+            &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)],
+            only_admin,
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn a_card_whose_panel_is_someone_elses_or_unresolved_is_never_acknowledged() {
+        // The card's agent must own the panel it resolved to.
+        let got = panel_acknowledgement(
+            STRANGER,
+            1_000,
+            true,
+            Some(&our_panel()),
+            &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)],
+            only_admin,
+        );
+        assert_eq!(got, None);
+        let got = panel_acknowledgement(
+            AGENT,
+            1_000,
+            true,
+            None,
+            &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)],
+            only_admin,
+        );
+        assert_eq!(got, None);
+        // A decision filed under a different d-tag is not this panel's.
+        let mut d = ack("ack-1", ADMIN, 2_000, PANEL_EVENT);
+        d.d_tag = "other-panel".into();
+        assert_eq!(alert_ack(1_000, &[d]), None);
+    }
+
+    #[test]
+    fn relay_tier_governs_the_card_where_the_relay_has_spoken() {
+        let b = compute_boundary(
+            "a",
+            &[tag("risk-tier", "low")],
+            &request(serde_json::json!({})),
+            None,
+            RiskTier::Medium,
+            false,
+        );
+        assert_eq!(b.effective, RiskTier::Low);
+        // e.g. an ADR-2013 ontology floor the client does not compute.
+        assert_eq!(
+            b.clone().with_relay_tier(Some("high")).effective,
+            RiskTier::High
+        );
+        // The relay is authoritative in both directions.
+        let hi = CaseBoundary {
+            effective: RiskTier::High,
+            ..b.clone()
+        };
+        assert_eq!(hi.with_relay_tier(Some("low")).effective, RiskTier::Low);
+        // Silence keeps the client's own computation.
+        assert_eq!(b.clone().with_relay_tier(None).effective, RiskTier::Low);
+        // A garbled column never parses to `Medium` by accident.
+        let hi = CaseBoundary {
+            effective: RiskTier::High,
+            ..b.clone()
+        };
+        assert_eq!(
+            hi.clone().with_relay_tier(Some("HIGH ")).effective,
+            RiskTier::High
+        );
+        assert_eq!(hi.with_relay_tier(Some("")).effective, RiskTier::High);
+        // The declaration is untouched: it stays telemetry.
+        assert_eq!(
+            b.with_relay_tier(Some("high")).declared,
+            Some(RiskTier::Low)
+        );
+    }
+
+    #[test]
+    fn only_decided_or_acknowledged_cases_are_archived() {
+        assert!(!is_settled(false, false), "an open case stays in the inbox");
+        assert!(is_settled(true, false));
+        assert!(is_settled(false, true));
+        let delegated = [step("d1", "delegate", Some("reviewer"), false)];
+        assert!(
+            !is_settled(chain_is_decided(&delegated), false),
+            "a delegated case waits for its delegatee"
+        );
+    }
+
+    // ── Ontology cases (ADR-2013) ───────────────────────────────────────
+
+    const SUBJECT: &str = "urn:ngm:class:knowledge-graph";
+
+    /// The tags and flat content `vault propose` publishes on a 31402.
+    fn ontology_request() -> (Vec<Vec<String>>, serde_json::Value) {
+        (
+            vec![
+                tag("d", "sha256:abc"),
+                tag("panel", "ontology-governance"),
+                tag("context_url", SUBJECT),
+                tag("level", "schema"),
+            ],
+            serde_json::json!({
+                "level": "schema",
+                "kind": "amend",
+                "iri": SUBJECT,
+                "page": "Knowledge Graph",
+                "hypothesis": "narrow the parent class",
+                "diff": "- a\n+ b",
+            }),
+        )
+    }
+
+    #[test]
+    fn an_ontology_case_offers_promote_and_demote_on_its_iri() {
+        let (tags, fields) = ontology_request();
+        assert!(is_ontology_case(&tags, None));
+        assert_eq!(
+            decision_controls(&tags, &fields, None),
+            DecisionControls::PromoteDemote {
+                iri: SUBJECT.into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_panel_is_recognised_from_an_a_tag_or_the_resolved_panel() {
+        let addressed = vec![tag("a", "31400:agentpk:ontology-governance")];
+        assert!(is_ontology_case(&addressed, None));
+        // Neither tag: only the registry's resolution can say.
+        assert!(is_ontology_case(&[], Some(PANEL_ONTOLOGY_GOVERNANCE)));
+        assert!(!is_ontology_case(&[], Some("deploy-approvals")));
+        assert!(!is_ontology_case(&[], None));
+    }
+
+    #[test]
+    fn the_request_iri_wins_over_the_context_url_tag() {
+        let (mut tags, fields) = ontology_request();
+        tags.retain(|t| t[0] != "context_url");
+        tags.push(tag("context_url", "urn:ngm:class:something-else"));
+        assert_eq!(
+            ontology_subject_iri(&tags, &fields, None).as_deref(),
+            Some(SUBJECT)
+        );
+    }
+
+    #[test]
+    fn a_urn_context_url_is_the_fallback_subject() {
+        let (tags, mut fields) = ontology_request();
+        fields.as_object_mut().unwrap().remove("iri");
+        assert_eq!(
+            ontology_subject_iri(&tags, &fields, None).as_deref(),
+            Some(SUBJECT)
+        );
+    }
+
+    /// A reviewer link is not a corpus subject: an `https://` context_url
+    /// must never be signed as the thing being promoted.
+    #[test]
+    fn a_web_context_url_is_not_a_subject() {
+        let (mut tags, mut fields) = ontology_request();
+        fields.as_object_mut().unwrap().remove("iri");
+        tags.retain(|t| t[0] != "context_url");
+        tags.push(tag("context_url", "https://example.org/page"));
+        assert_eq!(ontology_subject_iri(&tags, &fields, None), None);
+        assert_eq!(
+            decision_controls(&tags, &fields, None),
+            DecisionControls::ApproveReject,
+            "a subjectless ontology case keeps Approve / Reject"
+        );
+    }
+
+    #[test]
+    fn a_blank_or_control_bearing_iri_is_no_iri() {
+        let (mut tags, _) = ontology_request();
+        tags.retain(|t| t[0] != "context_url");
+        for bad in ["", "   ", "urn:ngm:\nclass:x"] {
+            let fields = serde_json::json!({ "iri": bad });
+            assert_eq!(ontology_subject_iri(&tags, &fields, None), None, "{bad:?}");
+        }
+        // A non-string `iri` is not read as one either.
+        let fields = serde_json::json!({ "iri": 7 });
+        assert_eq!(ontology_subject_iri(&tags, &fields, None), None);
+    }
+
+    #[test]
+    fn a_non_ontology_case_is_unchanged_even_if_it_carries_an_iri() {
+        let tags = vec![
+            tag("panel", "deploy-approvals"),
+            tag("context_url", SUBJECT),
+        ];
+        let fields = serde_json::json!({ "iri": SUBJECT });
+        assert_eq!(ontology_subject_iri(&tags, &fields, None), None);
+        assert_eq!(
+            decision_controls(&tags, &fields, Some("deploy-approvals")),
+            DecisionControls::ApproveReject
+        );
+    }
+
+    /// What the buttons publish parses back, in the relay's own parser, as the
+    /// outcome that names the subject.
+    #[test]
+    fn promote_and_demote_content_carries_the_subject_iri() {
+        for outcome in [
+            DecisionOutcome::Promote {
+                iri: SUBJECT.into(),
+            },
+            DecisionOutcome::Demote {
+                iri: SUBJECT.into(),
+            },
+        ] {
+            let content = decision_content(&outcome, "checked against the parent class");
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["iri"].as_str(), Some(SUBJECT));
+            assert_eq!(
+                DecisionOutcome::from_response_content(&content),
+                Some(outcome)
+            );
+        }
+    }
+
+    #[test]
+    fn a_promoted_or_demoted_case_is_decided_and_archived() {
+        for outcome in ["promote", "demote"] {
+            let chain = [step("dec-1", outcome, None, false)];
+            assert!(chain_is_decided(&chain), "{outcome} decides the case");
+            assert!(is_settled(chain_is_decided(&chain), false));
+            assert!(!is_decidable_by(&chain, Some("admin"), true));
+        }
+    }
+}

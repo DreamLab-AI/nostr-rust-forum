@@ -18,11 +18,12 @@ path = "src/main.rs"
 
 [features]
 default = []
-dev-auth = []
+dev-auth = ["nostr-bbs-client-core/dev-auth"]
 # Heap accounting for memory investigations (src/alloc_stats.rs). Never in release.
-alloc-stats = []
+alloc-stats = ["nostr-bbs-client-core/alloc-stats"]
 
 [dependencies]
+nostr-bbs-client-core = { workspace = true }
 nostr-bbs-core = { workspace = true }
 # Sealed per-zone search: manifest verification + key derivation only (no age,
 # no model: those live in the separate search Web Worker).

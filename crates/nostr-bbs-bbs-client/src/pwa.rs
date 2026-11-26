@@ -36,9 +36,10 @@ use wasm_bindgen_futures::JsFuture;
 use zeroize::Zeroize;
 
 #[cfg(target_arch = "wasm32")]
-use crate::config::BbsConfig;
+use nostr_bbs_client_core::auth::AuthStore;
+
 #[cfg(target_arch = "wasm32")]
-use crate::signer::BbsSigner;
+use crate::config::BbsConfig;
 
 // ── Pure helpers (unit-tested on the native target) ─────────────────────────
 
@@ -220,23 +221,22 @@ pub async fn bake_local(secret: &[u8; 32], zone_id: &str) -> Result<(), JsValue>
     Ok(())
 }
 
-/// One-shot adoption: unwrap the baked key and install the signer, or route to
-/// the iOS rebind screen when nothing is baked. Called from the boot once
-/// (`app.rs`) when in pwa mode and no session was already adopted. `state` is
-/// needed to route to [`crate::menu::Screen::Rebind`] on the no-baked-key path.
+/// One-shot adoption: unwrap the baked key and sign into [`AuthStore`], or
+/// route to [`crate::router::Route::Rebind`] when nothing is baked.
 #[cfg(target_arch = "wasm32")]
 pub async fn adopt_baked_or_rebind(
-    signer: &BbsSigner,
+    auth: &AuthStore,
     _cfg: &BbsConfig,
-    state: crate::chrome::BbsState,
+    router: crate::router::Router,
 ) {
     if let Some(secret) = unwrap_baked_secret().await {
-        if signer.adopt_baked_key(&secret) {
+        let hex_sk = hex::encode(&secret[..]);
+        if auth.login_with_local_key(&hex_sk).is_ok() {
             return;
         }
     }
     // iOS isolated storage / not baked / unwrap failed → one-time rebind.
-    state.go(crate::menu::Screen::Rebind);
+    router.go(crate::router::Route::Rebind);
 }
 
 /// Delete the baked IndexedDB record and the localStorage BootProfile — the

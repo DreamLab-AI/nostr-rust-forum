@@ -6,36 +6,32 @@
          The baseline the forum client ships: object-src and base-uri close the
          plugin-injection and <base>-hijack routes that need no script at all;
          form-action keeps a future form from posting elsewhere. No script-src
-         yet: this page carries five inline scripts and the host site injects
-         window.__ENV__ inline after the build, so a hash list cannot be kept
-         honest until those move to files (see the forum client's index.html). -->
+         yet: the host site injects window.__ENV__ inline after the build and
+         the Sentry Gun door game / SW registration remain inline (see the
+         forum client's index.html). -->
     <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; form-action 'self'" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>BBS // nostr-rust-forum</title>
-    <meta name="description" content="Retro ASCII/BBS terminal interface for the Nostr forum kit." />
+    <meta name="description" content="Retro ASCII/BBS terminal workspace for the Nostr community kit." />
     <meta name="theme-color" content="#0a0a0a" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230a0a0a'/><text x='1' y='13' font-family='monospace' font-size='12' fill='%23ffb000'>&gt;_</text></svg>" type="image/svg+xml" />
     <link data-trunk rel="css" href="assets/bbs.css" />
     <!-- UA 571-C sentry-gun door-game sound effects (copied verbatim to dist). -->
     <link data-trunk rel="copy-dir" href="assets/sentry-sounds" />
 
-    <!-- Zone-bound PWA install surface (ADR-109). The manifest, icons/ dir, and
-         the network-first service worker are copied verbatim into
-         dist/community/bbs/; the SW is registered from Rust (crate::pwa::register_sw)
-         so scope + guards live in one place. `name`/`short_name` are the neutral
-         kit defaults — the operator overlay brands them at deploy time. -->
+    <!-- Zone-bound PWA install surface (ADR-109). -->
     <link data-trunk rel="copy-file" href="manifest.webmanifest" />
     <link data-trunk rel="copy-dir" href="assets/icons" />
     <link data-trunk rel="copy-file" href="bbs-sw.js" />
     <link rel="manifest" href="manifest.webmanifest" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="BBS" />
     <link rel="apple-touch-icon" href="icons/icon-192.png" />
 
     <!-- Branding is injected by the host site into window.__ENV__ (THEME,
-         NODE_NAME, LOCATION, BANNER_URL, RELAY_URL, ZONE_CONFIG). The defaults
-         below let the BBS render standalone (e.g. `trunk serve`). -->
+         NODE_NAME, LOCATION, BANNER_URL, RELAY_URL, ZONE_CONFIG, etc.).
+         Defaults below let the BBS render standalone (e.g. `trunk serve`). -->
     <script>
       window.__ENV__ = window.__ENV__ || {
         THEME: "amber",
@@ -49,166 +45,9 @@
 <body>
     <noscript>This BBS requires a WebAssembly-capable browser.</noscript>
 
-    <!-- Phosphor persistence: when the terminal text changes, the previous
-         frame lingers as a faint afterglow and fades (see .phosphor-ghost in
-         bbs.css). A pure DOM overlay — a text-only clone of the prior screen
-         body — so it adds nothing to the WASM bundle and degrades gracefully. -->
-    <script>
-      (function () {
-        try {
-          if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-        } catch (e) {}
-        var THROTTLE_MS = 90, MAX_GHOSTS = 6, LIFE_MS = 3100;
-        function start(root) {
-          var prev = null, last = 0, live = [];
-          function bodyEls() {
-            var ch = Array.prototype.slice.call(root.children);
-            var b = ch.findIndex(function (c) { return c.classList && c.classList.contains('bbs-banner'); });
-            var f = ch.findIndex(function (c) { return c.classList && c.classList.contains('bbs-footer'); });
-            return ch.slice(b + 1, f === -1 ? ch.length : f);
-          }
-          function snap() {
-            var els = bodyEls(); if (!els.length) return null;
-            var rs = els.map(function (e) { return e.getBoundingClientRect(); });
-            var left = Math.min.apply(null, rs.map(function (r) { return r.left; }));
-            var top = Math.min.apply(null, rs.map(function (r) { return r.top; }));
-            var right = Math.max.apply(null, rs.map(function (r) { return r.right; }));
-            var bottom = Math.max.apply(null, rs.map(function (r) { return r.bottom; }));
-            return { html: els.map(function (e) { return e.outerHTML; }).join(''),
-                     left: left, top: top, w: right - left, h: bottom - top,
-                     font: getComputedStyle(root).font };
-          }
-          function ghost(p) {
-            var g = document.createElement('div');
-            g.className = 'phosphor-ghost';
-            g.style.cssText = 'left:' + p.left + 'px;top:' + p.top + 'px;width:' + p.w + 'px;height:' + p.h + 'px;font:' + p.font;
-            g.innerHTML = p.html;
-            // Text-only afterglow: drop heavy ASCII-image clones so ghosts stay light.
-            var imgs = g.querySelectorAll('.ascii-img-wrap, .ascii-img, .bbs-section-hero');
-            for (var i = 0; i < imgs.length; i++) imgs[i].remove();
-            document.body.appendChild(g);
-            live.push(g);
-            while (live.length > MAX_GHOSTS) { var o = live.shift(); if (o) o.remove(); }
-            requestAnimationFrame(function () { g.style.opacity = '0'; }); // next frame → transition
-            setTimeout(function () { g.remove(); var k = live.indexOf(g); if (k >= 0) live.splice(k, 1); }, LIFE_MS);
-          }
-          function tick() {
-            var cur = snap();
-            if (cur && prev && prev.html !== cur.html) {
-              var now = performance.now();
-              if (now - last > THROTTLE_MS) { ghost(prev); last = now; }
-            }
-            if (cur) prev = cur;
-            requestAnimationFrame(tick);
-          }
-          requestAnimationFrame(tick);
-        }
-        var iv = setInterval(function () {
-          var root = document.querySelector('.bbs-root');
-          if (root) { clearInterval(iv); start(root); }
-        }, 80);
-        setTimeout(function () { clearInterval(iv); }, 20000);
-      })();
-    </script>
-
-    <!-- Touch navigation: slide a finger over the menu/list to move the
-         highlight, lift to select. A thin bridge onto the existing keyboard
-         model — it hit-tests the item under the touch and drives the app's own
-         ArrowUp/ArrowDown/Enter handlers, so every screen behaves identically
-         to the keyboard. No-op without touch (mouse never fires these).
-
-         Menu items are real <button>s now (a11y). `closest('.bbs-menu-item')`
-         already matches them (selector match ignores tag), so hit-testing is
-         unchanged. Two button-specific constraints are handled below:
-          - Selection state has ONE source of truth — Rust's `selected` signal.
-            This script only SYNTHESISES ArrowUp/Down/Enter and reads back the
-            `.selected` class; it never writes that class, so a JS highlight can
-            never diverge from the Rust one.
-          - A tapped button takes focus, and the Rust key-guard skips keydowns
-            while a button is focused (so a native button-Enter isn't doubled).
-            That is correct for a pure tap (the native button click selects it),
-            but it would also swallow the synthetic Enter we fire at the end of a
-            SLIDE that moved to a different item. So when a slide has moved, we
-            blur the focused control before firing Enter — see touchend. -->
-    <script>
-      (function () {
-        function selectable() {
-          return Array.prototype.slice.call(document.querySelectorAll('.bbs-menu-item, .bbs-row'));
-        }
-        function fire(key) { document.dispatchEvent(new KeyboardEvent('keydown', { key: key, bubbles: true })); }
-        function itemAt(x, y) { var el = document.elementFromPoint(x, y); return el ? el.closest('.bbs-menu-item, .bbs-row') : null; }
-        var lastIdx = -1, active = false, over = false, moved = false;
-        function curIndex(items) {
-          if (lastIdx >= 0) return lastIdx;            // track in JS — the DOM `.selected` lags the re-render
-          var d = items.findIndex(function (e) { return e.classList.contains('selected'); });
-          return d < 0 ? 0 : d;
-        }
-        function moveTo(item) {
-          var items = selectable();
-          var target = items.indexOf(item);
-          if (target < 0) return false;
-          var cur = curIndex(items);
-          if (target !== cur) {
-            var key = target > cur ? 'ArrowDown' : 'ArrowUp';
-            for (var i = 0; i < Math.abs(target - cur); i++) fire(key);
-            moved = true;                              // a real slide, not a tap-in-place
-          }
-          lastIdx = target;
-          item.scrollIntoView({ block: 'nearest' });
-          return true;
-        }
-        document.addEventListener('touchstart', function (e) {
-          var t = e.touches[0]; if (!t) return;
-          lastIdx = -1; moved = false;
-          var it = itemAt(t.clientX, t.clientY);
-          if (!it) { active = false; return; }
-          active = true; over = true; moveTo(it);
-        }, { passive: true });
-        document.addEventListener('touchmove', function (e) {
-          if (!active) return;
-          var t = e.touches[0]; if (!t) return;
-          var it = itemAt(t.clientX, t.clientY);
-          if (it) { over = true; if (moveTo(it)) e.preventDefault(); } else { over = false; }
-        }, { passive: false });
-        document.addEventListener('touchend', function () {
-          if (active && over) {
-            // On a slide that moved, drop focus first so the focused start-button
-            // doesn't make the Rust key-guard swallow our Enter. A pure tap keeps
-            // focus and lets the native button/row click do the single select.
-            if (moved && document.activeElement && document.activeElement.blur) document.activeElement.blur();
-            fire('Enter');
-          }
-          active = false; lastIdx = -1; moved = false;
-        }, { passive: true });
-      })();
-    </script>
-
-    <!-- Home gesture: a swipe down from the top (not starting on a list row, so
-         it never clashes with the slide-to-select above) jumps back to the main
-         menu — the full options list — from any sub-screen. The only touch way
-         "back" on mobile, since there is no ESC key. -->
-    <script>
-      (function () {
-        function key(k) { document.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true })); }
-        function onMenu() { var f = document.querySelector('.bbs-footer'); return f && /Main Menu/.test(f.textContent || ''); }
-        function goHome() { var n = 0; (function step() { if (onMenu() || n++ > 12) return; key('Escape'); setTimeout(step, 70); })(); }
-        var sy = 0, sx = 0, arm = false;
-        document.addEventListener('touchstart', function (e) {
-          var t = e.touches[0]; if (!t) return;
-          sy = t.clientY; sx = t.clientX;
-          arm = sy < 60 && !(e.target.closest && e.target.closest('.bbs-menu-item, .bbs-row'));
-        }, { passive: true });
-        document.addEventListener('touchend', function (e) {
-          var t = e.changedTouches[0]; if (!t || !arm) return;
-          var dy = t.clientY - sy, dx = t.clientX - sx;
-          if (dy > 50 && Math.abs(dy) > Math.abs(dx)) goHome();
-        }, { passive: true });
-      })();
-    </script>
-
     <!-- Door game: UA 571-C remote sentry weapon system. A faithful Aliens
          (1986) control deck in OUR phosphor skin — pure client-side, no auth,
-         no relay. Opened by a `bbs:sentry` event (Door Games launch / /sentry
+         no relay. Opened by a `bbs:sentry` event (Door Games hub / /sentry
          command). Sounds adapted from the MIT-licensed CentriGUI project. -->
     <script>
       (function () {
@@ -243,7 +82,7 @@
           el.className = 'sentry bbs-crt ' + curTheme();
           el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', 'UA 571-C sentry weapon system');
           el.innerHTML =
-            '<div class="sentry-close" data-act="close" role="button" tabindex="0">[ X ] CLOSE</div>' +
+            '<button type="button" class="sentry-close" data-act="close">[ X ] CLOSE</button>' +
             '<div class="sentry-inner">' +
               '<pre class="sentry-boot" id="sentry-boot"></pre>' +
               '<div id="sentry-deck" style="display:none">' +
@@ -259,10 +98,10 @@
                   '</div>' +
                 '</div>' +
                 '<div class="sentry-actions">' +
-                  '<div class="sentry-btn" data-act="arm" role="button" tabindex="0">ARM</div>' +
-                  '<div class="sentry-btn" data-act="fire" role="button" tabindex="0">ENGAGE</div>' +
-                  '<div class="sentry-btn" data-act="reload" role="button" tabindex="0">RELOAD</div>' +
-                  '<div class="sentry-btn" data-act="diag" role="button" tabindex="0">DIAGNOSTIC</div>' +
+                  '<button type="button" class="sentry-btn" data-act="arm">ARM</button>' +
+                  '<button type="button" class="sentry-btn" data-act="fire">ENGAGE</button>' +
+                  '<button type="button" class="sentry-btn" data-act="reload">RELOAD</button>' +
+                  '<button type="button" class="sentry-btn" data-act="diag">DIAGNOSTIC</button>' +
                 '</div>' +
                 '<div class="sentry-log" id="sentry-log" aria-live="polite"></div>' +
                 '<div class="sentry-hint">select modes · ARM then ENGAGE to open fire · ESC to exit</div>' +
@@ -275,7 +114,8 @@
             cell.innerHTML = '<div class="lab">' + m[1] + '</div><div class="sentry-opts"></div>';
             var wrap = cell.querySelector('.sentry-opts');
             m[2].forEach(function (v, i) {
-              var o = document.createElement('div');
+              var o = document.createElement('button');
+              o.type = 'button';
               o.className = 'sentry-opt' + (i === 0 ? ' sel' : '') + (m[0] === 'weapon' && v === 'ARMED' ? ' danger' : '');
               o.setAttribute('data-grp', m[0]); o.setAttribute('data-val', v); o.textContent = v;
               wrap.appendChild(o);
@@ -283,10 +123,6 @@
             mc.appendChild(cell);
           });
           el.addEventListener('click', onClick);
-          el.addEventListener('keydown', function (e) {
-            var a = e.target.getAttribute && e.target.getAttribute('data-act');
-            if (a && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onClick(e); }
-          });
         }
         function log(msg, hi) { var l = el.querySelector('#sentry-log'); var d = document.createElement('div'); if (hi) d.className = 'hi'; d.textContent = '> ' + msg; l.appendChild(d); l.scrollTop = l.scrollHeight; }
         function getSel(grp) { var s = el.querySelector('.sentry-opt.sel[data-grp="' + grp + '"]'); return s ? s.getAttribute('data-val') : null; }
@@ -295,7 +131,9 @@
         function setTemp(t) { state.temp = Math.max(0, Math.min(100, t)); var g = el.querySelector('#s-temp'); g.querySelector('.fill').style.height = state.temp + '%'; g.classList.toggle('hot', state.temp > 80); }
 
         function onClick(e) {
-          var t = e.target, act = t.getAttribute('data-act');
+          var t = e.target.closest ? e.target.closest('[data-act], .sentry-opt') : e.target;
+          if (!t) return;
+          var act = t.getAttribute('data-act');
           if (act === 'close') { close(); return; }
           if (t.classList && t.classList.contains('sentry-opt')) {
             var grp = t.getAttribute('data-grp');

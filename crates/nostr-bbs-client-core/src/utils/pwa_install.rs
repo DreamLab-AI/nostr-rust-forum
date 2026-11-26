@@ -1,0 +1,551 @@
+//! PWA install orchestration (ADR-109, amended to remove single-zone gate).
+//!
+//! This module owns three concerns for the FORUM (write) side:
+//! 1. The **gating predicate** — any authenticated user with at least one
+//!    accessible locked zone can install; the PWA uses the full Nostr key so
+//!    the user retains access to every zone they are authorised for.
+//! 2. **Install orchestration** — after the bake (see [`crate::utils::bake`]) the
+//!    member is LINKED to the BBS (`/bbs/?pwa=1`) where installation actually
+//!    happens: `beforeinstallprompt` belongs to the BBS scope (`/community/bbs/`,
+//!    which carries the manifest + service worker), not the forum page.
+//! 3. **iOS instruction text** — Add-to-Home-Screen is manual on iOS, and the
+//!    isolated-storage rebind note is stated up front.
+//!
+//! The `beforeinstallprompt` capture here ([`init_capture`]) is the PRIMARY
+//! install path now the forum carries its own manifest:
+//! the event does not fire on the forum origin, so the listener is a harmless
+//! no-op that simply records the event on the rare build/scope where it does.
+
+use leptos::prelude::*;
+use send_wrapper::SendWrapper;
+use std::cell::{Cell, RefCell};
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+
+use crate::base::base_href;
+use crate::stores::zone_access::first_accessible_zone_for;
+use crate::stores::zones::Zone;
+
+/// `window.__ENV__` key toggling the whole feature. Missing ⇒ DISABLED (the
+/// forum-side default is OFF, per the ADR-109 rollout gate). The deploy sets
+/// `BBS_PWA_ENABLED:"true"` when the operator opts in.
+const FEATURE_FLAG_KEY: &str = "BBS_PWA_ENABLED";
+
+// ---------------------------------------------------------------------------
+// (a) Gating predicate
+// ---------------------------------------------------------------------------
+
+/// Show the install option to any authenticated user who can access at least
+/// one locked zone — admins, multi-zone members, and single-zone members
+/// alike. The installed PWA uses the full Nostr key so the user retains access
+/// to every zone they are authorised for.
+///
+/// Pure and unit-tested. The runtime `BBS_PWA_ENABLED` gate is a SEPARATE
+/// concern ([`feature_enabled`]); the caller ANDs them.
+pub fn install_option_visible(zones: &[Zone], cohorts: &[String], is_admin: bool) -> bool {
+    first_accessible_zone_for(zones, cohorts, is_admin).is_some()
+}
+
+/// Whether the operator has enabled the BBS-PWA feature for this deployment.
+///
+/// Reads `window.__ENV__.BBS_PWA_ENABLED`; treats a missing/undefined value as
+/// DISABLED (default off) and any value other than `"false"` as enabled.
+pub fn feature_enabled() -> bool {
+    window_env(FEATURE_FLAG_KEY)
+        .map(|v| !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// (b) Platform detection
+// ---------------------------------------------------------------------------
+
+/// Whether the current device is iOS (iPhone/iPad/iPod), including iPadOS 13+
+/// which reports as `MacIntel` but exposes a touch screen. Drives which panel
+/// (manual Add-to-Home-Screen vs. redirect/prompt) the Settings section renders.
+pub fn platform_is_ios() -> bool {
+    let Some(nav) = web_sys::window().map(|w| w.navigator()) else {
+        return false;
+    };
+    let ua = nav.user_agent().unwrap_or_default();
+    let platform = nav.platform().unwrap_or_default();
+    is_ios_ua(&ua, &platform, nav.max_touch_points())
+}
+
+/// Pure iOS heuristic, extracted for unit testing.
+fn is_ios_ua(ua: &str, platform: &str, max_touch_points: i32) -> bool {
+    let ua = ua.to_ascii_lowercase();
+    let platform = platform.to_ascii_lowercase();
+    if ua.contains("iphone") || ua.contains("ipad") || ua.contains("ipod") {
+        return true;
+    }
+    // iPadOS 13+ desktop-class Safari: reports MacIntel + a touch screen.
+    (platform.contains("mac") || ua.contains("macintosh")) && max_touch_points > 1
+}
+
+// ---------------------------------------------------------------------------
+// (c) Install flow — the MAIN interface is the installed app
+// ---------------------------------------------------------------------------
+
+/// Full-document navigate to the forum's own one-shot boot URL
+/// (`<base>/?pwa=1`, the manifest `start_url`). The forum page now carries its
+/// own manifest + service worker, so `beforeinstallprompt` fires here and the
+/// stashed prompt (see below) is the primary install path; this navigation is
+/// the fallback for browsers that never fired it (iOS: Share → Add to Home
+/// Screen from this page). The retro BBS keeps its nested-scope manifest at
+/// `<base>/bbs/` for users who prefer installing that interface instead.
+/// `zone_id` is the bound zone (already in the BootProfile) — logged for
+/// traceability.
+pub fn open_installed_app(zone_id: &str) {
+    let href = base_href("/?pwa=1");
+    web_sys::console::log_1(
+        &format!("[pwa_install] opening installed app for zone '{zone_id}' → {href}").into(),
+    );
+    if let Some(w) = web_sys::window() {
+        let _ = w.location().set_href(&href);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (d) Defensive beforeinstallprompt capture
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// The stashed (prevented-default) `beforeinstallprompt` event, if one ever
+    /// fires on this origin. `SendWrapper` keeps the JS handle on the WASM thread.
+    static DEFERRED_PROMPT: RefCell<Option<SendWrapper<web_sys::Event>>> =
+        const { RefCell::new(None) };
+    /// Reactive "an install prompt is available" flag. Created lazily under a
+    /// reactive owner by [`installable`].
+    static INSTALLABLE: RefCell<Option<RwSignal<bool>>> = const { RefCell::new(None) };
+    /// Guards against double-registering the window listener.
+    static CAPTURE_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The reactive `installable` flag, created on first use under the current
+/// reactive owner (App / a component). Defensive: on the forum origin it never
+/// flips true.
+pub fn installable() -> RwSignal<bool> {
+    INSTALLABLE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(sig) = *slot {
+            sig
+        } else {
+            let sig = RwSignal::new(false);
+            *slot = Some(sig);
+            sig
+        }
+    })
+}
+
+/// Register a `beforeinstallprompt` listener once, as early as possible (called
+/// from `App()`), per MDN: the event can originate from an earlier load. It
+/// `preventDefault`s and stashes the event + flips [`installable`]. No-op-safe:
+/// harmless if the event never fires (the forum origin), idempotent across calls.
+pub fn init_capture() {
+    let already = CAPTURE_REGISTERED.with(|c| c.replace(true));
+    if already {
+        return;
+    }
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    // Materialise the signal now, under App()'s owner, so later `.set(true)`
+    // from the (owner-less) event callback is safe.
+    let installable = installable();
+
+    let cb = Closure::<dyn Fn(web_sys::Event)>::new(move |event: web_sys::Event| {
+        // Suppress the browser's default mini-infobar; we drive install from
+        // the gated Settings button instead.
+        event.prevent_default();
+        DEFERRED_PROMPT.with(|slot| *slot.borrow_mut() = Some(SendWrapper::new(event)));
+        installable.set(true);
+    });
+    let _ =
+        window.add_event_listener_with_callback("beforeinstallprompt", cb.as_ref().unchecked_ref());
+    // Leak for the page lifetime (a single listener, registered once).
+    cb.forget();
+}
+
+/// Whether a deferred `beforeinstallprompt` event is currently stashed.
+pub fn deferred_prompt_available() -> bool {
+    DEFERRED_PROMPT.with(|slot| slot.borrow().is_some())
+}
+
+/// Fire the stashed install prompt if one exists (single-use: the event is
+/// consumed). Returns `true` when a prompt was shown, `false` when none was
+/// available — the caller then falls back to the redirect path. On the forum
+/// origin this returns `false` because the event never fires here.
+pub async fn trigger_prompt() -> bool {
+    let event = DEFERRED_PROMPT.with(|slot| slot.borrow_mut().take());
+    let Some(event) = event else {
+        return false;
+    };
+    installable().set(false);
+    // `BeforeInstallPromptEvent` is not in web-sys; call `.prompt()` via Reflect.
+    let event: JsValue = event.take().into();
+    let Ok(prompt_fn) = js_sys::Reflect::get(&event, &"prompt".into()) else {
+        return false;
+    };
+    let Ok(func) = prompt_fn.dyn_into::<js_sys::Function>() else {
+        return false;
+    };
+    match func.call0(&event) {
+        Ok(ret) => {
+            // `prompt()` returns a Promise; await it so a caller can sequence
+            // navigation after the choice resolves. Ignore the userChoice value.
+            if let Ok(promise) = ret.dyn_into::<js_sys::Promise>() {
+                let _ = JsFuture::from(promise).await;
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (e) iOS instruction copy (owned here so the strings are testable + single-source)
+// ---------------------------------------------------------------------------
+
+/// The manual Add-to-Home-Screen steps shown on iOS (no `beforeinstallprompt`
+/// there). UK English.
+pub fn ios_instructions() -> [&'static str; 3] {
+    [
+        "Tap the Share button in Safari's toolbar.",
+        "Choose \"Add to Home Screen\".",
+        "Tap \"Add\", then open the new icon from your home screen.",
+    ]
+}
+
+/// The one-time-rebind note for iOS: because iOS isolates the installed app's
+/// storage from Safari, the baked key cannot cross over, so first launch
+/// re-establishes your identity once. UK English.
+pub fn ios_rebind_note() -> &'static str {
+    "On iPhone and iPad the app keeps its own separate storage, so the first \
+     time you open it you sign in once more: tap Scan your sheet, or use a \
+     passkey or your recovery key. After that it opens straight into your zone."
+}
+
+/// The scan-again instruction shown after the iOS Add-to-Home-Screen steps
+/// in the post-sign-in onboarding. UK English.
+pub fn ios_scan_again_note() -> &'static str {
+    "Then open the new app and tap \"Scan your sheet\". Your iPhone keeps the \
+     app's sign-in separate from Safari, so you scan the same code once more \
+     inside the app."
+}
+
+/// Whether the page runs as an installed app (home-screen / standalone
+/// display mode): `display-mode: standalone` (or `fullscreen` /
+/// `minimal-ui`), or iOS Safari's legacy `navigator.standalone`.
+pub fn is_standalone() -> bool {
+    let Some(w) = web_sys::window() else {
+        return false;
+    };
+    let mode = |q: &str| {
+        w.match_media(q)
+            .ok()
+            .flatten()
+            .map(|m| m.matches())
+            .unwrap_or(false)
+    };
+    if mode("(display-mode: standalone)")
+        || mode("(display-mode: fullscreen)")
+        || mode("(display-mode: minimal-ui)")
+    {
+        return true;
+    }
+    js_sys::Reflect::get(&w.navigator(), &"standalone".into())
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// The user's answer to a shown install prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptOutcome {
+    /// No stashed prompt was available.
+    Unavailable,
+    /// The browser reported `accepted`.
+    Accepted,
+    /// Dismissed, or the outcome could not be read.
+    Dismissed,
+}
+
+/// Like [`trigger_prompt`], but reports the user's choice by reading the
+/// event's `userChoice.outcome`, so the caller can undo a bake when the
+/// install is dismissed (no durable key should sit at rest without an app).
+pub async fn trigger_prompt_outcome() -> PromptOutcome {
+    let event = DEFERRED_PROMPT.with(|slot| slot.borrow_mut().take());
+    let Some(event) = event else {
+        return PromptOutcome::Unavailable;
+    };
+    installable().set(false);
+    let event: JsValue = event.take().into();
+    let Some(func) = js_sys::Reflect::get(&event, &"prompt".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+    else {
+        return PromptOutcome::Unavailable;
+    };
+    if func.call0(&event).is_err() {
+        return PromptOutcome::Unavailable;
+    }
+    let Some(choice) = js_sys::Reflect::get(&event, &"userChoice".into())
+        .ok()
+        .and_then(|c| c.dyn_into::<js_sys::Promise>().ok())
+    else {
+        return PromptOutcome::Dismissed;
+    };
+    match JsFuture::from(choice).await {
+        Ok(v) => match js_sys::Reflect::get(&v, &"outcome".into())
+            .ok()
+            .and_then(|o| o.as_string())
+            .as_deref()
+        {
+            Some("accepted") => PromptOutcome::Accepted,
+            _ => PromptOutcome::Dismissed,
+        },
+        Err(_) => PromptOutcome::Dismissed,
+    }
+}
+
+/// Coarse browser family for install-guidance copy. UA sniffing is acceptable
+/// here — the result only selects advisory text, and every branch fails safe
+/// to the generic copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BrowserFamily {
+    /// Chrome, Edge, Brave, Chromium — native install prompt + toolbar icon.
+    Chromium,
+    /// Firefox — no PWA install support at all on desktop.
+    Firefox,
+    /// Safari on macOS — File → Add to Dock (no prompt event).
+    Safari,
+    /// Anything else — generic guidance.
+    Other,
+}
+
+/// Detect the browser family from the user agent.
+pub fn browser_family() -> BrowserFamily {
+    let ua = web_sys::window()
+        .and_then(|w| w.navigator().user_agent().ok())
+        .unwrap_or_default()
+        .to_lowercase();
+    family_from_ua(&ua)
+}
+
+/// Pure classifier (unit-tested). Order matters: Chromium UAs contain
+/// "safari", and Edge contains "chrome".
+pub fn family_from_ua(ua: &str) -> BrowserFamily {
+    if ua.contains("firefox") {
+        BrowserFamily::Firefox
+    } else if ua.contains("chrome")
+        || ua.contains("chromium")
+        || ua.contains("crios")
+        || ua.contains("edg")
+    {
+        BrowserFamily::Chromium
+    } else if ua.contains("safari") {
+        BrowserFamily::Safari
+    } else {
+        BrowserFamily::Other
+    }
+}
+
+/// Manual install guidance shown when the browser never offered an install
+/// prompt (Firefox desktop, Safari on Mac, or a Chromium build that withheld
+/// the event). Returns `(heading, steps)`. UK English.
+pub fn manual_install_steps(family: BrowserFamily) -> (&'static str, Vec<&'static str>) {
+    match family {
+        BrowserFamily::Chromium => (
+            "In Chrome / Edge",
+            vec![
+                "Look for the install icon at the right-hand end of the address bar (a small screen with a down arrow).",
+                "Click it and choose \"Install\".",
+                "The app opens in its own window, signed in — find it later in your launcher or taskbar.",
+            ],
+        ),
+        BrowserFamily::Safari => (
+            "In Safari on Mac",
+            vec![
+                "Open the File menu.",
+                "Choose \"Add to Dock…\".",
+                "Open the app from your Dock — it starts signed in.",
+            ],
+        ),
+        BrowserFamily::Firefox => (
+            "In Firefox",
+            vec![
+                "Firefox can't install web apps, so there's no app icon to add.",
+                "Bookmark this site instead — your saved key keeps signing you in on this device — or use Chrome, Edge or Safari to install the app.",
+            ],
+        ),
+        BrowserFamily::Other => (
+            "In this browser",
+            vec![
+                "Look for an \"Install app\" or \"Add to Home Screen\" option in your browser's menu.",
+                "If there isn't one, bookmark this site — your saved key keeps signing you in on this device.",
+            ],
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Read a `window.__ENV__` key (mirrors the private reader in `utils::relay_url`).
+fn window_env(key: &str) -> Option<String> {
+    let window = web_sys::window()?;
+    let env = js_sys::Reflect::get(&window, &"__ENV__".into()).ok()?;
+    if env.is_undefined() || env.is_null() {
+        return None;
+    }
+    let val = js_sys::Reflect::get(&env, &key.into()).ok()?;
+    let s = val.as_string()?;
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stores::zones::ZoneVisibility;
+
+    fn locked_zone(id: &str, cohort: &str) -> Zone {
+        Zone {
+            id: id.to_string(),
+            slug: None,
+            display_name: String::new(),
+            required_cohorts: vec![cohort.to_string()],
+            write_cohorts: None,
+            banner_image_url: None,
+            visibility: ZoneVisibility::Locked,
+            encrypted: false,
+            agent_keys: false,
+            history_from_epoch: None,
+            accent_hex: None,
+            section_order: Vec::new(),
+            kanban: false,
+            search: None,
+        }
+    }
+
+    fn public_zone(id: &str) -> Zone {
+        Zone {
+            id: id.to_string(),
+            slug: None,
+            display_name: String::new(),
+            required_cohorts: vec![],
+            write_cohorts: None,
+            banner_image_url: None,
+            visibility: ZoneVisibility::Public,
+            encrypted: false,
+            agent_keys: false,
+            history_from_epoch: None,
+            accent_hex: None,
+            section_order: Vec::new(),
+            kanban: false,
+            search: None,
+        }
+    }
+
+    // ── install_option_visible: open to all with zone access ────────────────
+
+    #[test]
+    fn admin_sees_install() {
+        let zones = vec![locked_zone("business", "business")];
+        let cohorts = vec!["business".to_string()];
+        assert!(install_option_visible(&zones, &cohorts, true));
+    }
+
+    #[test]
+    fn single_locked_zone_member_sees_install() {
+        let zones = vec![public_zone("public"), locked_zone("business", "business")];
+        let cohorts = vec!["business".to_string()];
+        assert!(install_option_visible(&zones, &cohorts, false));
+    }
+
+    #[test]
+    fn multi_zone_member_sees_install() {
+        let zones = vec![
+            locked_zone("business", "business"),
+            locked_zone("family", "family"),
+        ];
+        let cohorts = vec!["business".to_string(), "family".to_string()];
+        assert!(install_option_visible(&zones, &cohorts, false));
+    }
+
+    #[test]
+    fn zero_accessible_zones_hide_install() {
+        let zones = vec![public_zone("public"), locked_zone("business", "business")];
+        let cohorts: Vec<String> = vec![];
+        assert!(!install_option_visible(&zones, &cohorts, false));
+    }
+
+    // ── is_ios_ua heuristic ─────────────────────────────────────────────────
+
+    #[test]
+    fn detects_iphone_and_ipad_by_ua() {
+        assert!(is_ios_ua(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X)",
+            "iPhone",
+            5
+        ));
+        assert!(is_ios_ua("Mozilla/5.0 (iPad; CPU OS 17_4)", "iPad", 5));
+        assert!(is_ios_ua("something ipod touch", "iPod", 5));
+    }
+
+    #[test]
+    fn detects_ipados13_reporting_as_mac_with_touch() {
+        assert!(is_ios_ua(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari",
+            "MacIntel",
+            5
+        ));
+    }
+
+    #[test]
+    fn desktop_mac_without_touch_is_not_ios() {
+        assert!(!is_ios_ua(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari",
+            "MacIntel",
+            0
+        ));
+    }
+
+    #[test]
+    fn android_and_desktop_are_not_ios() {
+        assert!(!is_ios_ua(
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8)",
+            "Linux armv8l",
+            5
+        ));
+        assert!(!is_ios_ua(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Win32",
+            0
+        ));
+    }
+
+    // ── iOS copy is present and honest ──────────────────────────────────────
+
+    #[test]
+    fn ios_copy_mentions_home_screen_and_rebind() {
+        assert!(ios_instructions()
+            .iter()
+            .any(|s| s.contains("Add to Home Screen")));
+        let note = ios_rebind_note();
+        assert!(note.contains("passkey") && note.contains("recovery key"));
+        assert!(note.contains("Scan your sheet"));
+        let again = ios_scan_again_note();
+        assert!(again.contains("Scan your sheet") && again.contains("separate from Safari"));
+    }
+}

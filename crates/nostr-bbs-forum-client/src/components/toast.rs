@@ -8,142 +8,35 @@
 
 use leptos::prelude::*;
 
-use crate::utils::set_timeout_once;
+pub use nostr_bbs_client_core::toast::{provide_toasts, use_toasts, ToastStore, ToastVariant};
 
-/// Maximum number of visible toasts. Oldest are dismissed first.
-const MAX_VISIBLE: usize = 5;
-
-/// Auto-dismiss delay in milliseconds.
-const AUTO_DISMISS_MS: i32 = 4_000;
-
-// ---------------------------------------------------------------------------
-// Data
-// ---------------------------------------------------------------------------
-
-/// Visual variant for a toast notification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToastVariant {
-    Success,
-    Error,
-    Warning,
-    Info,
+fn variant_css_class(v: ToastVariant) -> &'static str {
+    match v {
+        ToastVariant::Success => "toast-success",
+        ToastVariant::Error => "toast-error",
+        ToastVariant::Warning => "toast-warning",
+        ToastVariant::Info => "",
+    }
 }
 
-impl ToastVariant {
-    fn css_class(self) -> &'static str {
-        match self {
-            Self::Success => "toast-success",
-            Self::Error => "toast-error",
-            Self::Warning => "toast-warning",
-            Self::Info => "",
+fn variant_icon_path(v: ToastVariant) -> &'static str {
+    match v {
+        ToastVariant::Success => "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z",
+        ToastVariant::Error => {
+            "M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"
         }
-    }
-
-    fn icon_path(self) -> &'static str {
-        match self {
-            Self::Success => "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z",
-            Self::Error => "M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z",
-            Self::Warning => "M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z",
-            Self::Info => "M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z",
-        }
-    }
-
-    fn icon_color(self) -> &'static str {
-        match self {
-            Self::Success => "text-green-400",
-            Self::Error => "text-red-400",
-            Self::Warning => "text-amber-400",
-            Self::Info => "text-blue-400",
-        }
+        ToastVariant::Warning => "M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z",
+        ToastVariant::Info => "M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z",
     }
 }
 
-/// A single toast notification.
-#[derive(Clone, Debug)]
-struct Toast {
-    id: u64,
-    message: String,
-    variant: ToastVariant,
-    exiting: RwSignal<bool>,
-}
-
-// ---------------------------------------------------------------------------
-// Context store
-// ---------------------------------------------------------------------------
-
-/// Shared toast store that lives in Leptos context.
-///
-/// `Copy` because both fields are already `Copy` (`RwSignal<T>` is Copy in
-/// Leptos 0.7). The Copy derive lets callers capture `toasts` into
-/// multiple closures without manual `.clone()` chains — required for
-/// FnMut on:click handlers.
-#[derive(Clone, Copy)]
-pub struct ToastStore {
-    toasts: RwSignal<Vec<Toast>>,
-    next_id: RwSignal<u64>,
-}
-
-impl ToastStore {
-    fn new() -> Self {
-        Self {
-            toasts: RwSignal::new(Vec::new()),
-            next_id: RwSignal::new(1),
-        }
+fn variant_icon_color(v: ToastVariant) -> &'static str {
+    match v {
+        ToastVariant::Success => "text-green-400",
+        ToastVariant::Error => "text-red-400",
+        ToastVariant::Warning => "text-amber-400",
+        ToastVariant::Info => "text-blue-400",
     }
-
-    /// Push a new toast. Trims oldest if over `MAX_VISIBLE`.
-    pub fn show(&self, message: impl Into<String>, variant: ToastVariant) {
-        let id = self.next_id.get_untracked();
-        self.next_id.set(id + 1);
-
-        let toast = Toast {
-            id,
-            message: message.into(),
-            variant,
-            exiting: RwSignal::new(false),
-        };
-
-        self.toasts.update(|list| {
-            list.push(toast);
-            // Enforce max visible — remove from front.
-            while list.len() > MAX_VISIBLE {
-                list.remove(0);
-            }
-        });
-
-        // Auto-dismiss after delay.
-        let store = *self;
-        set_timeout_once(move || store.dismiss(id), AUTO_DISMISS_MS);
-    }
-
-    /// Start exit animation then remove.
-    fn dismiss(&self, id: u64) {
-        // Mark as exiting for CSS animation.
-        let found = self
-            .toasts
-            .with_untracked(|list| list.iter().find(|t| t.id == id).map(|t| t.exiting));
-        if let Some(exiting) = found {
-            exiting.set(true);
-            // Remove after exit animation completes (200 ms).
-            let store = *self;
-            set_timeout_once(
-                move || {
-                    store.toasts.update(|list| list.retain(|t| t.id != id));
-                },
-                220,
-            );
-        }
-    }
-}
-
-/// Call once near the app root to install the toast store into context.
-pub fn provide_toasts() {
-    provide_context(ToastStore::new());
-}
-
-/// Retrieve the global toast store from context.
-pub fn use_toasts() -> ToastStore {
-    expect_context::<ToastStore>()
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +47,7 @@ pub fn use_toasts() -> ToastStore {
 #[component]
 pub(crate) fn ToastContainer() -> impl IntoView {
     let store = use_toasts();
-    let toasts = store.toasts;
+    let toasts = store.toasts();
 
     view! {
         <div class="toast-container" role="alert" aria-live="polite" aria-atomic="false">
@@ -164,9 +57,9 @@ pub(crate) fn ToastContainer() -> impl IntoView {
                 let:toast
             >
                 {
-                    let variant_cls = toast.variant.css_class();
-                    let icon_path = toast.variant.icon_path();
-                    let icon_color = toast.variant.icon_color();
+                    let variant_cls = variant_css_class(toast.variant);
+                    let icon_path = variant_icon_path(toast.variant);
+                    let icon_color = variant_icon_color(toast.variant);
                     let exiting = toast.exiting;
                     let id = toast.id;
 

@@ -602,8 +602,10 @@ fn report(reply: &str) {
 mod tests {
     use super::*;
 
-    const VIEW_SHOWDOWN: &str = include_str!("../poker/testdata/view_showdown.json");
-    const HAND_SHOWDOWN: &str = include_str!("../poker/testdata/hand_showdown.json");
+    const VIEW_SHOWDOWN: &str =
+        include_str!("../../../nostr-bbs-client-core/src/poker/testdata/view_showdown.json");
+    const HAND_SHOWDOWN: &str =
+        include_str!("../../../nostr-bbs-client-core/src/poker/testdata/hand_showdown.json");
 
     #[test]
     fn backend_follows_the_render_tier() {

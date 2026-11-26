@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_34 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_35 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -39,7 +39,7 @@ _34 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2005](ADR-2005-gift-wrap-recipient-tag-admission.md) | Admit gift-wraps on the recipient `p` tag, whitelist-gated, never on the ephemeral author | 2026-08-31 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
 | [ADR-2006](ADR-2006-trust-demotion-cron-tl3-never.md) | Run trust demotion time-driven on the cron trigger with hysteresis; never auto-demote TL3 | 2026-08-31 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
 | [ADR-2007](ADR-2007-kit-exact-pin-beta-channel.md) | Pin `solid-pod-rs` to an exact version and publish the kit on a single `1.0.0-beta.N` channel | 2026-08-31 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
-| [ADR-2008](ADR-2008-bbs-signer-holds-key-directly.md) | Let the retro BBS client hold its SecretKey directly, diverging from the ADR-105 `sign()` seam | 2026-08-31 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
+| [ADR-2008](ADR-2008-bbs-signer-holds-key-directly.md) | Let the retro BBS client hold its SecretKey directly, diverging from the ADR-105 `sign()` seam | 2026-08-31 | superseded | complete | inactive | — | ADR-2036 | jjohare | nostr-rust-forum |
 | [ADR-2009](ADR-2009-acl-sidecar-coerce-to-control.md) | Coerce every `.acl`/`.meta` sidecar access to `Control` via the shared upstream policy, reads and writes alike | 2026-08-31 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
 | [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) | Track governance decisions through durable projection and application receipts | 2026-09-04 | proposed | partial | staged | — | — | nostr-rust-forum maintainers (dreamlab AI) | nostr-rust-forum |
 | [ADR-2011](ADR-2011-operator-task-properties-set-the-escalation-boundary.md) | Operator-declared task properties set the escalation boundary, not the requesting agent's self-tier | 2026-09-14 | accepted | partial | live | — | — | jjohare | nostr-rust-forum |
@@ -65,4 +65,5 @@ _34 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2032](ADR-2032-a-space-is-a-nip29-group-with-a-signed-spatial-descriptor.md) | A space is a NIP-29 group with a relay-signed spatial descriptor, a NIP-53 interactive room and NIP-78 claims, using no new event kinds | 2026-10-30 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
 | [ADR-2033](ADR-2033-nip09-tombstones-member-deletion-gate-and-deleter-scoped-sync.md) | The relay keeps NIP-09 tombstones and gates members' kind-5s; clients sync deletions incrementally and scope each tombstone to its deleter | 2026-11-22 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
 | [ADR-2034](ADR-2034-absence-is-reported-only-after-an-authenticated-answer.md) | A deep-linked page reports "not found" only after an authenticated answer from the relay | 2026-11-22 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
-| [ADR-2035](ADR-2035-kanban-agent-columns-close-the-dispatch-loop-through-a-governed-case.md) | A kanban agent column dispatches its cards to a registered agent, and the agent's result returns as a governed case | 2026-11-23 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
+| [ADR-2035](ADR-2035-kanban-agent-columns-close-the-dispatch-loop-through-a-governed-case.md) | A kanban agent column dispatches its cards to a registered agent, and the agent's result returns as a governed case | 2026-11-23 | proposed | partial | inactive | — | — | jjohare | nostr-rust-forum |
+| [ADR-2036](ADR-2036-shared-client-core-and-retro-tui-redesign.md) | Extract shared nostr-bbs-client-core engine and re-imagine the retro BBS client as a responsive desktop and mobile TUI | 2026-11-26 | accepted | complete | staged | ADR-2008 | — | jjohare | nostr-rust-forum |

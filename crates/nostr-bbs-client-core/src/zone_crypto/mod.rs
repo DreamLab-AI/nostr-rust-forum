@@ -1,0 +1,1331 @@
+//! Zone end-to-end encryption (ADR-2016).
+//!
+//! A zone whose `ZONE_CONFIG` entry has `"encrypted": true` keeps the TEXT of
+//! its channel messages (kind 42, edits included) unreadable to the relay, the
+//! host, backups and any Nostr client that is not a key-holding member. The
+//! scheme is built only from published Nostr primitives — NIP-44 v2
+//! (`nostr_bbs_core::nip44`, rust-nostr, upstream-vector tested) and NIP-59 gift
+//! wraps (`nostr_bbs_core::gift_wrap`). No new cryptography lives here.
+//!
+//! ## Zone keys and epochs
+//!
+//! Each `(zone, epoch)` has its own random secp256k1 keypair. Epochs increase
+//! from 1; removing a member means rotating to a new epoch and granting it to
+//! everyone else.
+//!
+//! ## Message format
+//!
+//! `content = nip44_encrypt(author_secret, zone_epoch_pubkey, plaintext)` —
+//! the conversation key is `ECDH(author_sk, zone_pk) = ECDH(zone_sk, author_pk)`,
+//! so any holder of the zone secret decrypts it with the event's own author
+//! pubkey, and the author's signature still proves who wrote it. The event
+//! carries `["zk", <zone id>, <epoch>, <zone epoch pubkey hex>]`; every other tag
+//! is unchanged. The relay (`relay_do::nip_handlers`) refuses a kind-42 in an
+//! encrypted zone's channel without a well-formed `zk` tag and NIP-44 v2
+//! ciphertext.
+//!
+//! ## Key grants
+//!
+//! An admin hands a member the zone secret inside a NIP-59 gift wrap whose
+//! rumor is [`KIND_ZONE_KEY_GRANT`]. The grant is accepted only when the seal's
+//! (verified) author is an admin and the secret derives to the stated pubkey.
+//! This rumor kind and its content are a project-private construction: they
+//! live in this unpublished client crate on purpose, never in the published
+//! `nostr-bbs-core`.
+//!
+//! ## Read path
+//!
+//! [`read_outcome`] classifies every incoming kind-42 and
+//! [`store::ZoneKeyStore::prepare_incoming`] turns it into what the reader
+//! sees before the channel store's id-dedupe runs: the decrypted text, or a
+//! placeholder under the original id, tags and signature. The store caches
+//! each ciphertext by event id ([`read_cache::ReadCache`]) so a key that
+//! arrives later re-decrypts what is already on screen.
+//!
+//! A **sealed original** (ADR-2017, `nostr_bbs_core::sealed`) is a kind-42
+//! envelope, authored by an admin migrator, that carries a complete older
+//! plaintext message encrypted to the zone key. It is recognised by its
+//! `sealed` tag alone, never by the shape of its plaintext. When it opens and
+//! passes every core check the reader gets [`ReadOutcome::Sealed`], and the
+//! whole original event (its own id, author, timestamp and reply tags) is
+//! substituted for the envelope, so reactions, replies and deletions that
+//! name the original id attach to it as before. Without the key the envelope
+//! shows the missing-key placeholder under its own id; when the key arrives
+//! the placeholder is replaced in place by the original, and dropped instead
+//! if a copy with the original id is already on screen. An envelope that
+//! fails any check shows [`PLACEHOLDER_UNDECRYPTABLE`] and is never partly
+//! trusted.
+//!
+//! ## Deployment gate
+//!
+//! Encryption is dormant unless the operator enables it: a zone is treated as
+//! encrypted only when `window.__ENV__.ENCRYPTION_ENABLED == "true"` AND the
+//! zone's `encrypted` flag is set ([`zone_is_encrypted`]). With the gate off
+//! nothing is encrypted on write and the admin Encryption tab is hidden, but a
+//! `zk`-tagged message is still decrypted on read with any key held, so
+//! switching the gate off never makes history unreadable.
+//!
+//! ## Agents
+//!
+//! Grant targeting excludes every pubkey whose cohorts include
+//! [`AGENT_COHORT`] (admins included) unless the zone sets `agent_keys = true`
+//! — a per-zone operator trade-off, since an agent holding the key means the
+//! zone's plaintext reaches the agent stack and whatever model it calls.
+
+pub mod auto_grant;
+pub mod conversation_keys;
+pub mod grant_backlog;
+pub mod grant_backup;
+pub mod grant_ledger;
+pub mod grant_paging;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod grant_paging_local_relay;
+#[cfg(test)]
+mod grant_sync_sim;
+pub mod inbox_key;
+pub mod key_owner;
+pub mod keyset;
+pub mod nip171;
+pub mod public_inbox;
+pub mod read_cache;
+pub mod store;
+pub mod tickets;
+pub mod wrap_queue;
+
+use nostr_bbs_core::sealed::{has_sealed_tag, open_sealed_with_conversation_key};
+use nostr_bbs_core::signer::Signer;
+use nostr_bbs_core::{verify_event_strict, NostrEvent, UnsignedEvent};
+use serde::{Deserialize, Serialize};
+
+/// NIP-59 rumor kind carrying a zone-key grant. Lives in the ephemeral range:
+/// a rumor is never published on its own, only inside a seal + gift wrap.
+pub const KIND_ZONE_KEY_GRANT: u64 = 21453;
+
+/// `window.__ENV__` key of the deployment master gate. Only the exact string
+/// `"true"` turns encryption on.
+pub const GATE_ENV_KEY: &str = "ENCRYPTION_ENABLED";
+
+/// Interpret the gate's raw value: only the exact string `"true"` is on.
+pub fn gate_value_enabled(raw: Option<&str>) -> bool {
+    raw == Some("true")
+}
+
+/// Whether the deployment has zone encryption switched on.
+pub fn encryption_enabled() -> bool {
+    let raw = web_sys::window()
+        .and_then(|w| js_sys::Reflect::get(&w, &"__ENV__".into()).ok())
+        .filter(|env| !env.is_undefined() && !env.is_null())
+        .and_then(|env| js_sys::Reflect::get(&env, &GATE_ENV_KEY.into()).ok())
+        .and_then(|v| v.as_string());
+    gate_value_enabled(raw.as_deref())
+}
+
+/// Whether messages written into `zone` must be encrypted: gate on AND the
+/// zone's own flag.
+pub fn zone_is_encrypted(gate_on: bool, zone_flag: bool) -> bool {
+    gate_on && zone_flag
+}
+
+/// Tag name marking a zone-encrypted kind-42.
+pub const ZK_TAG: &str = "zk";
+
+/// Cohort that marks an agent identity. Excluded from key grants unless the
+/// zone sets `agent_keys`.
+pub const AGENT_COHORT: &str = "agent";
+
+/// Rendered in place of a zone-encrypted message the reader has no key for.
+pub const PLACEHOLDER_MISSING_KEY: &str = "🔒 Encrypted message — you don't have the key for this";
+
+/// Rendered in place of a zone-encrypted message that failed to decrypt with
+/// the key the reader holds (corrupt or forged ciphertext).
+pub const PLACEHOLDER_UNDECRYPTABLE: &str = "🔒 Encrypted message — it could not be decrypted";
+
+/// The relay's rejection text for a plaintext post into an encrypted zone.
+pub const RELAY_REJECT_PLAINTEXT: &str = "encrypted zone requires zone-key ciphertext";
+
+const SEAL_KIND: u64 = 13;
+
+// ---------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------
+
+/// A zone key the local client holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZoneKey {
+    /// Zone id (`"zone3"`), matching `ZONE_CONFIG`.
+    pub zone: String,
+    /// Epoch, from 1.
+    pub epoch: u32,
+    /// 64-hex zone epoch secret.
+    pub secret: String,
+    /// 64-hex x-only zone epoch pubkey.
+    pub pubkey: String,
+    /// Admin who granted it (the verified seal author), or the local admin
+    /// who created it.
+    pub granted_by: String,
+    /// Unix seconds this client learned the key.
+    pub received_at: u64,
+    /// Group identity pubkey (hex) this epoch key was derived under (NIP-171,
+    /// ADR-2028), or `None` for a legacy random epoch key. Older stored keys
+    /// deserialise as `None`.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// A key this device created (create or rotate) that has not yet been
+    /// delivered to its members and to the creator's own identity. It
+    /// decrypts, but is never chosen to send under (see
+    /// [`keyset::send_key`]), so a rotation whose grants fail cannot leave
+    /// new posts readable only on this device.
+    #[serde(default)]
+    pub pending_delivery: bool,
+}
+
+/// Whether `incoming` would replace `held` with a different key for the same
+/// slot. Keys are equal per `(zone, group, epoch)` for all time, so a different
+/// secret or epoch pubkey there is a conflicting mint, never an update.
+pub fn conflicts(held: &ZoneKey, incoming: &ZoneKey) -> bool {
+    held.store_id() == incoming.store_id()
+        && (held.secret != incoming.secret || held.pubkey != incoming.pubkey)
+}
+
+/// The channel a kind-42 belongs to: its `root`-marked `e` tag, else its first
+/// `e` tag (NIP-28).
+pub fn root_channel(tags: &[Vec<String>]) -> Option<String> {
+    let es = || {
+        tags.iter()
+            .filter(|t| t.first().map(String::as_str) == Some("e"))
+    };
+    es().find(|t| t.get(3).map(String::as_str) == Some("root"))
+        .or_else(|| es().next())
+        .and_then(|t| t.get(1).cloned())
+}
+
+/// The `(zone, epoch)` a zone-encrypted event's `zk` tag names, if any.
+pub fn zk_zone_epoch(tags: &[Vec<String>]) -> Option<(String, u32)> {
+    let t = tags
+        .iter()
+        .find(|t| t.first().map(String::as_str) == Some("zk"))?;
+    Some((t.get(1)?.clone(), t.get(2)?.parse().ok()?))
+}
+
+impl ZoneKey {
+    /// Storage id: `"<zone>:<group|->:<epoch>:<pubkey>"` (ADR-2028 decision
+    /// 6). The pubkey is part of it so two keys claiming one `(zone, epoch)`
+    /// both survive and the conflict is visible instead of overwritten.
+    pub fn store_id(&self) -> String {
+        // Gated on ZONE_GROUPS_ENABLED (ADR-2028, Phase 4 blocker fix). With the
+        // flag OFF the id is the legacy `<zone>:<epoch>`, and `migrate_zone_keys`
+        // is a no-op because a legacy row's id already equals its store_id. A
+        // second, different key for a held `(zone, epoch)` then shares the id,
+        // so `conflicts` fires and `put_zone_key_unless_conflicting` refuses it
+        // and keeps the held key (#84, #87); nothing is overwritten. With the
+        // flag ON the pubkey and group join the id, so two keys claiming one
+        // epoch get different ids and both persist: the inconsistency is
+        // visible, but the slot guard cannot fire. In both modes the IndexedDB
+        // row id is `<owner>/<store id>`, one row per signed-in identity (#92,
+        // `key_owner`).
+        self.store_id_with(crate::zone_crypto::tickets::zone_groups_enabled())
+    }
+
+    /// [`store_id`](Self::store_id) with the flag supplied, so both modes are
+    /// unit-testable (the native flag is always off).
+    pub fn store_id_with(&self, zone_groups_enabled: bool) -> String {
+        if zone_groups_enabled {
+            format!(
+                "{}:{}:{}:{}",
+                self.zone,
+                self.group.as_deref().unwrap_or("-"),
+                self.epoch,
+                self.pubkey
+            )
+        } else {
+            key_id(&self.zone, self.epoch)
+        }
+    }
+
+    /// The 32 secret bytes, if well-formed.
+    pub fn secret_bytes(&self) -> Option<[u8; 32]> {
+        hex32(&self.secret)
+    }
+}
+
+/// Storage id for `(zone, epoch)`.
+pub fn key_id(zone: &str, epoch: u32) -> String {
+    format!("{zone}:{epoch}")
+}
+
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let v = hex::decode(s).ok()?;
+    v.try_into().ok()
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Generate a fresh zone key for `(zone, epoch)`.
+pub fn generate_zone_key(
+    zone: &str,
+    epoch: u32,
+    creator: &str,
+    now: u64,
+) -> Result<ZoneKey, String> {
+    let kp = nostr_bbs_core::keys::generate_keypair().map_err(|e| e.to_string())?;
+    Ok(ZoneKey {
+        zone: zone.to_string(),
+        epoch,
+        secret: hex::encode(kp.secret.as_bytes()),
+        pubkey: kp.public.to_hex(),
+        granted_by: creator.to_string(),
+        received_at: now,
+        group: None,
+        pending_delivery: false,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The zk tag
+// ---------------------------------------------------------------------------
+
+/// A parsed `["zk", zone, epoch, pubkey]` tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZkRef {
+    pub zone: String,
+    pub epoch: u32,
+    pub pubkey: String,
+}
+
+/// Build the `zk` tag for a message encrypted to `key`.
+pub fn zk_tag(key: &ZoneKey) -> Vec<String> {
+    vec![
+        ZK_TAG.to_string(),
+        key.zone.clone(),
+        key.epoch.to_string(),
+        key.pubkey.clone(),
+    ]
+}
+
+/// Parse the first well-formed `zk` tag: zone non-empty, epoch a decimal
+/// `u32 >= 1`, pubkey 64 hex. The same shape the relay enforces.
+pub fn parse_zk(tags: &[Vec<String>]) -> Option<ZkRef> {
+    tags.iter().find_map(|t| {
+        if t.len() < 4 || t[0] != ZK_TAG || t[1].is_empty() {
+            return None;
+        }
+        let epoch: u32 = t[2].parse().ok().filter(|e| *e >= 1)?;
+        if !is_hex64(&t[3]) {
+            return None;
+        }
+        Some(ZkRef {
+            zone: t[1].clone(),
+            epoch,
+            pubkey: t[3].to_ascii_lowercase(),
+        })
+    })
+}
+
+/// Whether an event carries any `zk` tag (well-formed or not).
+pub fn has_zk_tag(tags: &[Vec<String>]) -> bool {
+    tags.iter()
+        .any(|t| t.first().map(String::as_str) == Some(ZK_TAG))
+}
+
+// ---------------------------------------------------------------------------
+// Grants
+// ---------------------------------------------------------------------------
+
+/// Content of a [`KIND_ZONE_KEY_GRANT`] rumor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantPayload {
+    pub zone: String,
+    pub epoch: u32,
+    pub secret: String,
+    pub pubkey: String,
+    pub created_at: u64,
+}
+
+impl GrantPayload {
+    pub fn from_key(key: &ZoneKey, now: u64) -> Self {
+        Self {
+            zone: key.zone.clone(),
+            epoch: key.epoch,
+            secret: key.secret.clone(),
+            pubkey: key.pubkey.clone(),
+            created_at: now,
+        }
+    }
+}
+
+/// Why a received grant was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GrantError {
+    #[error("not a zone-key grant (rumor kind {0})")]
+    WrongKind(u64),
+    #[error("grant content is malformed")]
+    Malformed,
+    #[error("grant secret does not derive to its stated pubkey")]
+    SecretMismatch,
+    #[error("grant was not sealed by an admin ({0})")]
+    NotAdmin(String),
+}
+
+/// Whether a zone-key grant wrap is settled and can be skipped from now on.
+///
+/// `admin` is the sealer's admin status (`None` when the relay could not be
+/// asked), `valid` whether [`validate_grant`] accepted it, and `persisted`
+/// whether the accepted key reached IndexedDB. A refused grant is final; a
+/// grant whose admin check or storage failed is retried next session, so a
+/// transient failure never loses a key.
+pub fn grant_settled(admin: Option<bool>, valid: bool, persisted: bool) -> bool {
+    match admin {
+        None => false,
+        Some(_) if valid => persisted,
+        Some(_) => true,
+    }
+}
+
+/// Validate a decrypted grant rumor sealed by `sealer`.
+///
+/// `is_admin` is injected so the check is testable; production passes the
+/// relay's `check-whitelist` answer.
+pub fn validate_grant(
+    rumor: &UnsignedEvent,
+    sealer: &str,
+    is_admin: bool,
+    now: u64,
+) -> Result<ZoneKey, GrantError> {
+    if rumor.kind != KIND_ZONE_KEY_GRANT {
+        return Err(GrantError::WrongKind(rumor.kind));
+    }
+    let p: GrantPayload =
+        serde_json::from_str(&rumor.content).map_err(|_| GrantError::Malformed)?;
+    if p.zone.is_empty() || p.epoch == 0 || !is_hex64(&p.pubkey) {
+        return Err(GrantError::Malformed);
+    }
+    let secret = hex32(&p.secret).ok_or(GrantError::Malformed)?;
+    let derived = nostr_bbs_core::keys::pubkey_hex(&secret).map_err(|_| GrantError::Malformed)?;
+    if !derived.eq_ignore_ascii_case(&p.pubkey) {
+        return Err(GrantError::SecretMismatch);
+    }
+    if !is_admin {
+        return Err(GrantError::NotAdmin(sealer.to_string()));
+    }
+    Ok(ZoneKey {
+        zone: p.zone,
+        epoch: p.epoch,
+        secret: p.secret.to_ascii_lowercase(),
+        pubkey: derived,
+        granted_by: sealer.to_string(),
+        received_at: now,
+        group: None,
+        pending_delivery: false,
+    })
+}
+
+/// Pubkeys that should hold `zone`'s key: members whose cohorts intersect the
+/// zone's `required_cohorts`, plus the granting admin themself. Agents (cohort
+/// [`AGENT_COHORT`]) are excluded — the admin included, if an agent — unless
+/// the zone opts in with `agent_keys`. Sorted, deduplicated.
+pub fn grant_targets(
+    members: &[(String, Vec<String>)],
+    required_cohorts: &[String],
+    me: &str,
+    agent_keys: bool,
+) -> Vec<String> {
+    let is_agent = |cohorts: &[String]| !agent_keys && cohorts.iter().any(|c| c == AGENT_COHORT);
+    let mut out: Vec<String> = members
+        .iter()
+        .filter(|(_, cohorts)| {
+            !is_agent(cohorts) && cohorts.iter().any(|c| required_cohorts.contains(c))
+        })
+        .map(|(pk, _)| pk.to_ascii_lowercase())
+        .collect();
+    let me_is_agent = members
+        .iter()
+        .find(|(pk, _)| pk.eq_ignore_ascii_case(me))
+        .is_some_and(|(_, c)| is_agent(c));
+    if !me.is_empty() && !me_is_agent {
+        out.push(me.to_ascii_lowercase());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The keys of `held` a grant may hand out, given the zone's configured
+/// `history_from_epoch` floor: every key at or above the floor, and always the
+/// newest held key (so a floor set too high never stops a zone being granted).
+pub fn grantable_keys(held: Vec<ZoneKey>, floor: Option<u32>) -> Vec<ZoneKey> {
+    let Some(floor) = floor else {
+        return held;
+    };
+    let newest = held.iter().map(|k| k.epoch).max();
+    held.into_iter()
+        .filter(|k| k.epoch >= floor || Some(k.epoch) == newest)
+        .collect()
+}
+
+/// The configured `history_from_epoch` of zone `zone_id`, if any.
+pub fn history_floor(zone_id: &str) -> Option<u32> {
+    crate::stores::zones::load_zones()
+        .into_iter()
+        .find(|z| z.id == zone_id)
+        .and_then(|z| z.history_from_epoch)
+}
+
+/// The grants to send when an admin grants a zone's key to `recipients`.
+///
+/// `held` is every key this admin holds for the zone, in any order. The
+/// newest epoch always goes to every recipient. With `include_history`, each
+/// earlier epoch also goes to the recipients not already recorded for it
+/// (`already_sent(epoch)`), so a member who joins after a rotation can read
+/// the zone's older messages. Without it they read only what is posted from
+/// the newest epoch on. Returns `(key, recipients)` pairs, newest first, with
+/// empty pairs dropped.
+pub fn grant_plan(
+    held: &[ZoneKey],
+    recipients: &[String],
+    include_history: bool,
+    already_sent: impl Fn(u32) -> std::collections::HashSet<String>,
+) -> Vec<(ZoneKey, Vec<String>)> {
+    let mut keys: Vec<&ZoneKey> = held.iter().collect();
+    keys.sort_by_key(|k| std::cmp::Reverse(k.epoch));
+    let mut out = Vec::new();
+    for (i, key) in keys.into_iter().enumerate() {
+        if i > 0 && !include_history {
+            break;
+        }
+        let sent = if i == 0 {
+            Default::default()
+        } else {
+            already_sent(key.epoch)
+        };
+        let recs: Vec<String> = recipients
+            .iter()
+            .filter(|pk| !sent.contains(*pk))
+            .cloned()
+            .collect();
+        if !recs.is_empty() {
+            out.push((key.clone(), recs));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Read path
+// ---------------------------------------------------------------------------
+
+/// What the reader sees for one kind-42.
+#[derive(Clone, Debug)]
+pub enum ReadOutcome {
+    /// No `zk` tag: legacy/plaintext, render as-is.
+    Plain,
+    /// Decrypted text.
+    Decrypted(String),
+    /// A sealed original (ADR-2017) that opened and passed every
+    /// `nostr_bbs_core::sealed::open_sealed` check: the complete original
+    /// signed event, with its own id, author, timestamp and reply tags.
+    /// Readers substitute the whole event for the envelope
+    /// ([`resolve_event`]); its text alone must never be shown under the
+    /// migrator's name.
+    Sealed(NostrEvent),
+    /// Encrypted to an epoch the reader has no key for.
+    MissingKey,
+    /// A key was held but decryption failed (or the tag is malformed). A
+    /// sealed envelope that fails any open check lands here too.
+    Failed,
+}
+
+// `NostrEvent` has no `PartialEq`; a sealed outcome compares field by field.
+impl PartialEq for ReadOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Plain, Self::Plain)
+            | (Self::MissingKey, Self::MissingKey)
+            | (Self::Failed, Self::Failed) => true,
+            (Self::Decrypted(a), Self::Decrypted(b)) => a == b,
+            (Self::Sealed(a), Self::Sealed(b)) => {
+                a.id == b.id
+                    && a.pubkey == b.pubkey
+                    && a.created_at == b.created_at
+                    && a.kind == b.kind
+                    && a.tags == b.tags
+                    && a.content == b.content
+                    && a.sig == b.sig
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ReadOutcome {}
+
+/// Whether `ev` is a kind-42 the zone read path must handle: it carries a
+/// `zk` tag or a `sealed` tag. Everything else is plaintext and passes
+/// through untouched.
+pub fn is_zone_message(ev: &NostrEvent) -> bool {
+    ev.kind == 42 && (has_zk_tag(&ev.tags) || has_sealed_tag(&ev.tags))
+}
+
+/// Decrypt `ev` with `key` (zone secret × event author), through the
+/// session's conversation-key cache ([`conversation_keys`]).
+pub fn decrypt_with(ev: &NostrEvent, key: &ZoneKey) -> Result<String, String> {
+    let sk = key.secret_bytes().ok_or("bad zone secret")?;
+    let author = hex32(&ev.pubkey).ok_or("bad author pubkey")?;
+    let ck = conversation_keys::conversation_key(&sk, &author).ok_or("bad author pubkey")?;
+    nostr_bbs_core::nip44::decrypt_with_conversation_key(&ck, &ev.content)
+        .map_err(|_| "ciphertext does not open with this zone key".to_string())
+}
+
+/// Classify `ev` for display, looking keys up by `(zone, epoch)`.
+///
+/// An event with a `sealed` tag is a sealed original (ADR-2017) and is only
+/// ever [`ReadOutcome::Sealed`], [`ReadOutcome::MissingKey`] or
+/// [`ReadOutcome::Failed`]: it never yields [`ReadOutcome::Decrypted`], so the
+/// envelope's JSON is never rendered as a message from the migrator.
+pub fn read_outcome(ev: &NostrEvent, lookup: impl Fn(&str, u32) -> Option<ZoneKey>) -> ReadOutcome {
+    let sealed = has_sealed_tag(&ev.tags);
+    if !sealed && !has_zk_tag(&ev.tags) {
+        return ReadOutcome::Plain;
+    }
+    let Some(zk) = parse_zk(&ev.tags) else {
+        return ReadOutcome::Failed;
+    };
+    let Some(key) = lookup(&zk.zone, zk.epoch) else {
+        return ReadOutcome::MissingKey;
+    };
+    if !key.pubkey.eq_ignore_ascii_case(&zk.pubkey) {
+        return ReadOutcome::Failed;
+    }
+    if sealed {
+        let Some(sk) = key.secret_bytes() else {
+            return ReadOutcome::Failed;
+        };
+        // The envelope's author (the migrator) is the NIP-44 peer; its
+        // conversation key with the zone secret is derived once per session.
+        // All six open checks, the inner signature included, still run.
+        let Some(author) = hex32(&ev.pubkey) else {
+            return ReadOutcome::Failed;
+        };
+        let Some(ck) = conversation_keys::conversation_key(&sk, &author) else {
+            return ReadOutcome::Failed;
+        };
+        return match open_sealed_with_conversation_key(ev, &author, &ck) {
+            Ok(inner) => ReadOutcome::Sealed(inner),
+            Err(_) => ReadOutcome::Failed,
+        };
+    }
+    match decrypt_with(ev, &key) {
+        Ok(text) => ReadOutcome::Decrypted(text),
+        Err(_) => ReadOutcome::Failed,
+    }
+}
+
+/// The content to render for `outcome` (`original` is the event's content).
+///
+/// For [`ReadOutcome::Sealed`] this is the original's text, which belongs to
+/// the original's author: use [`resolve_event`] to render it, never this text
+/// on the envelope.
+pub fn display_text(outcome: &ReadOutcome, original: &str) -> String {
+    match outcome {
+        ReadOutcome::Plain => original.to_string(),
+        ReadOutcome::Decrypted(t) => t.clone(),
+        ReadOutcome::Sealed(inner) => inner.content.clone(),
+        ReadOutcome::MissingKey => PLACEHOLDER_MISSING_KEY.to_string(),
+        ReadOutcome::Failed => PLACEHOLDER_UNDECRYPTABLE.to_string(),
+    }
+}
+
+/// The event to render for `ev` given its `outcome`: the restored original
+/// for a sealed envelope, otherwise `ev` with its content replaced by
+/// [`display_text`] (id, author, tags and signature kept).
+pub fn resolve_event(ev: &NostrEvent, outcome: ReadOutcome) -> NostrEvent {
+    match outcome {
+        ReadOutcome::Sealed(inner) => inner,
+        other => {
+            let mut out = ev.clone();
+            out.content = display_text(&other, &ev.content);
+            out
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write path
+// ---------------------------------------------------------------------------
+
+/// How an outgoing kind-42 must be published.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WritePlan {
+    /// The channel's zone is not encrypted.
+    Plain,
+    /// Encrypt to this key.
+    Encrypt(ZoneKey),
+}
+
+/// Message shown when a member tries to post without the zone key.
+pub fn missing_key_message(zone_display_name: &str) -> String {
+    let name = if zone_display_name.trim().is_empty() {
+        "this zone"
+    } else {
+        zone_display_name.trim()
+    };
+    format!(
+        "You don't have the {name} encryption key yet — an admin needs to grant it. \
+         Your message has not been sent."
+    )
+}
+
+/// Decide how to publish into a zone. An encrypted zone without a held key is
+/// an error — never a plaintext fallback.
+pub fn write_plan(
+    zone_encrypted: bool,
+    zone_display_name: &str,
+    latest: Option<ZoneKey>,
+) -> Result<WritePlan, String> {
+    if !zone_encrypted {
+        return Ok(WritePlan::Plain);
+    }
+    latest
+        .map(WritePlan::Encrypt)
+        .ok_or_else(|| missing_key_message(zone_display_name))
+}
+
+/// Apply `plan` to an outgoing unsigned kind-42: encrypt its content to the
+/// zone key through the author's signer (local key or NIP-07
+/// `window.nostr.nip44.encrypt`) and add the `zk` tag. Plain plans pass the
+/// event through untouched.
+pub async fn apply_write_plan(
+    plan: &WritePlan,
+    signer: &dyn Signer,
+    mut unsigned: UnsignedEvent,
+) -> Result<UnsignedEvent, String> {
+    let WritePlan::Encrypt(key) = plan else {
+        return Ok(unsigned);
+    };
+    if unsigned.content.is_empty() {
+        return Err("An encrypted message cannot be empty.".into());
+    }
+    let ct = signer
+        .nip44_encrypt(&key.pubkey, &unsigned.content)
+        .await
+        .map_err(|e| format!("Could not encrypt the message: {e}"))?;
+    unsigned.content = ct;
+    unsigned
+        .tags
+        .retain(|t| t.first().map(String::as_str) != Some(ZK_TAG));
+    unsigned.tags.push(zk_tag(key));
+    Ok(unsigned)
+}
+
+/// Turn a relay rejection into something a member can act on.
+pub fn explain_relay_rejection(message: &str) -> Option<String> {
+    message.contains(RELAY_REJECT_PLAINTEXT).then(|| {
+        "The relay refused this post because this zone is end-to-end encrypted and the \
+         message was not. Reload the page so the forum picks up your zone key, then try again."
+            .to_string()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Grant wrap / unwrap (composition of core NIP-44 + NIP-59 pieces)
+// ---------------------------------------------------------------------------
+
+fn seal_timestamp(now: u64) -> u64 {
+    // NIP-59 recommends randomising seal/wrap timestamps into the past so the
+    // relay cannot correlate the grant with the moment it was made.
+    #[cfg(target_arch = "wasm32")]
+    {
+        now.saturating_sub((js_sys::Math::random() * 172_800.0) as u64)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        now
+    }
+}
+
+/// Build the gift wrap that grants `key` to `recipient`, sealed by `signer`
+/// (an admin). The rumor is [`KIND_ZONE_KEY_GRANT`]; the seal is NIP-44
+/// encrypted to the recipient and signed by the admin; the wrap is
+/// `nostr_bbs_core::gift_wrap::wrap_seal` (throwaway key).
+pub async fn build_grant_wrap(
+    signer: &dyn Signer,
+    recipient: &str,
+    key: &ZoneKey,
+    now: u64,
+) -> Result<NostrEvent, String> {
+    let rumor = UnsignedEvent {
+        pubkey: signer.public_key().to_string(),
+        created_at: now,
+        kind: KIND_ZONE_KEY_GRANT,
+        tags: vec![vec!["p".to_string(), recipient.to_string()]],
+        content: serde_json::to_string(&GrantPayload::from_key(key, now))
+            .map_err(|e| e.to_string())?,
+    };
+    let rumor_json = serde_json::to_string(&rumor).map_err(|e| e.to_string())?;
+    let sealed = signer
+        .nip44_encrypt(recipient, &rumor_json)
+        .await
+        .map_err(|e| e.to_string())?;
+    let seal = signer
+        .sign_event(UnsignedEvent {
+            pubkey: signer.public_key().to_string(),
+            created_at: seal_timestamp(now),
+            kind: SEAL_KIND,
+            tags: vec![],
+            content: sealed,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    nostr_bbs_core::gift_wrap::wrap_seal(&seal, recipient).map_err(|e| e.to_string())
+}
+
+/// Unwrap a kind-1059 addressed to us, accepting any rumor kind. The store
+/// uses the kind to tell a grant from a DM or poker wrap sharing the same
+/// inbox, so unlike core's `unwrap_gift_with_signer_kind` it does not refuse
+/// on kind. Returns the verified seal author and the rumor.
+///
+/// Same checks as core, in the same order: the wrap's own id and signature
+/// verify before anything is decrypted, the seal's id and signature verify,
+/// and the rumor's author is the seal's author. Every error is a fixed
+/// string: serde quotes offending values in its messages, and a parse
+/// failure here is a failure on decrypted bytes.
+pub async fn unwrap_any(
+    gift: &NostrEvent,
+    signer: &dyn Signer,
+) -> Result<(String, UnsignedEvent), UnwrapError> {
+    let invalid = |m: &str| UnwrapError::Invalid(m.to_string());
+    let signer_failed = |m: &str| UnwrapError::Signer(m.to_string());
+    if gift.kind != nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP {
+        return Err(UnwrapError::Invalid(format!(
+            "not a gift wrap (kind {})",
+            gift.kind
+        )));
+    }
+    verify_event_strict(gift).map_err(|_| invalid("gift wrap id or signature does not verify"))?;
+    let seal_json = signer
+        .nip44_decrypt(&gift.pubkey, &gift.content)
+        .await
+        .map_err(|_| signer_failed("gift wrap layer does not decrypt"))?;
+    let seal: NostrEvent =
+        serde_json::from_str(&seal_json).map_err(|_| invalid("seal JSON malformed"))?;
+    if seal.kind != SEAL_KIND {
+        return Err(UnwrapError::Invalid(format!(
+            "not a seal (kind {})",
+            seal.kind
+        )));
+    }
+    verify_event_strict(&seal).map_err(|_| invalid("seal id or signature does not verify"))?;
+    let rumor_json = signer
+        .nip44_decrypt(&seal.pubkey, &seal.content)
+        .await
+        .map_err(|_| signer_failed("seal layer does not decrypt"))?;
+    let rumor: UnsignedEvent =
+        serde_json::from_str(&rumor_json).map_err(|_| invalid("rumor JSON malformed"))?;
+    if rumor.pubkey != seal.pubkey {
+        return Err(invalid("rumor author does not match seal author"));
+    }
+    Ok((seal.pubkey, rumor))
+}
+
+/// Why a gift wrap could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnwrapError {
+    /// The wrap itself is not valid (wrong kind, bad id or signature,
+    /// malformed JSON, mismatched authors). Final whoever opens it.
+    Invalid(String),
+    /// The signer's NIP-44 decrypt failed. With a local key that is final
+    /// (the wrap was not encrypted to it); with a NIP-07 extension it may be
+    /// a refused prompt or an extension error, which the error type does not
+    /// distinguish (`auth::nip07` maps every failure to `DecryptionFailed`).
+    Signer(String),
+}
+
+impl std::fmt::Display for UnwrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnwrapError::Invalid(m) | UnwrapError::Signer(m) => f.write_str(m),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    fn key_at(epoch: u32) -> ZoneKey {
+        generate_zone_key("zone3", epoch, &"a".repeat(64), 0).expect("key")
+    }
+
+    #[test]
+    fn grant_plan_newest_only_without_history() {
+        let held = vec![key_at(1), key_at(3), key_at(2)];
+        let recs = vec!["b".repeat(64)];
+        let plan = grant_plan(&held, &recs, false, |_| Default::default());
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.epoch, 3);
+        assert_eq!(plan[0].1, recs);
+    }
+
+    #[test]
+    fn grant_plan_history_sends_earlier_epochs_newest_first_skipping_holders() {
+        let held = vec![key_at(1), key_at(2), key_at(3)];
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let recs = vec![b.clone(), c.clone()];
+        // c already got epoch 2 from this device; nobody got epoch 1.
+        let plan = grant_plan(&held, &recs, true, |epoch| {
+            if epoch == 2 {
+                std::iter::once(c.clone()).collect()
+            } else {
+                Default::default()
+            }
+        });
+        let epochs: Vec<u32> = plan.iter().map(|(k, _)| k.epoch).collect();
+        assert_eq!(epochs, vec![3, 2, 1]);
+        assert_eq!(
+            plan[0].1, recs,
+            "newest epoch always goes to everyone asked"
+        );
+        assert_eq!(plan[1].1, vec![b.clone()]);
+        assert_eq!(plan[2].1, recs);
+    }
+
+    #[test]
+    fn grant_plan_empty_inputs() {
+        assert!(grant_plan(&[], &["b".repeat(64)], true, |_| Default::default()).is_empty());
+    }
+
+    #[test]
+    fn keys_below_the_history_floor_are_never_granted() {
+        let held = vec![key_at(1), key_at(2), key_at(3), key_at(5)];
+        let epochs = |v: Vec<ZoneKey>| {
+            let mut e: Vec<u32> = v.iter().map(|k| k.epoch).collect();
+            e.sort();
+            e
+        };
+        // A previous deployment's epochs 1-3 stay home; the current key goes.
+        assert_eq!(epochs(grantable_keys(held.clone(), Some(5))), vec![5]);
+        assert_eq!(epochs(grantable_keys(held.clone(), Some(2))), vec![2, 3, 5]);
+        assert_eq!(epochs(grantable_keys(held.clone(), None)), vec![1, 2, 3, 5]);
+        // A floor above every held key still leaves the newest grantable.
+        assert_eq!(epochs(grantable_keys(held, Some(9))), vec![5]);
+        assert!(grantable_keys(Vec::new(), Some(5)).is_empty());
+        // With history on, the plan then carries only the floor's keys.
+        let recs = vec!["b".repeat(64)];
+        let plan = grant_plan(
+            &grantable_keys(vec![key_at(1), key_at(2), key_at(5)], Some(5)),
+            &recs,
+            true,
+            |_| Default::default(),
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.epoch, 5);
+        assert!(grant_plan(&[key_at(1)], &[], true, |_| Default::default()).is_empty());
+    }
+
+    use super::*;
+
+    fn zk(secret: &str, pubkey: &str) -> ZoneKey {
+        ZoneKey {
+            zone: "zone3".into(),
+            epoch: 3,
+            secret: secret.into(),
+            pubkey: pubkey.into(),
+            granted_by: "a".repeat(64),
+            received_at: 1,
+            group: None,
+            pending_delivery: false,
+        }
+    }
+
+    #[test]
+    fn a_second_key_for_a_held_epoch_conflicts_the_same_one_does_not() {
+        let held = zk("s1", "p1");
+        assert!(!conflicts(&held, &zk("s1", "p1")));
+        assert!(
+            conflicts(&held, &zk("s2", "p2")),
+            "a different mint at the same epoch"
+        );
+        assert!(conflicts(&held, &zk("s2", "p1")));
+        let mut other_epoch = zk("s2", "p2");
+        other_epoch.epoch = 4;
+        assert!(
+            !conflicts(&held, &other_epoch),
+            "another epoch is another slot"
+        );
+    }
+
+    #[test]
+    fn zk_tag_names_zone_and_epoch() {
+        let tags = vec![
+            vec!["e".into(), "x".into()],
+            vec!["zk".into(), "zone3".into(), "3".into(), "pk".into()],
+        ];
+        assert_eq!(zk_zone_epoch(&tags), Some(("zone3".into(), 3)));
+        assert_eq!(
+            zk_zone_epoch(&[vec!["zk".into(), "zone3".into(), "x".into()]]),
+            None
+        );
+        assert_eq!(zk_zone_epoch(&[]), None);
+    }
+    use nostr_bbs_core::keys::generate_keypair;
+    use nostr_bbs_core::signer::PrfSigner;
+
+    fn signer() -> PrfSigner {
+        PrfSigner::new(generate_keypair().unwrap())
+    }
+
+    /// Drive a future that never truly suspends (the local `PrfSigner` does
+    /// all its work synchronously) without pulling in an executor crate.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    fn msg(author: &PrfSigner, content: &str, tags: Vec<Vec<String>>) -> NostrEvent {
+        NostrEvent {
+            id: "id".into(),
+            pubkey: author.public_key().to_string(),
+            created_at: 1,
+            kind: 42,
+            tags,
+            content: content.into(),
+            sig: String::new(),
+        }
+    }
+
+    fn unsigned42(author: &PrfSigner, content: &str) -> UnsignedEvent {
+        UnsignedEvent {
+            pubkey: author.public_key().to_string(),
+            created_at: 1,
+            kind: 42,
+            tags: vec![vec!["e".into(), "chan".into(), "".into(), "root".into()]],
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn author_encrypts_zone_decrypts_and_vice_versa() {
+        let author = signer();
+        let key = generate_zone_key("zone3", 1, "admin", 0).unwrap();
+        let plan = WritePlan::Encrypt(key.clone());
+        let out = block_on(apply_write_plan(
+            &plan,
+            &author,
+            unsigned42(&author, "hello family"),
+        ))
+        .unwrap();
+        assert_ne!(out.content, "hello family");
+        assert_eq!(parse_zk(&out.tags).unwrap().epoch, 1);
+        assert_eq!(out.tags[0][1], "chan", "other tags untouched");
+        let ev = msg(&author, &out.content, out.tags.clone());
+        assert_eq!(decrypt_with(&ev, &key).unwrap(), "hello family");
+        // The other direction of the ECDH: the zone key encrypts, the author
+        // (holding only their own secret) decrypts against the zone pubkey.
+        let zone_sk = key.secret_bytes().unwrap();
+        let author_pk = hex32(author.public_key()).unwrap();
+        let ct = nostr_bbs_core::nip44::encrypt(&zone_sk, &author_pk, "reply").unwrap();
+        let back = block_on(author.nip44_decrypt(&key.pubkey, &ct)).unwrap();
+        assert_eq!(back, "reply");
+    }
+
+    #[test]
+    fn ciphertext_is_what_the_relay_accepts() {
+        let author = signer();
+        let key = generate_zone_key("zone3", 2, "admin", 0).unwrap();
+        let out = block_on(apply_write_plan(
+            &WritePlan::Encrypt(key),
+            &author,
+            unsigned42(&author, "x"),
+        ))
+        .unwrap();
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&out.content)
+            .unwrap();
+        assert_eq!(raw[0], 2, "NIP-44 v2 version byte");
+        assert!(raw.len() >= 99);
+        assert!((132..=87472).contains(&out.content.len()));
+    }
+
+    #[test]
+    fn zk_tag_round_trips_and_rejects_malformed() {
+        let key = generate_zone_key("zone3", 7, "a", 0).unwrap();
+        let t = zk_tag(&key);
+        let z = parse_zk(&[t]).unwrap();
+        assert_eq!(
+            (z.zone.as_str(), z.epoch, z.pubkey.as_str()),
+            ("zone3", 7, key.pubkey.as_str())
+        );
+        let bad = |v: Vec<&str>| parse_zk(&[v.into_iter().map(String::from).collect()]);
+        assert!(bad(vec!["zk", "zone3", "0", &key.pubkey]).is_none());
+        assert!(bad(vec!["zk", "zone3", "x", &key.pubkey]).is_none());
+        assert!(bad(vec!["zk", "", "1", &key.pubkey]).is_none());
+        assert!(bad(vec!["zk", "zone3", "1", "abc"]).is_none());
+        assert!(bad(vec!["zk", "zone3", "1"]).is_none());
+    }
+
+    fn grant_rumor(sealer: &str, payload: &GrantPayload) -> UnsignedEvent {
+        UnsignedEvent {
+            pubkey: sealer.into(),
+            created_at: 1,
+            kind: KIND_ZONE_KEY_GRANT,
+            tags: vec![],
+            content: serde_json::to_string(payload).unwrap(),
+        }
+    }
+
+    #[test]
+    fn grant_validation() {
+        let key = generate_zone_key("zone3", 1, "a", 0).unwrap();
+        let good = GrantPayload::from_key(&key, 5);
+        let got = validate_grant(&grant_rumor("adm", &good), "adm", true, 9).unwrap();
+        assert_eq!(
+            (got.epoch, got.pubkey.as_str(), got.granted_by.as_str()),
+            (1, key.pubkey.as_str(), "adm")
+        );
+
+        let other = generate_zone_key("zone3", 1, "a", 0).unwrap();
+        let mismatched = GrantPayload {
+            pubkey: other.pubkey.clone(),
+            ..good.clone()
+        };
+        assert_eq!(
+            validate_grant(&grant_rumor("adm", &mismatched), "adm", true, 9),
+            Err(GrantError::SecretMismatch)
+        );
+        assert_eq!(
+            validate_grant(&grant_rumor("mem", &good), "mem", false, 9),
+            Err(GrantError::NotAdmin("mem".into()))
+        );
+        let mut dm = grant_rumor("adm", &good);
+        dm.kind = 14;
+        assert_eq!(
+            validate_grant(&dm, "adm", true, 9),
+            Err(GrantError::WrongKind(14))
+        );
+        let mut junk = grant_rumor("adm", &good);
+        junk.content = "{}".into();
+        assert_eq!(
+            validate_grant(&junk, "adm", true, 9),
+            Err(GrantError::Malformed)
+        );
+    }
+
+    #[test]
+    fn grant_wrap_round_trips_through_core_gift_wrap() {
+        let admin = signer();
+        let member = signer();
+        let key = generate_zone_key("zone3", 1, admin.public_key(), 0).unwrap();
+        let wrap = block_on(build_grant_wrap(&admin, member.public_key(), &key, 100)).unwrap();
+        assert_eq!(wrap.kind, 1059);
+        assert_ne!(
+            wrap.pubkey,
+            admin.public_key(),
+            "wrap signed by a throwaway key"
+        );
+        let (sealer, rumor) = block_on(unwrap_any(&wrap, &member)).unwrap();
+        assert_eq!(sealer, admin.public_key());
+        let got = validate_grant(&rumor, &sealer, true, 1).unwrap();
+        assert_eq!(got.secret, key.secret);
+        // A third party cannot open it.
+        assert!(block_on(unwrap_any(&wrap, &signer())).is_err());
+    }
+
+    #[test]
+    fn grant_unwrap_refuses_a_tampered_wrap_before_decrypting() {
+        let admin = signer();
+        let member = signer();
+        let key = generate_zone_key("zone3", 1, admin.public_key(), 0).unwrap();
+        let mut wrap = block_on(build_grant_wrap(&admin, member.public_key(), &key, 100)).unwrap();
+        wrap.sig = "00".repeat(64);
+        let err = block_on(unwrap_any(&wrap, &member)).unwrap_err();
+        assert!(matches!(err, UnwrapError::Invalid(_)), "{err}");
+        assert!(
+            err.to_string().contains("gift wrap id or signature"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn grant_unwrap_errors_never_echo_decrypted_bytes() {
+        // A seal whose plaintext is not a rumor: serde would quote the value
+        // of `created_at` in its message, so the canary must not surface.
+        let admin = signer();
+        let member = signer();
+        let canary = "CANARY-grant-plaintext";
+        let rumor_json = format!(
+            r#"{{"pubkey":"{}","created_at":"{canary}","kind":21453,"tags":[],"content":""}}"#,
+            admin.public_key()
+        );
+        let sealed = block_on(admin.nip44_encrypt(member.public_key(), &rumor_json)).unwrap();
+        let seal = block_on(admin.sign_event(UnsignedEvent {
+            pubkey: admin.public_key().to_string(),
+            created_at: 100,
+            kind: SEAL_KIND,
+            tags: vec![],
+            content: sealed,
+        }))
+        .unwrap();
+        let wrap = nostr_bbs_core::gift_wrap::wrap_seal(&seal, member.public_key()).unwrap();
+        let err = block_on(unwrap_any(&wrap, &member)).unwrap_err();
+        assert!(
+            !err.to_string().contains(canary),
+            "error echoed decrypted bytes: {err}"
+        );
+    }
+
+    #[test]
+    fn agents_are_never_grant_targets() {
+        let req = vec!["zone3".to_string(), "family".to_string()];
+        let members = vec![
+            (
+                "aa".to_string(),
+                vec!["members".to_string(), "family".to_string()],
+            ),
+            ("bb".to_string(), vec!["zone3".to_string()]),
+            (
+                "jj".to_string(),
+                vec![
+                    "members".to_string(),
+                    "agent".to_string(),
+                    "family".to_string(),
+                ],
+            ),
+            ("cc".to_string(), vec!["minimoonoir".to_string()]),
+        ];
+        assert_eq!(
+            grant_targets(&members, &req, "ME", false),
+            vec!["aa", "bb", "me"]
+        );
+        // An agent admin never grants itself a key.
+        assert_eq!(grant_targets(&members, &req, "jj", false), vec!["aa", "bb"]);
+    }
+
+    #[test]
+    fn agent_keys_zone_includes_agents() {
+        let req = vec!["family".to_string()];
+        let members = vec![
+            ("aa".to_string(), vec!["family".to_string()]),
+            (
+                "jj".to_string(),
+                vec!["agent".to_string(), "family".to_string()],
+            ),
+        ];
+        assert_eq!(
+            grant_targets(&members, &req, "me", true),
+            vec!["aa", "jj", "me"]
+        );
+        assert_eq!(grant_targets(&members, &req, "jj", true), vec!["aa", "jj"]);
+    }
+
+    #[test]
+    fn gate_is_exact_string_true_and_ands_with_zone_flag() {
+        assert!(gate_value_enabled(Some("true")));
+        for off in [
+            None,
+            Some("false"),
+            Some("TRUE"),
+            Some("1"),
+            Some(" true"),
+            Some(""),
+        ] {
+            assert!(!gate_value_enabled(off), "{off:?}");
+        }
+        assert!(zone_is_encrypted(true, true));
+        assert!(!zone_is_encrypted(false, true));
+        assert!(!zone_is_encrypted(true, false));
+    }
+
+    #[test]
+    fn encrypted_zone_without_key_refuses_never_plaintext() {
+        let err = write_plan(true, "Family", None).unwrap_err();
+        assert!(err.contains("Family encryption key"));
+        assert_eq!(write_plan(false, "Public", None).unwrap(), WritePlan::Plain);
+        let key = generate_zone_key("zone3", 1, "a", 0).unwrap();
+        assert_eq!(
+            write_plan(true, "Family", Some(key.clone())).unwrap(),
+            WritePlan::Encrypt(key)
+        );
+        let author = signer();
+        let plain = block_on(apply_write_plan(
+            &WritePlan::Plain,
+            &author,
+            unsigned42(&author, "hi"),
+        ))
+        .unwrap();
+        assert_eq!(plain.content, "hi");
+        assert!(!has_zk_tag(&plain.tags));
+    }
+
+    #[test]
+    fn read_path_placeholders_and_legacy() {
+        let author = signer();
+        let key = generate_zone_key("zone3", 3, "a", 0).unwrap();
+        let out = block_on(apply_write_plan(
+            &WritePlan::Encrypt(key.clone()),
+            &author,
+            unsigned42(&author, "secret"),
+        ))
+        .unwrap();
+        let ev = msg(&author, &out.content, out.tags);
+        let k2 = key.clone();
+        assert_eq!(
+            read_outcome(&ev, move |z, e| (z == "zone3" && e == 3)
+                .then(|| k2.clone())),
+            ReadOutcome::Decrypted("secret".into())
+        );
+        assert_eq!(read_outcome(&ev, |_, _| None), ReadOutcome::MissingKey);
+        assert_eq!(
+            display_text(&ReadOutcome::MissingKey, &ev.content),
+            PLACEHOLDER_MISSING_KEY
+        );
+        let wrong = generate_zone_key("zone3", 3, "a", 0).unwrap();
+        assert_eq!(
+            read_outcome(&ev, move |_, _| Some(wrong.clone())),
+            ReadOutcome::Failed
+        );
+        let legacy = msg(&author, "plain old message", vec![]);
+        assert_eq!(read_outcome(&legacy, |_, _| None), ReadOutcome::Plain);
+        assert_eq!(
+            display_text(&ReadOutcome::Plain, &legacy.content),
+            "plain old message"
+        );
+    }
+
+    #[test]
+    fn relay_rejection_is_explained() {
+        assert!(
+            explain_relay_rejection("blocked: encrypted zone requires zone-key ciphertext")
+                .is_some()
+        );
+        assert!(explain_relay_rejection("rate limited").is_none());
+    }
+
+    /// Regression: a grant wrap was marked processed before its key was
+    /// stored, so a failed IndexedDB write (or an unreachable admin check)
+    /// lost the key permanently. Only a final outcome settles a wrap.
+    #[test]
+    fn grant_wrap_settles_only_on_a_final_outcome() {
+        // Admin status unknown (relay unreachable): retry next session.
+        assert!(!grant_settled(None, false, false));
+        // Accepted but not persisted: retry, or the key is gone on reload.
+        assert!(!grant_settled(Some(true), true, false));
+        // Accepted and persisted: done.
+        assert!(grant_settled(Some(true), true, true));
+        // Refused (not an admin, bad secret, malformed): final.
+        assert!(grant_settled(Some(false), false, false));
+        assert!(grant_settled(Some(true), false, false));
+    }
+}

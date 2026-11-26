@@ -4,16 +4,12 @@ mod admin;
 #[cfg(feature = "alloc-stats")]
 mod alloc_stats;
 mod app;
-mod auth;
 mod components;
-mod dm;
 mod pages;
-pub(crate) mod poker;
-mod relay;
-pub(crate) mod stores;
-pub(crate) mod utils;
-pub(crate) mod wallet;
-pub(crate) mod zone_crypto;
+
+pub(crate) use nostr_bbs_client_core::{
+    auth, dm, poker, relay, stores, utils, wallet, zone_crypto,
+};
 
 use app::App;
 

@@ -20,7 +20,9 @@
 //! Every write goes through [`crate::utils::clipboard`].
 
 use leptos::prelude::*;
-use serde::{Deserialize, Serialize};
+
+#[allow(unused_imports)]
+pub use nostr_bbs_client_core::types::{KeyRef, KeyedText, TextPart};
 
 use crate::components::user_display::try_display_name_tracked;
 use crate::utils::{set_timeout_once, shorten_pubkey};
@@ -241,91 +243,7 @@ pub fn KeyGlyph(
 }
 
 // -- Text that mentions a key -------------------------------------------------
-
-/// A key as a sentence shows it: the full key plus the abridged text.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeyRef {
-    /// The full key (hex or npub) that a click copies.
-    pub full: String,
-    /// The abridged text shown in place of it.
-    pub display: String,
-}
-
-/// One run of a [`KeyedText`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TextPart {
-    /// Plain text.
-    Text(String),
-    /// An abridged key, rendered as a [`CopyKey`].
-    Key(KeyRef),
-}
-
-/// A sentence that may mention keys, kept as runs so the view can render each
-/// key as a [`CopyKey`] while the rest reads exactly as the flat string the
-/// surface showed before.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct KeyedText {
-    parts: Vec<TextPart>,
-}
-
-impl KeyedText {
-    /// An empty sentence.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Append plain text.
-    pub fn text(mut self, s: impl Into<String>) -> Self {
-        let s = s.into();
-        if s.is_empty() {
-            return self;
-        }
-        if let Some(TextPart::Text(prev)) = self.parts.last_mut() {
-            prev.push_str(&s);
-        } else {
-            self.parts.push(TextPart::Text(s));
-        }
-        self
-    }
-
-    /// Append a key: `full` is copied, `display` is shown.
-    pub fn key(mut self, full: impl Into<String>, display: impl Into<String>) -> Self {
-        self.parts.push(TextPart::Key(KeyRef {
-            full: full.into(),
-            display: display.into(),
-        }));
-        self
-    }
-
-    /// Split `text` around every occurrence of `key.display`, turning each
-    /// into a copyable key. Text that does not contain it stays plain.
-    pub fn with_key(text: &str, key: &KeyRef) -> Self {
-        if key.display.is_empty() {
-            return Self::new().text(text);
-        }
-        let mut out = Self::new();
-        let mut rest = text;
-        while let Some(at) = rest.find(&key.display) {
-            out = out
-                .text(&rest[..at])
-                .key(key.full.clone(), key.display.clone());
-            rest = &rest[at + key.display.len()..];
-        }
-        out.text(rest)
-    }
-}
-
-impl From<String> for KeyedText {
-    fn from(s: String) -> Self {
-        Self::new().text(s)
-    }
-}
-
-impl From<&str> for KeyedText {
-    fn from(s: &str) -> Self {
-        Self::new().text(s)
-    }
-}
+// `KeyRef`, `TextPart`, and `KeyedText` live in `nostr_bbs_client_core::types`.
 
 /// Render a [`KeyedText`]: plain runs as text, keys as [`CopyKey`]s.
 #[component]
@@ -356,24 +274,6 @@ mod tests {
     impl CopyFeedback {
         fn state(&self) -> CopyState {
             self.state
-        }
-    }
-
-    impl KeyedText {
-        fn parts(&self) -> &[TextPart] {
-            &self.parts
-        }
-
-        /// The sentence as flat text, keys in their abridged form — what the
-        /// surface showed before keys became copyable.
-        fn plain(&self) -> String {
-            self.parts
-                .iter()
-                .map(|p| match p {
-                    TextPart::Text(t) => t.as_str(),
-                    TextPart::Key(k) => k.display.as_str(),
-                })
-                .collect()
         }
     }
 
