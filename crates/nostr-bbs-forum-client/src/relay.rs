@@ -49,6 +49,25 @@ const MAX_SENDS_PER_SECOND: usize = 8;
 /// Rolling window for [`MAX_SENDS_PER_SECOND`], in milliseconds.
 const SEND_WINDOW_MS: f64 = 1_000.0;
 
+/// The `left_total` that means every frame queued so far has left: those
+/// already pushed onto the paced queue, plus `held` frames (held for AUTH or
+/// a reconnect) that will be pushed onto it ahead of anything queued later.
+fn send_mark(queued_total: u64, held: usize) -> u64 {
+    queued_total.saturating_add(held as u64)
+}
+
+/// How often [`RelayConnection::wait_until_sent`] re-checks the queue.
+const QUEUE_POLL_MS: i32 = 200;
+
+/// The time `frames` queued frames take to leave this client under its send
+/// pacing ([`MAX_SENDS_PER_SECOND`] per [`SEND_WINDOW_MS`]), assuming an open
+/// socket. A timer for a request queued behind them must allow at least this
+/// much before its own round trip begins.
+pub fn drain_time_ms(frames: usize) -> u32 {
+    let windows = u32::try_from(frames.div_ceil(MAX_SENDS_PER_SECOND)).unwrap_or(u32::MAX);
+    windows.saturating_mul(SEND_WINDOW_MS as u32)
+}
+
 /// Connection state for the relay WebSocket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -188,6 +207,12 @@ struct RelayInner {
     send_times: Vec<f64>,
     /// Frames awaiting a send slot. Drained FIFO by [`drain_send_queue`].
     send_queue: VecDeque<String>,
+    /// Frames ever pushed onto `send_queue`, and frames that have left it
+    /// (sent, or dropped by a reconnect or disconnect). Their difference is
+    /// `send_queue.len()`; [`RelayConnection::wait_until_sent`] waits on
+    /// `left_total` to reach a mark taken when it was called.
+    queued_total: u64,
+    left_total: u64,
     /// Whether a delayed drain is already scheduled (avoids timer pile-up).
     drain_scheduled: bool,
     relay_url: String,
@@ -303,7 +328,11 @@ unsafe impl Sync for RelayConnection {}
 /// Queue a frame for paced sending and kick the drain. See
 /// [`MAX_SENDS_PER_SECOND`] for why the client self-limits.
 fn queue_paced(inner_rc: &Rc<RefCell<RelayInner>>, msg: String) {
-    inner_rc.borrow_mut().send_queue.push_back(msg);
+    {
+        let mut inner = inner_rc.borrow_mut();
+        inner.send_queue.push_back(msg);
+        inner.queued_total += 1;
+    }
     drain_send_queue(inner_rc.clone());
 }
 
@@ -327,6 +356,7 @@ fn drain_send_queue(inner_rc: Rc<RefCell<RelayInner>>) {
         for _ in 0..budget {
             match inner.send_queue.pop_front() {
                 Some(m) => {
+                    inner.left_total += 1;
                     inner.send_times.push(now);
                     if let Some(wire) = req_wire_id(&m) {
                         let wire = wire.to_string();
@@ -391,6 +421,8 @@ impl RelayConnection {
             pending_messages: Vec::new(),
             send_times: Vec::new(),
             send_queue: VecDeque::new(),
+            queued_total: 0,
+            left_total: 0,
             drain_scheduled: false,
             relay_url,
             immediate_writes,
@@ -544,7 +576,9 @@ impl RelayConnection {
                 // socket (a reconnect without `disconnect` keeps the queue):
                 // the replay below re-sends them, and an uncounted extra REQ
                 // would let the ledger call an anonymous answer authenticated.
+                let before = inner.send_queue.len();
                 inner.send_queue.retain(|m| !m.starts_with("[\"REQ\""));
+                inner.left_total += (before - inner.send_queue.len()) as u64;
                 // Replay subscriptions on (re)connect. Answers owed on the old
                 // socket will never arrive, so each ledger restarts here.
                 let mut watches = Vec::new();
@@ -661,6 +695,7 @@ impl RelayConnection {
             inner.deferred_writes.clear();
             // Stale queued frames must not double-send after a reconnect —
             // the on_open flush + replay rebuilds everything still relevant.
+            inner.left_total += inner.send_queue.len() as u64;
             inner.send_queue.clear();
             inner.send_times.clear();
         });
@@ -886,6 +921,49 @@ impl RelayConnection {
             serde_json::to_string(&msg).map_err(|e| format!("serialize error: {}", e))?;
         self.send_or_defer_write(&serialized);
         Ok(())
+    }
+
+    /// Frames this connection has accepted but not yet put on the wire: the
+    /// paced send queue, writes held until NIP-42 AUTH completes, and frames
+    /// waiting for a (re)connect.
+    pub fn queued_frames(&self) -> usize {
+        self.with_inner(|rc| {
+            let inner = rc.borrow();
+            inner.send_queue.len() + inner.deferred_writes.len() + inner.pending_messages.len()
+        })
+    }
+
+    /// Wait until every frame queued before this call has left this client,
+    /// or `cap_ms` passes. Returns whether they all left. A caller about to
+    /// start a timed request waits here first, so its timer measures the
+    /// relay's answer and not the frames ahead of it. Frames queued after the
+    /// call are not waited for, so a busy page cannot starve the wait.
+    pub async fn wait_until_sent(&self, cap_ms: u32) -> bool {
+        let start = js_sys::Date::now();
+        let mark = self.with_inner(|rc| {
+            let inner = rc.borrow();
+            send_mark(
+                inner.queued_total,
+                inner.deferred_writes.len() + inner.pending_messages.len(),
+            )
+        });
+        loop {
+            if self.with_inner(|rc| rc.borrow().left_total) >= mark {
+                return true;
+            }
+            if js_sys::Date::now() - start >= f64::from(cap_ms) {
+                return false;
+            }
+            let promise = js_sys::Promise::new(&mut |resolve, _| {
+                if let Some(win) = web_sys::window() {
+                    let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        &resolve,
+                        QUEUE_POLL_MS,
+                    );
+                }
+            });
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        }
     }
 
     /// Send a raw string message to the WebSocket, paced under the relay's
@@ -1712,4 +1790,28 @@ fn get_relay_url() -> String {
     option_env!("VITE_RELAY_URL")
         .unwrap_or(DEFAULT_RELAY_URL)
         .to_string()
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::{drain_time_ms, send_mark};
+
+    #[test]
+    fn the_send_mark_covers_held_frames_but_not_later_ones() {
+        // 130 pushed, 3 held for AUTH: all 133 must leave first.
+        assert_eq!(send_mark(130, 3), 133);
+        assert_eq!(send_mark(0, 0), 0);
+        assert_eq!(send_mark(u64::MAX, 5), u64::MAX);
+    }
+
+    #[test]
+    fn drain_time_counts_whole_send_windows() {
+        assert_eq!(drain_time_ms(0), 0);
+        assert_eq!(drain_time_ms(1), 1_000);
+        assert_eq!(drain_time_ms(8), 1_000);
+        assert_eq!(drain_time_ms(9), 2_000);
+        // The 2026-11-26 sweep: ~127 zone2 + ~25 zone4 wraps.
+        assert_eq!(drain_time_ms(152), 19_000);
+        assert_eq!(drain_time_ms(usize::MAX), u32::MAX);
+    }
 }

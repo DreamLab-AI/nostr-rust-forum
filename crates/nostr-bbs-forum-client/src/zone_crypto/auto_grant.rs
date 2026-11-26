@@ -101,6 +101,10 @@ pub struct MissingPlan {
     /// surfaced for the admin to approve once (see
     /// [`AutoGrant::approve`](crate::zone_crypto::auto_grant::AutoGrant::approve)).
     pub pending: Vec<(String, String)>,
+    /// `(zone, epoch)` ledgers this device holds entries for but the relay
+    /// holds no backup of (see [`super::grant_backup::needs_repair`]). Filled
+    /// by [`AutoGrant::plan`], never by [`plan_missing`].
+    pub repair: Vec<(String, u32)>,
 }
 
 /// The grants still owed, across every zone this admin holds a key for, split
@@ -330,16 +334,34 @@ pub async fn send_grants(
     // data. Best effort: the local ledger stays authoritative on failure.
     acks.expect(report.sent);
     if !touched.is_empty() && report.sent > 0 {
+        // The wraps are paced out of the send queue (one frame each), so the
+        // ack window starts once they have all left, not when they were queued.
+        relay
+            .wait_until_sent(super::grant_backup::queue_wait_ms(relay.queued_frames()))
+            .await;
         acks.wait(BACKUP_ACK_WAIT_MS).await;
-        for (zone, epoch) in touched {
-            if let Err(e) =
-                super::grant_backup::push(relay, signer, store, &zone, epoch, now_secs()).await
-            {
-                web_sys::console::warn_1(&format!("[zone-key] grant backup: {e}").into());
-            }
-        }
+        push_backups(relay, signer, store, &touched).await;
     }
     report
+}
+
+/// Publish this admin's backup of each `(zone, epoch)` in `which`, retrying
+/// a failure once. Best effort: the local ledger stays authoritative.
+pub async fn push_backups(
+    relay: &RelayConnection,
+    signer: &dyn Signer,
+    store: ZoneKeyStore,
+    which: &[(String, u32)],
+) {
+    for (zone, epoch) in which {
+        if let Err(e) =
+            super::grant_backup::push_retrying(relay, signer, store, zone, *epoch, now_secs).await
+        {
+            web_sys::console::warn_1(
+                &format!("[zone-key] grant backup {zone}/{epoch}: {e}").into(),
+            );
+        }
+    }
 }
 
 /// The handles a grant needs, captured while a reactive owner is in scope
@@ -414,15 +436,30 @@ impl AutoGrant {
         // persisted approved set. Built from the device's own ledger, never
         // the relay's roster.
         let mut known: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut repair: Vec<(String, u32)> = Vec::new();
         for (zone, keys) in &held {
             for k in keys {
                 // Restore this admin's relay-held record first (once per
                 // session): after clearing site data the local ledger is empty
                 // and everyone would otherwise look ungranted. A relay that
                 // cannot answer leaves the local ledger standing alone.
-                let _ =
-                    super::grant_backup::pull(&self.relay, signer, self.store, &k.zone, k.epoch)
-                        .await;
+                let pulled = super::grant_backup::pull_detailed(
+                    &self.relay,
+                    signer,
+                    self.store,
+                    &k.zone,
+                    k.epoch,
+                )
+                .await;
+                let local = self.store.export_grant_backup(&k.zone, k.epoch).await.len();
+                let authed = self.relay.authenticated().get_untracked();
+                if super::grant_backup::needs_repair(
+                    pulled.as_ref().map_err(String::as_str).copied(),
+                    local,
+                    authed,
+                ) {
+                    repair.push((k.zone.clone(), k.epoch));
+                }
                 let s = self.store.grants_sent_to(&k.zone, k.epoch, &targets).await;
                 sent.insert((k.zone.clone(), k.epoch), s);
             }
@@ -450,7 +487,7 @@ impl AutoGrant {
                 known.insert(zone.id.clone(), base.into_iter().collect());
             }
         }
-        Ok(plan_missing(
+        let mut plan = plan_missing(
             &zones,
             &members,
             &me,
@@ -459,7 +496,9 @@ impl AutoGrant {
             &known,
             auto_grant_new,
             only,
-        ))
+        );
+        plan.repair = repair;
+        Ok(plan)
     }
 
     async fn run(&self, only: Option<&HashSet<String>>) -> Result<GrantReport, String> {
@@ -553,6 +592,36 @@ impl AutoGrant {
                     ),
                     ToastVariant::Info,
                 );
+            }
+            // Backups the relay is missing although this device holds the
+            // ledger: publish them unless this batch is about to (it pushes
+            // what it touches). An extension admin is not prompted here.
+            let touched: HashSet<(String, u32)> = plan
+                .grants
+                .iter()
+                .filter(|(_, r)| !r.is_empty())
+                .map(|(k, _)| (k.zone.clone(), k.epoch))
+                .collect();
+            let repair: Vec<(String, u32)> = plan
+                .repair
+                .iter()
+                .filter(|z| !touched.contains(*z))
+                .cloned()
+                .collect();
+            if !extension && !repair.is_empty() {
+                // Detached: a slow or refusing relay must not hold up the
+                // grants below. One attempt per key per session.
+                let owner = signer.public_key().to_string();
+                let repair: Vec<(String, u32)> = repair
+                    .into_iter()
+                    .filter(|(z, e)| super::grant_backup::claim_repair(&owner, z, *e))
+                    .collect();
+                if !repair.is_empty() {
+                    let (relay, store, signer) = (this.relay.clone(), this.store, signer.clone());
+                    spawn_local(async move {
+                        push_backups(&relay, &*signer, store, &repair).await;
+                    });
+                }
             }
             let waiting = grant_count(&plan.grants);
             if waiting == 0 {
