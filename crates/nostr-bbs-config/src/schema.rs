@@ -80,10 +80,59 @@ pub struct ForumConfig {
     /// Zone end-to-end encryption master gate (ADR-2016).
     #[serde(default)]
     pub encryption: Encryption,
+    /// Link-preview worker egress allow-list.
+    #[serde(default)]
+    pub preview: Preview,
     /// `[[ingress]]` recipients the relay admits gift wraps for without a
     /// whitelist row (see [`crate::ingress`]). Empty by default.
     #[serde(default)]
     pub ingress: Vec<crate::ingress::IngressRecipient>,
+}
+
+/// Link-preview worker egress allow-list.
+///
+/// The preview worker fetches third-party pages on members' behalf, so it only
+/// contacts hosts the operator lists here. Each entry is a bare hostname and
+/// also covers its subdomains (`twitter.com` covers `publish.twitter.com`).
+/// Redirect hops are checked too, so list both ends of a redirect (`youtu.be`
+/// and `youtube.com`). A link to an unlisted host gets no preview.
+///
+/// Projected by [`Preview::allowed_hosts_var`] into the preview worker's
+/// `[vars]` as `PREVIEW_ALLOWED_HOSTS`. An empty list projects an empty value,
+/// and the worker then refuses every fetch (previews answer 503).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Preview {
+    /// Hostnames the preview worker may fetch, each covering its subdomains.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Preview {
+    /// The allow-list in canonical form: lower-case, without a trailing dot,
+    /// sorted, with duplicates and entries already covered by a broader entry
+    /// removed (`en.wikipedia.org` is dropped when `wikipedia.org` is listed).
+    pub fn canonical_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .allowed_hosts
+            .iter()
+            .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        let covered = |h: &String| {
+            hosts
+                .iter()
+                .any(|parent| parent != h && h.ends_with(&format!(".{parent}")))
+        };
+        hosts.iter().filter(|h| !covered(h)).cloned().collect()
+    }
+
+    /// The value of the preview worker's `PREVIEW_ALLOWED_HOSTS` var: the
+    /// canonical hosts joined with `", "`.
+    pub fn allowed_hosts_var(&self) -> String {
+        self.canonical_hosts().join(", ")
+    }
 }
 
 /// Zone end-to-end encryption master gate (ADR-2016).

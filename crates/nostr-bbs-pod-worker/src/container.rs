@@ -65,56 +65,72 @@ pub async fn list_container(
     }))
 }
 
-/// Resolve the target path for a POST to a container.
-///
-/// If a valid `Slug` is provided it is used as the child name; otherwise a
-/// timestamp-based pseudo-random name is generated.  Slug values containing
-/// `/` or `..` are rejected (treated as absent).
-pub fn resolve_slug(container_path: &str, slug: Option<&str>) -> String {
-    let name = slug
-        .filter(|s| !s.is_empty() && !s.contains('/') && !s.contains(".."))
-        .map(|s| s.to_string())
-        .unwrap_or_else(generate_id);
+/// Longest `Slug` (in bytes) honoured as a child name. Longer hints are
+/// ignored and a generated name is used instead.
+pub const MAX_SLUG_BYTES: usize = 160;
 
-    format!("{container_path}{name}")
+/// Return `slug` when it is acceptable as a child name, `None` otherwise.
+///
+/// A container POST is authorised by `acl:Append` on the container, so the
+/// child name must never let that grant reach anything Append does not
+/// cover. A slug is accepted only when ALL of these hold:
+///
+/// - it is 1..=[`MAX_SLUG_BYTES`] bytes of `[A-Za-z0-9._-]` (an allowlist, so
+///   `/`, `\`, `%`-encodings, spaces and every control byte are excluded
+///   without a separate decode step);
+/// - it does not start with `.` (no dot-files, no `.acl`, no `.`/`..`);
+/// - it does not name an ACL or meta sidecar. The sidecar test is the shared
+///   WAC policy [`solid_pod_rs::wac::protected_resource_for_acl`] (`.acl`,
+///   `.meta`), applied to the ASCII-lower-cased name because the upstream
+///   check is case-sensitive; `.meta.json` is refused in addition, as the
+///   JSON-serialised meta form some Solid servers use.
+///
+/// Solid treats `Slug` as a hint, so a refused slug is treated as absent and
+/// the caller falls back to a generated name (reported via `Location`).
+pub fn accepted_slug(slug: Option<&str>) -> Option<&str> {
+    let s = slug?;
+    let b = s.as_bytes();
+    let well_formed = !b.is_empty()
+        && b.len() <= MAX_SLUG_BYTES
+        && b[0] != b'.'
+        && b.iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'));
+    if !well_formed {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    if solid_pod_rs::wac::protected_resource_for_acl(&lower).is_some()
+        || lower.ends_with(".meta.json")
+    {
+        return None;
+    }
+    Some(s)
 }
 
-/// Generate a pseudo-unique identifier.
+/// Resolve the target path for a POST to a container.
 ///
-/// In the Workers WASM environment this uses `Date.now()` via `js_sys`.
-/// In native test builds it falls back to `std::time` so unit tests can
-/// run without a JS runtime.
+/// If the `Slug` passes [`accepted_slug`] it is used as the child name;
+/// otherwise a random name from [`generated_child_path`] is used.
+pub fn resolve_slug(container_path: &str, slug: Option<&str>) -> String {
+    match accepted_slug(slug) {
+        Some(name) => format!("{container_path}{name}"),
+        None => generated_child_path(container_path),
+    }
+}
+
+/// A fresh child path under `container_path` with a random (UUID v4) name.
+pub fn generated_child_path(container_path: &str) -> String {
+    format!("{container_path}{}", generate_id())
+}
+
+/// Generate an unpredictable, collision-resistant child name.
+///
+/// UUID v4 draws from the platform CSPRNG (`crypto.getRandomValues` on
+/// wasm32 via `getrandom`'s `js` backend, the OS RNG natively). The previous
+/// implementation derived every byte from the millisecond clock, so two POSTs
+/// in the same millisecond produced the same name and names were guessable.
 fn generate_id() -> String {
-    let t: u64 = {
-        #[cfg(target_arch = "wasm32")]
-        {
-            js_sys::Date::now() as u64
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        }
-    };
-
-    let bytes: Vec<u8> = (0u8..16)
-        .map(|i| {
-            // Mix timestamp bits with the index for basic uniqueness
-            let shift = (i as u64 * 7) % 64;
-            ((t.wrapping_shr(shift as u32)) ^ (i as u64 * 0x9e3779b9)) as u8
-        })
-        .collect();
-
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        (bytes[6] & 0x0f) | 0x40, bytes[7],
-        (bytes[8] & 0x3f) | 0x80, bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-    )
+    uuid::Uuid::new_v4().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +167,75 @@ mod tests {
         let result = resolve_slug("/photos/", Some(".."));
         assert!(result.starts_with("/photos/"));
         assert!(!result.contains(".."));
+    }
+
+    /// Slugs naming an ACL/meta sidecar, a dot-file, or carrying control or
+    /// percent-encoded bytes must never become the child name: a container
+    /// POST only needs `acl:Append`, and a sidecar would rewrite the
+    /// container's authorisation graph.
+    #[test]
+    fn resolve_slug_rejects_sidecar_and_hidden_names() {
+        for bad in [
+            ".acl",
+            "x.acl",
+            "X.ACL",
+            "item.Acl",
+            ".meta",
+            "x.meta",
+            "x.META",
+            "x.meta.json",
+            ".hidden",
+            ".",
+            "a\nb",
+            "a\u{0}b",
+            "a\u{7f}b",
+            "%2Eacl",
+            "%2e%2e",
+            "a%2Fb",
+            "a\\b",
+            "a b",
+        ] {
+            let result = resolve_slug("/inbox/", Some(bad));
+            assert!(result.starts_with("/inbox/"), "{bad:?} -> {result}");
+            assert_ne!(result, format!("/inbox/{bad}"), "slug {bad:?} was accepted");
+            assert!(
+                accepted_slug(Some(bad)).is_none(),
+                "slug {bad:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_slug_keeps_ordinary_names() {
+        for good in [
+            "note.jsonld",
+            "cat.jpg",
+            "2026-11-26_msg",
+            "README",
+            "a.acl.txt",
+        ] {
+            assert_eq!(accepted_slug(Some(good)), Some(good));
+            assert_eq!(
+                resolve_slug("/inbox/", Some(good)),
+                format!("/inbox/{good}")
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_slug_rejects_overlong() {
+        let long = "a".repeat(MAX_SLUG_BYTES + 1);
+        assert!(accepted_slug(Some(&long)).is_none());
+        let max = "a".repeat(MAX_SLUG_BYTES);
+        assert_eq!(accepted_slug(Some(&max)), Some(max.as_str()));
+    }
+
+    #[test]
+    fn generated_names_are_distinct_and_plain() {
+        let a = generate_id();
+        let b = generate_id();
+        assert_ne!(a, b, "two names generated back-to-back collided");
+        assert!(accepted_slug(Some(&a)).is_some());
     }
 
     #[test]

@@ -18,6 +18,52 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Inter self-hosted; BBS page gets the baseline CSP (2026-11-26)
+
+Forum client and BBS client shells only.
+
+- **Inter.** The forum loaded Inter from Google Fonts on every page view, handing each visitor's IP and Referer to a
+  third party. It now ships `assets/fonts/InterVariable.woff2` (Inter 4.1, rsms/inter release `v4.1`, one variable file
+  for weights 100 to 900; SHA-256 `693b77d4f32ee9b8bfc995589b5fad5e99adf2832738661f5402f9978429a8e3`) with its SIL OFL
+  1.1 licence, copied to `<public-url>/fonts/`, and declares it with `@font-face` in `style.css`. No font CDN request
+  remains. First load fetches about 344 KiB of font instead of Google's Latin subset; the service worker caches it.
+- **BBS CSP.** The BBS page had no CSP at all. It now carries the forum's baseline meta policy
+  (`object-src 'none'; base-uri 'none'; form-action 'self'`). A `script-src` for either page needs the host site to
+  stop injecting inline scripts after the build; that is a separate, cross-repository change.
+
+### Forum deep-link restore stays inside the forum (2026-11-26)
+
+Forum client `index.html` only. The GitHub Pages pickup concatenated `__p` onto `/community` unchecked, so
+`?__p=/../contact/` rewrote the address bar out of the forum (same origin only: `history.replaceState` cannot leave
+the origin, so this was a path escape, not an open redirect). The target is now resolved with the URL parser and kept
+only when it is same-origin and under `/community/`; otherwise the page lands on `/community/`. `__p` is stripped in
+both cases. `tests/deep-link.test.mjs` drives the real script; CI now runs `node --test` over the forum client's
+`tests/` (which also brings the existing, previously unrun `sw-push.test.mjs` into CI).
+
+### Jev transport: no redirects with the bearer key, response capped (2026-11-26)
+
+`nostr-bbs-jev` only; covers both consumers, the relay worker's triage call and the auth worker's rationale check.
+
+- `WorkersFetch` sends with `redirect: manual`. The request may carry `Authorization: Bearer <TYPESAFE_API_KEY>`; a
+  followed redirect would have handed it to any host the upstream named. A 3xx now reaches `ask` as its status and
+  becomes `Fallback::Http`.
+- The body is read with a running total and refused past `MAX_RESPONSE_BYTES` (64 KiB), checked first against
+  `Content-Length`; overflow is `TransportError::Other` (`Fallback::Transport`). The deadline race, already present,
+  covers the body read.
+
+### Preview worker egress fails closed without an allow-list (2026-11-26, breaking)
+
+Preview worker only. **Breaking for deployments that do not set `PREVIEW_ALLOWED_HOSTS`:** link previews and the BBS
+ASCII image route now answer 503 until it is set.
+
+- **Why.** The Workers runtime resolves the hostname again at `fetch` time and cannot pin an IP, so the hostname
+  denylist alone is open to DNS rebinding (an attacker domain that resolves to `127.0.0.1` or `169.254.169.254`). The
+  allow-list was documented as the real mitigation but defaulted off.
+- **What.** `ssrf::EgressPolicy` (`AllowList`, `DenylistOnly`, `Closed`) is derived from the worker's `Env` on every
+  request. A non-empty `PREVIEW_ALLOWED_HOSTS` is authoritative; unset or blank is `Closed`: every fetch, redirect hop
+  included, is refused and `/preview` and `/ascii` return 503. The denylist-only mode needs the development opt-out
+  `PREVIEW_ALLOW_ANY_HOST = "true"` (exact value). The kit `wrangler.toml` now ships an example allow-list.
+
 ### Zone-key grant backlog paged past the relay's row cap (2026-11-24, PR #95)
 
 Forum client only. Not yet exercised in a browser or on a live relay; see "Not verified" below.

@@ -19,10 +19,15 @@
 //! **The real mitigation in this runtime is the egress allowlist**
 //! ([`AllowList`], env var `PREVIEW_ALLOWED_HOSTS`). When set, only fetches to
 //! hosts matching the allowlist are permitted, so a rebinding attacker domain
-//! is rejected up front regardless of what it resolves to. When the allowlist
-//! is empty/unset we fall back to the hardened denylist, which is
-//! rebind-vulnerable by construction — operators handling untrusted preview
-//! targets should configure `PREVIEW_ALLOWED_HOSTS`.
+//! is rejected up front regardless of what it resolves to.
+//!
+//! ## Fail closed ([`EgressPolicy`])
+//!
+//! When `PREVIEW_ALLOWED_HOSTS` is unset or blank the worker **fails closed**:
+//! every outbound fetch is refused and `/preview` and `/ascii` answer 503. The
+//! hardened denylist on its own (rebind-vulnerable by construction) is reachable
+//! only through the explicit development opt-out `PREVIEW_ALLOW_ANY_HOST =
+//! "true"`, which must never be set on an internet-facing deployment.
 
 use futures_util::TryStreamExt;
 use worker::{
@@ -85,9 +90,9 @@ impl std::fmt::Display for SsrfFetchError {
 ///
 /// When the allowlist is **non-empty** it is authoritative: only matching hosts
 /// are fetchable, which is the robust mitigation for DNS rebinding in the CF
-/// Workers runtime (see module docs). When **empty**, callers fall back to the
-/// hardened denylist in [`is_private_url`].
-#[derive(Debug, Clone, Default)]
+/// Workers runtime (see module docs). An empty allowlist never opens the
+/// worker; see [`EgressPolicy::from_vars`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AllowList {
     hosts: Vec<String>,
 }
@@ -104,7 +109,7 @@ impl AllowList {
         AllowList { hosts }
     }
 
-    /// `true` when no entries were configured (denylist fallback applies).
+    /// `true` when no entries were configured.
     pub fn is_empty(&self) -> bool {
         self.hosts.is_empty()
     }
@@ -123,45 +128,89 @@ impl AllowList {
     }
 }
 
-/// Process-global egress allowlist consulted by [`is_private_url`].
-///
-/// Kept global (rather than threaded through every call site) so the existing
-/// caller signatures — `is_private_url(&url)` at `lib.rs:216` and
-/// `ssrf_fetch_with_redirects(url, headers)` at `parse.rs`/`oembed.rs` — do not
-/// change; all callers benefit from the allowlist transparently.
-///
-/// Initialised lazily from `std::env::var("PREVIEW_ALLOWED_HOSTS")` (effective
-/// for native deployments and tests). The CF Workers WASM runtime injects vars
-/// via the JS `Env` object rather than the process environment, so the worker
-/// entry point should call [`set_allowlist`] with the parsed value; until then
-/// the lazy default yields an empty allowlist and the hardened denylist applies.
-static ALLOWLIST: std::sync::OnceLock<std::sync::RwLock<AllowList>> = std::sync::OnceLock::new();
+/// Env var holding the egress allowlist (comma/whitespace separated hosts).
+pub const ALLOWED_HOSTS_VAR: &str = "PREVIEW_ALLOWED_HOSTS";
 
-fn allowlist_cell() -> &'static std::sync::RwLock<AllowList> {
-    ALLOWLIST.get_or_init(|| {
-        let raw = std::env::var("PREVIEW_ALLOWED_HOSTS").unwrap_or_default();
-        std::sync::RwLock::new(AllowList::parse(&raw))
-    })
+/// Development-only opt-out: when exactly `"true"` and no allowlist is set, the
+/// worker runs on the hardened denylist alone (DNS-rebinding exposed).
+pub const ALLOW_ANY_HOST_VAR: &str = "PREVIEW_ALLOW_ANY_HOST";
+
+/// Outbound fetch policy, derived once per request from the worker's vars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressPolicy {
+    /// Only hosts on the allowlist are fetchable (and the denylist still
+    /// applies to them). The production mode.
+    AllowList(AllowList),
+    /// Any public host passes the hardened denylist. Rebind-vulnerable; only
+    /// reachable through [`ALLOW_ANY_HOST_VAR`] for local development.
+    DenylistOnly,
+    /// No allowlist and no opt-out: every outbound fetch is refused.
+    Closed,
 }
 
-/// Install the egress allowlist for all subsequent SSRF checks.
-///
-/// The worker entry point reads `PREVIEW_ALLOWED_HOSTS` from its JS `Env` and
-/// calls this once per request (cheap: a single `RwLock` write of a small
-/// `Vec<String>`). Passing an empty/unset value restores hardened-denylist-only
-/// behaviour.
-pub fn set_allowlist(list: AllowList) {
-    if let Ok(mut guard) = allowlist_cell().write() {
-        *guard = list;
+impl EgressPolicy {
+    /// Derive the policy from the raw [`ALLOWED_HOSTS_VAR`] and
+    /// [`ALLOW_ANY_HOST_VAR`] values (`None` when unset).
+    ///
+    /// A non-empty parsed allowlist always wins. A blank allowlist (`""`,
+    /// whitespace, bare separators) counts as unset. Without an allowlist the
+    /// worker is [`EgressPolicy::Closed`] unless the opt-out is exactly `true`
+    /// (surrounding whitespace ignored), so a typo or `"1"` never opens it.
+    pub fn from_vars(allowed_hosts: Option<&str>, allow_any_host: Option<&str>) -> Self {
+        let list = AllowList::parse(allowed_hosts.unwrap_or(""));
+        if !list.is_empty() {
+            EgressPolicy::AllowList(list)
+        } else if allow_any_host.map(str::trim) == Some("true") {
+            EgressPolicy::DenylistOnly
+        } else {
+            EgressPolicy::Closed
+        }
+    }
+
+    /// `true` when every outbound fetch is refused.
+    pub fn is_closed(&self) -> bool {
+        matches!(self, EgressPolicy::Closed)
     }
 }
 
-/// Snapshot the current global allowlist for use in a single validation pass.
-fn current_allowlist() -> AllowList {
-    allowlist_cell()
+/// Process-global egress policy consulted by [`is_private_url`].
+///
+/// Kept global (rather than threaded through every call site) so the redirect
+/// loop in [`ssrf_fetch_with_redirects`] and the OG/oEmbed fetchers re-check
+/// every hop against the same policy without signature changes.
+///
+/// Initialised lazily from the process environment (effective for native
+/// builds and tests); with nothing set that is [`EgressPolicy::Closed`]. The
+/// CF Workers WASM runtime injects vars via the JS `Env` object instead, so the
+/// worker entry point calls [`set_policy`] on every request.
+static POLICY: std::sync::OnceLock<std::sync::RwLock<EgressPolicy>> = std::sync::OnceLock::new();
+
+fn policy_cell() -> &'static std::sync::RwLock<EgressPolicy> {
+    POLICY.get_or_init(|| {
+        let allowed = std::env::var(ALLOWED_HOSTS_VAR).ok();
+        let any = std::env::var(ALLOW_ANY_HOST_VAR).ok();
+        std::sync::RwLock::new(EgressPolicy::from_vars(allowed.as_deref(), any.as_deref()))
+    })
+}
+
+/// Install the egress policy for all subsequent SSRF checks.
+///
+/// The worker entry point derives the policy from its JS `Env` and calls this
+/// on every request (cheap: one `RwLock` write), so no state from an earlier
+/// request or deployment can linger.
+pub fn set_policy(policy: EgressPolicy) {
+    if let Ok(mut guard) = policy_cell().write() {
+        *guard = policy;
+    }
+}
+
+/// Snapshot the current global policy for a single validation pass. A
+/// poisoned lock yields [`EgressPolicy::Closed`].
+fn current_policy() -> EgressPolicy {
+    policy_cell()
         .read()
         .map(|g| g.clone())
-        .unwrap_or_default()
+        .unwrap_or(EgressPolicy::Closed)
 }
 
 /// Build a request with manual redirect handling so we can re-run the SSRF
@@ -274,22 +323,25 @@ async fn read_response_capped(
     }
 }
 
-/// Returns `true` if the URL should be blocked: it fails the egress allowlist
-/// (when one is configured), uses a non-http(s) scheme, carries userinfo, uses
+/// Returns `true` if the URL should be blocked: the egress policy is closed,
+/// the host fails the egress allowlist, the URL uses a non-http(s) scheme, carries userinfo, uses
 /// a non-standard port, or its hostname text matches a private, loopback,
 /// link-local, metadata, `.local`, or otherwise internal address.
 ///
 /// **DNS rebinding caveat:** the hostname checks operate on the URL *string*,
 /// not the IP the CF runtime resolves at fetch time (see module docs). The
 /// allowlist is the authoritative mitigation; the denylist below is hardened
-/// best-effort and remains rebind-vulnerable when no allowlist is set.
+/// best-effort and is rebind-vulnerable under [`EgressPolicy::DenylistOnly`].
 pub(crate) fn is_private_url(raw_url: &str) -> bool {
-    is_private_url_with(raw_url, &current_allowlist())
+    is_private_url_with(raw_url, &current_policy())
 }
 
-/// Allowlist-explicit core of [`is_private_url`]. Kept pure (no global reads)
-/// so it can be unit-tested deterministically without mutating process state.
-pub(crate) fn is_private_url_with(raw_url: &str, allowlist: &AllowList) -> bool {
+/// Policy-explicit core of [`is_private_url`]. Kept pure (no global reads) so
+/// it can be unit-tested deterministically without mutating process state.
+pub(crate) fn is_private_url_with(raw_url: &str, policy: &EgressPolicy) -> bool {
+    if policy.is_closed() {
+        return true;
+    }
     let parsed = match Url::parse(raw_url) {
         Ok(u) => u,
         Err(_) => return true, // unparseable -> block
@@ -323,8 +375,10 @@ pub(crate) fn is_private_url_with(raw_url: &str, allowlist: &AllowList) -> bool 
     // Egress allowlist (authoritative when configured). A host outside the
     // allowlist is blocked before any denylist heuristic runs; this is the
     // robust DNS-rebinding mitigation available in the CF Workers runtime.
-    if !allowlist.is_empty() && !allowlist.allows(&hostname) {
-        return true;
+    if let EgressPolicy::AllowList(allowlist) = policy {
+        if !allowlist.allows(&hostname) {
+            return true;
+        }
     }
 
     // Reject mDNS / internal `.local` TLD (RFC 6762) — never publicly routable.
@@ -473,6 +527,12 @@ fn is_private_ipv4(octets: [u8; 4]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Denylist checks under the dev opt-out policy, independent of the
+    /// process-global policy (which fails closed when nothing is configured).
+    fn is_private_url(raw_url: &str) -> bool {
+        is_private_url_with(raw_url, &EgressPolicy::DenylistOnly)
+    }
 
     // SSRF protection tests
     #[test]
@@ -658,11 +718,11 @@ mod tests {
         assert!(is_private_url("http://local/"));
     }
 
-    // ── P1-7 egress allowlist ──────────────────────────────────────────
+    // ── Egress policy (allow-list, fail closed) ────────────────────────
     //
-    // Exercised through the pure `is_private_url_with(url, &allowlist)` core so
-    // tests never touch the process-global allowlist and cannot race the other
-    // public-host assertions that call `is_private_url`.
+    // Exercised through the pure `is_private_url_with(url, &policy)` core and
+    // `EgressPolicy::from_vars` so tests never touch the process-global policy
+    // and cannot race each other.
 
     #[test]
     fn allowlist_parse_matches_apex_and_subdomains() {
@@ -677,19 +737,71 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_empty_falls_back_to_denylist() {
-        // An empty allowlist must not block public hosts (denylist authoritative).
-        let empty = AllowList::parse("   ,  ");
-        assert!(empty.is_empty());
-        assert!(!is_private_url_with("https://example.com/", &empty));
-        assert!(!is_private_url_with("https://other.com/", &empty));
-        // ...but the denylist still applies under an empty allowlist.
-        assert!(is_private_url_with("http://127.0.0.1/", &empty));
+    fn policy_unset_fails_closed() {
+        assert_eq!(EgressPolicy::from_vars(None, None), EgressPolicy::Closed);
+    }
+
+    #[test]
+    fn policy_blank_allowlist_counts_as_unset() {
+        // Set-but-blank must not silently open the worker.
+        for raw in ["", "   ", ",,", " , \t\n"] {
+            assert_eq!(
+                EgressPolicy::from_vars(Some(raw), None),
+                EgressPolicy::Closed,
+                "blank PREVIEW_ALLOWED_HOSTS {raw:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_opt_out_requires_exact_true() {
+        assert_eq!(
+            EgressPolicy::from_vars(None, Some("true")),
+            EgressPolicy::DenylistOnly
+        );
+        assert_eq!(
+            EgressPolicy::from_vars(Some(" "), Some(" true ")),
+            EgressPolicy::DenylistOnly
+        );
+        for raw in ["", "false", "1", "yes", "TRUE", "on"] {
+            assert_eq!(
+                EgressPolicy::from_vars(None, Some(raw)),
+                EgressPolicy::Closed,
+                "PREVIEW_ALLOW_ANY_HOST={raw:?} must not open the worker"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_allowlist_wins_over_opt_out() {
+        let p = EgressPolicy::from_vars(Some("example.com"), Some("true"));
+        assert_eq!(p, EgressPolicy::AllowList(AllowList::parse("example.com")));
+        assert!(!p.is_closed());
+    }
+
+    #[test]
+    fn closed_policy_blocks_every_url() {
+        let closed = EgressPolicy::Closed;
+        assert!(closed.is_closed());
+        assert!(is_private_url_with("https://example.com/", &closed));
+        assert!(is_private_url_with(
+            "https://www.youtube.com/watch?v=x",
+            &closed
+        ));
+        assert!(is_private_url_with("http://127.0.0.1/", &closed));
+    }
+
+    #[test]
+    fn denylist_only_allows_public_and_blocks_private() {
+        let open = EgressPolicy::DenylistOnly;
+        assert!(!is_private_url_with("https://example.com/", &open));
+        assert!(!is_private_url_with("https://other.com/", &open));
+        assert!(is_private_url_with("http://127.0.0.1/", &open));
     }
 
     #[test]
     fn allowlist_enforced_when_set() {
-        let list = AllowList::parse("example.com");
+        let list = EgressPolicy::from_vars(Some("example.com"), None);
         // Allowlisted apex + subdomain pass.
         assert!(!is_private_url_with("https://example.com/", &list));
         assert!(!is_private_url_with("https://www.example.com/", &list));
@@ -707,9 +819,18 @@ mod tests {
         // Even when the initial host is allowlisted, a redirect hop to a host
         // outside the allowlist is rejected: the redirect loop re-runs the same
         // validation on every `Location` target.
-        let list = AllowList::parse("example.com");
+        let list = EgressPolicy::from_vars(Some("example.com"), None);
         assert!(is_private_url_with("http://169.254.169.254/latest/", &list));
         assert!(is_private_url_with("http://192.168.1.1/secret", &list));
+    }
+
+    #[test]
+    fn allowlisted_host_still_subject_to_denylist() {
+        // An operator who lists an IP literal or `.local` name by mistake does
+        // not reopen the internal ranges.
+        let list = EgressPolicy::from_vars(Some("127.0.0.1, printer.local"), None);
+        assert!(is_private_url_with("http://127.0.0.1/", &list));
+        assert!(is_private_url_with("http://printer.local/", &list));
     }
 
     #[test]

@@ -17,18 +17,34 @@
     <meta name="description" content="A fast, decentralized, Nostr-powered forum" />
     <meta name="theme-color" content="#111827" />
 
-    <!-- GitHub Pages SPA deep-link restore: picks up redirect from root 404.html -->
+    <!-- GitHub Pages SPA deep-link restore: picks up redirect from root 404.html.
+         __p is attacker-controllable, so the target is resolved by the URL
+         parser (which normalises dot segments, %2e%2e and backslashes) and
+         kept only when it is same-origin and inside /community/. Anything else
+         falls back to /community/. __p is stripped either way, so an older
+         unvalidated copy of this pickup injected later by an operator site
+         finds nothing to act on. Tested by tests/deep-link.test.mjs. -->
     <script>
         (function(){
-            var q = new URLSearchParams(window.location.search);
+            var loc = window.location;
+            var q = new URLSearchParams(loc.search);
             var redirect = q.get('__p');
-            if (redirect) {
-                q.delete('__p');
-                var qs = q.toString();
-                var base = '/community';
-                var full = base + redirect + (qs ? '?' + qs : '') + window.location.hash;
-                history.replaceState(null, '', full);
+            if (redirect === null) return;
+            q.delete('__p');
+            var qs = q.toString();
+            var tail = (qs ? '?' + qs : '') + loc.hash;
+            var base = '/community';
+            var target = base + '/' + tail;
+            if (redirect.charAt(0) === '/') {
+                try {
+                    var u = new URL(base + redirect + tail, loc.origin);
+                    if (u.origin === loc.origin &&
+                        (u.pathname === base || u.pathname.indexOf(base + '/') === 0)) {
+                        target = u.pathname + u.search + u.hash;
+                    }
+                } catch (e) { /* unparseable: keep the fallback */ }
             }
+            history.replaceState(null, '', target);
         })();
     </script>
 
@@ -69,10 +85,13 @@
     <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
     <link rel="icon" href="icons/icon-192.png" sizes="192x192" type="image/png" />
 
-    <!-- Inter font -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+    <!-- Inter, self-hosted: the @font-face lives in style.css. Never load it
+         from a font CDN; every such request hands the visitor's IP to a third
+         party. The OFL licence travels with the font into dist. No preload
+         link: a relative href here would resolve against the restored
+         deep-link path, whereas the stylesheet's url() resolves against the
+         stylesheet's own (public-url) location. -->
+    <link data-trunk rel="copy-dir" href="assets/fonts" data-target-path="fonts" />
 
     <!-- Tailwind utilities (tree-shaken at build time by Tailwind CLI v3.4.17,
          driven by Trunk pre_build hook in Trunk.toml). Replaces the legacy

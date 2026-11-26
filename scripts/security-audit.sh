@@ -19,6 +19,4 @@ cargo audit --deny warnings \
   --ignore RUSTSEC-2026-0546 \
   --ignore RUSTSEC-2026-0547 \
   --ignore RUSTSEC-2026-0548 \
-  --ignore RUSTSEC-2026-0374 \
-  --ignore RUSTSEC-2026-0253 \
-  --ignore RUSTSEC-2026-0002
+  --ignore RUSTSEC-2026-0374
