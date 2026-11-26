@@ -119,6 +119,8 @@ pub struct NostrRelayDO {
     pub(crate) count_cache: TtlCache<read_cache::CountSnapshot>,
     /// Count keys with a full count running in this isolate (single-flight).
     pub(crate) count_inflight: RefCell<std::collections::HashSet<String>>,
+    /// Full counts or rolls running in this isolate, across keys.
+    pub(crate) count_full_running: std::cell::Cell<u32>,
     /// ADR-2018: 60s-TTL memo of pubkey → (cohorts, whitelist is_admin).
     pub(crate) cohort_cache: TtlCache<(Vec<String>, bool)>,
     /// ADR-2018: 60s-TTL memo of device pubkey → owner (None = not a device key).
@@ -157,6 +159,7 @@ impl DurableObject for NostrRelayDO {
             channel_zone_none_cache: TtlCache::new(NEGATIVE_LOOKUP_TTL_SECS),
             count_cache: TtlCache::new(read_cache::COUNT_CACHE_TTL_SECS),
             count_inflight: RefCell::new(std::collections::HashSet::new()),
+            count_full_running: std::cell::Cell::new(0),
             cohort_cache: TtlCache::new(LOOKUP_TTL_SECS),
             device_owner_cache: TtlCache::new(LOOKUP_TTL_SECS),
             recipient_row_cache: TtlCache::new(LOOKUP_TTL_SECS),

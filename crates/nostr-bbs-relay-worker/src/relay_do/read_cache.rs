@@ -92,8 +92,8 @@ pub(crate) const COUNT_CACHE_MAX: usize = 1024;
 
 /// Most exception rows a snapshot keeps, and their total size; past either,
 /// the snapshot keeps none and they are read fresh each time.
-const SNAPSHOT_EXCEPTIONS_MAX: usize = 16;
-const SNAPSHOT_EXCEPTIONS_MAX_BYTES: usize = 32 * 1024;
+const SNAPSHOT_EXCEPTIONS_MAX: usize = 64;
+const SNAPSHOT_EXCEPTIONS_MAX_BYTES: usize = 64 * 1024;
 
 /// A message count (see `filter::build_channel_count`), valid for every
 /// message created at or before `as_of`: grouped counts, and the raw
@@ -118,7 +118,8 @@ impl CountSnapshot {
 }
 
 /// The exception rows a snapshot may keep: all of them when few and small,
-/// else none (read fresh on each hit instead).
+/// else `None`, which makes the snapshot unusable (the caller takes the
+/// row-capped generic path) rather than re-reading every row on each hit.
 pub(crate) fn snapshot_exceptions(rows: &[NostrEvent]) -> Option<Vec<NostrEvent>> {
     let bytes: usize = rows
         .iter()
@@ -207,19 +208,32 @@ pub(crate) fn merge_groups(a: &[(String, u64)], b: &[(String, u64)]) -> Vec<(Str
     out
 }
 
-/// The snapshot key of a count of `value` from `since`, or `None` when
-/// `value` is not a lowercase 64-hex event id. Only real ids are cached: the
-/// key's size is fixed, and it cannot contain the `|` separator.
+/// The snapshot key of a count of `value` with no `since`, or `None` when
+/// the count is not served from a snapshot: `value` not a lowercase 64-hex
+/// event id, or a `since` given. The forum never sends `since`; keying on it
+/// let one client mint unlimited snapshots of one big channel (review
+/// finding), so such counts take the row-capped generic path.
 pub(crate) fn count_key(value: &str, since: Option<u64>) -> Option<String> {
     let hex = value.len() == 64
         && value
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    hex.then(|| match since {
-        Some(s) => format!("{value}|{s}"),
-        None => value.to_string(),
-    })
+    (hex && since.is_none()).then(|| value.to_string())
 }
+
+/// Largest timestamp the count path accepts: beyond 2^53 the f64 and i64
+/// binds lose meaning (a `since` near 2^64 wrapped to -1 and disabled the
+/// windows). A larger `until` is clamped to it.
+pub(crate) const COUNT_MAX_TS: u64 = 1 << 53;
+
+/// DO storage key of a persisted snapshot. Versioned, so a change to the
+/// count logic can abandon old snapshots by bumping it.
+pub(crate) fn snapshot_storage_key(key: &str) -> String {
+    format!("count_snap:v1:{key}")
+}
+
+/// Most full (windowed) counts running at once in this isolate, across keys.
+pub(crate) const COUNT_FULL_MAX_CONCURRENT: u32 = 2;
 
 struct Entry<V> {
     value: V,
@@ -457,8 +471,8 @@ mod tests {
             snapshot_exceptions(&[ev(10), ev(10)]).map(|v| v.len()),
             Some(2)
         );
-        assert!(snapshot_exceptions(&vec![ev(1); 17]).is_none());
-        assert!(snapshot_exceptions(&[ev(40_000)]).is_none());
+        assert!(snapshot_exceptions(&vec![ev(1); 65]).is_none());
+        assert!(snapshot_exceptions(&[ev(70_000)]).is_none());
     }
 
     #[test]
@@ -481,8 +495,9 @@ mod tests {
     fn count_keys_are_only_for_hex_ids_and_never_collide() {
         let id = "a".repeat(64);
         assert_eq!(count_key(&id, None), Some(id.clone()));
-        assert_eq!(count_key(&id, Some(5)), Some(format!("{id}|5")));
-        assert_ne!(count_key(&id, Some(5)), count_key(&id, Some(6)));
+        // A `since` is never snapshotted (one key per channel only).
+        assert_eq!(count_key(&id, Some(5)), None);
+        assert_eq!(snapshot_storage_key(&id), format!("count_snap:v1:{id}"));
         // Anything else takes the uncached path: no oversized or colliding keys.
         assert_eq!(count_key(&format!("{}|5", "a".repeat(62)), None), None);
         assert_eq!(count_key(&"A".repeat(64), None), None);
