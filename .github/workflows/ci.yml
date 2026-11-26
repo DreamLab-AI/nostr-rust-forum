@@ -116,6 +116,9 @@ jobs:
       - name: 3D poker table (node, recorded hands)
         run: node crates/nostr-bbs-forum-client/tools/table3d-test.mjs
 
+      - name: Forum client shell scripts (node --test)
+        run: node --test crates/nostr-bbs-forum-client/tests/*.test.mjs
+
       - name: Validate configuration contract
         run: |
           bash scripts/validate-forum-config.sh forum.example.toml

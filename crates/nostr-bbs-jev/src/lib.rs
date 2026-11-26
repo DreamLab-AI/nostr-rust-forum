@@ -24,6 +24,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 
+mod body;
 #[cfg(feature = "worker")]
 pub mod fetch;
 
@@ -33,6 +34,10 @@ pub const VENDOR_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 pub const VENDOR_MODEL: &str = "jev-latest";
 /// Hard deadline for interactive Worker paths, in milliseconds. 0 retries.
 pub const DEFAULT_DEADLINE_MS: u32 = 4000;
+/// Largest response body a transport reads, in bytes. A System One answer is
+/// a few hundred bytes of JSON; anything near this size is a misbehaving
+/// upstream and is refused as [`TransportError::Other`].
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Why a Jev call produced no usable answer. The consumer must then behave
 /// exactly as it did before the Jev option existed.
@@ -80,7 +85,10 @@ pub enum TransportError {
     Other,
 }
 
-/// Minimal HTTP POST seam. Implementations must enforce `deadline_ms`.
+/// Minimal HTTP POST seam. Implementations must enforce `deadline_ms`, must
+/// not follow redirects (a 3xx is returned as the status, so a bearer key never
+/// travels to a redirect target), and must refuse bodies over
+/// [`MAX_RESPONSE_BYTES`].
 #[async_trait::async_trait(?Send)]
 pub trait JevTransport {
     /// POST `body` (JSON) to `url`; `bearer` is `Some` only for the vendor
@@ -659,6 +667,58 @@ mod tests {
         // type mismatch
         let bad = GOOD.replace(r#""type":"noul""#, r#""type":"score""#);
         assert_eq!(run(Ok((200, bad))), Fallback::Malformed);
+    }
+
+    #[test]
+    fn redirect_is_never_followed_and_maps_to_http() {
+        // `WorkersFetch` sends with `redirect: manual`, so a 3xx reaches `ask`
+        // as a status rather than being followed with the bearer attached.
+        let cfg = JevConfig {
+            endpoint: "http://e".into(),
+            model: "m".into(),
+            bearer: Some("k".into()),
+            deadline_ms: 10,
+        };
+        for status in [301u16, 302, 303, 307, 308] {
+            let got = block_on(ask(
+                &Mock::new(Ok((status, GOOD.into()))),
+                &cfg,
+                &json!({}),
+                &qs(),
+            ))
+            .unwrap_err();
+            assert_eq!(got, Fallback::Http(status));
+        }
+    }
+
+    #[test]
+    fn content_length_over_cap_is_refused_up_front() {
+        assert!(body::content_length_ok(None, 10));
+        assert!(body::content_length_ok(Some("10"), 10));
+        assert!(!body::content_length_ok(Some("11"), 10));
+        assert!(!body::content_length_ok(Some(" 99999999999 "), 10));
+        // An unparseable header is ignored; the streaming cap still applies.
+        assert!(body::content_length_ok(Some("nope"), 10));
+    }
+
+    #[test]
+    fn capped_body_accumulates_until_the_cap() {
+        let mut buf = Vec::new();
+        assert_eq!(body::append_capped(&mut buf, b"abcd", 8), Ok(()));
+        assert_eq!(body::append_capped(&mut buf, b"efgh", 8), Ok(()));
+        assert_eq!(buf, b"abcdefgh");
+        // One byte over: refused, and the buffer does not grow past the cap.
+        assert_eq!(
+            body::append_capped(&mut buf, b"i", 8),
+            Err(TransportError::Other)
+        );
+        assert_eq!(buf.len(), 8);
+    }
+
+    #[test]
+    fn response_cap_is_small() {
+        const { assert!(MAX_RESPONSE_BYTES <= 256 * 1024) };
+        const { assert!(MAX_RESPONSE_BYTES >= 16 * 1024) };
     }
 
     #[test]

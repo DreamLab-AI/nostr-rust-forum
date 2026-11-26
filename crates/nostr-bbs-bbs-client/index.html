@@ -2,6 +2,14 @@
 <html lang="en">
 <head>
     <meta charset="utf-8" />
+    <!-- Content Security Policy, meta form (static hosting sends no headers).
+         The baseline the forum client ships: object-src and base-uri close the
+         plugin-injection and <base>-hijack routes that need no script at all;
+         form-action keeps a future form from posting elsewhere. No script-src
+         yet: this page carries five inline scripts and the host site injects
+         window.__ENV__ inline after the build, so a hash list cannot be kept
+         honest until those move to files (see the forum client's index.html). -->
+    <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; form-action 'self'" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>BBS // nostr-rust-forum</title>
     <meta name="description" content="Retro ASCII/BBS terminal interface for the Nostr forum kit." />

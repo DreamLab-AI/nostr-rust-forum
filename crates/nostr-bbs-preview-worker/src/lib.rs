@@ -492,6 +492,11 @@ fn handle_stats(env: &Env) -> Result<Response> {
 
 // ── Router ───────────────────────────────────────────────────────────────────
 
+/// Body of the 503 returned by `/preview` and `/ascii` while the egress policy
+/// is closed (no `PREVIEW_ALLOWED_HOSTS`, no development opt-out).
+const EGRESS_CLOSED_ERROR: &str =
+    "Link previews are disabled: PREVIEW_ALLOWED_HOSTS is not configured";
+
 // wasm-bindgen registers this as the fetch handler; it is invoked only from the
 // generated glue on the wasm32 target and appears unused to native `cargo check`.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -503,16 +508,18 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Ok(Response::empty()?.with_headers(headers).with_status(204));
     }
 
-    // Install the egress allowlist from the JS `Env`. The lazy `std::env`
-    // fallback in `ssrf` is inert under the CF Workers WASM runtime (vars arrive
-    // via this `Env`, not the process environment), so without wiring it here the
-    // "authoritative" DNS-rebinding allowlist is permanently empty and the worker
-    // runs in denylist-only (rebind-vulnerable) mode. Cheap: a small RwLock write.
-    // When `PREVIEW_ALLOWED_HOSTS` is unset we leave the empty allowlist in place
-    // (hardened denylist applies), matching the documented default.
-    if let Ok(raw) = env.var("PREVIEW_ALLOWED_HOSTS").map(|v| v.to_string()) {
-        ssrf::set_allowlist(ssrf::AllowList::parse(&raw));
-    }
+    // Install the egress policy from the JS `Env` on every request. The lazy
+    // `std::env` fallback in `ssrf` is inert under the CF Workers WASM runtime
+    // (vars arrive via this `Env`, not the process environment). Unset or blank
+    // `PREVIEW_ALLOWED_HOSTS` fails closed unless the development opt-out
+    // `PREVIEW_ALLOW_ANY_HOST = "true"` is present; see `ssrf` module docs.
+    let var = |name: &str| env.var(name).ok().map(|v| v.to_string());
+    let policy = ssrf::EgressPolicy::from_vars(
+        var(ssrf::ALLOWED_HOSTS_VAR).as_deref(),
+        var(ssrf::ALLOW_ANY_HOST_VAR).as_deref(),
+    );
+    let egress_closed = policy.is_closed();
+    ssrf::set_policy(policy);
 
     // Rate limit: 30 requests per 60 seconds per IP
     let ip = nostr_bbs_rate_limit::client_ip(&req);
@@ -530,6 +537,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = url.path();
 
     let result = match (req.method(), path) {
+        (Method::Get, "/preview" | "/ascii") if egress_closed => json_response(
+            &ErrorResponse {
+                error: EGRESS_CLOSED_ERROR.to_string(),
+            },
+            503,
+            &env,
+        ),
         (Method::Get, "/preview") => handle_preview(&req, &env).await,
         (Method::Get, "/ascii") => handle_ascii(&req, &env).await,
         (Method::Get, "/health") => handle_health(&env),

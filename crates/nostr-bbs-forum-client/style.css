@@ -14,6 +14,23 @@
    original name at runtime. Do NOT re-add an @import here. */
 
 /* ---------------------------------------------------------------------------
+   0. Inter, self-hosted (no third-party font request, so no visitor IP or
+      Referer reaches a font CDN). assets/fonts/ is copied to <public-url>/fonts/
+      by index.html; Trunk emits this stylesheet at <public-url>/ and leaves
+      url() untouched, so the relative path resolves there. One variable file
+      covers weights 100-900. Inter 4.1 (rsms/inter release v4.1), SIL OFL 1.1:
+      assets/fonts/LICENSE-Inter.txt.
+   --------------------------------------------------------------------------- */
+
+@font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url("fonts/InterVariable.woff2") format("woff2");
+}
+
+/* ---------------------------------------------------------------------------
    1. CSS Custom Properties (forum-specific aliases)
    --------------------------------------------------------------------------- */
 

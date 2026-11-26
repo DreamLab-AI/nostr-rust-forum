@@ -146,7 +146,7 @@ Update each worker's `wrangler.toml` with the resource IDs from step 1:
 
 - `crates/nostr-bbs-auth-worker/wrangler.toml` -- D1 ID, KV IDs (SESSIONS, POD_META), R2 bucket, RP_ID, RP_NAME, EXPECTED_ORIGIN, POD_BASE_URL, NATIVE_POD_URL, NATIVE_POD_ADMIN_KEY (secret), WELCOME_MASTER_KEY (secret), DEVICE_KEYS_ENABLED
 - `crates/nostr-bbs-pod-worker/wrangler.toml` -- KV ID (POD_META), EXPECTED_ORIGIN
-- `crates/nostr-bbs-preview-worker/wrangler.toml` -- KV ID (RATE_LIMIT), ALLOWED_ORIGIN
+- `crates/nostr-bbs-preview-worker/wrangler.toml` -- KV ID (RATE_LIMIT), ALLOWED_ORIGIN, PREVIEW_ALLOWED_HOSTS (required: unset or blank fails closed and link previews answer 503)
 - `crates/nostr-bbs-relay-worker/wrangler.toml` -- D1 ID, RELAY_NAME, ALLOWED_ORIGIN(S), ZONE_CONFIG, DEVICE_KEYS_ENABLED, MESH_MODE, MESH_PEER_RELAYS, MESH_FEDERATED_KINDS, MESH_ALLOWED_REMOTE_DIDS
 - `crates/nostr-bbs-search-worker/wrangler.toml` -- R2 bucket, KV ID (SEARCH_CONFIG), ALLOWED_ORIGIN(S)
 
