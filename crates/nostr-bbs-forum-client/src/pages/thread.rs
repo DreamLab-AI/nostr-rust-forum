@@ -204,13 +204,18 @@ fn edit_chain_ids(original: &NostrEvent, events: &[NostrEvent]) -> Vec<String> {
     ids
 }
 
-/// The landing keeps re-pinning until the topic has stopped growing for this
-/// long: replies stream in, and images, embeds and link previews expand the
-/// posts above the bottom after first paint.
+/// Once the topic's history has settled, the landing keeps re-pinning until
+/// the topic has stopped growing for this long: images, embeds and link
+/// previews expand the posts above the bottom after first paint. While the
+/// history is still loading a quiet spell never ends the landing: on a cold
+/// load the rest of a long topic can arrive many seconds after the first
+/// replies, and a landing that had already settled would leave the reader
+/// mid-thread.
 const LANDING_SETTLE_MS: f64 = 2_500.0;
 
-/// Hard ceiling on the landing phase, however slowly media loads.
-const LANDING_MAX_MS: f64 = 12_000.0;
+/// Hard ceiling on the landing phase, however slowly history or media loads
+/// (a page request that times out never settles the history).
+const LANDING_MAX_MS: f64 = 30_000.0;
 
 /// Input this soon after landing starts is momentum carried over from the
 /// previous page, not the reader taking control.
@@ -229,12 +234,15 @@ struct Landing {
     target: Option<(String, bool)>,
     /// The focus outline has been flashed once.
     flashed: bool,
+    /// The topic's history has finished loading (see [`history_settled`]).
+    history_settled: bool,
 }
 
 impl Landing {
     /// Record growth at `now` and report whether the page should be
-    /// re-pinned. Starts the phase on first call; ends it once the topic has
-    /// been quiet for [`LANDING_SETTLE_MS`] or [`LANDING_MAX_MS`] has passed.
+    /// re-pinned. Starts the phase on first call; ends it once the history
+    /// has settled and the topic has then been quiet for
+    /// [`LANDING_SETTLE_MS`], or once [`LANDING_MAX_MS`] has passed.
     fn grow(&mut self, now: f64) -> bool {
         if self.done || self.target.is_none() {
             return false;
@@ -243,12 +251,26 @@ impl Landing {
             self.started_at = now;
             self.last_growth = now;
         }
-        if now - self.started_at > LANDING_MAX_MS || now - self.last_growth > LANDING_SETTLE_MS {
+        let quiet = self.history_settled && now - self.last_growth > LANDING_SETTLE_MS;
+        if now - self.started_at > LANDING_MAX_MS || quiet {
             self.done = true;
             return false;
         }
         self.last_growth = now;
         true
+    }
+
+    /// Record whether the topic's history has settled, at `now`.
+    ///
+    /// The moment it settles counts as growth: the batch that completes the
+    /// history usually lands with the receipt that settles it, long after
+    /// the last growth, and must still be pinned rather than read as the end
+    /// of a quiet spell.
+    fn note_history(&mut self, settled: bool, now: f64) {
+        if settled && !self.history_settled && self.started_at > 0.0 {
+            self.last_growth = now;
+        }
+        self.history_settled = settled;
     }
 
     /// The reader scrolled, tapped or pressed a key at `now`.
@@ -257,6 +279,17 @@ impl Landing {
             self.done = true;
         }
     }
+}
+
+/// Whether a topic's history has finished loading: the channel's history
+/// query has its authoritative receipt (`channel_settles`, see
+/// `SyncReceipt::settles`) and the topic's own list (`topic`, its cursor) has
+/// answered its first page and has no page in flight.
+fn history_settled(
+    channel_settles: bool,
+    topic: Option<&crate::stores::channels::HistoryCursor>,
+) -> bool {
+    channel_settles && topic.is_some_and(|c| c.started && !c.loading)
 }
 
 /// DOM id of a rendered post, for deep-link scrolling.
@@ -1035,8 +1068,9 @@ pub fn ThreadPage() -> impl IntoView {
     // notifications via `/go/:id`) centres that post instead and flashes it.
     // Replies stream in and media expands posts after first paint, so the pin
     // re-applies on every reply and every layout resize until the topic stops
-    // growing or the reader scrolls, taps or types — then it never moves under
-    // them again.
+    // growing (counted only once the topic's history has finished loading) or
+    // the reader scrolls, taps or types — then it never moves under them
+    // again.
     let query = use_query_map();
     let focus_param = move || query.read().get("focus");
     let landing = StoredValue::new(Landing::default());
@@ -1064,12 +1098,24 @@ pub fn ThreadPage() -> impl IntoView {
         );
     };
 
+    // Whether the topic's history is still arriving: the landing must not
+    // settle on a quiet spell before it is in.
+    let landing_history_settled = Memo::new(move |_| {
+        let Some(cid) = resolved_channel.get().map(|c| c.id) else {
+            return false;
+        };
+        let gated = zone_is_gated(&category_slug(), &load_zones());
+        let topic = topic_list.get().map(|key| store.history_cursor(&key));
+        history_settled(store.history_receipt(&cid).settles(gated), topic.as_ref())
+    });
+
     Effect::new(move |_| {
         if loading.get() {
             return;
         }
         let Some(root) = topic_root.get() else { return };
         let reply_ids: Vec<String> = replies.get().iter().map(|r| r.id.clone()).collect();
+        let settled = landing_history_settled.get();
         let focus = focus_param();
         let target = landing_target(focus.as_deref(), &root.id, &reply_ids);
         let now = js_sys::Date::now();
@@ -1079,6 +1125,7 @@ pub fn ThreadPage() -> impl IntoView {
                     return false;
                 }
                 l.target = target;
+                l.note_history(settled, now);
                 l.grow(now)
             })
             .unwrap_or(false);
@@ -2221,10 +2268,85 @@ mod tests {
     #[test]
     fn landing_settles_after_a_quiet_spell() {
         let mut l = landing_to("cc");
+        l.note_history(true, 1_000.0);
         assert!(l.grow(1_000.0));
         assert!(!l.grow(1_000.0 + LANDING_SETTLE_MS + 1.0));
         assert!(l.done);
         assert!(!l.grow(1_000.0 + LANDING_SETTLE_MS + 2.0));
+    }
+
+    #[test]
+    fn landing_does_not_settle_while_history_is_loading() {
+        // Cold load: 19 replies render, then nothing for 8 s while the rest
+        // of the topic is still on its way.
+        let mut l = landing_to("cc");
+        l.note_history(false, 1_000.0);
+        assert!(l.grow(1_000.0));
+        assert!(l.grow(9_000.0), "a quiet spell mid-load ended the landing");
+        assert!(!l.done);
+    }
+
+    #[test]
+    fn landing_repins_for_the_batch_that_settles_history() {
+        // The observed failure: the late batch of 79 arrives together with
+        // the receipt that settles the history, 8 s after the first paint.
+        // It must still move the reader to the newest post.
+        let mut l = landing_to("cc");
+        l.note_history(false, 1_000.0);
+        assert!(l.grow(1_000.0));
+        l.note_history(true, 9_000.0);
+        assert!(l.grow(9_000.0), "the settling batch was not pinned");
+        // From then on the ordinary quiet rule applies.
+        assert!(!l.grow(9_000.0 + LANDING_SETTLE_MS + 1.0));
+        assert!(l.done);
+    }
+
+    #[test]
+    fn reader_input_ends_landing_while_history_is_loading() {
+        let mut l = landing_to("cc");
+        l.note_history(false, 1_000.0);
+        assert!(l.grow(1_000.0));
+        l.reader_input(1_000.0 + LANDING_INPUT_GRACE_MS + 1.0);
+        assert!(l.done);
+        assert!(!l.grow(2_000.0));
+    }
+
+    #[test]
+    fn unsettled_history_still_has_a_ceiling() {
+        let mut l = landing_to("cc");
+        l.note_history(false, 1_000.0);
+        assert!(l.grow(1_000.0));
+        assert!(l.grow(1_000.0 + LANDING_MAX_MS - 1.0));
+        assert!(!l.grow(1_000.0 + LANDING_MAX_MS + 1.0));
+        assert!(l.done);
+        assert!(
+            LANDING_MAX_MS >= 30_000.0,
+            "ceiling must outlast a cold load"
+        );
+    }
+
+    #[test]
+    fn history_settles_on_both_receipts() {
+        use crate::stores::channels::HistoryCursor;
+        let started = HistoryCursor {
+            started: true,
+            ..HistoryCursor::default()
+        };
+        let in_flight = HistoryCursor {
+            started: true,
+            loading: true,
+            ..HistoryCursor::default()
+        };
+        let first_page_pending = HistoryCursor {
+            loading: true,
+            ..HistoryCursor::default()
+        };
+        assert!(history_settled(true, Some(&started)));
+        assert!(!history_settled(false, Some(&started)));
+        assert!(!history_settled(true, Some(&in_flight)));
+        assert!(!history_settled(true, Some(&first_page_pending)));
+        assert!(!history_settled(true, Some(&HistoryCursor::default())));
+        assert!(!history_settled(true, None));
     }
 
     #[test]
