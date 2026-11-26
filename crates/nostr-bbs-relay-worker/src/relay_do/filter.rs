@@ -307,6 +307,13 @@ pub struct ChannelCountQueries {
 /// channels, and the caller falls back to the generic, row-capped path.
 pub const COUNT_MAX_GROUPS: usize = 8;
 
+/// The `created_at` of the tag row `?4` rows into `#e = ?1` within
+/// `?2..=?3`, in time order: the end of one window of a full count
+/// (`read_cache::next_window`). Reads only `idx_event_tags_time`.
+pub const COUNT_WINDOW_EDGE_SQL: &str = "SELECT created_at FROM event_tags \
+     WHERE name = 'e' AND value = ?1 AND created_at >= ?2 AND created_at <= ?3 \
+     ORDER BY created_at LIMIT 1 OFFSET ?4";
+
 /// Build the count statements. Both read `idx_event_tags_time` for the value
 /// and look up each event by primary key: about two rows read per message,
 /// one statement, no rows shipped back for the grouped part. The generic
@@ -1493,6 +1500,62 @@ mod query_builder_tests {
 
     fn filter(json: serde_json::Value) -> NostrFilter {
         serde_json::from_value(json).unwrap()
+    }
+
+    /// A full count taken in windows (edges from `COUNT_WINDOW_EDGE_SQL`,
+    /// bounds from `read_cache::next_window`) equals the one-statement count,
+    /// for window sizes down to below a run of same-second messages.
+    #[test]
+    fn a_windowed_count_equals_the_single_count() {
+        use crate::relay_do::read_cache::{merge_groups, next_window};
+        let c = db();
+        let events = fixture();
+        store(&c, &events);
+        let grouped = |since: u64, until: u64| -> Vec<(String, u64)> {
+            let q = build_channel_count("a", Some(since), Some(until));
+            let mut s = c.prepare(&q.grouped.sql).unwrap();
+            s.query_map(
+                rusqlite::params_from_iter(bind(&q.grouped.params).iter()),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        };
+        let sorted = |mut v: Vec<(String, u64)>| {
+            v.sort();
+            v
+        };
+        let hi = 2_000;
+        let whole = sorted(grouped(0, hi));
+        assert!(whole.iter().map(|(_, n)| n).sum::<u64>() >= 600);
+        for rows in [1u32, 3, 6, 7, 50, 1_000] {
+            let mut lo = 0u64;
+            let mut acc: Vec<(String, u64)> = Vec::new();
+            let mut windows = 0;
+            loop {
+                let edge: Option<u64> = c
+                    .query_row(
+                        COUNT_WINDOW_EDGE_SQL,
+                        rusqlite::params!["a", lo as i64, hi as i64, rows],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .ok()
+                    .map(|e| e as u64);
+                let (w_lo, w_hi, next) = next_window(lo, edge, hi);
+                acc = merge_groups(&acc, &grouped(w_lo, w_hi));
+                windows += 1;
+                assert!(windows < 10_000, "windows must advance");
+                match next {
+                    Some(n) => lo = n,
+                    None => break,
+                }
+            }
+            assert_eq!(sorted(acc), whole, "window size {rows}");
+            if rows <= 50 {
+                assert!(windows > 1, "window size {rows} split the count");
+            }
+        }
     }
 
     /// Three channels; `a` is busy and has runs of up to 7 messages sharing a
