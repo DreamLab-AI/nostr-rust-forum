@@ -18,6 +18,17 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Jev transport: no redirects with the bearer key, response capped (2026-11-26)
+
+`nostr-bbs-jev` only (auth worker's rationale check is the one consumer).
+
+- `WorkersFetch` sends with `redirect: manual`. The request may carry `Authorization: Bearer <TYPESAFE_API_KEY>`; a
+  followed redirect would have handed it to any host the upstream named. A 3xx now reaches `ask` as its status and
+  becomes `Fallback::Http`.
+- The body is read with a running total and refused past `MAX_RESPONSE_BYTES` (64 KiB), checked first against
+  `Content-Length`; overflow is `TransportError::Other` (`Fallback::Transport`). The deadline race, already present,
+  covers the body read.
+
 ### Preview worker egress fails closed without an allow-list (2026-11-26, breaking)
 
 Preview worker only. **Breaking for deployments that do not set `PREVIEW_ALLOWED_HOSTS`:** link previews and the BBS
