@@ -200,7 +200,7 @@ async fn cached_object(
     if let Some(b) = idb_get(db, &o.sha256).await? {
         return Ok(b);
     }
-    let blob = crate::utils::restricted_media::fetch_restricted_blob(url, signer)
+    let blob = crate::utils::restricted_media::fetch_restricted_object(url, signer)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let bytes = blob_bytes(&blob).await?;
@@ -305,7 +305,9 @@ pub async fn ensure_zone(
     let mut best: Option<(Manifest, String)> = None;
     for p in &pubs {
         let url = format!("{}/pods/{p}/media/zones/{zone}/search/m.json", pod.trim_end_matches('/'));
-        let Ok(blob) = crate::utils::restricted_media::fetch_restricted_blob(&url, signer).await else {
+        let Ok(blob) =
+            crate::utils::restricted_media::fetch_restricted_object(&url, signer).await
+        else {
             continue;
         };
         let Ok(ev) = serde_json::from_slice::<NostrEvent>(&blob_bytes(&blob).await?) else {
