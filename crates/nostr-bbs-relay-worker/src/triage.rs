@@ -236,6 +236,31 @@ pub fn flag_on(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
+/// The candidate query for `n_zones` eligible zones: `?1` the window start,
+/// `?2` the row limit, `?3..` the zone ids.
+///
+/// Join order is fixed with CROSS JOIN: start from the few eligible (public,
+/// unencrypted) channels and walk `idx_event_tags_time` into their posts.
+/// Left to the planner, SQLite started from every `e` tag in the database
+/// (~900k rows, ~4 s of D1 time per tick), which together with the
+/// per-channel COUNT overloaded D1 for every member (2026-11-26).
+pub(crate) fn candidate_sql(n_zones: usize) -> String {
+    let marks: Vec<String> = (0..n_zones).map(|i| format!("?{}", i + 3)).collect();
+    format!(
+        "SELECT e.id AS id, e.content AS content, e.tags AS tags, cz.channel_id AS channel_id, \
+                cz.zone AS zone \
+         FROM channel_zones cz \
+         CROSS JOIN event_tags t ON t.name = 'e' AND t.value = cz.channel_id \
+         CROSS JOIN events e ON e.id = t.event_id \
+         WHERE cz.archived = 0 AND e.kind = 42 AND e.received_at >= ?1 \
+           AND cz.zone IN ({}) \
+           AND e.id NOT IN (SELECT event_id FROM jev_triage) \
+           AND e.id NOT IN (SELECT event_id FROM hidden_events) \
+         GROUP BY e.id ORDER BY e.received_at DESC LIMIT ?2",
+        marks.join(", ")
+    )
+}
+
 /// Same statement as `migrations/0011_jev_triage.sql`. Created lazily, only
 /// once the flag is on, so the relay boot path (`ensure_schema`) is unchanged.
 const CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS jev_triage (\
@@ -279,20 +304,7 @@ pub async fn run_sweep(env: &Env) {
         return;
     }
     let now = crate::auth::js_now_secs() as i64;
-    let marks: Vec<String> = (0..zone_ids.len()).map(|i| format!("?{}", i + 3)).collect();
-    let sql = format!(
-        "SELECT e.id AS id, e.content AS content, e.tags AS tags, cz.channel_id AS channel_id, \
-                cz.zone AS zone \
-         FROM events e \
-         JOIN event_tags t ON t.event_id = e.id AND t.name = 'e' \
-         JOIN channel_zones cz ON cz.channel_id = t.value AND cz.archived = 0 \
-         WHERE e.kind = 42 AND e.received_at >= ?1 \
-           AND cz.zone IN ({}) \
-           AND e.id NOT IN (SELECT event_id FROM jev_triage) \
-           AND e.id NOT IN (SELECT event_id FROM hidden_events) \
-         GROUP BY e.id ORDER BY e.received_at DESC LIMIT ?2",
-        marks.join(", ")
-    );
+    let sql = candidate_sql(zone_ids.len());
     let mut binds: Vec<JsValue> = vec![js_f64((now - WINDOW_SECS) as f64), js_f64(50.0)];
     binds.extend(zone_ids.iter().map(|z| js_str(z)));
     let rows: Vec<EvRow> = match db.prepare(&sql).bind(&binds) {
@@ -449,6 +461,118 @@ pub async fn handle_list(req: &Request, env: &Env) -> Result<Response> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The candidate query against SQLite with the real schema: the same rows
+    /// as the planner-ordered query it replaced, for a fraction of the work,
+    /// starting from the eligible channels.
+    #[test]
+    fn candidate_query_starts_from_eligible_channels() {
+        use rusqlite::{params, types::Value, Connection};
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::EVENTS_CREATE_SQL).unwrap();
+        c.execute_batch(include_str!("../migrations/0004_event_tags.sql"))
+            .unwrap();
+        let _ = c.execute_batch(crate::EVENT_TAGS_TIME_COLUMN_SQL);
+        for s in crate::PROBE_BLIND_STMTS {
+            c.execute_batch(s).unwrap();
+        }
+        for s in crate::PAGING_INDEX_STMTS {
+            c.execute_batch(s).unwrap();
+        }
+        c.execute_batch(
+            "CREATE TABLE channel_zones (channel_id TEXT PRIMARY KEY, \
+                 zone TEXT NOT NULL DEFAULT 'home', archived INTEGER NOT NULL DEFAULT 0); \
+             CREATE TABLE hidden_events (event_id TEXT PRIMARY KEY, hidden_by TEXT NOT NULL, \
+                 reason TEXT, created_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+        c.execute_batch(CREATE_SQL).unwrap();
+        c.execute_batch(
+            "INSERT INTO channel_zones VALUES ('pub', 'zone1', 0), ('sealed', 'zone2', 0);",
+        )
+        .unwrap();
+        let mut ins = c
+            .prepare(
+                "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, received_at) \
+                 VALUES (?1, 'p', ?2, 42, ?3, 'x', 's', ?4)",
+            )
+            .unwrap();
+        // A busy encrypted channel (the imported history) and a quiet public one.
+        for i in 0..3000 {
+            let tags = r#"[["e","sealed","","root"]]"#;
+            ins.execute(params![format!("s{i:06}"), 1000 + i, tags, 5000 + i])
+                .unwrap();
+        }
+        for i in 0..12 {
+            let tags = r#"[["e","pub","","root"]]"#;
+            ins.execute(params![format!("p{i:06}"), 2000 + i, tags, 9000 + i])
+                .unwrap();
+        }
+        // One public post already triaged, one hidden: both stay out.
+        c.execute(
+            "INSERT INTO jev_triage (event_id, channel_id, zone, spam, abuse, harm, severity, \
+             severity_confidence, queued, model, question_set, created_at) \
+             VALUES ('p000003', 'pub', 'zone1', 0, 0, 0, 0, 0, 0, 'm', 'q', 1)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO hidden_events VALUES ('p000005', 'admin', 'r', 1)",
+            [],
+        )
+        .unwrap();
+        let legacy = "SELECT e.id AS id, e.content AS content, e.tags AS tags, cz.channel_id AS channel_id, \
+                cz.zone AS zone FROM events e \
+             JOIN event_tags t ON t.event_id = e.id AND t.name = 'e' \
+             JOIN channel_zones cz ON cz.channel_id = t.value AND cz.archived = 0 \
+             WHERE e.kind = 42 AND e.received_at >= ?1 AND cz.zone IN (?3) \
+               AND e.id NOT IN (SELECT event_id FROM jev_triage) \
+               AND e.id NOT IN (SELECT event_id FROM hidden_events) \
+             GROUP BY e.id ORDER BY e.received_at DESC LIMIT ?2";
+        let binds = [
+            Value::Integer(0),
+            Value::Integer(50),
+            Value::Text("zone1".into()),
+        ];
+        let run = |sql: &str| {
+            let mut st = c.prepare(sql).unwrap();
+            let ids: Vec<String> = st
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                    r.get::<_, String>("id")
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            (ids, st.get_status(rusqlite::StatementStatus::VmStep))
+        };
+        let (new_ids, new_steps) = run(&candidate_sql(1));
+        let (old_ids, old_steps) = run(legacy);
+        assert_eq!(new_ids, old_ids, "same candidates as before");
+        assert_eq!(
+            new_ids.len(),
+            10,
+            "12 public posts less one triaged, one hidden"
+        );
+        assert!(new_ids.iter().all(|i| i.starts_with('p')));
+        assert!(!new_ids.iter().any(|i| i == "p000003" || i == "p000005"));
+        assert!(
+            new_steps * 20 < old_steps,
+            "eligible-channel walk took {new_steps} VM steps, legacy {old_steps}"
+        );
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", candidate_sql(1)))
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.first().is_some_and(|l| l.contains("cz")),
+            "plan: {plan:?}"
+        );
+    }
     use super::*;
     use crate::zone_config::ZoneConfig;
     use nostr_bbs_jev::testutil::{block_on, Mock};

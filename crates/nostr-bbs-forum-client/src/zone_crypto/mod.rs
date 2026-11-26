@@ -454,6 +454,27 @@ pub fn grant_targets(
     out
 }
 
+/// The keys of `held` a grant may hand out, given the zone's configured
+/// `history_from_epoch` floor: every key at or above the floor, and always the
+/// newest held key (so a floor set too high never stops a zone being granted).
+pub fn grantable_keys(held: Vec<ZoneKey>, floor: Option<u32>) -> Vec<ZoneKey> {
+    let Some(floor) = floor else {
+        return held;
+    };
+    let newest = held.iter().map(|k| k.epoch).max();
+    held.into_iter()
+        .filter(|k| k.epoch >= floor || Some(k.epoch) == newest)
+        .collect()
+}
+
+/// The configured `history_from_epoch` of zone `zone_id`, if any.
+pub fn history_floor(zone_id: &str) -> Option<u32> {
+    crate::stores::zones::load_zones()
+        .into_iter()
+        .find(|z| z.id == zone_id)
+        .and_then(|z| z.history_from_epoch)
+}
+
 /// The grants to send when an admin grants a zone's key to `recipients`.
 ///
 /// `held` is every key this admin holds for the zone, in any order. The
@@ -878,6 +899,33 @@ mod tests {
     #[test]
     fn grant_plan_empty_inputs() {
         assert!(grant_plan(&[], &["b".repeat(64)], true, |_| Default::default()).is_empty());
+    }
+
+    #[test]
+    fn keys_below_the_history_floor_are_never_granted() {
+        let held = vec![key_at(1), key_at(2), key_at(3), key_at(5)];
+        let epochs = |v: Vec<ZoneKey>| {
+            let mut e: Vec<u32> = v.iter().map(|k| k.epoch).collect();
+            e.sort();
+            e
+        };
+        // A previous deployment's epochs 1-3 stay home; the current key goes.
+        assert_eq!(epochs(grantable_keys(held.clone(), Some(5))), vec![5]);
+        assert_eq!(epochs(grantable_keys(held.clone(), Some(2))), vec![2, 3, 5]);
+        assert_eq!(epochs(grantable_keys(held.clone(), None)), vec![1, 2, 3, 5]);
+        // A floor above every held key still leaves the newest grantable.
+        assert_eq!(epochs(grantable_keys(held, Some(9))), vec![5]);
+        assert!(grantable_keys(Vec::new(), Some(5)).is_empty());
+        // With history on, the plan then carries only the floor's keys.
+        let recs = vec!["b".repeat(64)];
+        let plan = grant_plan(
+            &grantable_keys(vec![key_at(1), key_at(2), key_at(5)], Some(5)),
+            &recs,
+            true,
+            |_| Default::default(),
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.epoch, 5);
         assert!(grant_plan(&[key_at(1)], &[], true, |_| Default::default()).is_empty());
     }
 

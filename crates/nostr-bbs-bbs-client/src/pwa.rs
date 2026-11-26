@@ -549,6 +549,7 @@ mod tests {
             encrypted: false,
             group_pubkey: None,
             agent_keys: false,
+            history_from_epoch: None,
             auto_approve: false,
             kanban: false,
             search: None,

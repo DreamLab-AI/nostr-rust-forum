@@ -49,8 +49,33 @@ use crate::relay::{Filter, RelayConnection};
 /// Kind of the backup (NIP-78 application data, replaceable per `d`).
 pub const KIND_APP_DATA: u64 = 30078;
 
-/// How long to wait for the relay before giving up on a pull or push.
+/// How long to wait for the relay's answer before giving up on a pull or
+/// push, counted from when the request leaves this client.
 const RELAY_WAIT_MS: u32 = 8_000;
+
+/// Allowance on top of the computed drain time before a request stops
+/// waiting for the frames queued ahead of it (reconnects, AUTH, clock skew).
+const QUEUE_SLACK_MS: u32 = 5_000;
+
+/// Longest a request waits for the frames queued ahead of it.
+const QUEUE_WAIT_CAP_MS: u32 = 120_000;
+
+/// Pause before the one retry of a failed push.
+const PUSH_RETRY_DELAY_MS: u32 = 2_000;
+
+/// How long a backup request may wait for `frames_ahead` queued frames to
+/// leave this client before its own [`RELAY_WAIT_MS`] round trip starts.
+///
+/// The connection paces every frame (see [`crate::relay::drain_time_ms`]).
+/// A grant batch queues one frame per member, so a backup lookup made right
+/// after it can sit behind well over a hundred wraps; a timer started at
+/// queueing would expire before the lookup even left (the zone2 backup that
+/// was never published, 2026-11-26).
+pub fn queue_wait_ms(frames_ahead: usize) -> u32 {
+    crate::relay::drain_time_ms(frames_ahead)
+        .saturating_add(QUEUE_SLACK_MS)
+        .min(QUEUE_WAIT_CAP_MS)
+}
 
 /// The `d` tag of `(zone, epoch)`'s backup.
 pub fn d_tag(zone: &str, epoch: u32) -> String {
@@ -139,6 +164,12 @@ async fn fetch_remote(
     epoch: u32,
 ) -> Result<Option<NostrEvent>, String> {
     let owner = identity.public_key().to_string();
+    // Start the clock only once the frames ahead of this REQ have gone out:
+    // the timer below measures the relay, not this client's send queue. A
+    // queue that does not drain (socket down) leaves the timer to decide.
+    relay
+        .wait_until_sent(queue_wait_ms(relay.queued_frames()))
+        .await;
     let slot: Rc<Slot<Result<(), String>>> = Slot::new();
     let events: Rc<RefCell<Vec<NostrEvent>>> = Rc::default();
     let sink = events.clone();
@@ -175,17 +206,115 @@ pub async fn pull(
     zone: &str,
     epoch: u32,
 ) -> Result<usize, String> {
+    Ok(pull_detailed(relay, identity, store, zone, epoch)
+        .await?
+        .added())
+}
+
+/// What [`pull_detailed`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pulled {
+    /// Already found and merged earlier this session; not asked again.
+    Cached,
+    /// A backup was found; this many entries were new to this device.
+    Merged(usize),
+    /// The relay answered and holds no backup of this `(zone, epoch)`.
+    Missing,
+}
+
+impl Pulled {
+    /// Entries newly marked granted.
+    pub fn added(self) -> usize {
+        match self {
+            Pulled::Merged(n) => n,
+            Pulled::Cached | Pulled::Missing => 0,
+        }
+    }
+}
+
+/// [`pull`], saying whether the relay held a backup at all, so a caller can
+/// publish one that is missing (see [`needs_repair`]).
+pub async fn pull_detailed(
+    relay: &RelayConnection,
+    identity: &dyn Signer,
+    store: ZoneKeyStore,
+    zone: &str,
+    epoch: u32,
+) -> Result<Pulled, String> {
     let seen = (identity.public_key().to_string(), zone.to_string(), epoch);
     if PULLED.with(|p| p.borrow().contains(&seen)) {
-        return Ok(0);
+        return Ok(Pulled::Cached);
     }
     let Some(ev) = fetch_remote(relay, identity, zone, epoch).await? else {
-        return Ok(0);
+        return Ok(Pulled::Missing);
     };
     let entries = open(identity, &ev).await?;
     let added = store.merge_grant_backup(zone, epoch, &entries).await;
     PULLED.with(|p| p.borrow_mut().insert(seen));
-    Ok(added)
+    Ok(Pulled::Merged(added))
+}
+
+/// Whether a `(zone, epoch)` whose pull came back `pulled`, with `local`
+/// ledger entries on this device, should have its backup published now.
+///
+/// Only a definite "the relay holds none" with something to publish
+/// qualifies. This is how a backup a batch failed to publish (or one sent
+/// before backups existed) reaches the relay without waiting for the next
+/// grant: until it does, every other browser of this admin re-grants the
+/// whole roster on sign-in.
+///
+/// `authed` is whether the connection had completed NIP-42 AUTH when the
+/// relay answered: an answer given before AUTH can be empty because the
+/// relay withheld the event, and publishing then would replace a fuller
+/// backup with this device's subset.
+pub fn needs_repair(pulled: Result<Pulled, &str>, local: usize, authed: bool) -> bool {
+    authed && matches!(pulled, Ok(Pulled::Missing)) && local > 0
+}
+
+thread_local! {
+    /// `(admin, zone, epoch)` whose missing backup a repair was already
+    /// attempted for this session, successful or not: one try per session,
+    /// so a relay that refuses the backup is not asked on every sweep.
+    static REPAIRED: RefCell<HashSet<(String, String, u32)>> = RefCell::new(HashSet::new());
+}
+
+/// Claim the one repair attempt of `(owner, zone, epoch)` this session.
+/// `false` when it was already claimed.
+pub fn claim_repair(owner: &str, zone: &str, epoch: u32) -> bool {
+    REPAIRED.with(|r| {
+        r.borrow_mut()
+            .insert((owner.to_string(), zone.to_string(), epoch))
+    })
+}
+
+/// [`push`], retried once after a short pause if it fails. The second try
+/// re-reads the relay copy, so it never publishes blind.
+pub async fn push_retrying(
+    relay: &RelayConnection,
+    identity: &dyn Signer,
+    store: ZoneKeyStore,
+    zone: &str,
+    epoch: u32,
+    now: impl Fn() -> u64,
+) -> Result<(), String> {
+    match push(relay, identity, store, zone, epoch, now()).await {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            web_sys::console::warn_1(
+                &format!("[zone-key] grant backup {zone}/{epoch}: {first}; retrying").into(),
+            );
+            let promise = js_sys::Promise::new(&mut |resolve, _| {
+                if let Some(win) = web_sys::window() {
+                    let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        &resolve,
+                        PUSH_RETRY_DELAY_MS as i32,
+                    );
+                }
+            });
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            push(relay, identity, store, zone, epoch, now()).await
+        }
+    }
 }
 
 /// What a push should publish, given the relay's current copy (`Err`: could
@@ -255,6 +384,10 @@ pub async fn push(
         return Ok(());
     };
     let ev = build(identity, zone, epoch, &entries, at).await?;
+    // As in `fetch_remote`: the OK timer starts once the EVENT is out.
+    relay
+        .wait_until_sent(queue_wait_ms(relay.queued_frames()))
+        .await;
     let slot: Rc<Slot<Result<(), String>>> = Slot::new();
     let done = slot.clone();
     relay.publish_with_ack(
@@ -418,6 +551,64 @@ mod tests {
             plan_publish(Ok(Some((1, dirty))), &[], 5).unwrap().1.len(),
             2
         );
+    }
+
+    #[test]
+    fn a_backup_request_behind_a_grant_batch_waits_for_the_queue() {
+        use crate::relay::drain_time_ms;
+        // 2026-11-26: the zone2 lookup sat behind ~70 unsent wraps (~9 s at
+        // 8/s) with an 8 s timer started at queueing, so it always expired
+        // before leaving and the zone2 backup was never published.
+        assert!(drain_time_ms(70) > RELAY_WAIT_MS);
+        for frames in [0usize, 1, 8, 9, 70, 152, 400] {
+            let wait = queue_wait_ms(frames);
+            let drain = drain_time_ms(frames);
+            if drain + QUEUE_SLACK_MS <= QUEUE_WAIT_CAP_MS {
+                assert!(
+                    wait >= drain + QUEUE_SLACK_MS,
+                    "{frames} frames: {wait} < {drain}"
+                );
+            } else {
+                assert_eq!(wait, QUEUE_WAIT_CAP_MS);
+            }
+        }
+        // A whole roster's grants fit inside the cap.
+        assert!(drain_time_ms(400) + QUEUE_SLACK_MS <= QUEUE_WAIT_CAP_MS);
+        assert_eq!(queue_wait_ms(usize::MAX), QUEUE_WAIT_CAP_MS);
+    }
+
+    #[test]
+    fn only_a_definitely_missing_backup_with_local_entries_is_repaired() {
+        assert!(needs_repair(Ok(Pulled::Missing), 1, true));
+        assert!(!needs_repair(Ok(Pulled::Missing), 0, true));
+        assert!(!needs_repair(Ok(Pulled::Merged(0)), 5, true));
+        assert!(!needs_repair(Ok(Pulled::Merged(3)), 5, true));
+        assert!(!needs_repair(Ok(Pulled::Cached), 5, true));
+        // An unreachable relay is not "none": publishing then could shrink
+        // a backup this device simply failed to read.
+        assert!(!needs_repair(
+            Err("timed out waiting for the relay"),
+            5,
+            true
+        ));
+        // Nor is an answer given before AUTH, which may have withheld it.
+        assert!(!needs_repair(Ok(Pulled::Missing), 5, false));
+    }
+
+    #[test]
+    fn a_repair_is_attempted_once_per_session() {
+        let owner = "f".repeat(64);
+        assert!(claim_repair(&owner, "zone2", 5));
+        assert!(!claim_repair(&owner, "zone2", 5));
+        assert!(claim_repair(&owner, "zone2", 6));
+        assert!(claim_repair(&owner, "zone4", 5));
+    }
+
+    #[test]
+    fn pulled_counts_only_merged_entries() {
+        assert_eq!(Pulled::Merged(4).added(), 4);
+        assert_eq!(Pulled::Missing.added(), 0);
+        assert_eq!(Pulled::Cached.added(), 0);
     }
 
     #[test]

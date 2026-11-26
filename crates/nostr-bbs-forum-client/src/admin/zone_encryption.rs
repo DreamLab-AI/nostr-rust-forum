@@ -575,7 +575,10 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                                     let recipients = missing();
                                     let history = include_history.get_untracked();
                                     let zone_id = zone.with_value(|z| z.id.clone());
-                                    let held = keys.all_for_zone(&zone_id);
+                                    let held = crate::zone_crypto::grantable_keys(
+                                        keys.all_for_zone(&zone_id),
+                                        crate::zone_crypto::history_floor(&zone_id),
+                                    );
                                     let relay_btn = relay_btn.get_value();
                                     let signer_btn = auth.get_signer();
                                     spawn_local(async move {
