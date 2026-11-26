@@ -30,7 +30,7 @@ use crate::components::copy_key::CopyKey;
 use crate::relay::RelayConnection;
 use crate::stores::zones::{load_zones, Zone};
 use crate::utils::shorten_pubkey;
-use crate::zone_crypto::auto_grant::{grant_count, send_grants, AutoGrant};
+use crate::zone_crypto::auto_grant::{report_summary, send_grants, AutoGrant, PendingReview};
 use crate::zone_crypto::store::{try_use_zone_key_store, ZoneKeyStore};
 use crate::zone_crypto::{generate_zone_key, grant_plan, grant_targets, ZoneKey, AGENT_COHORT};
 
@@ -103,6 +103,12 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
 /// sweep silently wrap the zone key to an injected pubkey. Approving a target
 /// records it and grants the key; rotation to already-known members stays
 /// automatic and never appears here.
+///
+/// A browser with no grant record (a fresh device, or site data cleared with
+/// no relay backup) lists every member here: "Approve all" confirms them in
+/// one batch. Members of a zone whose relay-held record could not be read are
+/// listed apart as unverified (check again, or approve explicitly), and a
+/// failed check says so rather than showing an empty list.
 #[component]
 fn PendingApprovals() -> impl IntoView {
     let Some(auto) = AutoGrant::capture() else {
@@ -111,57 +117,141 @@ fn PendingApprovals() -> impl IntoView {
     // `StoredValue` is `Copy`, so the reactive list closure below stays `Fn`
     // (the `Show` children must be) while still reaching the captured handles.
     let auto = StoredValue::new(auto);
-    let pending: RwSignal<Vec<(String, String)>> = RwSignal::new(Vec::new());
-    let loaded = RwSignal::new(false);
+    let review: RwSignal<Option<Result<PendingReview, String>>> = RwSignal::new(None);
 
-    spawn_local(async move {
-        let p = auto.get_value().pending_targets().await;
-        pending.set(p);
-        loaded.set(true);
-    });
+    let check = move || {
+        review.set(None);
+        spawn_local(async move {
+            let r = auto.get_value().pending_targets().await;
+            let _ = review.try_set(Some(r));
+        });
+    };
+    check();
 
+    let drop_rows = move |done: &[(String, String)]| {
+        review.update(|r| {
+            if let Some(Ok(v)) = r {
+                v.pending.retain(|t| !done.contains(t));
+                v.unverified.retain(|t| !done.contains(t));
+            }
+        });
+    };
     let approve = move |zone: String, pubkey: String| {
         auto.get_value().approve(&zone, &pubkey);
-        // Drop the row optimistically; the next sweep recomputes the set.
-        pending.update(|p| p.retain(|(z, pk)| !(z == &zone && pk == &pubkey)));
+        // Drop the row optimistically; the next check recomputes the set.
+        drop_rows(&[(zone, pubkey)]);
+    };
+    let approve_all = move |targets: Vec<(String, String)>| {
+        let ok = web_sys::window()
+            .and_then(|w| {
+                w.confirm_with_message(&format!(
+                    "Approve and send zone keys to all {} listed member(s)? Confirm only if you \
+                     recognise every one: a compromised relay could have added a pubkey.",
+                    targets.len()
+                ))
+                .ok()
+            })
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+        auto.get_value().approve_all(targets.clone());
+        drop_rows(&targets);
+    };
+
+    let row = move |zone: String, pubkey: String| {
+        let (z, pk) = (zone.clone(), pubkey.clone());
+        view! {
+            <li class="flex items-center justify-between gap-3 text-sm">
+                <span class="flex items-center gap-2">
+                    <code class="text-xs text-gray-300">{zone}</code>
+                    <CopyKey full=pubkey />
+                </span>
+                <button
+                    class="px-2 py-1 text-xs rounded bg-amber-600 hover:bg-amber-500 text-white"
+                    on:click=move |_| approve(z.clone(), pk.clone())
+                >
+                    "Approve & send key"
+                </button>
+            </li>
+        }
     };
 
     view! {
-        <Show when=move || loaded.get() && !pending.get().is_empty() fallback=|| ()>
-            <div class="rounded border border-amber-500/40 bg-amber-500/5 p-4 space-y-3">
-                <div>
-                    <h3 class="text-sm font-semibold text-amber-300">"New members awaiting approval"</h3>
-                    <p class="text-xs text-gray-400 max-w-3xl mt-1">
-                        "These pubkeys were added to an encrypted zone's cohort but have never held \
-                         its key. The sign-in sweep will not send the key until you confirm each one \
-                         here — this is the only way a brand-new member receives a key automatically, \
-                         and it stops a compromised relay from silently granting the key to an \
-                         injected pubkey. Confirm only members you recognise."
-                    </p>
+        {move || match review.get() {
+            None => ().into_any(),
+            Some(Err(e)) => view! {
+                <div class="rounded border border-red-500/40 bg-red-500/5 p-4 space-y-2">
+                    <h3 class="text-sm font-semibold text-red-300">"Could not check for members awaiting a key"</h3>
+                    <p class="text-xs text-gray-400">{e}</p>
+                    <button
+                        class="px-2 py-1 text-xs rounded border border-gray-600 text-gray-200 hover:bg-gray-700"
+                        on:click=move |_| check()
+                    >"Check again"</button>
                 </div>
-                <ul class="space-y-2">
-                    {move || {
-                        pending.get().into_iter().map(move |(zone, pubkey)| {
-                            let (z, pk) = (zone.clone(), pubkey.clone());
-                            view! {
-                                <li class="flex items-center justify-between gap-3 text-sm">
-                                    <span class="flex items-center gap-2">
-                                        <code class="text-xs text-gray-300">{zone.clone()}</code>
-                                        <CopyKey full=pubkey.clone() />
-                                    </span>
+            }.into_any(),
+            Some(Ok(v)) => {
+                let PendingReview { pending, unverified, floor_blocked } = v;
+                let floors = (!floor_blocked.is_empty()).then(|| view! {
+                    <div class="rounded border border-red-500/40 bg-red-500/5 p-4 space-y-1">
+                        <h3 class="text-sm font-semibold text-red-300">"No key can be granted for some zones"</h3>
+                        {floor_blocked.iter().map(|b| view! {
+                            <p class="text-xs text-gray-400">{b.explain()}</p>
+                        }).collect_view()}
+                    </div>
+                });
+                let pending_box = (!pending.is_empty()).then(|| {
+                    let all = pending.clone();
+                    view! {
+                        <div class="rounded border border-amber-500/40 bg-amber-500/5 p-4 space-y-3">
+                            <div class="flex items-start justify-between gap-3">
+                                <div>
+                                    <h3 class="text-sm font-semibold text-amber-300">"New members awaiting approval"</h3>
+                                    <p class="text-xs text-gray-400 max-w-3xl mt-1">
+                                        "These pubkeys are in an encrypted zone's cohort but this browser has no \
+                                         record of granting them its key. The sign-in sweep will not send the key \
+                                         until you confirm each one here, which stops a compromised relay from \
+                                         silently granting the key to an injected pubkey. A browser with no grant \
+                                         record yet lists every member: confirm only members you recognise."
+                                    </p>
+                                </div>
+                                {(all.len() > 1).then(|| view! {
                                     <button
-                                        class="px-2 py-1 text-xs rounded bg-amber-600 hover:bg-amber-500 text-white"
-                                        on:click=move |_| approve(z.clone(), pk.clone())
-                                    >
-                                        "Approve & send key"
-                                    </button>
-                                </li>
-                            }
-                        }).collect_view()
-                    }}
-                </ul>
-            </div>
-        </Show>
+                                        class="shrink-0 px-2 py-1 text-xs rounded border border-amber-500 text-amber-200 hover:bg-amber-500/10"
+                                        on:click=move |_| approve_all(all.clone())
+                                    >{format!("Approve all ({})", all.len())}</button>
+                                })}
+                            </div>
+                            <ul class="space-y-2">
+                                {pending.into_iter().map(|(z, pk)| row(z, pk)).collect_view()}
+                            </ul>
+                        </div>
+                    }
+                });
+                let unverified_box = (!unverified.is_empty()).then(|| view! {
+                    <div class="rounded border border-sky-500/40 bg-sky-500/5 p-4 space-y-3">
+                        <div class="flex items-start justify-between gap-3">
+                            <div>
+                                <h3 class="text-sm font-semibold text-sky-300">"Grant status could not be checked"</h3>
+                                <p class="text-xs text-gray-400 max-w-3xl mt-1">
+                                    "The relay did not return this admin's grant record for these zones, so \
+                                     these members may or may not have been granted already. Nothing was sent to \
+                                     them. Check again once the relay answers, or approve a member you recognise."
+                                </p>
+                            </div>
+                            <button
+                                class="shrink-0 px-2 py-1 text-xs rounded border border-gray-600 text-gray-200 hover:bg-gray-700"
+                                on:click=move |_| check()
+                            >"Check again"</button>
+                        </div>
+                        <ul class="space-y-2">
+                            {unverified.into_iter().map(|(z, pk)| row(z, pk)).collect_view()}
+                        </ul>
+                    </div>
+                });
+                view! { {floors} {pending_box} {unverified_box} }.into_any()
+            }
+        }}
     }
     .into_any()
 }
@@ -217,12 +307,17 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 .collect::<Vec<_>>()
         });
         let ready = channels.msg_eose_received.get() && keys_ready();
-        crate::zone_crypto::keyset::plan_mint(
-            &zone_id,
-            latest().map(|k| k.epoch),
-            &keys.device_epochs_for(&zone_id),
-            &seen,
-            ready,
+        // A new key goes straight to every member, so it may not be minted
+        // below the zone's history floor (it could never be granted).
+        crate::zone_crypto::keyset::floor_mint(
+            crate::zone_crypto::keyset::plan_mint(
+                &zone_id,
+                latest().map(|k| k.epoch),
+                &keys.device_epochs_for(&zone_id),
+                &seen,
+                ready,
+            ),
+            zone.with_value(|z| z.history_from_epoch),
         )
     };
     let mint_waiting = move || {
@@ -414,7 +509,6 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             )));
             let relay = relay.clone();
             spawn_local(async move {
-                let total = grant_count(&plan);
                 // The tab may be closed by the time the relay acks.
                 let on_recorded = Rc::new(move |key: &ZoneKey, pk: &str| {
                     let _ = sent.try_update(|s| {
@@ -442,10 +536,13 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 });
                 let report = send_grants(keys, &relay, &*signer, plan, on_recorded).await;
                 let _ = busy.try_set(false);
-                let _ = status.try_set(Some(if report.failed == 0 {
-                    format!("Sent {total} grant(s). Members receive the key next time they open the forum.")
-                } else {
-                    format!("Sent {} grant(s); {} could not be built or sent — try again.", report.sent, report.failed)
+                let _ = status.try_set(Some(match report_summary(&report) {
+                    Some(s) if !s.problem => format!(
+                        "{} Members receive the key next time they open the forum.",
+                        s.text
+                    ),
+                    Some(s) => s.text,
+                    None => "Nothing was sent — try again.".to_string(),
                 }));
             });
         }
@@ -575,10 +672,15 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                                     let recipients = missing();
                                     let history = include_history.get_untracked();
                                     let zone_id = zone.with_value(|z| z.id.clone());
-                                    let held = crate::zone_crypto::grantable_keys(
-                                        keys.all_for_zone(&zone_id),
-                                        crate::zone_crypto::history_floor(&zone_id),
-                                    );
+                                    let floor = crate::zone_crypto::history_floor(&zone_id);
+                                    let all = keys.all_for_zone(&zone_id);
+                                    // Every held key below the floor: say why
+                                    // nothing goes, rather than "everyone has it".
+                                    if let Some(block) = crate::zone_crypto::floor_block(&zone_id, &all, floor) {
+                                        status.set(Some(block.explain()));
+                                        return;
+                                    }
+                                    let held = crate::zone_crypto::grantable_keys(all, floor);
                                     let relay_btn = relay_btn.get_value();
                                     let signer_btn = auth.get_signer();
                                     spawn_local(async move {

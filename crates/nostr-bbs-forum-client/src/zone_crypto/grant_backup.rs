@@ -271,6 +271,23 @@ pub fn needs_repair(pulled: Result<Pulled, &str>, local: usize, authed: bool) ->
     authed && matches!(pulled, Ok(Pulled::Missing)) && local > 0
 }
 
+/// Whether a `(zone, epoch)` whose pull came back `pulled` counts as read
+/// for the first-grant gate: this device then knows everything its admin's
+/// backup records, so a member absent from both is genuinely never granted.
+///
+/// `Err` (the relay did not answer, or a backup was found but did not
+/// decrypt) is not read. Neither is "none" answered before NIP-42 AUTH
+/// (`authed` false), which the relay may have said because it withheld the
+/// event (as in [`needs_repair`]). Either way the gate reports the zone as
+/// unverified rather than presenting its members as never granted.
+pub fn backup_verified(pulled: Result<Pulled, &str>, authed: bool) -> bool {
+    match pulled {
+        Ok(Pulled::Cached | Pulled::Merged(_)) => true,
+        Ok(Pulled::Missing) => authed,
+        Err(_) => false,
+    }
+}
+
 thread_local! {
     /// `(admin, zone, epoch)` whose missing backup a repair was already
     /// attempted for this session, successful or not: one try per session,
@@ -403,9 +420,10 @@ pub async fn push(
     slot.wait().await
 }
 
-/// Counts acknowledged-and-recorded grants so a caller can wait for a batch.
-/// Acks may arrive before the total is known (the sender is still looping),
-/// so completion needs both the total ([`expect`](Self::expect)) and the acks.
+/// Counts answered grants (accepted and recorded, or refused) so a caller can
+/// wait for a batch. Answers may arrive before the total is known (the sender
+/// is still looping), so completion needs both the total
+/// ([`expect`](Self::expect)) and the answers.
 pub struct AckCounter {
     acked: Cell<usize>,
     expected: Cell<Option<usize>>,
@@ -434,14 +452,15 @@ impl AckCounter {
         self.check();
     }
 
-    /// One grant was acknowledged and recorded.
+    /// One grant was answered: accepted and recorded, or refused.
     pub fn ack(&self) {
         self.acked.set(self.acked.get() + 1);
         self.check();
     }
 
-    /// Wait until every expected acknowledgement arrived, or `ms` elapsed.
-    /// Rejected grants never ack, so the timeout is what ends a partial batch.
+    /// Wait until every expected answer arrived, or `ms` elapsed. A grant the
+    /// relay never answers (or whose answer a reconnect dropped) never acks,
+    /// so the timeout is what ends such a batch.
     pub async fn wait(&self, ms: u32) {
         let late = self.done.clone();
         let _timer = gloo::timers::callback::Timeout::new(ms, move || late.fill(()));
@@ -593,6 +612,22 @@ mod tests {
         ));
         // Nor is an answer given before AUTH, which may have withheld it.
         assert!(!needs_repair(Ok(Pulled::Missing), 5, false));
+    }
+
+    #[test]
+    fn only_a_backup_actually_read_verifies_the_gate() {
+        assert!(backup_verified(Ok(Pulled::Merged(0)), true));
+        assert!(backup_verified(Ok(Pulled::Merged(4)), false));
+        assert!(backup_verified(Ok(Pulled::Cached), false));
+        // "None" is an answer only once AUTH completed.
+        assert!(backup_verified(Ok(Pulled::Missing), true));
+        assert!(!backup_verified(Ok(Pulled::Missing), false));
+        // A timeout, or a backup that would not decrypt, is not read.
+        assert!(!backup_verified(
+            Err("timed out waiting for the relay"),
+            true
+        ));
+        assert!(!backup_verified(Err("grant backup does not decrypt"), true));
     }
 
     #[test]

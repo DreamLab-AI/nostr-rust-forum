@@ -25,6 +25,10 @@
 //! (this device's ledger has granted it a held epoch, or an admin approved it).
 //! Any other target is held pending for a one-time approval in Admin →
 //! Encryption. An explicit allocation grants immediately and records approval.
+//! An empty record approves nobody: a fresh browser sees every member as
+//! awaiting approval (the tab approves them in bulk), and a zone whose
+//! relay-held backup could not be read is reported unverified, its unknown
+//! members neither granted nor called never-granted.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -88,7 +92,10 @@ pub fn encrypted_zone_rules() -> Vec<ZoneRule> {
 /// granted before on nothing but the relay's say-so. A never-granted pubkey is
 /// surfaced in [`pending`](Self::pending) for the admin to confirm once; a
 /// pubkey already in the ledger (granted a prior epoch) or on the persisted
-/// approved set is "known" and auto-grants, so rotation stays automatic.
+/// approved set is "known" and auto-grants, so rotation stays automatic. In a
+/// zone whose record could not be read, an unknown pubkey lands in
+/// [`unverified`](Self::unverified) instead: it may have been granted from a
+/// record this device could not see, so "never granted" would be a guess.
 //
 // Follow-up (option B, robust fix): signed membership records — each member
 // admitted by an admin-signed join event the client verifies — so the client
@@ -104,6 +111,15 @@ pub struct MissingPlan {
     /// surfaced for the admin to approve once (see
     /// [`AutoGrant::approve`](crate::zone_crypto::auto_grant::AutoGrant::approve)).
     pub pending: Vec<(String, String)>,
+    /// `(zone, pubkey)` pairs not on this device's record, in a zone whose
+    /// relay-held backup could not be read ([`GateRecords::unverified`]).
+    /// Neither wrapped nor presented as never granted: the admin may retry
+    /// the check, or approve them explicitly.
+    pub unverified: Vec<(String, String)>,
+    /// Zones this device holds keys for but may grant none of, because every
+    /// held key is below the zone's `history_from_epoch` floor. Filled by
+    /// [`AutoGrant::plan`], never by [`plan_missing`].
+    pub floor_blocked: Vec<super::FloorBlock>,
     /// `(zone, epoch)` ledgers this device holds entries for but the relay
     /// holds no backup of (see [`super::grant_backup::needs_repair`]). Filled
     /// by [`AutoGrant::plan`], never by [`plan_missing`].
@@ -115,19 +131,21 @@ pub struct MissingPlan {
 ///
 /// `held` maps zone id to the keys this admin holds for it; `sent` maps
 /// `(zone, epoch)` to the members this device's ledger records as granted at
-/// the key they would be granted at now. `known` maps zone id to the pubkeys
-/// that may be auto-granted without a fresh confirmation — those the ledger
-/// has ever granted any epoch of the zone, plus the persisted approved set.
+/// the key they would be granted at now. `gate.known` maps zone id to the
+/// pubkeys that may be auto-granted without a fresh confirmation — those the
+/// ledger has ever granted any epoch of the zone, plus the persisted approved
+/// set — and `gate.unverified` names the zones whose record was not read.
 ///
 /// A member is owed a zone's newest key when they are one of its
 /// [`grant_targets`] and the ledger has no record of it; with that grant go
 /// the earlier keys they were not sent ([`grant_plan`] with history), so a
 /// member who joins after a rotation can read the zone's older messages. A
-/// target that is `me`, or in `known` for the zone, auto-grants; any other
-/// never-granted target lands in [`MissingPlan::pending`] instead — unless
-/// `auto_grant_new` is set (an explicit admin allocation), when new targets
-/// both auto-grant and are reported in `pending` so the caller can persist the
-/// approval. `only` narrows the recipients to those pubkeys (an allocation).
+/// target that is `me`, or known for the zone, auto-grants; any other target
+/// lands in [`MissingPlan::pending`] (or [`MissingPlan::unverified`], in an
+/// unverified zone) instead — unless `auto_grant_new` is set (an explicit
+/// admin allocation), when new targets both auto-grant and are reported in
+/// `pending` so the caller can persist the approval. `only` narrows the
+/// recipients to those pubkeys (an allocation).
 // Each parameter is a distinct, named input (roster, identity, held keys,
 // ledger history, the known/approved set, the allocation flag and the `only`
 // filter); bundling them would hide rather than clarify, so the arg-count lint
@@ -139,7 +157,7 @@ pub fn plan_missing(
     me: &str,
     held: &HashMap<String, Vec<ZoneKey>>,
     sent: &HashMap<(String, u32), HashSet<String>>,
-    known: &HashMap<String, HashSet<String>>,
+    gate: &GateRecords,
     auto_grant_new: bool,
     only: Option<&HashSet<String>>,
 ) -> MissingPlan {
@@ -154,7 +172,8 @@ pub fn plan_missing(
             continue;
         };
         let have = sent.get(&(zone.id.clone(), newest)).unwrap_or(&none);
-        let known_z = known.get(&zone.id).unwrap_or(&none);
+        let known_z = gate.known.get(&zone.id).unwrap_or(&none);
+        let unverified = gate.unverified.contains(&zone.id);
         let recipients = grant_targets(members, &zone.required_cohorts, me, zone.agent_keys)
             .into_iter()
             .filter(|pk| only.is_none_or(|o| o.contains(pk)))
@@ -163,11 +182,13 @@ pub fn plan_missing(
         for pk in recipients {
             if pk == me_lower || known_z.contains(&pk) {
                 auto.push(pk);
-            } else {
+            } else if auto_grant_new {
                 out.pending.push((zone.id.clone(), pk.clone()));
-                if auto_grant_new {
-                    auto.push(pk);
-                }
+                auto.push(pk);
+            } else if unverified {
+                out.unverified.push((zone.id.clone(), pk));
+            } else {
+                out.pending.push((zone.id.clone(), pk));
             }
         }
         if auto.is_empty() {
@@ -186,45 +207,67 @@ pub fn plan_missing(
 /// known, per zone, before [`plan_missing`] splits the owed grants.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GateRecords {
-    /// Zone id to the pubkeys that may be auto-granted.
+    /// Zone id to the pubkeys that may be auto-granted: those this device's
+    /// ledger (with the relay-held backup merged in) has granted a held
+    /// epoch, plus the persisted approved set.
     pub known: HashMap<String, HashSet<String>>,
-    /// `(zone, pubkey)` approvals to persist.
-    pub adopt: Vec<(String, String)>,
+    /// Zones whose relay-held backup could not be read for some held epoch
+    /// (see [`super::grant_backup::backup_verified`]).
+    pub unverified: HashSet<String>,
 }
 
-/// Decide what the gate may treat as known, from this device's ledger and
-/// approved set (`known`), the roster, and the zones whose relay-held backup
-/// could not be read (`unread`).
+/// The gate's view of this device's records: `known` from the local ledger
+/// and approved set, and `unread`, the zones whose backup was not read.
+///
+/// The roster plays no part. An empty or unreadable record never widens
+/// approval: with nothing on record every member other than the admin is
+/// pending (never granted, needs an explicit approval), and a zone whose
+/// backup was not read is unverified, so its unknown members are not called
+/// never granted either. Nobody is approved here; only an admin's explicit
+/// action ([`AutoGrant::approve`], [`AutoGrant::approve_all`], an
+/// allocation) approves.
 pub fn gate_records(
-    zones: &[ZoneRule],
     held: &HashMap<String, Vec<ZoneKey>>,
-    members: &[(String, Vec<String>)],
-    me: &str,
-    mut known: HashMap<String, HashSet<String>>,
-    _unread: &HashSet<String>,
+    known: HashMap<String, HashSet<String>>,
+    unread: &HashSet<String>,
 ) -> GateRecords {
-    let mut adopt = Vec::new();
-    for zone in zones {
-        if known.get(&zone.id).is_none_or(HashSet::is_empty) && held.contains_key(&zone.id) {
-            let base = grant_targets(members, &zone.required_cohorts, me, zone.agent_keys);
-            for pk in &base {
-                adopt.push((zone.id.clone(), pk.clone()));
-            }
-            known.insert(zone.id.clone(), base.into_iter().collect());
-        }
+    GateRecords {
+        known,
+        unverified: unread
+            .iter()
+            .filter(|z| held.contains_key(*z))
+            .cloned()
+            .collect(),
     }
-    GateRecords { known, adopt }
 }
 
-/// What one run of grants did.
+/// What one run of grants did. Only `accepted` grants reached a member;
+/// every other count is a grant that did not, for a distinct reason.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GrantReport {
-    /// Grants handed to the relay.
-    pub sent: usize,
-    /// Grants that could not be built or sent.
+    /// Grants the relay accepted (`OK true`), recorded in the ledger.
+    pub accepted: usize,
+    /// Grants the relay refused (`OK false`). Not recorded; owed again.
+    pub rejected: usize,
+    /// Grants handed to the relay that it did not answer in time (or whose
+    /// answer a reconnect dropped). Not recorded; owed again, though a late
+    /// acceptance is still recorded when it arrives.
+    pub unconfirmed: usize,
+    /// Grants that could not be built or handed over (inbox lookup, signer
+    /// or send failure). Not recorded; owed again.
     pub failed: usize,
-    /// Distinct members granted at least one key.
+    /// Grants withheld because the key is below its zone's
+    /// `history_from_epoch` floor (see [`super::grantable_keys`]).
+    pub withheld: usize,
+    /// Distinct members with at least one accepted grant.
     pub members: usize,
+}
+
+impl GrantReport {
+    /// Grants that did not reach their member, for whatever reason.
+    pub fn problems(&self) -> usize {
+        self.rejected + self.unconfirmed + self.failed + self.withheld
+    }
 }
 
 /// Running count of one batch's grants as they are built, handed to the
@@ -237,6 +280,8 @@ pub struct GrantTally {
     pub handed: usize,
     /// Grants that could not be built or handed over.
     pub failed: usize,
+    /// Grants withheld below their zone's history floor.
+    pub withheld: usize,
     /// Grants the relay accepted (`OK true`) and the ledger recorded.
     pub accepted: usize,
     /// Grants the relay refused (`OK false`).
@@ -246,12 +291,19 @@ pub struct GrantTally {
 }
 
 impl GrantTally {
-    /// The batch's report.
+    /// The batch's report, once the wait for answers is over: whatever was
+    /// handed over and neither accepted nor refused by then is unconfirmed.
     pub fn report(&self) -> GrantReport {
         GrantReport {
-            sent: self.handed,
+            accepted: self.accepted,
+            rejected: self.rejected,
+            unconfirmed: self
+                .handed
+                .saturating_sub(self.accepted)
+                .saturating_sub(self.rejected),
             failed: self.failed,
-            members: self.planned_members,
+            withheld: self.withheld,
+            members: self.accepted_members.len(),
         }
     }
 }
@@ -265,25 +317,69 @@ pub struct ReportSummary {
     pub problem: bool,
 }
 
-/// Put `r` into words; `None` when the run sent nothing at all.
+/// Put `r` into words; `None` when the run had nothing to send at all.
+///
+/// Every caller (allocation, approval, sweep, the Encryption tab) words its
+/// outcome here, so a refused, unanswered or withheld grant is never shown as
+/// sent, nor as silence.
 pub fn report_summary(r: &GrantReport) -> Option<ReportSummary> {
-    if r.sent == 0 && r.failed == 0 {
+    if r.accepted == 0 && r.problems() == 0 {
         return None;
     }
-    Some(if r.failed > 0 {
-        ReportSummary {
+    if r.problems() == 0 {
+        return Some(ReportSummary {
             text: format!(
-                "Sent {} zone key grant(s); {} failed. Retry from Admin → Encryption.",
-                r.sent, r.failed
+                "Sent {} zone key grant(s) to {} member(s).",
+                r.accepted, r.members
             ),
-            problem: true,
-        }
-    } else {
-        ReportSummary {
-            text: format!("Sent zone keys to {} member(s).", r.members),
             problem: false,
-        }
+        });
+    }
+    let mut parts = vec![format!("{} zone key grant(s) delivered", r.accepted)];
+    if r.rejected > 0 {
+        parts.push(format!("{} refused by the relay", r.rejected));
+    }
+    if r.unconfirmed > 0 {
+        parts.push(format!("{} not confirmed by the relay", r.unconfirmed));
+    }
+    if r.failed > 0 {
+        parts.push(format!("{} could not be sent", r.failed));
+    }
+    if r.withheld > 0 {
+        parts.push(format!(
+            "{} withheld (below the zone's history floor)",
+            r.withheld
+        ));
+    }
+    Some(ReportSummary {
+        text: format!(
+            "{}. Undelivered grants are still owed: retry from Admin → Encryption.",
+            parts.join("; ")
+        ),
+        problem: true,
     })
+}
+
+/// Split `plan` at each zone's history floor (`floor_of`): the grants that
+/// may go, and how many single grants were withheld because their key is
+/// below the floor. The last check before anything is wrapped, so no path
+/// (a pending key's own delivery included) can send a key below the floor.
+pub fn withhold_below_floor(
+    plan: Vec<(ZoneKey, Vec<String>)>,
+    floor_of: impl Fn(&str) -> Option<u32>,
+) -> (Vec<(ZoneKey, Vec<String>)>, usize) {
+    let mut withheld = 0;
+    let kept = plan
+        .into_iter()
+        .filter(|(k, r)| {
+            let below = floor_of(&k.zone).is_some_and(|f| k.epoch < f);
+            if below {
+                withheld += r.len();
+            }
+            !below
+        })
+        .collect();
+    (kept, withheld)
 }
 
 /// Called with each grant once the relay has accepted it and it is recorded.
@@ -325,8 +421,11 @@ pub fn granted_targets(
 }
 
 /// Send `plan`: one gift wrap per recipient and key, each recorded in this
-/// device's ledger once the relay accepts it. `on_recorded` runs after each
-/// record (the Encryption tab updates its "granted here" list from it).
+/// device's ledger once the relay accepts it (`OK true`), and only then. A
+/// refused or unanswered grant is never recorded, so it stays owed, and the
+/// report counts it as such. A key below its zone's history floor is
+/// withheld. `on_recorded` runs after each record (the Encryption tab updates
+/// its "granted here" list from it).
 pub async fn send_grants(
     store: ZoneKeyStore,
     relay: &RelayConnection,
@@ -334,9 +433,16 @@ pub async fn send_grants(
     plan: Vec<(ZoneKey, Vec<String>)>,
     on_recorded: OnRecorded,
 ) -> GrantReport {
+    let (plan, withheld) = withhold_below_floor(plan, super::history_floor);
+    if withheld > 0 {
+        web_sys::console::warn_1(
+            &format!("[zone-key] {withheld} grant(s) withheld: key below the history floor").into(),
+        );
+    }
     let members: HashSet<String> = plan.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
     let tally = Rc::new(std::cell::RefCell::new(GrantTally {
         planned_members: members.len(),
+        withheld,
         ..GrantTally::default()
     }));
     let targets = resolve_targets(signer, &members).await;
@@ -403,9 +509,14 @@ pub async fn send_grants(
             let on_recorded = on_recorded.clone();
             let acks_for_ack = acks.clone();
             let tally_for_ack = tally.clone();
-            let on_ok = Rc::new(move |ok: bool, _msg: String| {
+            let on_ok = Rc::new(move |ok: bool, msg: String| {
                 if !ok {
+                    // Refused: not recorded, so the member stays owed.
+                    web_sys::console::warn_1(
+                        &format!("[zone-key] grant refused by the relay: {msg}").into(),
+                    );
                     tally_for_ack.borrow_mut().rejected += 1;
+                    acks_for_ack.ack();
                     return;
                 }
                 let acks = acks_for_ack.clone();
@@ -434,8 +545,10 @@ pub async fn send_grants(
             }
         }
     }
-    // Keep the ledger on the relay too, so "granted" survives clearing site
-    // data. Best effort: the local ledger stays authoritative on failure.
+    // Wait for the relay's answers, so the report can tell accepted, refused
+    // and unanswered apart, then keep the ledger on the relay too, so
+    // "granted" survives clearing site data. The backup is best effort: the
+    // local ledger stays authoritative on failure.
     let handed = tally.borrow().handed;
     acks.expect(handed);
     if !touched.is_empty() && handed > 0 {
@@ -514,17 +627,24 @@ impl AutoGrant {
         auto_grant_new: bool,
     ) -> Result<MissingPlan, String> {
         let zones = encrypted_zone_rules();
-        let held: HashMap<String, Vec<ZoneKey>> = zones
-            .iter()
-            .map(|z| {
-                let keys =
-                    super::grantable_keys(self.store.all_for_zone(&z.id), z.history_from_epoch);
-                (z.id.clone(), keys)
-            })
-            .filter(|(_, keys)| !keys.is_empty())
-            .collect();
+        let mut floor_blocked = Vec::new();
+        let mut held: HashMap<String, Vec<ZoneKey>> = HashMap::new();
+        for z in &zones {
+            let all = self.store.all_for_zone(&z.id);
+            if let Some(block) = super::floor_block(&z.id, &all, z.history_from_epoch) {
+                web_sys::console::warn_1(&format!("[zone-key] {}", block.explain()).into());
+                floor_blocked.push(block);
+            }
+            let keys = super::grantable_keys(all, z.history_from_epoch);
+            if !keys.is_empty() {
+                held.insert(z.id.clone(), keys);
+            }
+        }
         if held.is_empty() {
-            return Ok(MissingPlan::default());
+            return Ok(MissingPlan {
+                floor_blocked,
+                ..MissingPlan::default()
+            });
         }
         let rows = crate::admin::fetch_whitelist_rows(signer).await?;
         let members: Vec<(String, Vec<String>)> =
@@ -546,13 +666,14 @@ impl AutoGrant {
         // persisted approved set. Built from the device's own ledger, never
         // the relay's roster.
         let mut known: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut unread: HashSet<String> = HashSet::new();
         let mut repair: Vec<(String, u32)> = Vec::new();
         for (zone, keys) in &held {
             for k in keys {
                 // Restore this admin's relay-held record first (once per
                 // session): after clearing site data the local ledger is empty
                 // and everyone would otherwise look ungranted. A relay that
-                // cannot answer leaves the local ledger standing alone.
+                // cannot answer leaves the zone unverified.
                 let pulled = super::grant_backup::pull_detailed(
                     &self.relay,
                     signer,
@@ -563,11 +684,16 @@ impl AutoGrant {
                 .await;
                 let local = self.store.export_grant_backup(&k.zone, k.epoch).await.len();
                 let authed = self.relay.authenticated().get_untracked();
-                if super::grant_backup::needs_repair(
-                    pulled.as_ref().map_err(String::as_str).copied(),
-                    local,
-                    authed,
-                ) {
+                let read = pulled.as_ref().map_err(String::as_str).copied();
+                if !super::grant_backup::backup_verified(read, authed) {
+                    if let Err(e) = &pulled {
+                        web_sys::console::warn_1(
+                            &format!("[zone-key] grant backup {zone}/{}: {e}", k.epoch).into(),
+                        );
+                    }
+                    unread.insert(zone.clone());
+                }
+                if super::grant_backup::needs_repair(read, local, authed) {
                     repair.push((k.zone.clone(), k.epoch));
                 }
                 let s = self.store.grants_sent_to(&k.zone, k.epoch, &targets).await;
@@ -579,47 +705,56 @@ impl AutoGrant {
             known.insert(zone.clone(), k);
         }
         let me = self.auth.pubkey().get_untracked().unwrap_or_default();
-        // First-run baseline: a device with NO record for a zone (ledger and
-        // approved set both empty) has nothing to compare an injected roster
-        // row against, so quarantining every owed member would only break
-        // rotation on a fresh admin browser (the ledger is per-browser; there
-        // is no durable "ever granted" source). Adopt the current eligible
-        // roster as the baseline once and persist it; from then on the device
-        // has a baseline and a genuinely new pubkey is held pending. A relay
-        // compromised before a device's first sweep is adopted — documented in
-        // ADR-2016; the robust fix is a durable admin-signed grant ledger.
-        let gate = gate_records(&zones, &held, &members, &me, known, &HashSet::new());
-        for (zone, pk) in &gate.adopt {
-            self.store.approve_target(zone, pk).await;
-        }
-        let known = gate.known;
+        // No first-run baseline: a device with no record approves nobody (see
+        // `gate_records`). The relay could have injected a pubkey before this
+        // device's first sweep as easily as after it.
+        let gate = gate_records(&held, known, &unread);
         let mut plan = plan_missing(
             &zones,
             &members,
             &me,
             &held,
             &sent,
-            &known,
+            &gate,
             auto_grant_new,
             only,
         );
         plan.repair = repair;
+        plan.floor_blocked = floor_blocked;
         Ok(plan)
     }
 
-    async fn run(&self, only: Option<&HashSet<String>>) -> Result<GrantReport, String> {
+    /// Plan and send the grants owed to `only`. With `auto_grant_new` (an
+    /// allocation) never-granted targets are approved and granted; without
+    /// it only targets already known or approved are.
+    async fn run(
+        &self,
+        only: Option<&HashSet<String>>,
+        auto_grant_new: bool,
+    ) -> Result<GrantReport, String> {
         let signer = self
             .auth
             .get_signer()
             .ok_or_else(|| "Sign in again to grant zone keys.".to_string())?;
-        // An allocation is an explicit admin action on this pubkey, not a
-        // silent sweep: approve any never-granted target so it is granted now
-        // and remembered, rather than held for a second confirmation.
-        let plan = self.plan(&*signer, only, true).await?;
-        for (zone, pk) in &plan.pending {
-            self.store.approve_target(zone, pk).await;
+        let plan = self.plan(&*signer, only, auto_grant_new).await?;
+        if auto_grant_new {
+            // An allocation is an explicit admin action on this pubkey, not
+            // a silent sweep: approve any never-granted target so it is
+            // granted now and remembered, rather than held for a second
+            // confirmation.
+            for (zone, pk) in &plan.pending {
+                self.store.approve_target(zone, pk).await;
+            }
         }
+        let withheld = plan
+            .floor_blocked
+            .iter()
+            .map(super::FloorBlock::explain)
+            .collect::<Vec<_>>();
         if plan.grants.is_empty() {
+            if !withheld.is_empty() {
+                return Err(withheld.join(" "));
+            }
             return Ok(GrantReport::default());
         }
         Ok(send_grants(
@@ -638,29 +773,34 @@ impl AutoGrant {
         }
     }
 
+    /// Toast the outcome of an explicit grant run (allocation, approval).
+    /// `nothing` is said when the run had nothing to send, so an explicit
+    /// action never ends in silence.
+    fn toast_run(&self, outcome: Result<GrantReport, String>, nothing: &str) {
+        match outcome {
+            Ok(r) => match report_summary(&r) {
+                Some(s) if s.problem => self.toast(s.text, ToastVariant::Error),
+                Some(s) => self.toast(s.text, ToastVariant::Success),
+                None => self.toast(nothing.to_string(), ToastVariant::Info),
+            },
+            Err(e) => self.toast(
+                format!("Zone keys were not granted: {e}"),
+                ToastVariant::Error,
+            ),
+        }
+    }
+
     /// After `pubkey` was given a cohort: send them the key of every
     /// encrypted zone they now belong to that this device holds, and say so.
     pub fn after_allocation(&self, pubkey: &str) {
         let this = self.clone();
         let only: HashSet<String> = std::iter::once(pubkey.to_ascii_lowercase()).collect();
         spawn_local(async move {
-            match this.run(Some(&only)).await {
-                Ok(r) if r.sent > 0 && r.failed == 0 => this.toast(
-                    format!("Sent {} zone key(s) to the member.", r.sent),
-                    ToastVariant::Success,
-                ),
-                Ok(r) if r.failed > 0 => this.toast(
-                    format!(
-                        "{} zone key grant(s) could not be sent. Retry from Admin → Encryption.",
-                        r.failed
-                    ),
-                    ToastVariant::Error,
-                ),
-                Ok(_) => {}
-                Err(e) => this.toast(
-                    format!("Zone keys were not granted: {e}"),
-                    ToastVariant::Error,
-                ),
+            match this.run(Some(&only), true).await {
+                // Nothing owed (no encrypted zone in the new cohorts, or the
+                // member already holds the keys) is not worth a toast here.
+                Ok(r) if report_summary(&r).is_none() => {}
+                outcome => this.toast_run(outcome, ""),
             }
         });
     }
@@ -670,8 +810,9 @@ impl AutoGrant {
     /// zone before. A never-granted target is held for a one-time admin
     /// confirmation (the first-grant gate, deepsec #1) and surfaced here, not
     /// wrapped — so a hostile relay injecting an attacker pubkey into a cohort
-    /// cannot make the sweep silently exfiltrate the zone key. With a NIP-07
-    /// signer, only report.
+    /// cannot make the sweep silently exfiltrate the zone key. A zone whose
+    /// record could not be read is reported, and only its known members are
+    /// granted. With a NIP-07 signer, only report.
     pub fn sweep(&self) {
         let this = self.clone();
         spawn_local(async move {
@@ -686,6 +827,9 @@ impl AutoGrant {
                     return;
                 }
             };
+            for block in &plan.floor_blocked {
+                this.toast(block.explain(), ToastVariant::Warning);
+            }
             // Never-granted targets are held back: tell the admin to confirm
             // them in Admin → Encryption, and never wrap a key to them here.
             if !plan.pending.is_empty() {
@@ -697,6 +841,20 @@ impl AutoGrant {
                         new_pubkeys.len()
                     ),
                     ToastVariant::Info,
+                );
+            }
+            if !plan.unverified.is_empty() {
+                let zones: HashSet<&String> = plan.unverified.iter().map(|(z, _)| z).collect();
+                let pubkeys: HashSet<&String> = plan.unverified.iter().map(|(_, pk)| pk).collect();
+                this.toast(
+                    format!(
+                        "Could not read the grant record for {} zone(s) from the relay, so {} \
+                         member(s) not on this device's record were left alone. Check again \
+                         from Admin → Encryption.",
+                        zones.len(),
+                        pubkeys.len()
+                    ),
+                    ToastVariant::Warning,
                 );
             }
             // Backups the relay is missing although this device holds the
@@ -764,52 +922,72 @@ impl AutoGrant {
         });
     }
 
-    /// The `(zone, pubkey)` targets a sweep would hold for approval right now:
-    /// never-granted pubkeys the relay's roster puts in a required cohort. The
-    /// Encryption tab lists these so the admin can confirm each with
-    /// [`approve`](Self::approve).
-    pub async fn pending_targets(&self) -> Vec<(String, String)> {
-        let Some(signer) = self.auth.get_signer() else {
-            return Vec::new();
-        };
-        self.plan(&*signer, None, false)
-            .await
-            .map(|p| p.pending)
-            .unwrap_or_default()
+    /// What a sweep would hold back right now, for the Encryption tab:
+    /// never-granted targets to approve, targets left unverified because a
+    /// zone's record could not be read, and zones blocked by their history
+    /// floor. `Err` when the roster (or the signer) was unavailable: the tab
+    /// then says it could not check, never "nothing awaiting approval".
+    pub async fn pending_targets(&self) -> Result<PendingReview, String> {
+        let signer = self
+            .auth
+            .get_signer()
+            .ok_or_else(|| "Sign in again to check for members awaiting a key.".to_string())?;
+        let p = self.plan(&*signer, None, false).await?;
+        Ok(PendingReview {
+            pending: p.pending,
+            unverified: p.unverified,
+            floor_blocked: p.floor_blocked,
+        })
     }
 
     /// Confirm a never-granted `pubkey` as a legitimate target for `zone`:
     /// persist the approval so this and future sweeps auto-grant to it, then
     /// grant the zone's held keys to it now. The one admin action that lets a
     /// brand-new pubkey receive a zone key, closing the silent-exfiltration
-    /// hole without a second confirmation per rotation.
+    /// hole without a second confirmation per rotation. Only `zone` is
+    /// approved: the same pubkey pending in another zone stays pending there.
     pub fn approve(&self, zone: &str, pubkey: &str) {
+        self.approve_all(vec![(zone.to_string(), pubkey.to_ascii_lowercase())]);
+    }
+
+    /// [`approve`](Self::approve) every `(zone, pubkey)` in `targets` at
+    /// once: persist each approval, then grant them all in one batch (one
+    /// roster read and one backup push, not one per member).
+    pub fn approve_all(&self, targets: Vec<(String, String)>) {
+        if targets.is_empty() {
+            return;
+        }
         let this = self.clone();
-        let zone = zone.to_string();
-        let pubkey = pubkey.to_ascii_lowercase();
         spawn_local(async move {
-            this.store.approve_target(&zone, &pubkey).await;
-            let only: HashSet<String> = std::iter::once(pubkey).collect();
-            match this.run(Some(&only)).await {
-                Ok(r) if r.sent > 0 && r.failed == 0 => this.toast(
-                    format!("Approved and sent {} zone key(s).", r.sent),
-                    ToastVariant::Success,
-                ),
-                Ok(r) if r.failed > 0 => this.toast(
-                    format!(
-                        "{} zone key grant(s) could not be sent. Retry from Admin → Encryption.",
-                        r.failed
-                    ),
-                    ToastVariant::Error,
-                ),
-                Ok(_) => {}
-                Err(e) => this.toast(
-                    format!("Zone keys were not granted: {e}"),
-                    ToastVariant::Error,
-                ),
+            for (zone, pk) in &targets {
+                this.store
+                    .approve_target(zone, &pk.to_ascii_lowercase())
+                    .await;
             }
+            let only: HashSet<String> = targets
+                .iter()
+                .map(|(_, pk)| pk.to_ascii_lowercase())
+                .collect();
+            let outcome = this.run(Some(&only), false).await;
+            this.toast_run(
+                outcome,
+                "Approved. Nothing was owed to send: the member(s) already hold this device's keys.",
+            );
         });
     }
+}
+
+/// What the Encryption tab lists for the admin to act on (see
+/// [`AutoGrant::pending_targets`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PendingReview {
+    /// `(zone, pubkey)` targets never granted, awaiting approval.
+    pub pending: Vec<(String, String)>,
+    /// `(zone, pubkey)` targets whose grant status could not be checked
+    /// (the zone's relay-held record was not read).
+    pub unverified: Vec<(String, String)>,
+    /// Zones whose held keys are all below the history floor.
+    pub floor_blocked: Vec<super::FloorBlock>,
 }
 
 #[cfg(test)]
@@ -850,9 +1028,13 @@ mod tests {
         HashMap::from([(zone.to_string(), keys)])
     }
 
-    /// Known (previously granted or approved) targets for one zone.
-    fn known(zone: &str, pks: &[String]) -> HashMap<String, HashSet<String>> {
-        HashMap::from([(zone.to_string(), pks.iter().cloned().collect())])
+    /// Known (previously granted or approved) targets for one zone, with
+    /// its record read.
+    fn known(zone: &str, pks: &[String]) -> GateRecords {
+        GateRecords {
+            known: HashMap::from([(zone.to_string(), pks.iter().cloned().collect())]),
+            unverified: HashSet::new(),
+        }
     }
 
     #[test]
@@ -952,7 +1134,7 @@ mod tests {
             ME,
             &keys,
             &HashMap::new(),
-            &HashMap::new(),
+            &GateRecords::default(),
             true,
             Some(&only),
         );
@@ -993,7 +1175,7 @@ mod tests {
             ME,
             &held("zone3", &[1]),
             &HashMap::new(),
-            &HashMap::new(), // nothing known: b has never been granted
+            &GateRecords::default(), // nothing known: b has never been granted
             false,
             None,
         );
@@ -1060,7 +1242,7 @@ mod tests {
             ME,
             &held("zone3", &[1]),
             &HashMap::new(),
-            &HashMap::new(),
+            &GateRecords::default(),
             false,
             None,
         );
@@ -1080,7 +1262,7 @@ mod tests {
             ME,
             &held("zone3", &[1]),
             &HashMap::new(),
-            &HashMap::new(),
+            &GateRecords::default(),
             false,
             None,
         );
@@ -1096,30 +1278,24 @@ mod tests {
         // approved and sent the key with no admin decision.
         let zones = [rule("zone3", "family", false)];
         let held = held("zone3", &[1]);
-        let gate = gate_records(
-            &zones,
-            &held,
-            &members(),
-            ME,
-            HashMap::new(),
-            &HashSet::new(),
-        );
-        assert!(gate.adopt.is_empty(), "nothing is approved on no record");
+        let gate = gate_records(&held, HashMap::new(), &HashSet::new());
         assert!(gate
             .known
             .get("zone3")
             .is_none_or(|k| !k.contains(&pk('b'))));
+        assert!(gate.unverified.is_empty(), "the relay answered: verified");
         let plan = plan_missing(
             &zones,
             &members(),
             ME,
             &held,
             &HashMap::new(),
-            &gate.known,
+            &gate,
             false,
             None,
         );
         assert_eq!(plan.pending, vec![("zone3".to_string(), pk('b'))]);
+        assert!(plan.unverified.is_empty());
         assert!(plan.grants.iter().all(|(_, r)| r == &vec![ME.to_string()]));
     }
 
@@ -1129,16 +1305,104 @@ mod tests {
         // member granted elsewhere from an injected one, so nobody is adopted.
         let zones = [rule("zone3", "family", false)];
         let unread = HashSet::from(["zone3".to_string()]);
-        let gate = gate_records(
+        let held = held("zone3", &[1]);
+        let gate = gate_records(&held, HashMap::new(), &unread);
+        assert!(gate.known.get("zone3").is_none_or(HashSet::is_empty));
+        assert_eq!(gate.unverified, unread);
+        // Its members are neither granted nor called never granted.
+        let plan = plan_missing(
             &zones,
-            &held("zone3", &[1]),
             &members(),
             ME,
-            HashMap::new(),
-            &unread,
+            &held,
+            &HashMap::new(),
+            &gate,
+            false,
+            None,
         );
-        assert!(gate.adopt.is_empty());
-        assert!(gate.known.get("zone3").is_none_or(HashSet::is_empty));
+        assert!(plan.pending.is_empty(), "not presented as never granted");
+        assert_eq!(plan.unverified, vec![("zone3".to_string(), pk('b'))]);
+        assert!(plan.grants.iter().all(|(_, r)| r == &vec![ME.to_string()]));
+    }
+
+    #[test]
+    fn an_unverified_zone_still_grants_members_on_this_devices_record() {
+        // Rotation keeps working through a flaky relay: b is on the local
+        // ledger, so b is granted; e (unknown) waits for the check.
+        let zones = [rule("zone3", "family", false)];
+        let mut roster = members();
+        roster.push((pk('e'), vec!["family".into()]));
+        let held = held("zone3", &[1, 2]);
+        let gate = gate_records(
+            &held,
+            HashMap::from([("zone3".to_string(), HashSet::from([pk('b')]))]),
+            &HashSet::from(["zone3".to_string()]),
+        );
+        let plan = plan_missing(
+            &zones,
+            &roster,
+            ME,
+            &held,
+            &HashMap::new(),
+            &gate,
+            false,
+            None,
+        );
+        let epoch2 = plan.grants.iter().find(|(k, _)| k.epoch == 2).unwrap();
+        assert!(epoch2.1.contains(&pk('b')));
+        assert!(plan.grants.iter().all(|(_, r)| !r.contains(&pk('e'))));
+        assert_eq!(plan.unverified, vec![("zone3".to_string(), pk('e'))]);
+        assert!(plan.pending.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_allocation_in_an_unverified_zone_still_grants() {
+        // The admin named this pubkey: the backup state does not bear on it.
+        let zones = [rule("zone3", "family", false)];
+        let held = held("zone3", &[1]);
+        let gate = gate_records(&held, HashMap::new(), &HashSet::from(["zone3".into()]));
+        let only = HashSet::from([pk('b')]);
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held,
+            &HashMap::new(),
+            &gate,
+            true,
+            Some(&only),
+        );
+        assert_eq!(plan.grants[0].1, vec![pk('b')]);
+        assert_eq!(plan.pending, vec![("zone3".to_string(), pk('b'))]);
+        assert!(plan.unverified.is_empty());
+    }
+
+    #[test]
+    fn no_grant_below_the_floor_leaves_send_grants() {
+        let plan = vec![
+            (key("zone3", 4), vec![pk('b'), pk('c')]),
+            (key("zone3", 5), vec![pk('b')]),
+            (key("zone2", 1), vec![pk('b')]),
+        ];
+        let floor = |z: &str| (z == "zone3").then_some(5);
+        let (kept, withheld) = withhold_below_floor(plan, floor);
+        assert_eq!(withheld, 2);
+        let kept: Vec<(String, u32)> = kept
+            .iter()
+            .map(|(k, _)| (k.zone.clone(), k.epoch))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("zone3".to_string(), 5), ("zone2".to_string(), 1)]
+        );
+        // A withheld grant is a problem in the report, never a success.
+        let r = GrantTally {
+            withheld: 2,
+            ..GrantTally::default()
+        }
+        .report();
+        let s = report_summary(&r).expect("something to say");
+        assert!(s.problem && s.text.contains("history floor"), "{}", s.text);
     }
 
     fn tally(handed: usize, accepted: &[String], rejected: usize, failed: usize) -> GrantTally {
@@ -1146,6 +1410,7 @@ mod tests {
             planned_members: 3,
             handed,
             failed,
+            withheld: 0,
             accepted: accepted.len(),
             rejected,
             accepted_members: accepted.iter().cloned().collect(),
@@ -1161,6 +1426,7 @@ mod tests {
         assert!(s.problem, "a refusal is not a success: {}", s.text);
         assert!(s.text.contains("refused"), "{}", s.text);
         assert!(s.text.contains("not confirmed"), "{}", s.text);
+        assert_eq!((r.accepted, r.rejected, r.unconfirmed), (1, 1, 1));
         // Nothing accepted at all, everything refused: still a problem.
         let r = tally(2, &[], 2, 0).report();
         let s = report_summary(&r).expect("something to say");

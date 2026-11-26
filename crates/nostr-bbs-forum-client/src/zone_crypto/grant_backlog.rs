@@ -168,8 +168,11 @@ pub enum InboxSub {
         /// The subscription reached EOSE.
         eose: bool,
     },
-    /// The inbox key could not be set up; grants can only come on the
-    /// identity subscription, so there is nothing more to wait for here.
+    /// The inbox key could not be set up (its backup could not be fetched or
+    /// opened, the relay refused it, storage failed). Grants addressed to it
+    /// may exist and were never fetched, so the backlog cannot settle: it
+    /// reads as stalled, and a page says the keys could not be checked
+    /// rather than concluding none exist. A later sign-in tries again.
     Failed,
 }
 
@@ -300,7 +303,8 @@ impl GrantBacklog {
         self.advance(now);
     }
 
-    /// The inbox key could not be set up (at `now`).
+    /// The inbox key could not be set up (at `now`): the backlog stalls
+    /// rather than settling (see [`InboxSub::Failed`]).
     pub fn inbox_failed(&mut self, now: f64) {
         self.inbox = InboxSub::Failed;
         self.advance(now);
@@ -324,7 +328,7 @@ impl GrantBacklog {
     fn through(&self) -> bool {
         let inbox_done = matches!(
             self.inbox,
-            InboxSub::NotUsed | InboxSub::Failed | InboxSub::Open { eose: true }
+            InboxSub::NotUsed | InboxSub::Open { eose: true }
         );
         !self.gave_up
             && self.identity_eose
@@ -340,7 +344,9 @@ impl GrantBacklog {
         if self.settled() {
             return KeyPhase::Settled;
         }
-        if self.gave_up {
+        // Nothing more will arrive this sign-in that could settle it: a scope
+        // stopped paging, or the inbox key (and its grants) was never reached.
+        if self.gave_up || self.inbox == InboxSub::Failed {
             return KeyPhase::Stalled;
         }
         let stall_at = self.last_progress_at + KEYS_STALL_MS;
