@@ -212,6 +212,10 @@ pub(crate) enum Resolver {
     System(String),
 }
 
+/// CLOSED reason for a COUNT the database could not answer: an `error:`
+/// prefix, never a count that would read as "nothing here".
+const COUNT_BUSY_REASON: &str = "error: the relay is busy and could not count; try again";
+
 impl Resolver {
     pub(crate) fn is_human(&self) -> bool {
         matches!(self, Resolver::Human(_))
@@ -3539,10 +3543,21 @@ impl NostrRelayDO {
         if let Some((value, since, until)) = filter::channel_count_target(&filters) {
             // More own channels than COUNT_MAX_GROUPS (one zone lookup each)
             // means crafted spread; the generic path's row cap bounds that.
-            if let Some((groups, exceptions)) = self
+            let cached = match self
                 .count_channel_messages_cached(&value, since, until)
                 .await
-                .filter(|(g, _)| g.len() <= filter::COUNT_MAX_GROUPS)
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    // No count rather than a wrong one, and no heavier
+                    // generic retry while D1 is struggling.
+                    console_error!("COUNT {sub_id}: {e}");
+                    Self::send_closed(ws, sub_id, COUNT_BUSY_REASON);
+                    return;
+                }
+            };
+            if let Some((groups, exceptions)) =
+                cached.filter(|(g, _)| g.len() <= filter::COUNT_MAX_GROUPS)
             {
                 let mut count = 0u64;
                 for (channel, n) in groups {
@@ -3567,7 +3582,14 @@ impl NostrRelayDO {
             }
         }
 
-        let events = self.query_events(&filters).await;
+        let events = match self.query_events_checked(&filters).await {
+            Ok(events) => events,
+            Err(e) => {
+                console_error!("COUNT {sub_id}: stored read failed: {e}");
+                Self::send_closed(ws, sub_id, COUNT_BUSY_REASON);
+                return;
+            }
+        };
 
         let mut count: u64 = 0;
         for event in &events {

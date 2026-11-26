@@ -236,8 +236,6 @@ pub fn flag_on(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
-/// Same statement as `migrations/0011_jev_triage.sql`. Created lazily, only
-/// once the flag is on, so the relay boot path (`ensure_schema`) is unchanged.
 /// The candidate query for `n_zones` eligible zones: `?1` the window start,
 /// `?2` the row limit, `?3..` the zone ids.
 ///
@@ -263,6 +261,8 @@ pub(crate) fn candidate_sql(n_zones: usize) -> String {
     )
 }
 
+/// Same statement as `migrations/0011_jev_triage.sql`. Created lazily, only
+/// once the flag is on, so the relay boot path (`ensure_schema`) is unchanged.
 const CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS jev_triage (\
     event_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, zone TEXT NOT NULL, \
     spam REAL NOT NULL, abuse REAL NOT NULL, harm REAL NOT NULL, \

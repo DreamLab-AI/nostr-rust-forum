@@ -35,6 +35,7 @@
 //! Everything here is pure over an explicit `now` so it is unit-tested
 //! natively, without the Workers runtime.
 
+use nostr_bbs_core::event::NostrEvent;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -52,21 +53,54 @@ pub(crate) const ACTIVITY_FLUSH_SECS: u64 = 300;
 pub(crate) const PENDING_READS_FLUSH_AT: i32 = 50;
 
 /// How long a channel/topic message-count snapshot is reused. A hit adds the
-/// messages created after the snapshot with a cheap time-range query, so the
-/// answer stays exact for new posts; only a post backdated into the counted
-/// range, or a deletion, waits for the snapshot to expire.
+/// messages created after the snapshot with a cheap time-range query, so new
+/// posts are counted. Not exact: a post stored after the snapshot with a
+/// `created_at` at or before `as_of` (more than
+/// [`COUNT_SNAPSHOT_MARGIN_SECS`] back-dated), and deletions, show only once
+/// the snapshot expires.
 pub(crate) const COUNT_CACHE_TTL_SECS: u64 = 300;
 
-/// Most snapshots kept before the cache is emptied (one per channel or topic
-/// counted; each holds at most a few `(channel, n)` pairs).
-pub(crate) const COUNT_CACHE_MAX: usize = 4096;
+/// A snapshot covers messages up to this long before it was taken, so posts
+/// arriving with a slightly old `created_at` (clock skew, slow sends) still
+/// fall in the always-fresh delta.
+pub(crate) const COUNT_SNAPSHOT_MARGIN_SECS: u64 = 120;
 
-/// A grouped message count (see `filter::build_channel_count`), valid for
-/// every message created at or before `as_of`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Most snapshots kept before the cache is emptied. Keys are 64-hex event
+/// ids ([`count_key`]); each entry holds at most a few `(channel, n)` pairs
+/// and [`snapshot_exceptions`]-bounded exception rows.
+pub(crate) const COUNT_CACHE_MAX: usize = 1024;
+
+/// Most exception rows a snapshot keeps, and their total size; past either,
+/// the snapshot keeps none and they are read fresh each time.
+const SNAPSHOT_EXCEPTIONS_MAX: usize = 16;
+const SNAPSHOT_EXCEPTIONS_MAX_BYTES: usize = 32 * 1024;
+
+/// A message count (see `filter::build_channel_count`), valid for every
+/// message created at or before `as_of`: grouped counts, and the raw
+/// exception rows (NIP-40 expiry is applied when served) when small enough.
+#[derive(Debug, Clone)]
 pub(crate) struct CountSnapshot {
     pub(crate) as_of: u64,
     pub(crate) groups: Vec<(String, u64)>,
+    pub(crate) exceptions: Option<Vec<NostrEvent>>,
+}
+
+/// The exception rows a snapshot may keep: all of them when few and small,
+/// else none (read fresh on each hit instead).
+pub(crate) fn snapshot_exceptions(rows: &[NostrEvent]) -> Option<Vec<NostrEvent>> {
+    let bytes: usize = rows
+        .iter()
+        .map(|e| e.content.len() + e.tags.iter().flatten().map(String::len).sum::<usize>())
+        .sum();
+    (rows.len() <= SNAPSHOT_EXCEPTIONS_MAX && bytes <= SNAPSHOT_EXCEPTIONS_MAX_BYTES)
+        .then(|| rows.to_vec())
+}
+
+/// Whether a full count to `horizon` should become the snapshot: only one
+/// reaching the present (minus the margin). A request with an old `until`
+/// is answered but never replaces a newer snapshot with an older one.
+pub(crate) fn should_store(horizon: u64, now: u64) -> bool {
+    horizon == now.saturating_sub(COUNT_SNAPSHOT_MARGIN_SECS)
 }
 
 /// How to answer a grouped count for a request ending at `until` (`None`:
@@ -91,7 +125,7 @@ pub(crate) fn plan_count(snap: Option<&CountSnapshot>, until: Option<u64>, now: 
             from: s.as_of.saturating_add(1),
         },
         _ => CountPlan::Full {
-            horizon: reach.min(now),
+            horizon: reach.min(now.saturating_sub(COUNT_SNAPSHOT_MARGIN_SECS)),
         },
     }
 }
@@ -108,12 +142,18 @@ pub(crate) fn merge_groups(a: &[(String, u64)], b: &[(String, u64)]) -> Vec<(Str
     out
 }
 
-/// The snapshot key of a count of `value` from `since`.
-pub(crate) fn count_key(value: &str, since: Option<u64>) -> String {
-    match since {
+/// The snapshot key of a count of `value` from `since`, or `None` when
+/// `value` is not a lowercase 64-hex event id. Only real ids are cached: the
+/// key's size is fixed, and it cannot contain the `|` separator.
+pub(crate) fn count_key(value: &str, since: Option<u64>) -> Option<String> {
+    let hex = value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    hex.then(|| match since {
         Some(s) => format!("{value}|{s}"),
         None => value.to_string(),
-    }
+    })
 }
 
 struct Entry<V> {
@@ -251,6 +291,7 @@ mod tests {
         CountSnapshot {
             as_of,
             groups: vec![("ch".into(), 200_000)],
+            exceptions: None,
         }
     }
 
@@ -275,19 +316,47 @@ mod tests {
             plan_count(Some(&snap(1_000)), Some(900), 1_030),
             CountPlan::Full { horizon: 900 }
         );
-        // No snapshot: count to now (never past it), keep that as the snapshot.
+        // No snapshot: count to the margin before now, never past it.
+        let h = 1_030 - COUNT_SNAPSHOT_MARGIN_SECS;
         assert_eq!(
             plan_count(None, None, 1_030),
-            CountPlan::Full { horizon: 1_030 }
+            CountPlan::Full { horizon: h }
         );
         assert_eq!(
             plan_count(None, Some(5_000), 1_030),
-            CountPlan::Full { horizon: 1_030 }
+            CountPlan::Full { horizon: h }
         );
         assert_eq!(
             plan_count(None, Some(700), 1_030),
             CountPlan::Full { horizon: 700 }
         );
+        // Only a count reaching the present becomes the snapshot.
+        assert!(should_store(h, 1_030));
+        assert!(!should_store(700, 1_030));
+        assert!(!should_store(1, 1_030));
+    }
+
+    fn ev(content_len: usize) -> NostrEvent {
+        NostrEvent {
+            id: "i".into(),
+            pubkey: "p".into(),
+            created_at: 1,
+            kind: 42,
+            tags: vec![vec!["expiration".into(), "9".into()]],
+            content: "x".repeat(content_len),
+            sig: "s".into(),
+        }
+    }
+
+    #[test]
+    fn snapshots_keep_only_few_small_exception_rows() {
+        assert_eq!(snapshot_exceptions(&[]).map(|v| v.len()), Some(0));
+        assert_eq!(
+            snapshot_exceptions(&[ev(10), ev(10)]).map(|v| v.len()),
+            Some(2)
+        );
+        assert!(snapshot_exceptions(&vec![ev(1); 17]).is_none());
+        assert!(snapshot_exceptions(&[ev(40_000)]).is_none());
     }
 
     #[test]
@@ -307,10 +376,17 @@ mod tests {
     }
 
     #[test]
-    fn count_keys_separate_since_values() {
-        assert_eq!(count_key("ch", None), "ch");
-        assert_eq!(count_key("ch", Some(5)), "ch|5");
-        assert_ne!(count_key("ch", Some(5)), count_key("ch", Some(6)));
+    fn count_keys_are_only_for_hex_ids_and_never_collide() {
+        let id = "a".repeat(64);
+        assert_eq!(count_key(&id, None), Some(id.clone()));
+        assert_eq!(count_key(&id, Some(5)), Some(format!("{id}|5")));
+        assert_ne!(count_key(&id, Some(5)), count_key(&id, Some(6)));
+        // Anything else takes the uncached path: no oversized or colliding keys.
+        assert_eq!(count_key(&format!("{}|5", "a".repeat(62)), None), None);
+        assert_eq!(count_key(&"A".repeat(64), None), None);
+        assert_eq!(count_key(&"a".repeat(65), None), None);
+        assert_eq!(count_key(&"a".repeat(100_000), None), None);
+        assert_eq!(count_key("", None), None);
     }
 
     #[test]

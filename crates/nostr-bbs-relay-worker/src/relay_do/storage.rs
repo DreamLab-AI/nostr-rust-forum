@@ -373,61 +373,88 @@ impl NostrRelayDO {
     }
 
     /// [`Self::count_channel_messages`] for `#e = value` from `since` to
-    /// `until`, with the grouped half served from a per-DO snapshot
-    /// (`read_cache::plan_count`). A big channel's grouped count reads every
-    /// message in it (seconds of D1 time for the imported history); the
-    /// snapshot is taken at most once per `COUNT_CACHE_TTL_SECS` and each hit
-    /// adds only the messages created since, through the `(name, value,
-    /// created_at)` index, so new posts are counted exactly. The exception
-    /// rows are always read fresh (they are few, and expire).
+    /// `until`, served from a per-DO snapshot (`read_cache::plan_count`). A
+    /// big channel's count reads every message in it (seconds of D1 time for
+    /// the imported history); the snapshot is taken at most once per
+    /// `COUNT_CACHE_TTL_SECS` and each hit adds the messages created since,
+    /// through the `(name, value, created_at)` index.
+    ///
+    /// `Ok(None)`: not cacheable (`value` not a 64-hex id), so the caller
+    /// takes the generic path. `Err`: D1 could not answer, and the caller
+    /// must not report a count.
     pub(crate) async fn count_channel_messages_cached(
         &self,
         value: &str,
         since: Option<u64>,
         until: Option<u64>,
-    ) -> Option<(Vec<(String, u64)>, Vec<NostrEvent>)> {
-        use super::read_cache::{count_key, merge_groups, plan_count, CountPlan, CountSnapshot};
+    ) -> std::result::Result<Option<(Vec<(String, u64)>, Vec<NostrEvent>)>, String> {
+        use super::read_cache::{
+            count_key, merge_groups, plan_count, should_store, snapshot_exceptions, CountPlan,
+            CountSnapshot,
+        };
+        const FAILED: &str = "count read failed";
+        let Some(key) = count_key(value, since) else {
+            return Ok(None);
+        };
         let now = auth::js_now_secs();
-        let key = count_key(value, since);
         let snap = self.count_cache.get(&key, now);
         // Messages created from `from` onward, within the request's range.
         let tail = |from: u64| {
             let lo = Some(since.map_or(from, |s| s.max(from)));
-            filter::build_channel_count(value, lo, until).grouped
+            filter::build_channel_count(value, lo, until)
         };
-        let groups = match plan_count(snap.as_ref(), until, now) {
-            CountPlan::Delta { from } => {
-                let base = snap.map(|s| s.groups).unwrap_or_default();
-                let newer = self.run_count_groups(&tail(from)).await?;
-                merge_groups(&base, &newer)
+        let (groups, rows) = match (plan_count(snap.as_ref(), until, now), snap) {
+            (CountPlan::Delta { from }, Some(s)) => {
+                let t = tail(from);
+                let newer = self.run_count_groups(&t.grouped).await.ok_or(FAILED)?;
+                let rows = match s.exceptions {
+                    Some(mut base) => {
+                        base.extend(self.count_exception_rows(&t).await.ok_or(FAILED)?);
+                        base
+                    }
+                    None => {
+                        let all = filter::build_channel_count(value, since, until);
+                        self.count_exception_rows(&all).await.ok_or(FAILED)?
+                    }
+                };
+                (merge_groups(&s.groups, &newer), rows)
             }
-            CountPlan::Full { horizon } => {
+            (plan, _) => {
+                let horizon = match plan {
+                    CountPlan::Full { horizon } => horizon,
+                    CountPlan::Delta { .. } => {
+                        now.saturating_sub(super::read_cache::COUNT_SNAPSHOT_MARGIN_SECS)
+                    }
+                };
                 let q = filter::build_channel_count(value, since, Some(horizon));
-                let base = self.run_count_groups(&q.grouped).await?;
-                if self.count_cache.len() >= super::read_cache::COUNT_CACHE_MAX {
-                    self.count_cache.clear();
+                let base = self.run_count_groups(&q.grouped).await.ok_or(FAILED)?;
+                let base_rows = self.count_exception_rows(&q).await.ok_or(FAILED)?;
+                if should_store(horizon, now) {
+                    if self.count_cache.len() >= super::read_cache::COUNT_CACHE_MAX {
+                        self.count_cache.clear();
+                    }
+                    self.count_cache.insert(
+                        &key,
+                        CountSnapshot {
+                            as_of: horizon,
+                            groups: base.clone(),
+                            exceptions: snapshot_exceptions(&base_rows),
+                        },
+                        now,
+                    );
                 }
-                self.count_cache.insert(
-                    &key,
-                    CountSnapshot {
-                        as_of: horizon,
-                        groups: base.clone(),
-                    },
-                    now,
-                );
                 if until.is_none_or(|u| u > horizon) {
-                    let newer = self
-                        .run_count_groups(&tail(horizon.saturating_add(1)))
-                        .await?;
-                    merge_groups(&base, &newer)
+                    let t = tail(horizon.saturating_add(1));
+                    let newer = self.run_count_groups(&t.grouped).await.ok_or(FAILED)?;
+                    let mut rows = base_rows;
+                    rows.extend(self.count_exception_rows(&t).await.ok_or(FAILED)?);
+                    (merge_groups(&base, &newer), rows)
                 } else {
-                    base
+                    (base, base_rows)
                 }
             }
         };
-        let q = filter::build_channel_count(value, since, until);
-        let exceptions = self.count_channel_exceptions(&q).await?;
-        Some((groups, exceptions))
+        Ok(Some((groups, drop_expired(rows, now))))
     }
 
     /// Run a tag-scoped message count (`filter::build_channel_count`): the
@@ -452,6 +479,15 @@ impl NostrRelayDO {
         &self,
         q: &filter::ChannelCountQueries,
     ) -> Option<Vec<NostrEvent>> {
+        let rows = self.count_exception_rows(q).await?;
+        Some(drop_expired(rows, auth::js_now_secs()))
+    }
+
+    /// The raw exception rows of a message count, expiry not yet applied.
+    async fn count_exception_rows(
+        &self,
+        q: &filter::ChannelCountQueries,
+    ) -> Option<Vec<NostrEvent>> {
         let db = self.env.d1("DB").ok()?;
         let bind = |p: &[filter::SqlParam]| -> Vec<JsValue> {
             p.iter()
@@ -471,24 +507,11 @@ impl NostrRelayDO {
             .ok()?
             .results()
             .ok()?;
-        let now = auth::js_now_secs();
-        let exceptions = rows
-            .into_iter()
-            .filter_map(EventRow::into_nostr_event)
-            .filter(|event| {
-                !filter::tag_value(event, "expiration")
-                    .and_then(|exp| exp.parse::<u64>().ok())
-                    .is_some_and(|exp_ts| exp_ts < now)
-            })
-            .collect();
-        Some(exceptions)
-    }
-
-    /// [`Self::query_events_checked`], with a failed read answered as no
-    /// events. For callers where a short answer is harmless; a REQ must not
-    /// do this (an empty answer followed by EOSE reads as "complete").
-    pub(crate) async fn query_events(&self, filters: &[NostrFilter]) -> Vec<NostrEvent> {
-        self.query_events_checked(filters).await.unwrap_or_default()
+        Some(
+            rows.into_iter()
+                .filter_map(EventRow::into_nostr_event)
+                .collect(),
+        )
     }
 
     /// The events matching `filters`, or `Err` when D1 could not answer (for
@@ -540,10 +563,7 @@ impl NostrRelayDO {
                 continue;
             };
             let result = stmt.all().await.map_err(|e| e.to_string())?;
-            let rows: Vec<EventRow> = match result.results() {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+            let rows: Vec<EventRow> = result.results().map_err(|e| e.to_string())?;
 
             for row in rows {
                 if let Some(event) = row.into_nostr_event() {
@@ -562,6 +582,17 @@ impl NostrRelayDO {
 
         Ok(events)
     }
+}
+
+/// `rows` without those whose NIP-40 `expiration` has passed at `now`.
+fn drop_expired(rows: Vec<NostrEvent>, now: u64) -> Vec<NostrEvent> {
+    rows.into_iter()
+        .filter(|event| {
+            !filter::tag_value(event, "expiration")
+                .and_then(|exp| exp.parse::<u64>().ok())
+                .is_some_and(|exp_ts| exp_ts < now)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
