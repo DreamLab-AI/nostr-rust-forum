@@ -61,6 +61,21 @@ fn short_npub(pubkey_hex: &str) -> String {
     }
 }
 
+/// Hold main.rs's one-shot service-worker reload for the life of this page:
+/// the confirmation and welcome screens live in component state, and a reload
+/// would drop the member at the forum index without them. Setting the
+/// reload's own sentinel means "already reloaded"; the page is on the newest
+/// build anyway (the HTML is network-first).
+fn hold_sw_reload() {
+    if let Some(w) = web_sys::window() {
+        let _ = js_sys::Reflect::set(
+            &w,
+            &wasm_bindgen::JsValue::from_str("__sw_reloaded__"),
+            &wasm_bindgen::JsValue::TRUE,
+        );
+    }
+}
+
 #[component]
 pub fn ConnectPage() -> impl IntoView {
     let auth = use_auth();
@@ -115,6 +130,7 @@ pub fn ConnectPage() -> impl IntoView {
         if prev.is_some() {
             return;
         }
+        hold_sw_reload();
         let key =
             connect_link::take_stashed().or_else(|| connect_link::take_pending_key(&base_href("")));
         let Some(key) = key else {

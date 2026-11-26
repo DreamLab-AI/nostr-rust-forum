@@ -183,10 +183,26 @@ fn install_foreground_update_check(reg: wasm_bindgen::JsValue) {
 /// Reload the page once when a new service worker takes control, so an open tab
 /// picks up the just-deployed build. A `window.__sw_reloaded__` sentinel
 /// prevents the reload loop that `controllerchange` can otherwise trigger.
+///
+/// Only an UPDATE reloads: on a first visit there is no controller at page
+/// load, and the first worker's `clients.claim()` fires `controllerchange`
+/// on a page that is already running the newest build (the HTML came from
+/// the network). Reloading then threw away in-memory UI state, notably the
+/// sheet sign-in welcome screen, which never survived a member's first scan.
+/// A page can also hold the reload by setting the sentinel itself
+/// (`/connect` does, for the life of the welcome screen).
 fn install_controllerchange_reload(sw_container: &web_sys::ServiceWorkerContainer) {
     use wasm_bindgen::JsCast;
 
+    // `controller` read by reflection: web-sys's typed getter needs the
+    // `ServiceWorker` feature, which nothing else here uses.
+    let had_controller_at_load = js_sys::Reflect::get(sw_container, &"controller".into())
+        .map(|c| !c.is_null() && !c.is_undefined())
+        .unwrap_or(false);
     let closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+        if !should_reload_on_controllerchange(had_controller_at_load) {
+            return;
+        }
         let Some(window) = web_sys::window() else {
             return;
         };
@@ -213,6 +229,12 @@ fn install_controllerchange_reload(sw_container: &web_sys::ServiceWorkerContaine
         .add_event_listener_with_callback("controllerchange", closure.as_ref().unchecked_ref());
     // Leak the closure: it must outlive this fn for the lifetime of the page.
     closure.forget();
+}
+
+/// A `controllerchange` reloads the page only when it replaces a worker that
+/// already controlled the page at load (a new deploy), never on first install.
+fn should_reload_on_controllerchange(had_controller_at_load: bool) -> bool {
+    had_controller_at_load
 }
 
 /// Run startup tasks: evict stale IndexedDB data, check storage quota.
@@ -261,7 +283,16 @@ fn run_offline_startup() {
 
 #[cfg(test)]
 mod tests {
-    use super::foreground_update_due;
+    use super::{foreground_update_due, should_reload_on_controllerchange};
+
+    #[test]
+    fn first_install_never_reloads() {
+        // First visit: no controller at load, the first worker's claim must
+        // not reload (it would drop the sheet sign-in welcome screen).
+        assert!(!should_reload_on_controllerchange(false));
+        // A deploy replacing a controlling worker still reloads once.
+        assert!(should_reload_on_controllerchange(true));
+    }
 
     #[test]
     fn foreground_update_is_throttled() {
