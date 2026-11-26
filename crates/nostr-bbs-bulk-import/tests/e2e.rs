@@ -264,7 +264,7 @@ fn keybase_archive_to_sealed_upload_plan() {
     std::fs::write(
         w.structure(),
         json!({"version": 1,
-          "zones": [{"id": "zone2", "cohorts": ["zone2", "minimoonoir"], "encrypted": true}],
+          "zones": [{"id": "zone2", "cohorts": ["zone2", "members"], "encrypted": true}],
           "threads": {
             "rants": {"zone": "zone2", "section": "zone2-rants", "channel": {"new": {"name": "Rants", "about": "Archived"}}},
             "photos": {"zone": "zone2", "section": "zone2-photos", "channel": {"new": {"name": "Photos"}}}},

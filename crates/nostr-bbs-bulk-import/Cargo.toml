@@ -45,4 +45,4 @@ rusqlite = { workspace = true }
 libc = "0.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-nostr-bbs-zone-migrate = { path = "../nostr-bbs-zone-migrate" }
+nostr-bbs-zone-migrate = { path = "../nostr-bbs-zone-migrate", version = "1.0.0-beta.11" }
