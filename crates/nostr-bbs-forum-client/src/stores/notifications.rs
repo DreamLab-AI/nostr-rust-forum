@@ -729,12 +729,15 @@ impl NotificationStoreV2 {
                     // Deep-link to the post itself: `/go/:event_id` resolves it
                     // to its thread and focuses it. `/chat/:channel_id` only
                     // reached the section's topic list, so a reply or mention
-                    // landed the reader on a list and not the post.
+                    // landed the reader on a list and not the post. The link
+                    // carries the post's channel (`?c=`): in an encrypted zone
+                    // the relay holds only the envelope, under another id, so
+                    // the jump page resolves the post from that channel.
                     store.add_at(
                         kind,
                         &title,
                         &post_body(&author, &event.content, &channel_name, encrypted),
-                        Some(&format!("/go/{}", event.id)),
+                        Some(&crate::pages::post_link(event, cid)),
                         Origin {
                             timestamp: event.created_at,
                             dedup_id: Some(format!("post:{}", event.id)),
