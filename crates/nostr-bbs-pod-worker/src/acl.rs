@@ -37,6 +37,14 @@ pub use solid_pod_rs::wac::{
     effective_acl_target, method_to_mode, wac_allow_header, AccessMode, AclDocument,
 };
 
+/// Kit policy gate in front of the upstream classifier (applies the stricter
+/// [`MAX_ACL_DOC_BYTES`] cap).
+///
+/// Evaluation deliberately still accepts whatever upstream accepts, including
+/// its Turtle fallback: before the storage gate in [`parse_acl_with_cap`]
+/// existed, an `acl:Control` holder could store a Turtle ACL, and refusing it
+/// here would lock that subtree (owner included) until an operator repaired
+/// it. Tightening evaluation is a follow-up once R2 holds no non-JSON sidecar.
 fn classify_kit_policy(path: &str, read: PolicyRead<'_>, inherited: bool) -> PolicyStep {
     if let PolicyRead::Present { body, .. } = &read {
         if body.len() > MAX_ACL_DOC_BYTES {
@@ -131,10 +139,15 @@ pub fn coerce_required_mode_for_acl(path: &str, method: &str) -> AccessMode {
 /// far smaller than a generic Solid pod.
 pub const MAX_ACL_DOC_BYTES: usize = 64 * 1024;
 
-/// Parse an ACL document from raw bytes, enforcing [`MAX_ACL_DOC_BYTES`].
+/// Validate an ACL body for STORAGE, enforcing [`MAX_ACL_DOC_BYTES`] and
+/// requiring JSON(-LD).
 ///
-/// Returns `Some(doc)` on success and `None` for any size or parse failure.
+/// Returns `Some(doc)` on success and `None` for any size or parse failure,
+/// or when the body is not JSON (Turtle is never stored by the kit).
 pub fn parse_acl_with_cap(bytes: &[u8]) -> Option<AclDocument> {
+    // Storage gate: the kit only writes JSON-LD ACLs, so a body that is not
+    // JSON is refused before upstream's Turtle fallback can accept it.
+    serde_json::from_slice::<serde::de::IgnoredAny>(bytes).ok()?;
     settled_document(classify_kit_policy(
         "candidate.acl",
         PolicyRead::Present {
@@ -1051,6 +1064,22 @@ mod tests {
     }
 
     // ── ACL doc size cap ───────────────────────────────────────────────
+
+    /// The kit only ever writes JSON-LD ACLs (provisioning, delegation, raw
+    /// PUT). The ACL PUT handler validates through `parse_acl_with_cap`, so a
+    /// Turtle body must be refused there and never reach R2.
+    #[test]
+    fn turtle_acl_is_refused_for_storage() {
+        let turtle = concat!(
+            "@prefix acl: <http://www.w3.org/ns/auth/acl#>.\n",
+            "<#owner> a acl:Authorization;\n",
+            "  acl:agent <did:nostr:abc>;\n",
+            "  acl:accessTo <./>;\n",
+            "  acl:default <./>;\n",
+            "  acl:mode acl:Read, acl:Write, acl:Control.\n",
+        );
+        assert!(parse_acl_with_cap(turtle.as_bytes()).is_none());
+    }
 
     #[test]
     fn parse_acl_within_cap_succeeds() {
