@@ -5,11 +5,11 @@
 
 // -- Existing components ------------------------------------------------------
 pub mod channel_card;
-pub mod sheet_scanner;
-pub mod welcome_onboarding;
 pub mod history_loader;
 pub mod message_bubble;
 pub mod particle_canvas;
+pub mod sheet_scanner;
+pub mod welcome_onboarding;
 
 // -- Visual effects (WebGPU / Canvas2D / CSS fallback) -----------------------
 pub mod fx;

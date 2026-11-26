@@ -71,7 +71,10 @@ fn stop_stream(stream: &web_sys::MediaStream) {
 /// Shared, non-Send slot for the session (lives on the UI thread only).
 type SessionSlot = Rc<RefCell<Option<CameraSession>>>;
 
-fn scan_canvas() -> Option<(web_sys::HtmlCanvasElement, web_sys::CanvasRenderingContext2d)> {
+fn scan_canvas() -> Option<(
+    web_sys::HtmlCanvasElement,
+    web_sys::CanvasRenderingContext2d,
+)> {
     let canvas: web_sys::HtmlCanvasElement = web_sys::window()?
         .document()?
         .create_element("canvas")
@@ -89,7 +92,10 @@ fn scan_canvas() -> Option<(web_sys::HtmlCanvasElement, web_sys::CanvasRendering
 }
 
 /// Read back the canvas and decode; wipes the canvas afterwards.
-fn decode_canvas(canvas: &web_sys::HtmlCanvasElement, ctx: &web_sys::CanvasRenderingContext2d) -> Decoded {
+fn decode_canvas(
+    canvas: &web_sys::HtmlCanvasElement,
+    ctx: &web_sys::CanvasRenderingContext2d,
+) -> Decoded {
     let (w, h) = (canvas.width(), canvas.height());
     if w == 0 || h == 0 {
         return Decoded::Nothing;
@@ -173,7 +179,8 @@ pub fn SheetScanner() -> impl IntoView {
         status.set("Starting the camera…".into());
         open.set(true);
         leptos::task::spawn_local(async move {
-            let Some(media) = web_sys::window().and_then(|w| w.navigator().media_devices().ok()) else {
+            let Some(media) = web_sys::window().and_then(|w| w.navigator().media_devices().ok())
+            else {
                 status.set("This browser can\u{2019}t use the camera here. Choose a photo of the code instead.".into());
                 return;
             };
@@ -184,11 +191,17 @@ pub fn SheetScanner() -> impl IntoView {
             let _ = js_sys::Reflect::set(&video_c, &"facingMode".into(), &facing);
             let _ = js_sys::Reflect::set(&constraints, &"video".into(), &video_c);
             let _ = js_sys::Reflect::set(&constraints, &"audio".into(), &JsValue::FALSE);
-            let Ok(promise) = media.get_user_media_with_constraints(constraints.unchecked_ref()) else {
-                status.set("The camera isn\u{2019}t available. Choose a photo of the code instead.".into());
+            let Ok(promise) = media.get_user_media_with_constraints(constraints.unchecked_ref())
+            else {
+                status.set(
+                    "The camera isn\u{2019}t available. Choose a photo of the code instead.".into(),
+                );
                 return;
             };
-            let stream: web_sys::MediaStream = match JsFuture::from(promise).await.and_then(|s| s.dyn_into()) {
+            let stream: web_sys::MediaStream = match JsFuture::from(promise)
+                .await
+                .and_then(|s| s.dyn_into())
+            {
                 Ok(s) => s,
                 Err(_) => {
                     status.set("Camera permission was refused. Allow the camera, or choose a photo of the code.".into());
@@ -221,14 +234,21 @@ pub fn SheetScanner() -> impl IntoView {
                 if v.ready_state() < 2 {
                     return;
                 }
-                let (w, h) = qr_scan::scaled_dims(v.video_width(), v.video_height(), MAX_DECODE_SIDE);
+                let (w, h) =
+                    qr_scan::scaled_dims(v.video_width(), v.video_height(), MAX_DECODE_SIDE);
                 if w == 0 || h == 0 {
                     return;
                 }
                 canvas.set_width(w);
                 canvas.set_height(h);
                 if ctx
-                    .draw_image_with_html_video_element_and_dw_and_dh(&v, 0.0, 0.0, f64::from(w), f64::from(h))
+                    .draw_image_with_html_video_element_and_dw_and_dh(
+                        &v,
+                        0.0,
+                        0.0,
+                        f64::from(w),
+                        f64::from(h),
+                    )
                     .is_err()
                 {
                     return;
@@ -239,7 +259,9 @@ pub fn SheetScanner() -> impl IntoView {
             let hidden = EventListener::new(&doc, "visibilitychange", move |_| {
                 if gloo::utils::document().hidden() {
                     stop();
-                    status.set("Camera paused. Tap \u{201c}Scan your sheet\u{201d} to try again.".into());
+                    status.set(
+                        "Camera paused. Tap \u{201c}Scan your sheet\u{201d} to try again.".into(),
+                    );
                 }
             });
             let pagehide = EventListener::new(&gloo::utils::window(), "pagehide", move |_| stop());
@@ -256,8 +278,12 @@ pub fn SheetScanner() -> impl IntoView {
     };
 
     let on_file = move |_| {
-        let Some(input) = file_ref.get_untracked() else { return };
-        let Some(file) = input.files().and_then(|f| f.get(0)) else { return };
+        let Some(input) = file_ref.get_untracked() else {
+            return;
+        };
+        let Some(file) = input.files().and_then(|f| f.get(0)) else {
+            return;
+        };
         // Clear the input so the same file can be chosen again, and so the
         // File object is not kept by the element.
         input.set_value("");
@@ -267,19 +293,25 @@ pub fn SheetScanner() -> impl IntoView {
         }
         status.set("Reading the picture…".into());
         leptos::task::spawn_local(async move {
-            let Some(window) = web_sys::window() else { return };
+            let Some(window) = web_sys::window() else {
+                return;
+            };
             let Ok(promise) = window.create_image_bitmap_with_blob(&file) else {
                 status.set("That file isn\u{2019}t a picture this browser can read.".into());
                 return;
             };
-            let Ok(bitmap) = JsFuture::from(promise).await.and_then(|b| b.dyn_into::<web_sys::ImageBitmap>()) else {
+            let Ok(bitmap) = JsFuture::from(promise)
+                .await
+                .and_then(|b| b.dyn_into::<web_sys::ImageBitmap>())
+            else {
                 status.set("That file isn\u{2019}t a picture this browser can read.".into());
                 return;
             };
             let (bw, bh) = (bitmap.width(), bitmap.height());
             if u64::from(bw) * u64::from(bh) > MAX_FILE_PIXELS {
                 bitmap.close();
-                status.set("That picture is too large. Use a screenshot of the code instead.".into());
+                status
+                    .set("That picture is too large. Use a screenshot of the code instead.".into());
                 return;
             }
             let Some((canvas, ctx)) = scan_canvas() else {
@@ -294,7 +326,13 @@ pub fn SheetScanner() -> impl IntoView {
                 canvas.set_width(w);
                 canvas.set_height(h);
                 if ctx
-                    .draw_image_with_image_bitmap_and_dw_and_dh(&bitmap, 0.0, 0.0, f64::from(w), f64::from(h))
+                    .draw_image_with_image_bitmap_and_dw_and_dh(
+                        &bitmap,
+                        0.0,
+                        0.0,
+                        f64::from(w),
+                        f64::from(h),
+                    )
                     .is_err()
                 {
                     break;

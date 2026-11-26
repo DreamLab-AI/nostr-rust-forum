@@ -21,7 +21,9 @@ use std::rc::Rc;
 use zeroize::Zeroize;
 
 use self::passkey::{PasskeyAuthResult, PasskeyRegistrationResult};
-use self::session::{clear_privkey_session, read_privkey_session, save_privkey_session, StoredSession};
+use self::session::{
+    clear_privkey_session, read_privkey_session, save_privkey_session, StoredSession,
+};
 use crate::app::base_href;
 use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::{NostrEvent, UnsignedEvent};
@@ -447,11 +449,14 @@ impl AuthStore {
             known.push(pk);
         }
         if let Some(hex_sk) = read_privkey_session().map(zeroize::Zeroizing::new) {
-            match hex::decode(hex_sk.as_str()).ok().map(zeroize::Zeroizing::new).and_then(|b| {
-                let arr: [u8; 32] = b.as_slice().try_into().ok()?;
-                let arr = zeroize::Zeroizing::new(arr);
-                nostr_bbs_core::keys::pubkey_hex(&arr).ok()
-            }) {
+            match hex::decode(hex_sk.as_str())
+                .ok()
+                .map(zeroize::Zeroizing::new)
+                .and_then(|b| {
+                    let arr: [u8; 32] = b.as_slice().try_into().ok()?;
+                    let arr = zeroize::Zeroizing::new(arr);
+                    nostr_bbs_core::keys::pubkey_hex(&arr).ok()
+                }) {
                 Some(pk) => known.push(pk),
                 None => unknown = true,
             }
@@ -926,13 +931,28 @@ mod tests {
         let a = "aa".repeat(32);
         let b = "bb".repeat(32);
         assert_eq!(classify_prior(&[], false, &a), PriorIdentity::None);
-        assert_eq!(classify_prior(std::slice::from_ref(&a), false, &a), PriorIdentity::Same);
-        assert_eq!(classify_prior(&[a.to_uppercase()], false, &a), PriorIdentity::Same);
-        assert_eq!(classify_prior(std::slice::from_ref(&b), false, &a), PriorIdentity::Other(Some(b.clone())));
-        assert_eq!(classify_prior(&[a.clone(), b.clone()], false, &a), PriorIdentity::Other(Some(b)));
+        assert_eq!(
+            classify_prior(std::slice::from_ref(&a), false, &a),
+            PriorIdentity::Same
+        );
+        assert_eq!(
+            classify_prior(&[a.to_uppercase()], false, &a),
+            PriorIdentity::Same
+        );
+        assert_eq!(
+            classify_prior(std::slice::from_ref(&b), false, &a),
+            PriorIdentity::Other(Some(b.clone()))
+        );
+        assert_eq!(
+            classify_prior(&[a.clone(), b.clone()], false, &a),
+            PriorIdentity::Other(Some(b))
+        );
         // A bake or stored key whose owner can't be read counts as another account.
         assert_eq!(classify_prior(&[], true, &a), PriorIdentity::Other(None));
-        assert_eq!(classify_prior(std::slice::from_ref(&a), true, &a), PriorIdentity::Other(None));
+        assert_eq!(
+            classify_prior(std::slice::from_ref(&a), true, &a),
+            PriorIdentity::Other(None)
+        );
     }
 
     // ── decode_nsec ─────────────────────────────────────────────────────

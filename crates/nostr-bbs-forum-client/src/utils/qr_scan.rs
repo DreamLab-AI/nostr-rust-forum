@@ -44,7 +44,11 @@ pub fn rgba_to_luma(rgba: &[u8], w: usize, h: usize) -> Option<Zeroizing<Vec<u8>
     for px in rgba.chunks_exact(4) {
         let (r, g, b) = (u32::from(px[0]), u32::from(px[1]), u32::from(px[2]));
         // Transparent pixels (an alpha-only PNG) read as white paper.
-        let y = if px[3] == 0 { 255 } else { (299 * r + 587 * g + 114 * b) / 1000 };
+        let y = if px[3] == 0 {
+            255
+        } else {
+            (299 * r + 587 * g + 114 * b) / 1000
+        };
         out.push(y as u8);
     }
     Some(out)
@@ -74,7 +78,9 @@ pub fn decode_luma(luma: &[u8], w: usize, h: usize) -> Decoded {
     let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| luma[y * w + x]);
     let mut found: Option<Zeroizing<String>> = None;
     for grid in prepared.detect_grids() {
-        let Ok((_, text)) = grid.decode() else { continue };
+        let Ok((_, text)) = grid.decode() else {
+            continue;
+        };
         let text = Zeroizing::new(text);
         match &found {
             None => found = Some(text),
@@ -133,7 +139,11 @@ mod tests {
         for scale in [2usize, 3, 5, 8] {
             let side = (45 + 8) * scale + 40;
             let img = render(&link, scale, (side, side), 20, 20);
-            assert_eq!(decode_luma(&img, side, side), Decoded::One(Zeroizing::new(link.clone())), "scale {scale}");
+            assert_eq!(
+                decode_luma(&img, side, side),
+                Decoded::One(Zeroizing::new(link.clone())),
+                "scale {scale}"
+            );
         }
     }
 
@@ -158,12 +168,18 @@ mod tests {
         let side = 300;
         let luma = render(&link, 4, (side, side), 10, 10);
         let rgba: Vec<u8> = luma.iter().flat_map(|&y| [y, y, y, 255]).collect();
-        assert_eq!(decode_rgba(&rgba, side, side), Decoded::One(Zeroizing::new(link)));
+        assert_eq!(
+            decode_rgba(&rgba, side, side),
+            Decoded::One(Zeroizing::new(link))
+        );
     }
 
     #[test]
     fn blank_and_malformed_inputs() {
-        assert_eq!(decode_luma(&vec![255u8; 100 * 100], 100, 100), Decoded::Nothing);
+        assert_eq!(
+            decode_luma(&vec![255u8; 100 * 100], 100, 100),
+            Decoded::Nothing
+        );
         assert_eq!(decode_luma(&[0u8; 10], 100, 100), Decoded::Nothing);
         assert_eq!(decode_luma(&[], 0, 0), Decoded::Nothing);
         assert!(rgba_to_luma(&[0u8; 7], 1, 2).is_none());
@@ -249,7 +265,10 @@ mod tests {
                 }
             };
             let r = std::panic::catch_unwind(|| decode_luma(&img, w, h));
-            assert!(r.is_ok(), "rqrr panicked on fuzz case {case} (kind {kind}, {w}x{h})");
+            assert!(
+                r.is_ok(),
+                "rqrr panicked on fuzz case {case} (kind {kind}, {w}x{h})"
+            );
         }
     }
 

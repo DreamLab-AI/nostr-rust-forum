@@ -173,7 +173,9 @@ mod tests {
         let bound = BootProfile::new("z".into(), 5).with_pubkey("ab".repeat(32));
         let json = serde_json::to_string(&bound).unwrap();
         assert_eq!(parse_boot_profile(&json), Some(bound));
-        assert!(!serde_json::to_string(&BootProfile::new("z".into(), 5)).unwrap().contains("pubkey"));
+        assert!(!serde_json::to_string(&BootProfile::new("z".into(), 5))
+            .unwrap()
+            .contains("pubkey"));
         // A malformed pubkey invalidates the profile.
         let bad = BootProfile::new("z".into(), 5).with_pubkey("xyz".into());
         assert!(!bad.validate());

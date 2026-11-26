@@ -78,7 +78,9 @@ pub fn ConnectPage() -> impl IntoView {
     // welcome screen.
     let import = move |switching: bool| {
         let Some(key) = pending.try_update_value(Option::take).flatten() else {
-            state.set(ConnectState::Error("The sign-in code has expired. Scan it again.".into()));
+            state.set(ConnectState::Error(
+                "The sign-in code has expired. Scan it again.".into(),
+            ));
             return;
         };
         state.set(ConnectState::Working);
@@ -94,7 +96,11 @@ pub fn ConnectPage() -> impl IntoView {
                     // Leave the /connect URL (a reload must not land here
                     // again); the welcome screen stays mounted.
                     if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
-                        let _ = h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&base_href("/")));
+                        let _ = h.replace_state_with_url(
+                            &wasm_bindgen::JsValue::NULL,
+                            "",
+                            Some(&base_href("/")),
+                        );
                     }
                     state.set(ConnectState::Welcome);
                 }
@@ -109,8 +115,8 @@ pub fn ConnectPage() -> impl IntoView {
         if prev.is_some() {
             return;
         }
-        let key = connect_link::take_stashed()
-            .or_else(|| connect_link::take_pending_key(&base_href("")));
+        let key =
+            connect_link::take_stashed().or_else(|| connect_link::take_pending_key(&base_href("")));
         let Some(key) = key else {
             if auth.is_authenticated().get_untracked() {
                 go("/forums");

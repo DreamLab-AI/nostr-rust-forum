@@ -111,10 +111,12 @@ pub fn WelcomeOnboarding() -> impl IntoView {
             .get()
             .filter(|n| !n.trim().is_empty())
             .or_else(|| {
-                auth.pubkey().get().map(|pk| match nostr_bbs_core::encode_npub(&pk) {
-                    Ok(n) if n.len() > 20 => format!("{}…{}", &n[..12], &n[n.len() - 6..]),
-                    _ => crate::utils::shorten_pubkey(&pk),
-                })
+                auth.pubkey()
+                    .get()
+                    .map(|pk| match nostr_bbs_core::encode_npub(&pk) {
+                        Ok(n) if n.len() > 20 => format!("{}…{}", &n[..12], &n[n.len() - 6..]),
+                        _ => crate::utils::shorten_pubkey(&pk),
+                    })
             })
             .unwrap_or_default()
     });
@@ -194,7 +196,9 @@ pub fn WelcomeOnboarding() -> impl IntoView {
             }
             if !baked {
                 // Signed in, but no zone to bind yet: the app's scanner covers it.
-                web_sys::console::info_1(&"[onboarding] app install without bake: zone access not ready".into());
+                web_sys::console::info_1(
+                    &"[onboarding] app install without bake: zone access not ready".into(),
+                );
             }
         });
     };
@@ -368,12 +372,27 @@ mod tests {
     #[test]
     fn install_path_matrix() {
         let f = BrowserFamily::Chromium;
-        assert_eq!(choose_install_path(true, true, true, true, f), InstallPath::AlreadyInstalled);
-        assert_eq!(choose_install_path(false, false, false, true, f), InstallPath::Disabled);
-        assert_eq!(choose_install_path(false, true, true, false, f), InstallPath::Ios);
+        assert_eq!(
+            choose_install_path(true, true, true, true, f),
+            InstallPath::AlreadyInstalled
+        );
+        assert_eq!(
+            choose_install_path(false, false, false, true, f),
+            InstallPath::Disabled
+        );
+        assert_eq!(
+            choose_install_path(false, true, true, false, f),
+            InstallPath::Ios
+        );
         // iOS never uses a prompt, even if one were somehow stashed.
-        assert_eq!(choose_install_path(false, true, true, true, f), InstallPath::Ios);
-        assert_eq!(choose_install_path(false, true, false, true, f), InstallPath::Prompt);
+        assert_eq!(
+            choose_install_path(false, true, true, true, f),
+            InstallPath::Ios
+        );
+        assert_eq!(
+            choose_install_path(false, true, false, true, f),
+            InstallPath::Prompt
+        );
         assert_eq!(
             choose_install_path(false, true, false, false, BrowserFamily::Firefox),
             InstallPath::Manual(BrowserFamily::Firefox)

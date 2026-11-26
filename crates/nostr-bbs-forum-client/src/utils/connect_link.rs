@@ -57,7 +57,10 @@ pub fn is_wellformed_link_key(key: &str) -> bool {
     if let Some(rest) = key.strip_prefix("nsec1") {
         rest.len() == 58 && rest.chars().all(|c| BECH32_CHARSET.contains(c))
     } else {
-        key.len() == 64 && key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        key.len() == 64
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
 }
 
@@ -297,9 +300,19 @@ mod tests {
     #[test]
     fn fragment_extraction() {
         let n = synthetic_nsec();
-        assert_eq!(key_from_fragment(&format!("#k={n}")).as_deref().map(String::as_str), Some(n.as_str()));
+        assert_eq!(
+            key_from_fragment(&format!("#k={n}"))
+                .as_deref()
+                .map(String::as_str),
+            Some(n.as_str())
+        );
         // Legacy bare form, as the old /connect page accepted.
-        assert_eq!(key_from_fragment(&format!("#{n}")).as_deref().map(String::as_str), Some(n.as_str()));
+        assert_eq!(
+            key_from_fragment(&format!("#{n}"))
+                .as_deref()
+                .map(String::as_str),
+            Some(n.as_str())
+        );
         assert!(key_from_fragment(&format!("k={n}")).is_none());
         assert!(key_from_fragment(&format!("#K={n}")).is_none());
         assert!(key_from_fragment("#k=").is_none());
@@ -323,7 +336,9 @@ mod tests {
         }
         let hex = "02".repeat(32);
         assert_eq!(
-            parse_sheet_payload(&format!("{ORIGIN}{BASE}/#k={hex}"), ORIGIN, BASE).unwrap().as_str(),
+            parse_sheet_payload(&format!("{ORIGIN}{BASE}/#k={hex}"), ORIGIN, BASE)
+                .unwrap()
+                .as_str(),
             hex
         );
         // Root-mounted forum.
@@ -343,19 +358,32 @@ mod tests {
             format!("{ORIGIN}{BASE}x/#k={n}"),
         ];
         for p in other {
-            assert_eq!(parse_sheet_payload(&p, ORIGIN, BASE), Err(PayloadError::OtherSite), "{p}");
+            assert_eq!(
+                parse_sheet_payload(&p, ORIGIN, BASE),
+                Err(PayloadError::OtherSite),
+                "{p}"
+            );
         }
-        assert_eq!(parse_sheet_payload("hello", ORIGIN, BASE), Err(PayloadError::NotSignInCode));
+        assert_eq!(
+            parse_sheet_payload("hello", ORIGIN, BASE),
+            Err(PayloadError::NotSignInCode)
+        );
         assert_eq!(
             parse_sheet_payload(&"03".repeat(32), ORIGIN, BASE),
             Err(PayloadError::NotSignInCode)
         );
-        assert_eq!(parse_sheet_payload("javascript:alert(1)", ORIGIN, BASE), Err(PayloadError::NotSignInCode));
+        assert_eq!(
+            parse_sheet_payload("javascript:alert(1)", ORIGIN, BASE),
+            Err(PayloadError::NotSignInCode)
+        );
         // Corrupt checksum: flip the last character.
         let mut bad = n.clone();
         let last = bad.pop().unwrap();
         bad.push(if last == 'q' { 'p' } else { 'q' });
-        assert_eq!(parse_sheet_payload(&bad, ORIGIN, BASE), Err(PayloadError::BadKey));
+        assert_eq!(
+            parse_sheet_payload(&bad, ORIGIN, BASE),
+            Err(PayloadError::BadKey)
+        );
         assert_eq!(
             parse_sheet_payload(&format!("{ORIGIN}{BASE}/#k={bad}"), ORIGIN, BASE),
             Err(PayloadError::BadKey)
@@ -368,7 +396,11 @@ mod tests {
 
     #[test]
     fn error_messages_never_echo_payload() {
-        for e in [PayloadError::OtherSite, PayloadError::NotSignInCode, PayloadError::BadKey] {
+        for e in [
+            PayloadError::OtherSite,
+            PayloadError::NotSignInCode,
+            PayloadError::BadKey,
+        ] {
             let s = e.to_string();
             assert!(!s.contains("nsec1") && !s.contains("#k="));
         }
@@ -382,7 +414,10 @@ mod tests {
         assert_eq!(from_nsec, from_hex);
         assert_eq!(from_nsec.len(), 64);
         assert!(pubkey_for_key("nsec1garbage").is_none());
-        assert!(pubkey_for_key(&"00".repeat(32)).is_none(), "zero is not a valid secret");
+        assert!(
+            pubkey_for_key(&"00".repeat(32)).is_none(),
+            "zero is not a valid secret"
+        );
     }
 
     #[test]

@@ -296,8 +296,7 @@ pub fn SectionPage() -> impl IntoView {
             if !store.history_receipt(&ch.id).settles(gated) {
                 return;
             }
-            let ids: Vec<String> =
-                topics_memo.with(|ts| ts.iter().map(|t| t.id.clone()).collect());
+            let ids: Vec<String> = topics_memo.with(|ts| ts.iter().map(|t| t.id.clone()).collect());
             store.request_topic_stats(&relay_for_stats, &ch.id, &ids, gated);
         });
     }

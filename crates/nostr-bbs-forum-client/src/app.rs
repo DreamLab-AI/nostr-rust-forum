@@ -322,7 +322,11 @@ pub fn App() -> impl IntoView {
         crate::utils::connect_link::stash(key);
         if let Some(w) = web_sys::window() {
             let _ = w.history().and_then(|h| {
-                h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&base_href("/connect")))
+                h.replace_state_with_url(
+                    &wasm_bindgen::JsValue::NULL,
+                    "",
+                    Some(&base_href("/connect")),
+                )
             });
         }
     }

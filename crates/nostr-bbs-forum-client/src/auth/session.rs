@@ -234,7 +234,9 @@ impl AuthStore {
     /// if one exists. Public data only.
     pub(super) fn stored_session_pubkey(&self) -> Option<String> {
         let json: String = LocalStorage::get(STORAGE_KEY).ok()?;
-        serde_json::from_str::<StoredSession>(&json).ok()?.public_key
+        serde_json::from_str::<StoredSession>(&json)
+            .ok()?
+            .public_key
     }
 
     /// Persist session data to localStorage (never includes private keys).
