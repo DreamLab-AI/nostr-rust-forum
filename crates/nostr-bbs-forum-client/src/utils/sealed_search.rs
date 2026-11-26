@@ -17,10 +17,17 @@
 //!    pending keys skipped) and hand only `okm` to the search worker.
 //!
 //! The worker embeds the query on the device; it never fetches anything.
-//! Hits are resolved by one relay `ids` REQ that hides them among decoy ids
-//! drawn from the index (review H1), then opened with the existing zone
-//! crypto; a hit counts only if it decrypts or opens and its `zk` tag names
-//! the zone, epoch and key of the shard it came from (review M4).
+//! Hits are resolved by one relay REQ that hides them among decoy ids drawn
+//! from the index (review H1), then opened with the existing zone crypto; a
+//! hit counts only if it decrypts or opens and its `zk` tag names the zone,
+//! epoch and key of the shard it came from (review M4).
+//!
+//! An index row's id is the id of the post as members see it. For a sealed
+//! original (ADR-2017; every imported or migrated post) that is the ORIGINAL's
+//! id, which the relay does not store: it holds only the envelope, under its
+//! own id, naming the original in its `["sealed", <id>, "1"]` tag. The REQ
+//! therefore asks for the ids both ways ([`resolve_filters`]) and maps each
+//! envelope back by that tag ([`verified_hits`]).
 //!
 //! [`wipe`] (sign-out, owner switch) terminates the worker first, then deletes
 //! the cache database.
@@ -41,7 +48,7 @@ use zeroize::Zeroize;
 
 use crate::relay::{Filter, RelayConnection};
 use crate::zone_crypto::store::ZoneKeyStore;
-use crate::zone_crypto::{parse_zk, read_outcome, ReadOutcome};
+use crate::zone_crypto::{parse_zk, read_outcome, ReadOutcome, ZoneKey};
 
 /// IndexedDB database for sealed objects and the model (deleted by [`wipe`]).
 const DB_NAME: &str = "nostr-bbs-sealed-search";
@@ -58,6 +65,89 @@ pub struct SealedHit {
     pub event: NostrEvent,
     /// Rescored similarity.
     pub score: f64,
+}
+
+/// Where a hit came from: `(zone, epoch, lowercase zone_pk, score)`.
+type HitSource = (String, u32, String, f64);
+
+/// The REQ filters that fetch hit and decoy `ids`: live zone-encrypted posts
+/// by their own id, sealed originals (ADR-2017) by the inner id their
+/// envelope names in its `sealed` tag (`#sealed`, which the relay indexes
+/// like any tag, as [`ChannelStore::fetch_by_id`] does for one id).
+///
+/// [`ChannelStore::fetch_by_id`]: crate::stores::channels::ChannelStore::fetch_by_id
+fn resolve_filters(ids: &[String]) -> Vec<Filter> {
+    let n = ids.len() as u64;
+    vec![
+        Filter {
+            ids: Some(ids.to_vec()),
+            limit: Some(n),
+            ..Default::default()
+        },
+        Filter {
+            kinds: Some(vec![42]),
+            sealed_tags: Some(ids.to_vec()),
+            limit: Some(n),
+            ..Default::default()
+        },
+    ]
+}
+
+/// The verified hits among `events` (as fetched by [`resolve_filters`]),
+/// best first, one per hit id.
+///
+/// An event answers the hit named by its `sealed` tag when it is a sealed
+/// envelope, otherwise the hit with its own id; events answering no hit are
+/// decoys. It counts only if its `zk` tag names the zone, epoch and key of
+/// the shard the hit came from, and it decrypts (a live post, whose id must
+/// be the hit id) or opens to an original whose id is the hit id.
+fn verified_hits(
+    events: &[NostrEvent],
+    want: &HashMap<String, HitSource>,
+    lookup: impl Fn(&str, u32) -> Option<ZoneKey>,
+) -> Vec<SealedHit> {
+    let mut out: HashMap<String, SealedHit> = HashMap::new();
+    for ev in events {
+        let sealed = nostr_bbs_core::sealed::parse_sealed(&ev.tags);
+        let hit_id = match &sealed {
+            Some(r) => r.inner_id.clone(),
+            None => ev.id.to_lowercase(),
+        };
+        if out.contains_key(&hit_id) {
+            continue;
+        }
+        let Some((zone, epoch, zone_pk, score)) = want.get(&hit_id) else {
+            continue; // a decoy
+        };
+        // The fetched event must be encrypted under the shard's exact key.
+        match parse_zk(&ev.tags) {
+            Some(zk) if zk.zone == *zone && zk.epoch == *epoch && zk.pubkey == *zone_pk => {}
+            _ => continue,
+        }
+        let shown = match read_outcome(ev, &lookup) {
+            ReadOutcome::Decrypted(text) if sealed.is_none() => NostrEvent {
+                content: text,
+                ..ev.clone()
+            },
+            ReadOutcome::Sealed(original) if original.id.eq_ignore_ascii_case(&hit_id) => original,
+            _ => continue,
+        };
+        out.insert(
+            hit_id,
+            SealedHit {
+                event: shown,
+                score: *score,
+            },
+        );
+    }
+    let mut out: Vec<SealedHit> = out.into_values().collect();
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.event.id.cmp(&b.event.id))
+    });
+    out
 }
 
 type Waiters = Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>;
@@ -496,11 +586,10 @@ pub async fn search(
     set(&msg, "decoys", (k * DECOYS_PER_HIT) as f64);
     let r = rpc(&svc, msg, &Array::new()).await?;
 
-    // (zone, epoch, zone_pk, score) per hit id.
-    let mut want: HashMap<String, (String, u32, String, f64)> = HashMap::new();
+    let mut want: HashMap<String, HitSource> = HashMap::new();
     let mut ids: Vec<String> = Vec::new();
     for h in Array::from(&get(&r, "hits")).iter() {
-        let id = get(&h, "id").as_string().unwrap_or_default();
+        let id = get(&h, "id").as_string().unwrap_or_default().to_lowercase();
         want.insert(
             id.clone(),
             (
@@ -520,7 +609,7 @@ pub async fn search(
     }
     for d in Array::from(&get(&r, "decoys")).iter() {
         if let Some(id) = get(&d, "id").as_string() {
-            ids.push(id);
+            ids.push(id.to_lowercase());
         }
     }
     // Shuffle so the hits are not the first k ids of the REQ.
@@ -533,11 +622,7 @@ pub async fn search(
     let got: Rc<RefCell<Vec<NostrEvent>>> = Rc::default();
     let g2 = got.clone();
     let sid = relay.subscribe(
-        vec![Filter {
-            ids: Some(ids),
-            limit: Some(n as u64),
-            ..Default::default()
-        }],
+        resolve_filters(&ids),
         Rc::new(move |ev: NostrEvent| g2.borrow_mut().push(ev)),
         None,
     );
@@ -549,35 +634,8 @@ pub async fn search(
     let _ = JsFuture::from(delay).await;
     relay.unsubscribe(&sid);
 
-    let mut out = Vec::new();
-    for ev in got.borrow().iter() {
-        let Some((zone, epoch, zone_pk, score)) = want.get(&ev.id).cloned() else {
-            continue; // a decoy
-        };
-        // The fetched event must be encrypted under the shard's exact key.
-        match parse_zk(&ev.tags) {
-            Some(zk) if zk.zone == zone && zk.epoch == epoch && zk.pubkey == zone_pk => {}
-            _ => continue,
-        }
-        let shown = match read_outcome(ev, |z, e| store.lookup(z, e)) {
-            ReadOutcome::Decrypted(text) => NostrEvent {
-                content: text,
-                ..ev.clone()
-            },
-            ReadOutcome::Sealed(original) => original,
-            _ => continue,
-        };
-        out.push(SealedHit {
-            event: shown,
-            score,
-        });
-    }
-    out.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    Ok(out)
+    let events = got.borrow().clone();
+    Ok(verified_hits(&events, &want, |z, e| store.lookup(z, e)))
 }
 
 /// Whether any sealed zone is loaded in the worker.
@@ -599,5 +657,153 @@ pub fn wipe() {
     }
     if let Some(f) = web_sys::window().and_then(|w| w.indexed_db().ok().flatten()) {
         let _ = f.delete_database(DB_NAME);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zone_crypto::zk_tag;
+    use k256::schnorr::SigningKey;
+    use nostr_bbs_core::keys::SecretKey;
+    use nostr_bbs_core::sealed::seal_original;
+    use nostr_bbs_core::{sign_event_deterministic, UnsignedEvent};
+
+    const ALICE: [u8; 32] = [0x11; 32];
+    const MIGRATOR: [u8; 32] = [0x22; 32];
+    const ZONE: [u8; 32] = [0x33; 32];
+    const OTHER_ZONE: [u8; 32] = [0x55; 32];
+
+    fn pk_hex(sk: [u8; 32]) -> String {
+        SecretKey::from_bytes(sk).unwrap().public_key().to_hex()
+    }
+
+    fn zone_key() -> ZoneKey {
+        ZoneKey {
+            zone: "zone2".into(),
+            epoch: 5,
+            secret: hex::encode(ZONE),
+            pubkey: pk_hex(ZONE),
+            granted_by: pk_hex(MIGRATOR),
+            received_at: 0,
+            group: None,
+            pending_delivery: false,
+        }
+    }
+
+    fn lookup(z: &str, e: u32) -> Option<ZoneKey> {
+        (z == "zone2" && e == 5).then(zone_key)
+    }
+
+    fn root_tag() -> Vec<String> {
+        vec!["e".into(), "c".repeat(64), "".into(), "root".into()]
+    }
+
+    fn signed(sk: [u8; 32], created_at: u64, tags: Vec<Vec<String>>, content: &str) -> NostrEvent {
+        sign_event_deterministic(
+            UnsignedEvent {
+                pubkey: pk_hex(sk),
+                created_at,
+                kind: 42,
+                tags,
+                content: content.into(),
+            },
+            &SigningKey::from_bytes((&sk).into()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// An imported post as the index knows it (its original id) and as the
+    /// relay stores it (the sealed envelope, under another id).
+    fn imported(created_at: u64, text: &str, zone_sk: [u8; 32]) -> (NostrEvent, NostrEvent) {
+        let original = signed(ALICE, created_at, vec![root_tag()], text);
+        let migrator = SecretKey::from_bytes(MIGRATOR).unwrap();
+        let env = seal_original(&original, "zone2", 5, &pk_hex(zone_sk), &migrator).unwrap();
+        (original, env)
+    }
+
+    fn live(created_at: u64, text: &str) -> NostrEvent {
+        let zone_pk: [u8; 32] = hex::decode(pk_hex(ZONE)).unwrap().try_into().unwrap();
+        let ct = nostr_bbs_core::nip44_encrypt(&ALICE, &zone_pk, text).unwrap();
+        signed(
+            ALICE,
+            created_at,
+            vec![root_tag(), zk_tag(&zone_key())],
+            &ct,
+        )
+    }
+
+    fn source(score: f64) -> HitSource {
+        ("zone2".into(), 5, pk_hex(ZONE), score)
+    }
+
+    #[test]
+    fn resolving_asks_for_sealed_originals_by_their_inner_id() {
+        let ids = vec!["a".repeat(64), "b".repeat(64)];
+        let json = serde_json::to_string(&resolve_filters(&ids)).unwrap();
+        assert!(
+            json.contains(&format!(r##""#sealed":["{}","{}"]"##, ids[0], ids[1])),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!(r#""ids":["{}","{}"]"#, ids[0], ids[1])),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_sealed_envelope_answers_the_hit_named_by_its_sealed_tag() {
+        // The live failure: the index holds the original's id, the relay
+        // returns the envelope (another id), and the hit was dropped.
+        let (original, env) = imported(1_600_000_000, "Glastonbury tickets", ZONE);
+        assert_ne!(env.id, original.id);
+        let want = HashMap::from([(original.id.clone(), source(0.99))]);
+        let hits = verified_hits(&[env], &want, lookup);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].event.id, original.id);
+        assert_eq!(hits[0].event.content, "Glastonbury tickets");
+        assert_eq!(hits[0].event.pubkey, pk_hex(ALICE));
+        assert!((hits[0].score - 0.99).abs() < 1e-9);
+    }
+
+    #[test]
+    fn live_posts_still_resolve_by_their_own_id_and_rank_with_sealed_ones() {
+        let post = live(1_700_000_000, "wartracker update");
+        let (original, env) = imported(1_600_000_000, "ukraine map", ZONE);
+        let want = HashMap::from([
+            (post.id.clone(), source(0.7)),
+            (original.id.clone(), source(0.9)),
+        ]);
+        let hits = verified_hits(&[post.clone(), env], &want, lookup);
+        let ids: Vec<&str> = hits.iter().map(|h| h.event.id.as_str()).collect();
+        assert_eq!(ids, [original.id.as_str(), post.id.as_str()]);
+        assert_eq!(hits[1].event.content, "wartracker update");
+    }
+
+    #[test]
+    fn decoys_duplicates_and_mismatched_keys_are_dropped() {
+        let (original, env) = imported(1_600_000_000, "kept", ZONE);
+        let (dup_original, dup_env) = (original.clone(), imported(1_600_000_000, "kept", ZONE).1);
+        assert_eq!(dup_original.id, original.id);
+        let (decoy_original, decoy_env) = imported(1_600_000_001, "decoy", ZONE);
+        // Sealed under another zone key than the shard's: refused (review M4).
+        let (wrong_original, wrong_env) = imported(1_600_000_002, "wrong key", OTHER_ZONE);
+        let want = HashMap::from([
+            (original.id.clone(), source(0.8)),
+            (wrong_original.id.clone(), source(0.95)),
+        ]);
+        let hits = verified_hits(&[env, dup_env, decoy_env, wrong_env], &want, lookup);
+        assert_eq!(hits.len(), 1, "one hit per id; decoy and wrong key dropped");
+        assert_eq!(hits[0].event.id, original.id);
+        assert_ne!(hits[0].event.id, decoy_original.id);
+    }
+
+    #[test]
+    fn an_envelope_cannot_answer_for_another_hit_by_its_own_id() {
+        // A sealed envelope whose OWN id is a hit, but which wraps another
+        // original, must not be shown as that hit.
+        let (_, env) = imported(1_600_000_000, "other", ZONE);
+        let want = HashMap::from([(env.id.clone(), source(0.9))]);
+        assert!(verified_hits(&[env], &want, lookup).is_empty());
     }
 }
