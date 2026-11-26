@@ -274,8 +274,6 @@ impl GrantReport {
 /// relay and answered.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GrantTally {
-    /// Members the batch plans to grant.
-    pub planned_members: usize,
     /// Grants handed to the relay.
     pub handed: usize,
     /// Grants that could not be built or handed over.
@@ -441,7 +439,6 @@ pub async fn send_grants(
     }
     let members: HashSet<String> = plan.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
     let tally = Rc::new(std::cell::RefCell::new(GrantTally {
-        planned_members: members.len(),
         withheld,
         ..GrantTally::default()
     }));
@@ -726,12 +723,13 @@ impl AutoGrant {
 
     /// Plan and send the grants owed to `only`. With `auto_grant_new` (an
     /// allocation) never-granted targets are approved and granted; without
-    /// it only targets already known or approved are.
+    /// it only targets already known or approved are. Also returns the zones
+    /// blocked by their history floor, for the caller to scope and report.
     async fn run(
         &self,
         only: Option<&HashSet<String>>,
         auto_grant_new: bool,
-    ) -> Result<GrantReport, String> {
+    ) -> Result<(GrantReport, Vec<super::FloorBlock>), String> {
         let signer = self
             .auth
             .get_signer()
@@ -746,25 +744,18 @@ impl AutoGrant {
                 self.store.approve_target(zone, pk).await;
             }
         }
-        let withheld = plan
-            .floor_blocked
-            .iter()
-            .map(super::FloorBlock::explain)
-            .collect::<Vec<_>>();
         if plan.grants.is_empty() {
-            if !withheld.is_empty() {
-                return Err(withheld.join(" "));
-            }
-            return Ok(GrantReport::default());
+            return Ok((GrantReport::default(), plan.floor_blocked));
         }
-        Ok(send_grants(
+        let report = send_grants(
             self.store,
             &self.relay,
             &*signer,
             plan.grants,
             Rc::new(|_, _| ()),
         )
-        .await)
+        .await;
+        Ok((report, plan.floor_blocked))
     }
 
     fn toast(&self, message: String, variant: ToastVariant) {
@@ -796,7 +787,9 @@ impl AutoGrant {
         let this = self.clone();
         let only: HashSet<String> = std::iter::once(pubkey.to_ascii_lowercase()).collect();
         spawn_local(async move {
-            match this.run(Some(&only), true).await {
+            // Floor-blocked zones are not this member's to report: the sweep,
+            // the Encryption tab and the console already name them.
+            match this.run(Some(&only), true).await.map(|(r, _)| r) {
                 // Nothing owed (no encrypted zone in the new cohorts, or the
                 // member already holds the keys) is not worth a toast here.
                 Ok(r) if report_summary(&r).is_none() => {}
@@ -968,7 +961,21 @@ impl AutoGrant {
                 .iter()
                 .map(|(_, pk)| pk.to_ascii_lowercase())
                 .collect();
-            let outcome = this.run(Some(&only), false).await;
+            let zones: HashSet<&String> = targets.iter().map(|(z, _)| z).collect();
+            let outcome = this.run(Some(&only), false).await.and_then(|(r, blocked)| {
+                // A zone being approved that no key can be granted for is
+                // the reason nothing went: say so, not "nothing was owed".
+                let why: Vec<String> = blocked
+                    .iter()
+                    .filter(|b| zones.contains(&b.zone))
+                    .map(super::FloorBlock::explain)
+                    .collect();
+                if report_summary(&r).is_none() && !why.is_empty() {
+                    Err(format!("approved, but {}", why.join(" ")))
+                } else {
+                    Ok(r)
+                }
+            });
             this.toast_run(
                 outcome,
                 "Approved. Nothing was owed to send: the member(s) already hold this device's keys.",
@@ -1407,7 +1414,6 @@ mod tests {
 
     fn tally(handed: usize, accepted: &[String], rejected: usize, failed: usize) -> GrantTally {
         GrantTally {
-            planned_members: 3,
             handed,
             failed,
             withheld: 0,
