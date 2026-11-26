@@ -52,12 +52,11 @@ pub(crate) const ACTIVITY_FLUSH_SECS: u64 = 300;
 /// Pending delivered-read count that forces an early flush.
 pub(crate) const PENDING_READS_FLUSH_AT: i32 = 50;
 
-/// How long a channel/topic message-count snapshot is reused. A hit adds the
-/// messages created after the snapshot with a cheap time-range query, so new
-/// posts are counted. Not exact: a post stored after the snapshot with a
-/// `created_at` at or before `as_of` (more than
-/// [`COUNT_SNAPSHOT_MARGIN_SECS`] back-dated), and deletions, show only once
-/// the snapshot expires.
+/// How long a snapshot stays in the per-isolate memory cache before it is
+/// re-read from DO storage. The durable copy ([`persist_snapshot`]) is the
+/// source of truth: the DO hibernates when idle and loses memory, which is
+/// why an in-memory snapshot alone left every cold page load paying for a
+/// full count (2026-11-26).
 pub(crate) const COUNT_CACHE_TTL_SECS: u64 = 300;
 
 /// A snapshot covers messages up to this long before it was taken, so posts
@@ -65,28 +64,62 @@ pub(crate) const COUNT_CACHE_TTL_SECS: u64 = 300;
 /// fall in the always-fresh delta.
 pub(crate) const COUNT_SNAPSHOT_MARGIN_SECS: u64 = 120;
 
-/// Most snapshots kept before the cache is emptied. Keys are 64-hex event
-/// ids ([`count_key`]); each entry holds at most a few `(channel, n)` pairs
-/// and [`snapshot_exceptions`]-bounded exception rows.
+/// Once a snapshot is this old it is rolled forward (the messages since are
+/// folded in with a small range count) so deltas stay small.
+pub(crate) const COUNT_ROLL_SECS: u64 = 600;
+
+/// A request ending before the snapshot is answered by subtracting the
+/// messages between its `until` and the snapshot, when that gap is at most
+/// this long; a longer gap is counted afresh in windows, not stored.
+pub(crate) const COUNT_SUBTRACT_MAX_GAP_SECS: u64 = 86_400;
+
+/// Smallest snapshot (total messages) kept in DO storage. Smaller counts are
+/// cheap to redo, and a random id (no messages) must never occupy storage.
+pub(crate) const COUNT_PERSIST_MIN: u64 = 200;
+
+/// Rows per window of a full count, and the pause between windows: each
+/// window is a short statement, and the pause lets other members' queries
+/// run, so D1 is never held for seconds by one count.
+pub(crate) const COUNT_WINDOW_ROWS: u32 = 10_000;
+pub(crate) const COUNT_WINDOW_PAUSE_MS: u64 = 150;
+
+/// How long a request waits for a full count of the same key already running
+/// in this isolate before giving up with a retryable error.
+pub(crate) const COUNT_INFLIGHT_WAIT_MS: u64 = 30_000;
+
+/// Most snapshots kept in memory before the memory cache is emptied.
 pub(crate) const COUNT_CACHE_MAX: usize = 1024;
 
 /// Most exception rows a snapshot keeps, and their total size; past either,
 /// the snapshot keeps none and they are read fresh each time.
-const SNAPSHOT_EXCEPTIONS_MAX: usize = 16;
-const SNAPSHOT_EXCEPTIONS_MAX_BYTES: usize = 32 * 1024;
+const SNAPSHOT_EXCEPTIONS_MAX: usize = 64;
+const SNAPSHOT_EXCEPTIONS_MAX_BYTES: usize = 64 * 1024;
 
 /// A message count (see `filter::build_channel_count`), valid for every
 /// message created at or before `as_of`: grouped counts, and the raw
 /// exception rows (NIP-40 expiry is applied when served) when small enough.
-#[derive(Debug, Clone)]
+///
+/// Drift: a deletion, or a post stored after `as_of` with a `created_at` at
+/// or before it (more than the margin back-dated), is not reflected. Counts
+/// are display-only; the drift is accepted and documented rather than paid
+/// for with periodic full recounts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CountSnapshot {
     pub(crate) as_of: u64,
     pub(crate) groups: Vec<(String, u64)>,
     pub(crate) exceptions: Option<Vec<NostrEvent>>,
 }
 
+impl CountSnapshot {
+    /// Total messages counted.
+    pub(crate) fn total(&self) -> u64 {
+        self.groups.iter().map(|(_, n)| n).sum()
+    }
+}
+
 /// The exception rows a snapshot may keep: all of them when few and small,
-/// else none (read fresh on each hit instead).
+/// else `None`, which makes the snapshot unusable (the caller takes the
+/// row-capped generic path) rather than re-reading every row on each hit.
 pub(crate) fn snapshot_exceptions(rows: &[NostrEvent]) -> Option<Vec<NostrEvent>> {
     let bytes: usize = rows
         .iter()
@@ -96,37 +129,70 @@ pub(crate) fn snapshot_exceptions(rows: &[NostrEvent]) -> Option<Vec<NostrEvent>
         .then(|| rows.to_vec())
 }
 
-/// Whether a full count to `horizon` should become the snapshot: only one
-/// reaching the present (minus the margin). A request with an old `until`
-/// is answered but never replaces a newer snapshot with an older one.
-pub(crate) fn should_store(horizon: u64, now: u64) -> bool {
-    horizon == now.saturating_sub(COUNT_SNAPSHOT_MARGIN_SECS)
+/// Whether a snapshot is worth keeping in DO storage.
+pub(crate) fn persist_snapshot(snap: &CountSnapshot) -> bool {
+    snap.total() >= COUNT_PERSIST_MIN
 }
 
-/// How to answer a grouped count for a request ending at `until` (`None`:
-/// no upper bound), given the snapshot held for its `(value, since)`.
+/// The horizon a snapshot taken at `now` covers.
+pub(crate) fn snapshot_horizon(now: u64) -> u64 {
+    now.saturating_sub(COUNT_SNAPSHOT_MARGIN_SECS)
+}
+
+/// Whether `snap` should be rolled forward to [`snapshot_horizon`] first.
+pub(crate) fn should_roll(snap: &CountSnapshot, now: u64) -> bool {
+    snapshot_horizon(now).saturating_sub(snap.as_of) >= COUNT_ROLL_SECS
+}
+
+/// How to answer a count ending at `until` (`None`: no upper bound) from a
+/// snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CountPlan {
-    /// Add the messages created after the snapshot (`from` onward, up to the
-    /// request's `until`) to it.
+    /// The snapshot plus the messages created from `from` up to `until`.
     Delta { from: u64 },
-    /// Count up to `horizon` from scratch and keep that as the snapshot, then
-    /// add anything after `horizon` the request still covers.
-    Full { horizon: u64 },
+    /// The snapshot minus the messages created in `lo..=hi` (the request
+    /// ends before the snapshot; the gap is small).
+    Subtract { lo: u64, hi: u64 },
+    /// Count the request's range afresh, in windows, without storing it (the
+    /// request ends long before the snapshot).
+    Fresh,
 }
 
-/// The plan for a count ending at `until`, at time `now`. A snapshot serves
-/// any request whose range reaches at least to its `as_of`; an older `until`
-/// is counted from scratch, exactly.
-pub(crate) fn plan_count(snap: Option<&CountSnapshot>, until: Option<u64>, now: u64) -> CountPlan {
+/// The plan for a count ending at `until` against `snap`.
+pub(crate) fn plan_count(snap: &CountSnapshot, until: Option<u64>) -> CountPlan {
     let reach = until.unwrap_or(u64::MAX);
-    match snap {
-        Some(s) if s.as_of <= reach => CountPlan::Delta {
-            from: s.as_of.saturating_add(1),
-        },
-        _ => CountPlan::Full {
-            horizon: reach.min(now.saturating_sub(COUNT_SNAPSHOT_MARGIN_SECS)),
-        },
+    if reach >= snap.as_of {
+        CountPlan::Delta {
+            from: snap.as_of.saturating_add(1),
+        }
+    } else if snap.as_of - reach <= COUNT_SUBTRACT_MAX_GAP_SECS {
+        CountPlan::Subtract {
+            lo: reach.saturating_add(1),
+            hi: snap.as_of,
+        }
+    } else {
+        CountPlan::Fresh
+    }
+}
+
+/// `a` minus `b`, channel by channel, never below zero.
+pub(crate) fn subtract_groups(a: &[(String, u64)], b: &[(String, u64)]) -> Vec<(String, u64)> {
+    a.iter()
+        .map(|(ch, n)| {
+            let minus = b.iter().find(|(c, _)| c == ch).map_or(0, |(_, m)| *m);
+            (ch.clone(), n.saturating_sub(minus))
+        })
+        .collect()
+}
+
+/// The bounds of the next full-count window: from `lo` up to `edge` (the
+/// `created_at` [`COUNT_WINDOW_ROWS`] rows on, `None` when fewer remain) or
+/// `hi`, and where the window after it starts (`None`: this is the last).
+/// Every message is in exactly one window, ties at an edge included.
+pub(crate) fn next_window(lo: u64, edge: Option<u64>, hi: u64) -> (u64, u64, Option<u64>) {
+    match edge {
+        Some(e) if e < hi => (lo, e, Some(e + 1)),
+        _ => (lo, hi, None),
     }
 }
 
@@ -142,19 +208,32 @@ pub(crate) fn merge_groups(a: &[(String, u64)], b: &[(String, u64)]) -> Vec<(Str
     out
 }
 
-/// The snapshot key of a count of `value` from `since`, or `None` when
-/// `value` is not a lowercase 64-hex event id. Only real ids are cached: the
-/// key's size is fixed, and it cannot contain the `|` separator.
+/// The snapshot key of a count of `value` with no `since`, or `None` when
+/// the count is not served from a snapshot: `value` not a lowercase 64-hex
+/// event id, or a `since` given. The forum never sends `since`; keying on it
+/// let one client mint unlimited snapshots of one big channel (review
+/// finding), so such counts take the row-capped generic path.
 pub(crate) fn count_key(value: &str, since: Option<u64>) -> Option<String> {
     let hex = value.len() == 64
         && value
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    hex.then(|| match since {
-        Some(s) => format!("{value}|{s}"),
-        None => value.to_string(),
-    })
+    (hex && since.is_none()).then(|| value.to_string())
 }
+
+/// Largest timestamp the count path accepts: beyond 2^53 the f64 and i64
+/// binds lose meaning (a `since` near 2^64 wrapped to -1 and disabled the
+/// windows). A larger `until` is clamped to it.
+pub(crate) const COUNT_MAX_TS: u64 = 1 << 53;
+
+/// DO storage key of a persisted snapshot. Versioned, so a change to the
+/// count logic can abandon old snapshots by bumping it.
+pub(crate) fn snapshot_storage_key(key: &str) -> String {
+    format!("count_snap:v1:{key}")
+}
+
+/// Most full (windowed) counts running at once in this isolate, across keys.
+pub(crate) const COUNT_FULL_MAX_CONCURRENT: u32 = 2;
 
 struct Entry<V> {
     value: V,
@@ -296,44 +375,81 @@ mod tests {
     }
 
     #[test]
-    fn a_count_snapshot_serves_any_request_reaching_its_horizon() {
-        // The client asks "up to now": served from the snapshot plus newer.
+    fn requests_reaching_the_snapshot_add_newer_messages() {
         assert_eq!(
-            plan_count(Some(&snap(1_000)), Some(1_030), 1_030),
+            plan_count(&snap(1_000), Some(1_030)),
             CountPlan::Delta { from: 1_001 }
         );
         assert_eq!(
-            plan_count(Some(&snap(1_000)), None, 1_030),
+            plan_count(&snap(1_000), None),
             CountPlan::Delta { from: 1_001 }
         );
-        // Exactly at the horizon: nothing newer to add, still a hit.
         assert_eq!(
-            plan_count(Some(&snap(1_000)), Some(1_000), 1_030),
+            plan_count(&snap(1_000), Some(1_000)),
             CountPlan::Delta { from: 1_001 }
         );
-        // An older `until` is counted from scratch (the snapshot would overcount).
+    }
+
+    #[test]
+    fn an_older_until_subtracts_a_small_gap_or_counts_afresh() {
+        // An open tab resends its original `until` after the snapshot rolled.
         assert_eq!(
-            plan_count(Some(&snap(1_000)), Some(900), 1_030),
-            CountPlan::Full { horizon: 900 }
+            plan_count(&snap(10_000), Some(9_400)),
+            CountPlan::Subtract {
+                lo: 9_401,
+                hi: 10_000
+            }
         );
-        // No snapshot: count to the margin before now, never past it.
-        let h = 1_030 - COUNT_SNAPSHOT_MARGIN_SECS;
+        let far = 10_000 + COUNT_SUBTRACT_MAX_GAP_SECS + 1;
+        assert_eq!(plan_count(&snap(far), Some(9_999)), CountPlan::Fresh);
+    }
+
+    #[test]
+    fn snapshots_roll_forward_and_only_big_ones_persist() {
+        let now = 100_000;
+        let h = snapshot_horizon(now);
+        assert_eq!(h, now - COUNT_SNAPSHOT_MARGIN_SECS);
+        assert!(!should_roll(&snap(h - COUNT_ROLL_SECS + 1), now));
+        assert!(should_roll(&snap(h - COUNT_ROLL_SECS), now));
+        assert!(persist_snapshot(&snap(1)));
+        let small = CountSnapshot {
+            as_of: 1,
+            groups: vec![("ch".into(), COUNT_PERSIST_MIN - 1)],
+            exceptions: None,
+        };
+        assert!(!persist_snapshot(&small));
+        // A random id: nothing counted, nothing stored.
+        let empty = CountSnapshot {
+            as_of: 1,
+            groups: vec![],
+            exceptions: None,
+        };
+        assert!(!persist_snapshot(&empty));
+    }
+
+    #[test]
+    fn subtracting_groups_never_goes_negative() {
+        let a = vec![("x".to_string(), 10), ("y".to_string(), 1)];
+        let b = vec![
+            ("x".to_string(), 3),
+            ("y".to_string(), 5),
+            ("z".to_string(), 9),
+        ];
         assert_eq!(
-            plan_count(None, None, 1_030),
-            CountPlan::Full { horizon: h }
+            subtract_groups(&a, &b),
+            vec![("x".to_string(), 7), ("y".to_string(), 0)]
         );
-        assert_eq!(
-            plan_count(None, Some(5_000), 1_030),
-            CountPlan::Full { horizon: h }
-        );
-        assert_eq!(
-            plan_count(None, Some(700), 1_030),
-            CountPlan::Full { horizon: 700 }
-        );
-        // Only a count reaching the present becomes the snapshot.
-        assert!(should_store(h, 1_030));
-        assert!(!should_store(700, 1_030));
-        assert!(!should_store(1, 1_030));
+    }
+
+    #[test]
+    fn windows_cover_the_range_once_ties_included() {
+        assert_eq!(next_window(0, Some(50), 100), (0, 50, Some(51)));
+        assert_eq!(next_window(51, None, 100), (51, 100, None));
+        // An edge at or past the end closes the range.
+        assert_eq!(next_window(51, Some(100), 100), (51, 100, None));
+        assert_eq!(next_window(51, Some(130), 100), (51, 100, None));
+        // Many rows sharing one timestamp: the window still advances.
+        assert_eq!(next_window(70, Some(70), 100), (70, 70, Some(71)));
     }
 
     fn ev(content_len: usize) -> NostrEvent {
@@ -355,8 +471,8 @@ mod tests {
             snapshot_exceptions(&[ev(10), ev(10)]).map(|v| v.len()),
             Some(2)
         );
-        assert!(snapshot_exceptions(&vec![ev(1); 17]).is_none());
-        assert!(snapshot_exceptions(&[ev(40_000)]).is_none());
+        assert!(snapshot_exceptions(&vec![ev(1); 65]).is_none());
+        assert!(snapshot_exceptions(&[ev(70_000)]).is_none());
     }
 
     #[test]
@@ -379,8 +495,9 @@ mod tests {
     fn count_keys_are_only_for_hex_ids_and_never_collide() {
         let id = "a".repeat(64);
         assert_eq!(count_key(&id, None), Some(id.clone()));
-        assert_eq!(count_key(&id, Some(5)), Some(format!("{id}|5")));
-        assert_ne!(count_key(&id, Some(5)), count_key(&id, Some(6)));
+        // A `since` is never snapshotted (one key per channel only).
+        assert_eq!(count_key(&id, Some(5)), None);
+        assert_eq!(snapshot_storage_key(&id), format!("count_snap:v1:{id}"));
         // Anything else takes the uncached path: no oversized or colliding keys.
         assert_eq!(count_key(&format!("{}|5", "a".repeat(62)), None), None);
         assert_eq!(count_key(&"A".repeat(64), None), None);

@@ -373,11 +373,18 @@ impl NostrRelayDO {
     }
 
     /// [`Self::count_channel_messages`] for `#e = value` from `since` to
-    /// `until`, served from a per-DO snapshot (`read_cache::plan_count`). A
-    /// big channel's count reads every message in it (seconds of D1 time for
-    /// the imported history); the snapshot is taken at most once per
-    /// `COUNT_CACHE_TTL_SECS` and each hit adds the messages created since,
-    /// through the `(name, value, created_at)` index.
+    /// `until`, served from a snapshot (`read_cache::CountSnapshot`).
+    ///
+    /// A big channel's count reads every message in it (seconds of D1 time
+    /// for the imported history, which froze D1 for every member). Now:
+    /// - the snapshot is kept in DO storage, so it survives the DO
+    ///   hibernating, and is taken once per channel;
+    /// - taking it runs in windows of `COUNT_WINDOW_ROWS` rows with a pause
+    ///   between them, so no single statement holds D1 for long;
+    /// - only one full count per key runs at a time in this isolate;
+    /// - a request reaching the snapshot adds the newer messages, one ending
+    ///   a little before it subtracts the gap, both through the
+    ///   `(name, value, created_at)` index.
     ///
     /// `Ok(None)`: not cacheable (`value` not a 64-hex id), so the caller
     /// takes the generic path. `Err`: D1 could not answer, and the caller
@@ -389,72 +396,225 @@ impl NostrRelayDO {
         until: Option<u64>,
     ) -> std::result::Result<Option<(Vec<(String, u64)>, Vec<NostrEvent>)>, String> {
         use super::read_cache::{
-            count_key, merge_groups, plan_count, should_store, snapshot_exceptions, CountPlan,
-            CountSnapshot,
+            count_key, merge_groups, plan_count, subtract_groups, CountPlan, COUNT_MAX_TS,
         };
         const FAILED: &str = "count read failed";
         let Some(key) = count_key(value, since) else {
             return Ok(None);
         };
+        let until = until.map(|u| u.min(COUNT_MAX_TS));
         let now = auth::js_now_secs();
-        let snap = self.count_cache.get(&key, now);
-        // Messages created from `from` onward, within the request's range.
-        let tail = |from: u64| {
-            let lo = Some(since.map_or(from, |s| s.max(from)));
-            filter::build_channel_count(value, lo, until)
+        let snap = self.count_snapshot(&key, value, now).await?;
+        // Too many expiring rows to keep: the snapshot cannot serve counts.
+        let Some(base_rows) = snap.exceptions.clone() else {
+            return Ok(None);
         };
-        let (groups, rows) = match (plan_count(snap.as_ref(), until, now), snap) {
-            (CountPlan::Delta { from }, Some(s)) => {
-                let t = tail(from);
-                let newer = self.run_count_groups(&t.grouped).await.ok_or(FAILED)?;
-                let rows = match s.exceptions {
-                    Some(mut base) => {
-                        base.extend(self.count_exception_rows(&t).await.ok_or(FAILED)?);
-                        base
-                    }
-                    None => {
-                        let all = filter::build_channel_count(value, since, until);
-                        self.count_exception_rows(&all).await.ok_or(FAILED)?
-                    }
-                };
-                (merge_groups(&s.groups, &newer), rows)
+        let (groups, rows) = match plan_count(&snap, until) {
+            CountPlan::Delta { from } => {
+                let q = filter::build_channel_count(value, Some(from), until);
+                let newer = self.run_count_groups(&q.grouped).await.ok_or(FAILED)?;
+                let mut rows = base_rows;
+                rows.extend(self.count_exception_rows(&q).await.ok_or(FAILED)?);
+                (merge_groups(&snap.groups, &newer), rows)
             }
-            (plan, _) => {
-                let horizon = match plan {
-                    CountPlan::Full { horizon } => horizon,
-                    CountPlan::Delta { .. } => {
-                        now.saturating_sub(super::read_cache::COUNT_SNAPSHOT_MARGIN_SECS)
-                    }
-                };
-                let q = filter::build_channel_count(value, since, Some(horizon));
-                let base = self.run_count_groups(&q.grouped).await.ok_or(FAILED)?;
-                let base_rows = self.count_exception_rows(&q).await.ok_or(FAILED)?;
-                if should_store(horizon, now) {
-                    if self.count_cache.len() >= super::read_cache::COUNT_CACHE_MAX {
-                        self.count_cache.clear();
-                    }
-                    self.count_cache.insert(
-                        &key,
-                        CountSnapshot {
-                            as_of: horizon,
-                            groups: base.clone(),
-                            exceptions: snapshot_exceptions(&base_rows),
-                        },
-                        now,
-                    );
-                }
-                if until.is_none_or(|u| u > horizon) {
-                    let t = tail(horizon.saturating_add(1));
-                    let newer = self.run_count_groups(&t.grouped).await.ok_or(FAILED)?;
-                    let mut rows = base_rows;
-                    rows.extend(self.count_exception_rows(&t).await.ok_or(FAILED)?);
-                    (merge_groups(&base, &newer), rows)
-                } else {
-                    (base, base_rows)
-                }
+            CountPlan::Subtract { lo, hi } => {
+                let q = filter::build_channel_count(value, Some(lo), Some(hi));
+                let gap = self.run_count_groups(&q.grouped).await.ok_or(FAILED)?;
+                let cutoff = until.unwrap_or(u64::MAX);
+                let rows = base_rows
+                    .into_iter()
+                    .filter(|e| e.created_at <= cutoff)
+                    .collect();
+                (subtract_groups(&snap.groups, &gap), rows)
             }
+            // A request ending long before the snapshot: not served here
+            // (uncached and attacker-triggerable); the generic path is
+            // row-capped.
+            CountPlan::Fresh => return Ok(None),
         };
         Ok(Some((groups, drop_expired(rows, now))))
+    }
+
+    /// The current snapshot for `key`, rolled forward when old: memory, else
+    /// DO storage, else a windowed full count to the present. Full counts and
+    /// rolls are single-flight per key and at most
+    /// `COUNT_FULL_MAX_CONCURRENT` at once across keys.
+    async fn count_snapshot(
+        &self,
+        key: &str,
+        value: &str,
+        now: u64,
+    ) -> std::result::Result<super::read_cache::CountSnapshot, String> {
+        use super::read_cache::{
+            merge_groups, should_roll, snapshot_exceptions, snapshot_horizon, CountSnapshot,
+        };
+        let current = match self.count_cache.get(key, now) {
+            Some(s) => Some(s),
+            None => self.load_count_snapshot(key, now).await,
+        };
+        if let Some(s) = &current {
+            if !should_roll(s, now) {
+                return Ok(s.clone());
+            }
+        }
+        // A full count or roll is needed. Join one already running.
+        if self.count_inflight.borrow().contains(key) {
+            return self.await_count_snapshot(key, current).await;
+        }
+        if self.count_full_running.get() >= super::read_cache::COUNT_FULL_MAX_CONCURRENT {
+            // Busy: an old snapshot still answers; none means retry later.
+            return current.ok_or_else(|| "count busy".to_string());
+        }
+        let _guard = InflightGuard::claim(&self.count_inflight, &self.count_full_running, key);
+        let started = js_sys::Date::now();
+        let h = snapshot_horizon(now);
+        let from = current.as_ref().map(|s| s.as_of.saturating_add(1));
+        let (groups, rows, windows) = self
+            .windowed_count_n(value, from, h)
+            .await
+            .ok_or("count read failed")?;
+        let snap = match current {
+            // Roll forward: fold in what arrived since, drop expired rows.
+            Some(old) => CountSnapshot {
+                as_of: h,
+                groups: merge_groups(&old.groups, &groups),
+                exceptions: old.exceptions.and_then(|mut base| {
+                    base.extend(rows);
+                    snapshot_exceptions(&drop_expired(base, now))
+                }),
+            },
+            None => CountSnapshot {
+                as_of: h,
+                groups,
+                exceptions: snapshot_exceptions(&rows),
+            },
+        };
+        console_log!(
+            "count {} {}: {} windows, {} messages, {:.0} ms",
+            if from.is_some() { "roll" } else { "full" },
+            &key[..8.min(key.len())],
+            windows,
+            snap.total(),
+            js_sys::Date::now() - started
+        );
+        self.keep_count_snapshot(key, &snap, now).await;
+        Ok(snap)
+    }
+
+    /// The snapshot persisted for `key`, if any (also put back in memory).
+    async fn load_count_snapshot(
+        &self,
+        key: &str,
+        now: u64,
+    ) -> Option<super::read_cache::CountSnapshot> {
+        let k = super::read_cache::snapshot_storage_key(key);
+        let json = self
+            .state
+            .storage()
+            .get::<String>(&k)
+            .await
+            .ok()
+            .flatten()?;
+        let s = serde_json::from_str::<super::read_cache::CountSnapshot>(&json).ok()?;
+        self.count_cache.insert(key, s.clone(), now);
+        Some(s)
+    }
+
+    /// Wait for the full count or roll of `key` running in this isolate. On
+    /// timeout, an older snapshot still answers; with none, a retryable error.
+    async fn await_count_snapshot(
+        &self,
+        key: &str,
+        older: Option<super::read_cache::CountSnapshot>,
+    ) -> std::result::Result<super::read_cache::CountSnapshot, String> {
+        let mut waited = 0;
+        while waited < super::read_cache::COUNT_INFLIGHT_WAIT_MS {
+            worker::Delay::from(std::time::Duration::from_millis(250)).await;
+            waited += 250;
+            if !self.count_inflight.borrow().contains(key) {
+                break;
+            }
+        }
+        let now = auth::js_now_secs();
+        if let Some(s) = self.count_cache.get(key, now) {
+            return Ok(s);
+        }
+        // The memory cache may have been cleared: re-read DO storage.
+        if let Some(s) = self.load_count_snapshot(key, now).await {
+            return Ok(s);
+        }
+        older.ok_or_else(|| "count busy".to_string())
+    }
+
+    /// Keep `snap` in memory, and in DO storage when big enough to matter.
+    async fn keep_count_snapshot(
+        &self,
+        key: &str,
+        snap: &super::read_cache::CountSnapshot,
+        now: u64,
+    ) {
+        if self.count_cache.len() >= super::read_cache::COUNT_CACHE_MAX {
+            self.count_cache.clear();
+        }
+        self.count_cache.insert(key, snap.clone(), now);
+        if super::read_cache::persist_snapshot(snap) {
+            if let Ok(json) = serde_json::to_string(snap) {
+                let k = super::read_cache::snapshot_storage_key(key);
+                if let Err(e) = self.state.storage().put(&k, json).await {
+                    console_error!("count snapshot not persisted: {e:?}");
+                }
+            }
+        }
+    }
+
+    /// A count of `#e = value` from `since` to `hi`, in windows, with the
+    /// number of windows. Each window covers about `COUNT_WINDOW_ROWS` tag
+    /// rows (edges read from the tag index); a pause between windows lets
+    /// other queries run.
+    async fn windowed_count_n(
+        &self,
+        value: &str,
+        since: Option<u64>,
+        hi: u64,
+    ) -> Option<(Vec<(String, u64)>, Vec<NostrEvent>, u32)> {
+        use super::read_cache::{merge_groups, next_window, COUNT_WINDOW_PAUSE_MS};
+        let db = self.env.d1("DB").ok()?;
+        let mut lo = since.unwrap_or(0);
+        let mut groups: Vec<(String, u64)> = Vec::new();
+        let mut rows: Vec<NostrEvent> = Vec::new();
+        let mut windows = 0u32;
+        loop {
+            #[derive(Deserialize)]
+            struct Edge {
+                created_at: f64,
+            }
+            let edge: Option<Edge> = db
+                .prepare(filter::COUNT_WINDOW_EDGE_SQL)
+                .bind(&[
+                    JsValue::from_str(value),
+                    JsValue::from_f64(lo as f64),
+                    JsValue::from_f64(hi as f64),
+                    JsValue::from_f64(f64::from(super::read_cache::COUNT_WINDOW_ROWS)),
+                ])
+                .ok()?
+                .first::<Edge>(None)
+                .await
+                .ok()?;
+            let (w_lo, w_hi, next) = next_window(lo, edge.map(|e| e.created_at as u64), hi);
+            let q = filter::build_channel_count(value, Some(w_lo), Some(w_hi));
+            groups = merge_groups(&groups, &self.run_count_groups(&q.grouped).await?);
+            rows.extend(self.count_exception_rows(&q).await?);
+            windows += 1;
+            match next {
+                Some(n) => {
+                    lo = n;
+                    worker::Delay::from(std::time::Duration::from_millis(COUNT_WINDOW_PAUSE_MS))
+                        .await;
+                }
+                None => break,
+            }
+        }
+        Some((groups, rows, windows))
     }
 
     /// Run a tag-scoped message count (`filter::build_channel_count`): the
@@ -581,6 +741,37 @@ impl NostrRelayDO {
         }
 
         Ok(events)
+    }
+}
+
+/// Marks a count key as being counted, and holds one of the isolate's full
+/// count slots, until dropped (any exit path).
+struct InflightGuard<'a> {
+    set: &'a std::cell::RefCell<std::collections::HashSet<String>>,
+    running: &'a std::cell::Cell<u32>,
+    key: String,
+}
+
+impl<'a> InflightGuard<'a> {
+    fn claim(
+        set: &'a std::cell::RefCell<std::collections::HashSet<String>>,
+        running: &'a std::cell::Cell<u32>,
+        key: &str,
+    ) -> Self {
+        set.borrow_mut().insert(key.to_string());
+        running.set(running.get() + 1);
+        Self {
+            set,
+            running,
+            key: key.to_string(),
+        }
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.set.borrow_mut().remove(&self.key);
+        self.running.set(self.running.get().saturating_sub(1));
     }
 }
 
