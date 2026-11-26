@@ -18,6 +18,15 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Forum deep-link restore stays inside the forum (2026-11-26)
+
+Forum client `index.html` only. The GitHub Pages pickup concatenated `__p` onto `/community` unchecked, so
+`?__p=/../contact/` rewrote the address bar out of the forum (same origin only: `history.replaceState` cannot leave
+the origin, so this was a path escape, not an open redirect). The target is now resolved with the URL parser and kept
+only when it is same-origin and under `/community/`; otherwise the page lands on `/community/`. `__p` is stripped in
+both cases. `tests/deep-link.test.mjs` drives the real script; CI now runs `node --test` over the forum client's
+`tests/` (which also brings the existing, previously unrun `sw-push.test.mjs` into CI).
+
 ### Jev transport: no redirects with the bearer key, response capped (2026-11-26)
 
 `nostr-bbs-jev` only (auth worker's rationale check is the one consumer).
