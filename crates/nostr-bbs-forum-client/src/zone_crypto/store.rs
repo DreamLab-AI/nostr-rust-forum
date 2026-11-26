@@ -142,6 +142,8 @@ pub struct ZoneKeyStore {
     /// Automatic grant re-checks per `(zone, epoch)` this session
     /// ([`keyset::recheck_due`]).
     rechecks: StoredValue<HashMap<(String, u32), keyset::RecheckState>>,
+    /// Automatic re-checks started this session, across all slots.
+    recheck_total: StoredValue<u32>,
     /// The signed-in identity's signer, kept while its grant sync runs so a
     /// re-check can open wraps again. Cleared with the sync.
     grant_signer: StoredValue<Option<Rc<dyn Signer>>, leptos::prelude::LocalStorage>,
@@ -182,6 +184,7 @@ impl ZoneKeyStore {
             opened: StoredValue::new(HashMap::new()),
             resolving: StoredValue::new(HashSet::new()),
             rechecks: StoredValue::new(HashMap::new()),
+            recheck_total: StoredValue::new(0),
             grant_signer: StoredValue::new_local(None),
             epochs_seen: RwSignal::new(HashMap::new()),
         }
@@ -273,6 +276,9 @@ impl ZoneKeyStore {
             return;
         };
         self.stop_grant_sync();
+        // A new identity starts with a fresh re-check budget and no stale slots.
+        self.rechecks.set_value(HashMap::new());
+        self.recheck_total.set_value(0);
         let _ = self.loaded_for.try_set(None);
         let _ = self.grant_backlog.try_set(None);
         let _ = self.keys.try_set(HashMap::new());
@@ -815,10 +821,12 @@ impl ZoneKeyStore {
                 .iter()
                 .any(|s| keyset::recheck_due(r.get(s).copied(), now))
         });
-        if slots.is_empty() || !due {
+        if slots.is_empty() || !due || !keyset::recheck_budget_left(self.recheck_total.get_value())
+        {
             return;
         }
         if self.recheck_grants() {
+            self.recheck_total.update_value(|n| *n += 1);
             self.rechecks.update_value(|r| {
                 for s in slots {
                     let e = r.entry(s).or_default();
@@ -857,10 +865,11 @@ impl ZoneKeyStore {
             .map(|s| s.public_key().to_string());
         let handler = self.wrap_handler(&relay, signer, lease, false, true);
         let sub: Rc<RefCell<Option<String>>> = Rc::default();
-        let (done_sub, done_relay) = (sub.clone(), relay.clone());
+        let (done_sub, done_relay, store) = (sub.clone(), relay.clone(), *self);
         let eose = Rc::new(move || {
             if let Some(id) = done_sub.borrow_mut().take() {
                 done_relay.unsubscribe(&id);
+                store.grant_subs.update_value(|v| v.retain(|s| s != &id));
             }
         });
         let id = relay.subscribe(
@@ -868,6 +877,8 @@ impl ZoneKeyStore {
             handler,
             Some(eose),
         );
+        // Tracked so an identity switch tears it down (and drops its signer).
+        self.grant_subs.update_value(|v| v.push(id.clone()));
         *sub.borrow_mut() = Some(id);
         true
     }

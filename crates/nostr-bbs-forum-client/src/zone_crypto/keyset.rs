@@ -288,6 +288,10 @@ pub fn mint_confirmation(plan: &MintPlan) -> Option<String> {
 
 /// Most automatic grant re-checks per `(zone, epoch)` per session.
 pub const RECHECK_MAX_ATTEMPTS: u32 = 3;
+/// Most automatic re-checks of ANY slots per session. A forged `zk` tag can
+/// name endless fresh `(zone, epoch)` slots, so the per-slot bound alone does
+/// not limit relay reads or signer work; this global budget does.
+pub const RECHECK_SESSION_BUDGET: u32 = 4;
 /// Least time between automatic re-checks of one slot (ms).
 pub const RECHECK_GAP_MS: f64 = 60_000.0;
 
@@ -309,6 +313,11 @@ pub fn recheck_due(state: Option<RecheckState>, now_ms: f64) -> bool {
         None => true,
         Some(s) => s.attempts < RECHECK_MAX_ATTEMPTS && now_ms - s.last_ms >= RECHECK_GAP_MS,
     }
+}
+
+/// Whether the session-wide automatic re-check budget allows another.
+pub fn recheck_budget_left(used: u32) -> bool {
+    used < RECHECK_SESSION_BUDGET
 }
 
 /// The `(zone, epoch)` slots that posts name (`seen`) and `held` does not
@@ -775,6 +784,13 @@ mod recheck_tests {
             last_ms: 0.0,
         };
         assert!(!recheck_due(Some(spent), 1e12), "bounded per session");
+    }
+
+    #[test]
+    fn the_session_budget_caps_automatic_rechecks_across_slots() {
+        assert!(recheck_budget_left(0));
+        assert!(recheck_budget_left(RECHECK_SESSION_BUDGET - 1));
+        assert!(!recheck_budget_left(RECHECK_SESSION_BUDGET));
     }
 
     #[test]
