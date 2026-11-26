@@ -346,6 +346,22 @@ issuer = ""                                            # set your issuer pubkey 
 shared_venues = ["primary", "secondary"]
 
 
+# ─── Link previews ───────────────────────────────────────────────────────────
+# Sites the preview worker may fetch when a member posts a link. Each entry is a
+# bare hostname and covers its subdomains; a link to any other site shows as a
+# plain link. Redirects are checked too, so list both ends (youtu.be and
+# youtube.com). Projected into the preview worker's wrangler [vars] as
+# PREVIEW_ALLOWED_HOSTS (comma-separated). Leave it empty to turn previews off.
+[preview]
+allowed_hosts = [
+  "example.com",        # your own site
+  "wikipedia.org",
+  "github.com",
+  "youtube.com", "youtu.be",
+  "twitter.com", "x.com",
+]
+
+
 # ─── Poker tables ────────────────────────────────────────────────────────────
 # OPTIONAL. Table parameters for the poker UI (shown only when
 # [features] poker = true). Stakes and buy-in are in BIG BLINDS so one table
