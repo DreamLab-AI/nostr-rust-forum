@@ -166,16 +166,21 @@ fn PendingApprovals(refresh: RwSignal<u64>) -> impl IntoView {
         // Drop the row optimistically; the next check recomputes the set.
         drop_rows(&[(zone, pubkey)]);
     };
+    let admin = use_admin();
     let approve_all = move |targets: Vec<(String, String)>| {
+        let roster: HashMap<String, (Option<String>, Vec<String>)> =
+            admin.state.users.with_untracked(|users| {
+                users
+                    .iter()
+                    .map(|u| {
+                        let name = u.display_name.clone().or_else(|| u.handle.clone());
+                        (u.pubkey.to_ascii_lowercase(), (name, u.cohorts.clone()))
+                    })
+                    .collect()
+            });
+        let ask = approve_all_summary(&targets, &roster, APPROVE_ALL_LISTED);
         let ok = web_sys::window()
-            .and_then(|w| {
-                w.confirm_with_message(&format!(
-                    "Approve and send zone keys to all {} listed member(s)? Confirm only if you \
-                     recognise every one: a compromised relay could have added a pubkey.",
-                    targets.len()
-                ))
-                .ok()
-            })
+            .and_then(|w| w.confirm_with_message(&ask).ok())
             .unwrap_or(false);
         if !ok {
             return;
@@ -279,6 +284,87 @@ fn PendingApprovals(refresh: RwSignal<u64>) -> impl IntoView {
         }}
     }
     .into_any()
+}
+
+/// How many pending members the "Approve all" confirmation lists by name.
+const APPROVE_ALL_LISTED: usize = 20;
+
+/// A roster display name made safe for one line of a plain-text dialog:
+/// control characters (a newline could forge a line of the list) become
+/// spaces, and the result is capped at 40 characters.
+fn one_line_name(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.chars().count() > 40 {
+        format!("{}…", clean.chars().take(39).collect::<String>())
+    } else {
+        clean
+    }
+}
+
+/// The "Approve all" confirmation: every `(zone, pubkey)` in `targets`,
+/// grouped by zone, each with its display name (where `roster` has one), the
+/// first eight hex characters of its key and its cohorts. At most `cap`
+/// members are listed; the rest are counted, so an unexpected key is
+/// noticeable without a dialog too long to read.
+fn approve_all_summary(
+    targets: &[(String, String)],
+    roster: &HashMap<String, (Option<String>, Vec<String>)>,
+    cap: usize,
+) -> String {
+    let members: HashSet<&String> = targets.iter().map(|(_, pk)| pk).collect();
+    let mut by_zone: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    for (zone, pk) in targets {
+        let prefix = pk.get(..8).unwrap_or(pk);
+        let line = match roster.get(&pk.to_ascii_lowercase()) {
+            Some((name, cohorts)) => {
+                let name = name.as_deref().map(one_line_name).unwrap_or_default();
+                let cohorts = if cohorts.is_empty() {
+                    "no cohort".to_string()
+                } else {
+                    cohorts
+                        .iter()
+                        .map(|c| one_line_name(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                format!("{name} ({prefix}…) · {cohorts}")
+            }
+            None => format!("({prefix}…) · not in the member list"),
+        };
+        by_zone.entry(zone.as_str()).or_default().push(line);
+    }
+    let mut lines = vec![
+        format!(
+            "Approve and send zone keys: {} grant(s) to {} member(s)? Confirm only if you \
+             recognise every one: a compromised relay could have added a pubkey.",
+            targets.len(),
+            members.len()
+        ),
+        String::new(),
+    ];
+    let mut listed = 0;
+    for (zone, mut entries) in by_zone {
+        if listed >= cap {
+            break;
+        }
+        entries.sort();
+        lines.push(format!("{zone}:"));
+        for e in entries.into_iter().take(cap - listed) {
+            lines.push(format!("  {}", e.trim_start()));
+            listed += 1;
+        }
+    }
+    let rest = targets.len() - listed;
+    if rest > 0 {
+        lines.push(format!(
+            "…and {rest} more not listed here. Approve them one at a time below to check each."
+        ));
+    }
+    lines.join("\n")
 }
 
 /// The confirmation shown before a new key is created (`rotate` false) or
@@ -1040,6 +1126,56 @@ mod tests {
             "{ask}"
         );
         assert!(ask.contains("4 member(s) get nothing for now"), "{ask}");
+    }
+
+    #[test]
+    fn approve_all_lists_each_member_by_zone_with_name_key_and_cohorts() {
+        let pk = |c: char| c.to_string().repeat(64);
+        let roster = HashMap::from([
+            (
+                pk('b'),
+                (Some("Alice".to_string()), vec!["family".to_string()]),
+            ),
+            (
+                pk('c'),
+                // A name that tries to forge a line of its own.
+                (
+                    Some("Mallory\n  Bob (dddddddd…) · family".to_string()),
+                    vec!["family".to_string(), "business".to_string()],
+                ),
+            ),
+        ]);
+        let targets = vec![
+            ("zone3".to_string(), pk('c')),
+            ("zone2".to_string(), pk('b')),
+            ("zone3".to_string(), pk('b')),
+            ("zone3".to_string(), pk('e')),
+        ];
+        let text = approve_all_summary(&targets, &roster, 20);
+        assert!(text.contains("4 grant(s) to 3 member(s)"), "{text}");
+        let zone2 = text.find("zone2:").expect("zone2 group");
+        let zone3 = text.find("zone3:").expect("zone3 group");
+        assert!(zone2 < zone3, "zones in order: {text}");
+        assert_eq!(text.matches("zone3:").count(), 1, "one header per zone");
+        assert!(text.contains("Alice (bbbbbbbb…) · family"), "{text}");
+        assert!(
+            text.contains("(eeeeeeee…) · not in the member list"),
+            "{text}"
+        );
+        assert!(text.contains("family, business"), "{text}");
+        // A display name cannot add a line to the list.
+        assert!(!text.contains("\n  Bob"), "{text}");
+    }
+
+    #[test]
+    fn approve_all_caps_the_list_and_says_how_many_are_not_shown() {
+        let roster = HashMap::new();
+        let targets: Vec<(String, String)> = (0..25)
+            .map(|i| ("zone3".to_string(), format!("{i:064x}")))
+            .collect();
+        let text = approve_all_summary(&targets, &roster, 20);
+        assert_eq!(text.matches("not in the member list").count(), 20, "{text}");
+        assert!(text.contains("and 5 more not listed"), "{text}");
     }
 
     #[test]
