@@ -87,6 +87,8 @@ Reading them:
   after sign-in, so the first encrypted messages of a cold load can show placeholders briefly.
 - A device with no deletion marker fetches the newest 1,000 deletions once, as before, then only newer ones. A cold link into
   an encrypted zone can still say "Topic Not Found" for some seconds before correcting itself (KF-23).
+  Note 2026-11-23: from kit `fd31193` (PR #98, tag `v1.0.0-beta.21-rc.3`) such a link shows "Fetching your keys for this
+  zone…" until the keys arrive instead; KF-23 is closed.
 - Admins creating or rotating a zone key are told when another account on the same browser holds a higher epoch, and are
   asked to confirm when posts name an epoch above the one about to be minted.
 

@@ -117,6 +117,13 @@ pub enum ToCitizen {
         commit: String,
         /// The action, seat 0.
         action: Action,
+        /// How many log entries the hand had when the hero chose this
+        /// action. The citizen applies it only to a hand of exactly that
+        /// length, so a copy the relay streams again later never lands on
+        /// a later turn. `None` from a client that does not say, which the
+        /// citizen accepts as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        log_len: Option<usize>,
     },
     /// The hero paid a settlement it owed.
     Paid {
@@ -267,6 +274,24 @@ pub enum ToHero {
         /// What the hand owes from the recipient's side: `Hero` is the
         /// recipient, `Citizen` the opponent; `None` for a split pot.
         settlement: Option<Settlement>,
+    },
+    /// The hand was voided and no funds move for it: the house could not
+    /// carry it on (it restarted and the saved hand did not prove itself,
+    /// or it could not take its own turn). The secret and nonces are
+    /// revealed, with the log, so the deal can still be checked.
+    Voided {
+        /// The hand.
+        commit: String,
+        /// Why, in words.
+        why: String,
+        /// The citizen's secret, 64 hex.
+        secret: String,
+        /// The players' nonces as the citizen received them.
+        nonces: Vec<String>,
+        /// The seed the hand was dealt from.
+        seed: String,
+        /// The hand log up to the void.
+        log: Vec<LogEntry>,
     },
     /// The citizen paid a settlement it owed.
     Paid {

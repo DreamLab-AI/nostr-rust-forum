@@ -43,7 +43,8 @@ const MAX_CONTENT_SIZE: usize = 64 * 1024;
 const MAX_REGISTRATION_CONTENT_SIZE: usize = 8 * 1024;
 const MAX_TAG_COUNT: usize = 2000;
 const MAX_TAG_VALUE_SIZE: usize = 1024;
-const MAX_TIMESTAMP_DRIFT: u64 = 60 * 60 * 24 * 7; // 7 days
+// The relay's bound, from the one constant it is defined from (7 days).
+const MAX_TIMESTAMP_DRIFT: u64 = nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS;
 
 #[test]
 fn max_content_size_is_64kb() {

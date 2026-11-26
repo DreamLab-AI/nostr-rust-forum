@@ -43,28 +43,8 @@ pub async fn ensure_schema(env: &Env) {
         let _ = db.prepare(stmt).run().await;
     }
 
-    // --- NIP-1984 standard report events (kind-1984) --------------------
-    // Populated by the relay-worker when it stores kind-1984 events.
-    // The auth-worker reads from this table at GET /api/moderation/reports.
-    let _ = db
-        .prepare(
-            "CREATE TABLE IF NOT EXISTS nip1984_reports (\
-                event_id TEXT PRIMARY KEY, \
-                pubkey TEXT NOT NULL, \
-                created_at INTEGER NOT NULL, \
-                content TEXT NOT NULL DEFAULT '', \
-                tags_json TEXT NOT NULL DEFAULT '[]'\
-            )",
-        )
-        .run()
-        .await;
-    let _ = db
-        .prepare(
-            "CREATE INDEX IF NOT EXISTS idx_nip1984_reports_created \
-             ON nip1984_reports(created_at DESC)",
-        )
-        .run()
-        .await;
+    // The dead `nip1984_reports` table (never written) was dropped; kind-1984
+    // reports live in the relay's `reports` table (see migration 0005).
 
     // --- WI-2: moderation tables + indexes ------------------------------
     let mod_stmts = [

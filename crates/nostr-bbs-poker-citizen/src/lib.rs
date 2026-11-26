@@ -12,12 +12,15 @@
 //! ([`chain::select`]) — with the memo `hand:<root>`
 //! ([`nostr_bbs_poker::rules`]): the member signs theirs in the browser;
 //! the house signs its own with the key it holds. The chain is the ledger;
-//! the house keeps a small book ([`ledger`]) of what is not yet on it.
+//! the house keeps a book ([`ledger`]) of what is not yet on it, saved
+//! with the hands in play in one state file ([`state`]).
 //!
 //! | Module | Does |
 //! |---|---|
+//! | [`alert`] | Alerts for the operator: stderr always, a rate-limited DM when an alert pubkey is set |
 //! | [`table`] | The state machine: messages in, messages and effects out; every money rule |
 //! | [`ledger`] | What members owe, what the house owes, what it paid today; saved as JSON |
+//! | [`state`] | What is saved between runs: the ledger, the hands in play, the events already acted on |
 //! | [`chain`] | The two chain locks; replay the producer's blocks, read asset balances and `hand:` payments, build payouts |
 //! | [`coach`] | The practice table's coach: the request, the question to the model, the reply (binary `nostr-bbs-poker-coach`) |
 //! | [`net`] | One authenticated connection to the forum relay (native only), shared by both binaries |
@@ -35,9 +38,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod alert;
 pub mod chain;
 pub mod coach;
 pub mod ledger;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod net;
+pub mod state;
 pub mod table;

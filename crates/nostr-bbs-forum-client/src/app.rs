@@ -846,7 +846,10 @@ pub fn App() -> impl IntoView {
             if !store.ready_for(Some(&me)) {
                 return;
             }
-            store.start_grant_sync(&relay_for_keys, signer, me);
+            // A NIP-07 extension can refuse a decrypt (a denied prompt), so its
+            // failures are retried rather than taken as unreadable wraps.
+            let can_refuse = auth_for_keys.state.with_untracked(|s| s.is_nip07);
+            store.start_grant_sync(&relay_for_keys, signer, me, can_refuse);
         });
     }
 

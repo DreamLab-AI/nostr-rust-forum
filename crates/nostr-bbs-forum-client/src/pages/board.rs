@@ -61,8 +61,10 @@ enum PendingState {
 struct BoardCtx {
     /// Kanban 31402 requests by event id (admins respond to these).
     approval_requests: RwSignal<HashMap<String, NostrEvent>>,
-    /// 31403 decisions: request event id -> approved.
-    decisions: RwSignal<HashMap<String, bool>>,
+    /// Kanban 31403 decisions by the request event id they bind to (via
+    /// `decision_request_link`). Kept as events so the badge can apply the
+    /// relay's rules (admin signer, latest wins, no self-review).
+    decisions: RwSignal<HashMap<String, Vec<NostrEvent>>>,
     /// Card currently being dragged (HTML5 drag-and-drop). Set on `dragstart`
     /// by the card, consumed on `drop` by the target column.
     dragging: RwSignal<Option<KanbanCard>>,
@@ -95,6 +97,18 @@ fn publish_with_toast(
 /// Current unix seconds (also used as an append-to-bottom rank).
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
+}
+
+/// Whether this signing key may skip the approval request flow. The relay
+/// exempts an admin by the RAW signer key, so an admin account signing with a
+/// different key (a device key) is gated like a member there; the client must
+/// raise the request in that case or the relay refuses the move.
+fn signs_as_admin(
+    account_is_admin: bool,
+    account_pubkey: Option<&str>,
+    signer_pubkey: &str,
+) -> bool {
+    account_is_admin && account_pubkey.is_some_and(|a| a.eq_ignore_ascii_case(signer_pubkey))
 }
 
 /// Move `card` into `target_col`, honouring the approval gate: a direct move
@@ -382,7 +396,10 @@ pub fn BoardPage() -> impl IntoView {
             KIND_ACTION_RESPONSE => {
                 if let Some(decision) = parse_approval_decision(&event) {
                     ctx.decisions.update(|map| {
-                        map.insert(decision.request_id, decision.approved);
+                        let list = map.entry(decision.request_id).or_default();
+                        if !list.iter().any(|e| e.id == event.id) {
+                            list.push(event);
+                        }
                     });
                 }
             }
@@ -558,6 +575,7 @@ pub fn BoardPage() -> impl IntoView {
                                 };
                                 let cards = active_cards.get();
                                 let decisions_map = ctx.decisions.get();
+                                let requests_map = ctx.approval_requests.get();
                                 let admin = is_admin.get();
                                 board
                                     .columns
@@ -566,22 +584,13 @@ pub fn BoardPage() -> impl IntoView {
                                         let col_id = col.id.clone();
                                         let col_name = col.name.clone();
                                         let needs_approval = board.column_needs_approval(&col_id);
-                                        // A card renders in its pending TARGET column
-                                        // once approved; otherwise it stays put.
+                                        // A card is always drawn in the column its
+                                        // `s` tag names. A pending move is only a
+                                        // badge there: nothing a writer copies onto
+                                        // a card can relocate it.
                                         let col_cards: Vec<KanbanCard> = cards
                                             .iter()
-                                            .filter(|c| {
-                                                let effective = match &c.pending_move {
-                                                    Some((target, req)) => {
-                                                        match decisions_map.get(req) {
-                                                            Some(true) => target.clone(),
-                                                            _ => c.column.clone(),
-                                                        }
-                                                    }
-                                                    None => c.column.clone(),
-                                                };
-                                                effective == col_id
-                                            })
+                                            .filter(|c| c.column == col_id)
                                             .cloned()
                                             .collect();
                                         let count = col_cards.len();
@@ -608,13 +617,20 @@ pub fn BoardPage() -> impl IntoView {
                                                 return;
                                             };
                                             let relay = relay_for_dnd.get_value();
+                                            let signer_pk = signer.public_key().to_string();
+                                            let account_for_drop = auth_for_drop.pubkey().get_untracked();
                                             spawn_move(
                                                 relay,
                                                 toasts,
                                                 signer,
                                                 card,
                                                 drop_col.clone(),
-                                                drop_approval && !admin,
+                                                drop_approval
+                                                    && !signs_as_admin(
+                                                        admin,
+                                                        account_for_drop.as_deref(),
+                                                        signer_pk.as_str(),
+                                                    ),
                                             );
                                         };
                                         view! {
@@ -646,13 +662,27 @@ pub fn BoardPage() -> impl IntoView {
                                                     {col_cards
                                                         .into_iter()
                                                         .map(|card| {
+                                                            // Same rules as the relay gate; the
+                                                            // client has no admin set, so the
+                                                            // signer check is left to the relay.
                                                             let pending_state = card
                                                                 .pending_move
                                                                 .as_ref()
-                                                                .map(|(_, req)| match decisions_map.get(req) {
-                                                                    Some(true) => PendingState::Approved,
-                                                                    Some(false) => PendingState::Rejected,
-                                                                    None => PendingState::Awaiting,
+                                                                .and_then(|(_, req)| {
+                                                                    nostr_bbs_core::evaluate_pending_move(
+                                                                        &card,
+                                                                        requests_map.get(req),
+                                                                        decisions_map
+                                                                            .get(req)
+                                                                            .map(Vec::as_slice)
+                                                                            .unwrap_or(&[]),
+                                                                        |_| true,
+                                                                    )
+                                                                })
+                                                                .map(|s| match s {
+                                                                    nostr_bbs_core::PendingMoveState::Approved => PendingState::Approved,
+                                                                    nostr_bbs_core::PendingMoveState::Rejected => PendingState::Rejected,
+                                                                    nostr_bbs_core::PendingMoveState::Awaiting => PendingState::Awaiting,
                                                                 });
                                                             view! {
                                                                 <CardView
@@ -819,7 +849,9 @@ fn CardView(
                 toasts.show("Not authenticated", ToastVariant::Error);
                 return;
             };
-            let needs_approval = approval_columns.contains(&target_col) && !is_admin;
+            let account = auth.pubkey().get_untracked();
+            let needs_approval = approval_columns.contains(&target_col)
+                && !signs_as_admin(is_admin, account.as_deref(), signer.public_key());
             spawn_move(
                 relay.clone(),
                 toasts,
@@ -1558,5 +1590,18 @@ fn CreateCardForm(board: KanbanBoard, on_close: Callback<()>) -> impl IntoView {
                 </button>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signs_as_admin;
+
+    #[test]
+    fn admin_skips_the_request_flow_only_when_the_signer_is_the_account_key() {
+        assert!(signs_as_admin(true, Some("ab12"), "AB12"));
+        assert!(!signs_as_admin(true, Some("ab12"), "device-key"));
+        assert!(!signs_as_admin(false, Some("ab12"), "ab12"));
+        assert!(!signs_as_admin(true, None, "ab12"));
     }
 }

@@ -42,7 +42,7 @@ pub(crate) const RECIPIENT_KEYS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS r
 pub(crate) const RECIPIENT_KEYS_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_recipient_keys_owner ON recipient_keys(owner_pubkey)";
 
-/// Migration 0012. Idempotent in effect: on a table that already has the column
+/// Migration 0013. Idempotent in effect: on a table that already has the column
 /// SQLite returns a duplicate-column error, which `ensure_schema` ignores.
 pub(crate) const RECIPIENT_KEYS_ADD_PROOF_SQL: &str =
     "ALTER TABLE recipient_keys ADD COLUMN proof TEXT";

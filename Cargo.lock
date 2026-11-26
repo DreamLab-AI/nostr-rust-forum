@@ -3353,6 +3353,8 @@ dependencies = [
  "sidestr-wallet",
  "solid-pod-rs",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
  "unicode-normalization",
  "uuid",
  "wasm-bindgen",

@@ -13,6 +13,7 @@
 //! | [`rules`] | Stakes, settlement, the `hand:<root>` memo, RFC 8785 roots, the HAND.md record types | forum client `wallet::poker` |
 //! | [`record`] | An engine hand → a HAND.md record | — |
 //! | [`protocol`] | The member ↔ house messages | — |
+//! | [`bind`] | Check a hand's reported settlement and opponent against the verified replay, and derive the payment from it | — |
 //! | [`verify`] | Replay a finished hand from its seed and check the house played by the book | — |
 //!
 //! # The table, in one paragraph
@@ -67,6 +68,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod bind;
 pub mod bots;
 pub mod engine;
 pub mod fair;

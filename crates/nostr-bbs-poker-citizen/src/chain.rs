@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use crate::ledger::TxOnChain;
 use bitcoin::{OutPoint, Script, ScriptBuf, Transaction, Txid};
 use sidestr_agent::AgentKey;
 use sidestr_core::assets::{AssetView, Outcome};
@@ -245,6 +246,9 @@ pub struct Facts {
     pub hand_payments: BTreeMap<String, BTreeMap<String, u64>>,
     /// Every transaction id on the chain.
     pub txids: HashSet<String>,
+    /// The transactions on the chain that the assets rule rejected: their
+    /// coins are spent and the asset did not move.
+    pub invalid_txids: HashSet<String>,
 }
 
 impl std::fmt::Debug for Facts {
@@ -319,14 +323,14 @@ pub fn scan(
     now: Option<u32>,
 ) -> Result<Facts, String> {
     let family = doc.family().map_err(|e| format!("chain document: {e}"))?;
-    let (state, assets, hand_payments, txids) = match family {
+    let (state, assets, hand_payments, txids, invalid_txids) = match family {
         Family::Stock => {
-            let (s, a, h, t) = scan_in::<Stock>(doc, &asset, dat, now)?;
-            (ChainState::Stock(s), a, h, t)
+            let (s, a, h, t, i) = scan_in::<Stock>(doc, &asset, dat, now)?;
+            (ChainState::Stock(s), a, h, t, i)
         }
         Family::Blake2b => {
-            let (s, a, h, t) = scan_in::<Blake2bV2>(doc, &asset, dat, now)?;
-            (ChainState::Blake2b(s), a, h, t)
+            let (s, a, h, t, i) = scan_in::<Blake2bV2>(doc, &asset, dat, now)?;
+            (ChainState::Blake2b(s), a, h, t, i)
         }
     };
     Ok(Facts {
@@ -335,6 +339,7 @@ pub fn scan(
         asset,
         hand_payments,
         txids,
+        invalid_txids,
     })
 }
 
@@ -342,6 +347,7 @@ type Scanned<F> = (
     StateOf<F>,
     AssetView,
     BTreeMap<String, BTreeMap<String, u64>>,
+    HashSet<String>,
     HashSet<String>,
 );
 
@@ -353,10 +359,14 @@ fn scan_in<F: HeaderFamily>(
 ) -> Result<Scanned<F>, String> {
     let mut hand_payments: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     let mut txids = HashSet::new();
+    let mut invalid_txids = HashSet::new();
     let (state, assets) = replay_in::<F>(doc, dat, now, |txdata, outcomes| {
         for tx in txdata {
             let txid = tx.compute_txid();
             txids.insert(txid.to_string());
+            if outcomes.iter().any(|o| o.txid == txid && o.error.is_some()) {
+                invalid_txids.insert(txid.to_string());
+            }
             let Some(root) = records_of(tx)
                 .into_iter()
                 .find_map(|(_, t)| nostr_bbs_poker::rules::parse_hand_memo(&t).map(str::to_string))
@@ -403,7 +413,7 @@ fn scan_in<F: HeaderFamily>(
             }
         }
     })?;
-    Ok((state, assets, hand_payments, txids))
+    Ok((state, assets, hand_payments, txids, invalid_txids))
 }
 
 impl Facts {
@@ -424,6 +434,29 @@ impl Facts {
             .filter_map(|c| self.assets.carried(&c.outpoint))
             .filter_map(|carry| carry.get(&self.asset))
             .sum()
+    }
+
+    /// What the chain shows of the transaction `txid`.
+    pub fn tx_state(&self, txid: &str) -> TxOnChain {
+        if self.invalid_txids.contains(txid) {
+            TxOnChain::Invalid
+        } else if self.txids.contains(txid) {
+            TxOnChain::Valid
+        } else {
+            TxOnChain::NotSeen
+        }
+    }
+
+    /// Whether every coin in `outpoints` (`txid:vout`) is still unspent at
+    /// the tip among those `script` holds. A coin that cannot be read as an
+    /// outpoint counts as unspent: the only thing that permits signing a
+    /// replacement payout is proof the coins went elsewhere.
+    pub fn all_unspent(&self, script: &Script, outpoints: &[String]) -> bool {
+        let coins = self.state.coins(script);
+        outpoints.iter().all(|o| match o.parse::<OutPoint>() {
+            Ok(op) => coins.iter().any(|c| c.outpoint == op),
+            Err(_) => true,
+        })
     }
 
     /// Whether the chain shows the asset's issue.
@@ -517,6 +550,15 @@ mod tests {
             Some(pk.as_str())
         );
         assert!(script_of("abc").is_none());
+        // the house's own script is the one its pubkey pays on every chain,
+        // which is what a member's wallet pays and what the ledger matches
+        let key = AgentKey::parse(&"11".repeat(32)).unwrap();
+        let pk = hex::encode(key.pubkey().serialize());
+        assert_eq!(key.script(), script_of(&pk).unwrap());
+        assert_eq!(
+            pubkey_of_script(&key.script()).as_deref(),
+            Some(pk.as_str())
+        );
         assert_eq!(
             parse_asset(DREAM_ASSET_ID).unwrap().to_string(),
             DREAM_ASSET_ID
@@ -603,6 +645,32 @@ mod tests {
         assert!(
             facts.units_of("f6b84686a2323a233e99c60ed79a59d3ec45289fec58a4c359997e551b0326b0") > 0
         );
+        // the coins a key holds are unspent; a coin that is not there, or
+        // is not named well, is judged as the hold-or-replace rule needs
+        let holder =
+            script_of("f6b84686a2323a233e99c60ed79a59d3ec45289fec58a4c359997e551b0326b0").unwrap();
+        let coins = facts.state.coins(&holder);
+        let held: Vec<String> = coins.iter().map(|c| c.outpoint.to_string()).collect();
+        assert!(!held.is_empty());
+        assert!(facts.all_unspent(&holder, &held));
+        let gone = format!("{}:0", "ab".repeat(32));
+        assert!(!facts.all_unspent(&holder, &[held[0].clone(), gone]));
+        assert!(facts.all_unspent(&holder, &["not an outpoint".to_string()]));
+        assert!(facts.all_unspent(&holder, &[]));
+        // what the chain shows of a transaction
+        let on_chain = facts
+            .txids
+            .iter()
+            .next()
+            .expect("a chain has transactions")
+            .clone();
+        assert_eq!(facts.tx_state(&on_chain), TxOnChain::Valid);
+        assert_eq!(facts.tx_state(&"9".repeat(64)), TxOnChain::NotSeen);
+        // one the assets rule rejected is told apart from one it accepted
+        let mut facts = facts;
+        let rejected = on_chain;
+        facts.invalid_txids.insert(rejected.clone());
+        assert_eq!(facts.tx_state(&rejected), TxOnChain::Invalid);
         let blakes7 = parse_asset(&"07".repeat(32)).unwrap();
         let facts = scan(
             DREAMLAB_TXBT4.document().unwrap(),

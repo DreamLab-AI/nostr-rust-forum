@@ -422,6 +422,19 @@ pub fn first_step(since: Option<u64>, rows: usize, oldest: Option<u64>) -> PageS
 ///   rows. Give up.
 /// - Otherwise page on from the new oldest, up to [`MAX_PAGES`].
 pub fn next_page(rows: usize, oldest: Option<u64>, until: u64, pages_done: u32) -> PageStep {
+    next_page_within(rows, oldest, until, pages_done, MAX_PAGES)
+}
+
+/// [`next_page`] with the page bound given: the same rule for another
+/// paged sync over the same relay query (the grant sync,
+/// `zone_crypto::grant_paging`), which bounds its pages separately.
+pub fn next_page_within(
+    rows: usize,
+    oldest: Option<u64>,
+    until: u64,
+    pages_done: u32,
+    max_pages: u32,
+) -> PageStep {
     let Some(oldest) = oldest.filter(|_| rows > 0) else {
         return PageStep::GiveUp;
     };
@@ -432,7 +445,7 @@ pub fn next_page(rows: usize, oldest: Option<u64>, until: u64, pages_done: u32) 
             PageStep::Done
         };
     }
-    if pages_done >= MAX_PAGES {
+    if pages_done >= max_pages {
         return PageStep::GiveUp;
     }
     PageStep::Next { until: oldest }

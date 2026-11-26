@@ -36,16 +36,18 @@ storage and response types:
 
 ## Staged Phase 1 consumer surface
 
-The following stub modules are wired in `nostr-bbs-pod-worker/src/lib.rs` behind
-the `solid-pod-rs-phase1` cargo feature. They remain Worker-portability markers
-because the native upstream implementations are not directly linkable in
+The following stub module is wired in `nostr-bbs-pod-worker/src/lib.rs` behind
+the `solid-pod-rs-phase1` cargo feature. It remains a Worker-portability marker
+because the native upstream implementation is not directly linkable in
 `wasm32-unknown-unknown`.
 
 | NRF stub file | Anticipated solid-pod-rs symbol | Role on activation |
 | --- | --- | --- |
-| `nostr-bbs-pod-worker/src/key_provisioning.rs` | `solid_pod_rs::idp::key_provisioning::*` | Re-export shim (public API) for the Schnorr keypair signup helper |
 | `nostr-bbs-pod-worker/src/export.rs` | `solid_pod_rs::export::PodExportBundle` (+ helpers) | Re-export shim (public API) for the time-chain JSON-LD export bundle |
-| `nostr-bbs-pod-worker/src/nip05_endpoint.rs` | `solid_pod_rs::nip05::endpoint::*` (handler helpers) | Re-export shim (public API) for the pod-resident `/.well-known/nostr.json` route. Distinct from the existing `verify_nip05` builder. |
+
+> Note 2026-11-23: this table also listed `src/key_provisioning.rs` and `src/nip05_endpoint.rs`. Both shims were removed
+> at closeout (2026-07-03): CF-native code already serves those paths (`provision.rs` and the pod worker's
+> `/.well-known/nostr.json` handler), per the comment at `nostr-bbs-pod-worker/src/lib.rs:37-40`.
 
 ## Notes
 

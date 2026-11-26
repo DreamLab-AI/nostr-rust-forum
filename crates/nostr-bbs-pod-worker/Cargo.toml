@@ -17,8 +17,11 @@ crate-type = ["cdylib"]
 
 [features]
 # JSS Phase 1 forward-compat alias (ADR-086, consumer-surface-map.md).
-# Activates the upstream Phase 1 feature trio and unlocks the stub modules
-# in `src/{key_provisioning,export,nip05_endpoint}.rs`.
+# Activates the upstream Phase 1 feature trio. The only module it gates is the
+# inert re-export shim `src/export.rs`; the `key_provisioning` and
+# `nip05_endpoint` shims were removed at closeout (2026-07-03, see `src/lib.rs`).
+# Upstream `provision-keys` and `export-jsonld` enable `tokio-runtime`, so this
+# alias builds natively only, not for the wasm32 worker target.
 solid-pod-rs-phase1 = [
     "solid-pod-rs/provision-keys",
     "solid-pod-rs/nip05-endpoint",

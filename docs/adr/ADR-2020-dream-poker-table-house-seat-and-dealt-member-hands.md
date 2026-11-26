@@ -45,9 +45,22 @@ times on the calendar, and invitations to real players.
 4. **Settlement is one DREAM transfer per hand, `hand:<root>` beside the tally**, from the loser to the
    winner (`rules::settlement`): the member's browser signs its own from the wallet at once; the house
    signs its own with its key through the local producer. No forum event kind, no ledger: the chain is
-   the ledger (ADR-2012). The house keeps a small JSON book of what is not yet on the chain, refuses
-   to deal to a member who owes for a hand the chain has not shown paid (a reported transfer id buys a
-   grace period), and stops paying out at a daily cap.
+   the ledger (ADR-2012). The house keeps one state file (`--state`, written whole by an atomic rename,
+   mode 0600 because it holds each live hand's deck secret and nonces) with the book of what is not yet
+   on the chain, the hands in play and the relay events already acted on, so a restart resumes a hand
+   where it stood and voids, with a `Voided` message that reveals the secret and log so the deal can
+   still be checked, one that no longer proves itself. It refuses to deal to a member who owes for a hand
+   the chain has not shown paid (a reported transfer id buys a grace period), reserves each house hand's
+   buy-in while it is in play, and stops paying out at a daily cap. A payout is signed once per hand
+   and saved before it is sent; every retry sends the same bytes, and the debt stays owed until
+   `hand:<root>` shows on-chain. A payout the chain shows rejected is replaced once through the cap
+   check; a second rejection, or too many replacements, halts the debt: no payout is signed, its amount
+   stays held back from new buy-ins, and only an operator paying the member on-chain with the memo
+   `hand:<root>` clears it (there is no unhalt command). A halted debt, and a producer that keeps
+   refusing a payout, raise an alert: stderr always, and with `--alert-pubkey`
+   (`POKER_CITIZEN_ALERT_PUBKEY`) a NIP-17 direct message, gift-wrapped (NIP-59), to that operator
+   key, once per debt and cause per window and capped overall, plus one summary at startup when
+   any debt is halted.
 5. **Transport is NIP-59 gift wrap of rumor kind 20779** (Libre Poker's table kind) on the forum relay,
    so DM inboxes never show a hand; `nostr-bbs-core` gift wrap takes the rumor kind as a parameter.
    The relay's recipient-whitelist gate means the house key must be whitelisted.
@@ -78,6 +91,10 @@ pin moves them together. The practice table is unchanged for an instance without
   wasm32-unknown-unknown` for the two new crates clean.
 - `grep -rn RUMOR_KIND crates/` shows the one transport constant; `grep -rn citizen_pubkey
   crates/nostr-bbs-forum-client/src` shows the one extra gate.
+
+## Amendment 2026-11-23
+
+Decision 4's description of the house's book is brought up to date (state file, idempotent payouts, halting, `Voided`, operator alerts). No decision changes.
 
 ## Close-out 2026-10-30
 

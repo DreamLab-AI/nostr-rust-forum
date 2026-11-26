@@ -28,8 +28,9 @@ schema stays absent until activation. Keep it that way for this deploy.
 ## The one hard precondition: RELAY_URL
 
 The NIP-42 relay-tag check now **fails closed**. The shipped `wrangler.toml` has
-`RELAY_URL = ""`, and a relay deployed with it blank **refuses every
-authenticated write** and logs an error on each AUTH. This is deliberate
+`RELAY_URL = ""`, and a relay deployed with it blank **refuses every NIP-42
+AUTH**, so no client can authenticate and every authenticated write is refused;
+it logs an error on each AUTH. This is deliberate
 (ADR-2029 security review): the relay never derives its identity from the
 request. So `RELAY_URL` must be set in production **before** the relay deploys,
 or the board stops accepting posts and DMs.

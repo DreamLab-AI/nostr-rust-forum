@@ -50,7 +50,8 @@ use crate::http::{error_json, json_response};
 /// Worker var that gates the feature. Enabled only by the exact string `"true"`.
 pub const RECIPIENT_KEYS_ENABLED_VAR: &str = "RECIPIENT_KEYS_ENABLED";
 
-/// Event kind of the inbox-key proof-of-possession event.
+/// Event kind of the member-signed authorization of an inbox key (the proof
+/// that is stored and later re-verified by grant issuers).
 const RECIPIENT_KEY_PROOF_KIND: u64 = 27237;
 /// Kind of the possession proof, signed by the inbox key itself (distinct from
 /// the member-signed authorization so neither can be passed off as the other).
@@ -183,8 +184,8 @@ fn proof_tag<'a>(proof: &'a NostrEvent, name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-/// Verify an inbox-key proof: authored and signed by `key`, of the right kind,
-/// committing to `owner` and to a short forward-only `exp`.
+/// Verify an inbox-key authorization: authored and signed by `owner`, of the
+/// right kind, naming `key` in a `k` tag, with a short forward-only `exp`.
 ///
 /// `key` and `owner` must already be lowercase.
 fn verify_key_proof(

@@ -613,11 +613,43 @@ mod tests {
     #[test]
     fn keyless_member_settles() {
         let mut b = crate::zone_crypto::grant_backlog::GrantBacklog::new(false, 0.0);
-        b.identity_eose(500.0);
+        b.scope_delivered(
+            crate::zone_crypto::grant_paging::GrantScope::Identity,
+            true,
+            500.0,
+        );
         let keys = key_state(true, Some(b.phase(600.0)), false);
         assert_eq!(keys, KeyState::Settled);
         assert_eq!(Lookup::decide_with_keys(false, true, keys, false), NotFound);
         assert_eq!(Lookup::decide_with_keys(true, true, keys, false), Found);
+    }
+
+    /// The zone's only grant ended in a retryable failure (an unanswered
+    /// admin check, a refused NIP-07 prompt): the page must say the keys are
+    /// late, never "not found", which is what this page fix exists for.
+    #[test]
+    fn a_grant_left_to_retry_never_reads_as_not_found() {
+        use crate::zone_crypto::grant_backlog::{GrantBacklog, WrapOutcome, KEYS_STALL_MS};
+        use crate::zone_crypto::grant_paging::GrantScope;
+        for outcome in [WrapOutcome::Retry, WrapOutcome::Refused] {
+            let mut b = GrantBacklog::new(false, 0.0);
+            b.wrap_started();
+            b.scope_delivered(GrantScope::Identity, true, 500.0);
+            b.wrap_done(800.0, "grant", 1, outcome);
+            let early = key_state(true, Some(b.phase(900.0)), false);
+            assert_ne!(
+                Lookup::decide_with_keys(false, true, early, false),
+                NotFound,
+                "{outcome:?}"
+            );
+            let late = key_state(true, Some(b.phase(800.0 + KEYS_STALL_MS)), false);
+            assert_eq!(late, KeyState::Stalled, "{outcome:?}");
+            assert_ne!(
+                Lookup::decide_with_keys(false, true, late, false),
+                NotFound,
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]
