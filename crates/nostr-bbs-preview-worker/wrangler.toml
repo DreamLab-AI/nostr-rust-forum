@@ -17,6 +17,7 @@ ALLOWED_ORIGIN = "https://example.com"
 # Workers runtime cannot pin resolved IPs and a denylist alone is open to DNS
 # rebinding. List the sites your members link to; unlisted hosts get no preview.
 # Twitter/X previews fetch publish.twitter.com, which `twitter.com` covers.
-PREVIEW_ALLOWED_HOSTS = "example.com, wikipedia.org, github.com, youtube.com, twitter.com, x.com"
+# Redirect hops are checked too, so list both ends (youtu.be -> youtube.com).
+PREVIEW_ALLOWED_HOSTS = "example.com, wikipedia.org, github.com, youtube.com, youtu.be, twitter.com, x.com"
 # Local development only: PREVIEW_ALLOW_ANY_HOST = "true" with no allow-list
 # falls back to the denylist alone. Never set it on an internet-facing worker.

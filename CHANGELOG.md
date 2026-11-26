@@ -42,7 +42,7 @@ both cases. `tests/deep-link.test.mjs` drives the real script; CI now runs `node
 
 ### Jev transport: no redirects with the bearer key, response capped (2026-11-26)
 
-`nostr-bbs-jev` only (auth worker's rationale check is the one consumer).
+`nostr-bbs-jev` only; covers both consumers, the relay worker's triage call and the auth worker's rationale check.
 
 - `WorkersFetch` sends with `redirect: manual`. The request may carry `Authorization: Bearer <TYPESAFE_API_KEY>`; a
   followed redirect would have handed it to any host the upstream named. A 3xx now reaches `ask` as its status and
