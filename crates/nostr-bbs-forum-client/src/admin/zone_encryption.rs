@@ -36,7 +36,7 @@ use crate::stores::zones::{load_zones, Zone};
 use crate::utils::shorten_pubkey;
 use crate::zone_crypto::auto_grant::{
     gate_split, plan_grant_missing, plan_new_key, report_summary, send_grants, tab_gate, AutoGrant,
-    GateRecords, PendingReview, ZoneRule,
+    GateRecords, PendingReview, TabPlan, ZoneRule,
 };
 use crate::zone_crypto::store::{try_use_zone_key_store, ZoneKeyStore};
 use crate::zone_crypto::{generate_zone_key, grant_targets, ZoneKey, AGENT_COHORT};
@@ -87,9 +87,10 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
             .into_any();
     };
 
-    // Bumped when a card's action holds members back, so the approval list
-    // re-checks and shows them.
-    let refresh = RwSignal::new(0u64);
+    // Members a card's action held back, shown in the approval list straight
+    // away (re-checking would re-read the roster and look up every inbox key,
+    // one extension prompt per member for a NIP-07 admin).
+    let held = RwSignal::new(Held::default());
 
     if zones.is_empty() {
         return view! {
@@ -110,8 +111,8 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
                  when someone leaves so they cannot read anything posted afterwards. Agents get \
                  a key only in zones the operator configured with agent_keys."
             </p>
-            <PendingApprovals refresh=refresh />
-            {zones.into_iter().map(|z| view! { <ZoneKeyCard zone=z keys=keys members_ready=members_ready refresh=refresh /> }).collect_view()}
+            <PendingApprovals held=held />
+            {zones.into_iter().map(|z| view! { <ZoneKeyCard zone=z keys=keys members_ready=members_ready held=held /> }).collect_view()}
         </div>
     }
     .into_any()
@@ -131,7 +132,7 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
 /// listed apart as unverified (check again, or approve explicitly), and a
 /// failed check says so rather than showing an empty list.
 #[component]
-fn PendingApprovals(refresh: RwSignal<u64>) -> impl IntoView {
+fn PendingApprovals(held: RwSignal<Held>) -> impl IntoView {
     let Some(auto) = AutoGrant::capture() else {
         return ().into_any();
     };
@@ -142,18 +143,20 @@ fn PendingApprovals(refresh: RwSignal<u64>) -> impl IntoView {
 
     let check = move || {
         review.set(None);
+        // The fresh check covers whatever the cards held back.
+        held.set(Held::default());
         spawn_local(async move {
             let r = auto.get_value().pending_targets().await;
             let _ = review.try_set(Some(r));
         });
     };
-    // On mount, and again whenever a card's action held members back.
-    Effect::new(move |_| {
-        refresh.track();
-        check();
-    });
+    check();
 
     let drop_rows = move |done: &[(String, String)]| {
+        held.update(|h| {
+            h.pending.retain(|t| !done.contains(t));
+            h.unverified.retain(|t| !done.contains(t));
+        });
         review.update(|r| {
             if let Some(Ok(v)) = r {
                 v.pending.retain(|t| !done.contains(t));
@@ -220,7 +223,8 @@ fn PendingApprovals(refresh: RwSignal<u64>) -> impl IntoView {
                     >"Check again"</button>
                 </div>
             }.into_any(),
-            Some(Ok(v)) => {
+            Some(Ok(mut v)) => {
+                held.with(|h| h.merge_into(&mut v));
                 let PendingReview { pending, unverified, floor_blocked } = v;
                 let floors = (!floor_blocked.is_empty()).then(|| view! {
                     <div class="rounded border border-red-500/40 bg-red-500/5 p-4 space-y-1">
@@ -284,6 +288,44 @@ fn PendingApprovals(refresh: RwSignal<u64>) -> impl IntoView {
         }}
     }
     .into_any()
+}
+
+/// Members the cards' actions held back since the approval list last
+/// checked, merged into it without a fresh check.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Held {
+    pending: Vec<(String, String)>,
+    unverified: Vec<(String, String)>,
+}
+
+impl Held {
+    /// Remember what `plan` held back.
+    fn add(&mut self, plan: &TabPlan) {
+        for t in &plan.pending {
+            if !self.pending.contains(t) {
+                self.pending.push(t.clone());
+            }
+        }
+        for t in &plan.unverified {
+            if !self.unverified.contains(t) {
+                self.unverified.push(t.clone());
+            }
+        }
+    }
+
+    /// Add these members to `review`, once each.
+    fn merge_into(&self, review: &mut PendingReview) {
+        for t in &self.pending {
+            if !review.pending.contains(t) {
+                review.pending.push(t.clone());
+            }
+        }
+        for t in &self.unverified {
+            if !review.unverified.contains(t) {
+                review.unverified.push(t.clone());
+            }
+        }
+    }
 }
 
 /// How many pending members the "Approve all" confirmation lists by name.
@@ -426,7 +468,7 @@ fn ZoneKeyCard(
     zone: Zone,
     keys: ZoneKeyStore,
     members_ready: RwSignal<bool>,
-    refresh: RwSignal<u64>,
+    held: RwSignal<Held>,
 ) -> impl IntoView {
     let admin = use_admin();
     let auth = use_auth();
@@ -512,10 +554,9 @@ fn ZoneKeyCard(
     let gate: RwSignal<Option<GateRecords>> = RwSignal::new(None);
 
     // Reload "granted from this device" and the gate whenever the current
-    // epoch changes, or an action asks.
+    // epoch changes.
     let relay_for_ledger = relay.clone();
     Effect::new(move |_| {
-        refresh.track();
         let latest_key = latest();
         if latest_key.is_none() {
             sent.set(HashSet::new());
@@ -624,10 +665,10 @@ fn ZoneKeyCard(
         gate.with(|g| g.as_ref().map(|g| gate_split(&zone_id, m, &me, g)))
     };
 
-    // Ask the approval list (and this card's gate) to re-check: members were
-    // held back and should be listed.
-    let held_back = move || {
-        let _ = refresh.try_update(|n| *n = n.wrapping_add(1));
+    // List the members an action held back under "New members awaiting
+    // approval" (or as unverified).
+    let held_back = move |plan: &TabPlan| {
+        let _ = held.try_update(|h| h.add(plan));
     };
 
     // Send each `(key, recipients)` pair: one gift wrap per recipient, recorded
@@ -830,9 +871,7 @@ fn ZoneKeyCard(
                     let _ = gate.try_set(Some(g));
                     match keys.insert_local(key).await {
                         Ok(()) => {
-                            if pending + unverified > 0 {
-                                held_back();
-                            }
+                            held_back(&plan);
                             let note = plan.held_note();
                             grant(plan.grants, note)
                         }
@@ -935,10 +974,7 @@ fn ZoneKeyCard(
                                             |e| earlier.get(&e).cloned().unwrap_or_default(),
                                         );
                                         let _ = gate.try_set(Some(g));
-                                        let (pending, unverified) = plan.held();
-                                        if pending + unverified > 0 {
-                                            held_back();
-                                        }
+                                        held_back(&plan);
                                         let note = plan.held_note();
                                         grant.with_value(|f| f(plan.grants, note));
                                     });
@@ -1176,6 +1212,27 @@ mod tests {
         let text = approve_all_summary(&targets, &roster, 20);
         assert_eq!(text.matches("not in the member list").count(), 20, "{text}");
         assert!(text.contains("and 5 more not listed"), "{text}");
+    }
+
+    #[test]
+    fn members_a_card_held_back_are_listed_once() {
+        let t = |z: &str, c: char| (z.to_string(), c.to_string().repeat(64));
+        let plan = TabPlan {
+            grants: Vec::new(),
+            pending: vec![t("zone3", 'c'), t("zone3", 'f')],
+            unverified: vec![t("zone2", 'g')],
+        };
+        let mut held = Held::default();
+        held.add(&plan);
+        held.add(&plan);
+        assert_eq!(held.pending.len(), 2, "no duplicates");
+        let mut review = PendingReview {
+            pending: vec![t("zone3", 'c')],
+            ..PendingReview::default()
+        };
+        held.merge_into(&mut review);
+        assert_eq!(review.pending, vec![t("zone3", 'c'), t("zone3", 'f')]);
+        assert_eq!(review.unverified, vec![t("zone2", 'g')]);
     }
 
     #[test]
