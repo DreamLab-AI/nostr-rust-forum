@@ -413,8 +413,10 @@ pub fn admin_global_count_target(
 /// there is no per-channel grouping: an admin reads every zone, so no per-zone
 /// decision is needed); `exceptions` returns the events carrying an
 /// `expiration` tag, bounded by the caller, for NIP-40 filtering. Expiring
-/// events are told apart through `event_tags` (an index range scan collected
-/// once), not by re-parsing every row's JSON tags.
+/// events are told apart through `event_tags`: the total is a covering count on
+/// the kind index, minus the (rare) expiring ones, so no row's JSON tags are
+/// parsed and `events` is not scanned. Limit: the exceptions are read up to the
+/// frame row cap (10,000); beyond that expiring events are under-counted.
 pub fn build_admin_kind_count(
     kind: u64,
     since: Option<u64>,
@@ -433,8 +435,10 @@ pub fn build_admin_kind_count(
     ChannelCountQueries {
         grouped: FilterQuery {
             sql: format!(
-                "SELECT 'all' AS ch, COUNT(*) AS n FROM events \
-                 WHERE events.kind = {kind}{range} AND events.id NOT IN ({expiring})"
+                "SELECT 'all' AS ch, \
+                 (SELECT COUNT(*) FROM events WHERE events.kind = {kind}{range}) \
+                 - (SELECT COUNT(*) FROM events \
+                    WHERE events.kind = {kind}{range} AND events.id IN ({expiring})) AS n"
             ),
             params: params.clone(),
         },
