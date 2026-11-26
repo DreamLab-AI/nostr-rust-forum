@@ -120,6 +120,61 @@ fn is_acl_path(path: &str) -> bool {
     path.ends_with(".acl")
 }
 
+/// What a write may do when an object already exists at its target key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingObject {
+    /// Create only: an existing object makes the write fail (409).
+    Refuse,
+    /// The write may replace an existing object.
+    Replace,
+}
+
+/// Decide whether a POST may replace an existing object.
+///
+/// POST is authorised by `acl:Append`, which WAC defines as adding data
+/// without modifying what is there. A container POST therefore always
+/// creates a new child and never replaces one. A POST to a non-container
+/// path keeps its historical overwrite behaviour only for an agent that also
+/// holds `acl:Write` on the target; an Append-only agent may create it but
+/// not replace it.
+fn post_write_policy(target_is_container: bool, agent_has_write: bool) -> ExistingObject {
+    if !target_is_container && agent_has_write {
+        ExistingObject::Replace
+    } else {
+        ExistingObject::Refuse
+    }
+}
+
+/// R2 condition that makes a put succeed only when no object exists at the
+/// key. workerd maps an `etagDoesNotMatch` of `"*"` to a wildcard etag, so
+/// R2 evaluates the existence check atomically with the write (no
+/// check-then-put race); a failed condition yields `Ok(None)` from
+/// `PutOptionsBuilder::execute`.
+fn create_only_condition() -> Conditional {
+    Conditional {
+        etag_does_not_match: Some("*".into()),
+        ..Default::default()
+    }
+}
+
+/// Access mode a container POST must hold on the CHILD it is about to
+/// create, or `None` when the child path may never be created through a
+/// container POST at all.
+///
+/// The container's `acl:Append` authorises adding ordinary members only.
+/// Any child that the shared sidecar policy elevates (an `.acl` / `.meta`
+/// sidecar, which needs `acl:Control` of the protected resource) is refused
+/// outright, independently of `Slug` filtering.
+fn container_post_child_mode(child_path: &str) -> Option<AccessMode> {
+    if is_acl_path(child_path) {
+        return None;
+    }
+    match coerce_required_mode_for_acl(child_path, "POST") {
+        AccessMode::Append => Some(AccessMode::Append),
+        _ => None,
+    }
+}
+
 /// Check whether a resource path targets the pod provisioning endpoint.
 fn is_provision_path(path: &str) -> bool {
     path == "/.provision"
@@ -1648,14 +1703,37 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                     return reserve_error(&env, &e.to_string());
                 }
 
-                bucket
-                    .put(&r2_key, data)
-                    .http_metadata(HttpMetadata {
-                        content_type: Some(content_type),
-                        ..Default::default()
-                    })
-                    .execute()
-                    .await?;
+                // Append (the mode POST maps to) may create but never modify:
+                // replacing an existing object needs acl:Write on it as well.
+                let agent_has_write = evaluate_access(
+                    acl_doc.as_ref(),
+                    agent_uri.as_deref(),
+                    &resource_path,
+                    AccessMode::Write,
+                );
+                let put = bucket.put(&r2_key, data).http_metadata(HttpMetadata {
+                    content_type: Some(content_type),
+                    ..Default::default()
+                });
+                let put = match post_write_policy(false, agent_has_write) {
+                    ExistingObject::Replace => put,
+                    ExistingObject::Refuse => put.only_if(create_only_condition()),
+                };
+                if put.execute().await?.is_none() {
+                    quota::update_usage_d1(
+                        &quota_db,
+                        &quota_account,
+                        -(data_len as i64),
+                        quota_limit,
+                    )
+                    .await
+                    .ok();
+                    return json_error(
+                        &env,
+                        "Resource already exists; acl:Write is required to replace it",
+                        409,
+                    );
+                }
 
                 // Fire notification webhooks (non-blocking)
                 notifications::notify_change(&kv, &owner_pubkey, &resource_path, "Update").await;
@@ -1691,6 +1769,56 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                 );
             }
 
+            // Resolve and authorise the child BEFORE reserving quota, so a
+            // refused request never leaks a reservation.
+            //
+            // The `Slug` is a hint: `resolve_slug` drops dot-files, sidecar
+            // names and anything outside `[A-Za-z0-9._-]` in favour of a random
+            // name. If the slug names an existing member, a random name is used
+            // instead; the create-only put below is what actually guarantees
+            // that a container POST never replaces an object.
+            let mut child_path = container::resolve_slug(&resource_path, slug_header.as_deref());
+            if container::accepted_slug(slug_header.as_deref()).is_some()
+                && bucket
+                    .head(format!("pods/{owner_pubkey}{child_path}"))
+                    .await?
+                    .is_some()
+            {
+                child_path = container::generated_child_path(&resource_path);
+            }
+            // Defense-in-depth (P2): the child path is derived from the
+            // attacker-controlled `Slug` header, so re-validate before building
+            // the r2_key — `parse_pod_route`'s guard only covers the URL path.
+            if !is_safe_resource_path(&child_path) {
+                return json_error(&env, "Invalid resource path", 400);
+            }
+            // The container's Append authorises the POST; the CHILD must also
+            // be an ordinary member (never an ACL/meta sidecar) that the agent
+            // may append under its own effective ACL — a flat `{child}.acl`
+            // sidecar can be narrower than the container's default.
+            let Some(child_mode) = container_post_child_mode(&child_path) else {
+                return json_error(&env, "Invalid resource path", 400);
+            };
+            let child_acl = find_effective_acl(&bucket, &kv, &owner_pubkey, &child_path).await;
+            if !evaluate_access(
+                child_acl.as_ref(),
+                agent_uri.as_deref(),
+                &child_path,
+                child_mode,
+            ) {
+                return if requester_pubkey.is_some() {
+                    json_error(&env, "Forbidden", 403)
+                } else {
+                    json_error_with_reason(
+                        &env,
+                        "Authentication required",
+                        401,
+                        nip98_reason.as_deref(),
+                    )
+                };
+            }
+            let child_r2_key = format!("pods/{owner_pubkey}{child_path}");
+
             let (quota_account, quota_limit) = quota::reservation_account(
                 &owner_pubkey,
                 requester_pubkey.as_deref(),
@@ -1708,23 +1836,24 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                 return reserve_error(&env, &e.to_string());
             }
 
-            let child_path = container::resolve_slug(&resource_path, slug_header.as_deref());
-            // Defense-in-depth (P2): the child path is derived from the
-            // attacker-controlled `Slug` header, so re-validate before building
-            // the r2_key — `parse_pod_route`'s guard only covers the URL path.
-            if !is_safe_resource_path(&child_path) {
-                return json_error(&env, "Invalid resource path", 400);
+            let put = bucket.put(&child_r2_key, data).http_metadata(HttpMetadata {
+                content_type: Some(content_type),
+                ..Default::default()
+            });
+            // A container POST never replaces, whatever else the agent holds.
+            let put = match post_write_policy(true, false) {
+                ExistingObject::Replace => put,
+                ExistingObject::Refuse => put.only_if(create_only_condition()),
+            };
+            let created = put.execute().await?;
+            if created.is_none() {
+                // Lost a race for this name (or a UUID collision): refuse
+                // rather than replace, and give the reservation back.
+                quota::update_usage_d1(&quota_db, &quota_account, -(data_len as i64), quota_limit)
+                    .await
+                    .ok();
+                return json_error(&env, "Child resource already exists; retry", 409);
             }
-            let child_r2_key = format!("pods/{owner_pubkey}{child_path}");
-
-            bucket
-                .put(&child_r2_key, data)
-                .http_metadata(HttpMetadata {
-                    content_type: Some(content_type),
-                    ..Default::default()
-                })
-                .execute()
-                .await?;
 
             // Fire notification webhooks (non-blocking)
             notifications::notify_change(&kv, &owner_pubkey, &child_path, "Create").await;
@@ -2722,6 +2851,43 @@ mod tests {
         let (pk, rp) = parse_pod_route(&normal_path).unwrap();
         assert_eq!(pk, pubkey);
         assert_eq!(rp, "/public/file");
+    }
+
+    #[test]
+    fn container_post_never_replaces() {
+        assert_eq!(post_write_policy(true, false), ExistingObject::Refuse);
+        assert_eq!(post_write_policy(true, true), ExistingObject::Refuse);
+    }
+
+    #[test]
+    fn non_container_post_replaces_only_with_write() {
+        assert_eq!(post_write_policy(false, false), ExistingObject::Refuse);
+        assert_eq!(post_write_policy(false, true), ExistingObject::Replace);
+    }
+
+    #[test]
+    fn create_only_condition_is_wildcard_if_none_match() {
+        let c = create_only_condition();
+        assert_eq!(c.etag_does_not_match.as_deref(), Some("*"));
+        assert!(c.etag_matches.is_none());
+        assert!(c.uploaded_before.is_none() && c.uploaded_after.is_none());
+    }
+
+    #[test]
+    fn container_post_cannot_create_sidecars() {
+        for child in [
+            "/inbox/.acl",
+            "/inbox/note.acl",
+            "/inbox/.meta",
+            "/inbox/note.meta",
+            "/.acl",
+        ] {
+            assert_eq!(container_post_child_mode(child), None, "{child}");
+        }
+        assert_eq!(
+            container_post_child_mode("/inbox/note.jsonld"),
+            Some(AccessMode::Append)
+        );
     }
 
     #[test]

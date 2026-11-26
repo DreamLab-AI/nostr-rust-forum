@@ -37,6 +37,14 @@ pub use solid_pod_rs::wac::{
     effective_acl_target, method_to_mode, wac_allow_header, AccessMode, AclDocument,
 };
 
+/// Kit policy gate in front of the upstream classifier.
+///
+/// Every ACL this kit writes is JSON-LD (provisioning, delegation grants and
+/// validated raw PUTs), so a present policy body that is not JSON settles as
+/// `Invalid` (deny) here and never reaches upstream's Turtle fallback, whose
+/// hand-written parser is not part of the kit's trusted surface. The same
+/// gate guards storage: the ACL PUT handler validates through
+/// [`parse_acl_with_cap`], so a non-JSON body can no longer be stored either.
 fn classify_kit_policy(path: &str, read: PolicyRead<'_>, inherited: bool) -> PolicyStep {
     if let PolicyRead::Present { body, .. } = &read {
         if body.len() > MAX_ACL_DOC_BYTES {
@@ -47,6 +55,14 @@ fn classify_kit_policy(path: &str, read: PolicyRead<'_>, inherited: bool) -> Pol
                     body.len(),
                     MAX_ACL_DOC_BYTES
                 )),
+            });
+        }
+        if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err() {
+            return PolicyStep::Settled(PolicyOutcome::Invalid {
+                policy_path: path.into(),
+                reason: InvalidPolicyReason::Malformed(
+                    "kit ACLs must be JSON-LD; non-JSON policy refused".into(),
+                ),
             });
         }
     }
@@ -1051,6 +1067,39 @@ mod tests {
     }
 
     // ── ACL doc size cap ───────────────────────────────────────────────
+
+    /// The kit only ever writes JSON-LD ACLs (provisioning, delegation, raw
+    /// PUT). A Turtle body must neither be accepted for storage (the PUT
+    /// handler validates through `parse_acl_with_cap`) nor evaluated when
+    /// found in R2/KV; upstream's hand-written Turtle fallback stays
+    /// unreachable from the kit.
+    #[test]
+    fn turtle_acl_is_refused_for_storage_and_evaluation() {
+        let turtle = concat!(
+            "@prefix acl: <http://www.w3.org/ns/auth/acl#>.\n",
+            "<#owner> a acl:Authorization;\n",
+            "  acl:agent <did:nostr:abc>;\n",
+            "  acl:accessTo <./>;\n",
+            "  acl:default <./>;\n",
+            "  acl:mode acl:Read, acl:Write, acl:Control.\n",
+        );
+        assert!(parse_acl_with_cap(turtle.as_bytes()).is_none());
+        assert!(resolve_r2_sidecar(turtle.as_bytes(), true).is_none());
+        assert!(resolve_kv_fallback(turtle).is_none());
+        // A present-but-refused sidecar terminates the walk (deny), it is
+        // never treated as missing.
+        assert!(matches!(
+            classify_kit_policy(
+                "/inbox/.acl",
+                PolicyRead::Present {
+                    body: turtle.as_bytes(),
+                    content_type: "text/turtle",
+                },
+                true,
+            ),
+            PolicyStep::Settled(PolicyOutcome::Invalid { .. })
+        ));
+    }
 
     #[test]
     fn parse_acl_within_cap_succeeds() {
