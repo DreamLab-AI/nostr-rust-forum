@@ -197,6 +197,63 @@ thread_local! {
     static SCHEMA_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Fingerprint of this build's schema code (see `build.rs`).
+const SCHEMA_FINGERPRINT: &str = env!("RELAY_SCHEMA_FINGERPRINT");
+
+/// `settings` key holding the fingerprint of the last completed schema pass.
+const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
+
+/// Whether a stored fingerprint means this build's schema is already in place.
+fn schema_is_current(stored: Option<&str>) -> bool {
+    stored == Some(SCHEMA_FINGERPRINT)
+}
+
+/// Bring the schema up to date at most once per deploy, not once per isolate.
+///
+/// The full pass (`ensure_schema`, ~100 statements including `ALTER TABLE`
+/// writes, ~1.4 s) used to run in every new isolate. A quiet forum's isolates
+/// are recycled quickly, so a page load's ~6 parallel requests each started a
+/// pass in a fresh isolate and the queued DDL left D1 "overloaded" for about
+/// five seconds (2026-11-26). Now a new isolate reads one `settings` row; only
+/// a build whose fingerprint differs runs the pass, then records it.
+async fn schema_gate(env: &Env) {
+    let stored = match env.d1("DB") {
+        Ok(db) => match db
+            .prepare("SELECT value FROM settings WHERE key = ?1")
+            .bind(&[wasm_bindgen::JsValue::from_str(SCHEMA_FINGERPRINT_KEY)])
+        {
+            Ok(stmt) => stmt.first::<String>(Some("value")).await.ok().flatten(),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    if schema_is_current(stored.as_deref()) {
+        record_schema_pass(true);
+        return;
+    }
+    let ok = ensure_schema(env).await;
+    nostr_bbs_rate_limit::ensure_replay_schema(env, "REPLAY_DB").await;
+    if ok {
+        if let Ok(db) = env.d1("DB") {
+            let write = db
+                .prepare(
+                    "INSERT INTO settings (key, value, type, category) VALUES (?1, ?2, 'string', 'system') \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .bind(&[
+                    wasm_bindgen::JsValue::from_str(SCHEMA_FINGERPRINT_KEY),
+                    wasm_bindgen::JsValue::from_str(SCHEMA_FINGERPRINT),
+                ]);
+            if let Ok(stmt) = write {
+                if let Err(e) = stmt.run().await {
+                    console_error!("schema_gate: fingerprint not recorded: {e}");
+                }
+            }
+        }
+    }
+    record_schema_pass(ok);
+}
+
 /// Latch the once-per-isolate guard after a schema pass. A pass that reported a
 /// failed CREATE leaves it open so the next request retries.
 fn record_schema_pass(ok: bool) {
@@ -222,9 +279,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // the Durable Object and `scheduled` never bootstrap the schema, so a
     // WebSocket-only isolate would otherwise never create it.
     if !SCHEMA_READY.with(|c| c.get()) {
-        let ok = ensure_schema(&env).await;
-        nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
-        record_schema_pass(ok);
+        schema_gate(&env).await;
     }
 
     // WebSocket upgrade -> Durable Object
@@ -1878,6 +1933,18 @@ mod cors_tests {
 #[cfg(test)]
 mod schema_order_tests {
     use super::{BROKER_CASES_CREATE_SQL, GOVERNANCE_RECEIPTS_CREATE_SQL, SCHEMA_READY};
+
+    #[test]
+    fn the_schema_pass_runs_only_for_a_new_fingerprint() {
+        use super::{schema_is_current, SCHEMA_FINGERPRINT};
+        assert_eq!(SCHEMA_FINGERPRINT.len(), 16);
+        assert!(SCHEMA_FINGERPRINT.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(schema_is_current(Some(SCHEMA_FINGERPRINT)));
+        // Fresh database, unreadable settings, or an older build: run the pass.
+        assert!(!schema_is_current(None));
+        assert!(!schema_is_current(Some("0000000000000000")));
+        assert!(!schema_is_current(Some("")));
+    }
 
     #[test]
     fn governance_tables_exist_for_the_alters_and_the_tier_index() {
