@@ -616,6 +616,31 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 </label>
             })}
 
+            {move || {
+                let missing = keys.unheld_epochs(&zone.with_value(|z| z.id.clone()));
+                (!missing.is_empty() && keys_ready()).then(|| {
+                    let list = missing.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
+                    view! {
+                        <div class="flex flex-wrap items-center gap-2 text-sm text-amber-300">
+                            <span>{format!(
+                                "Messages here use key epoch {list}, which this device does not hold. A grant for it may already be waiting on the relay: re-check before creating or rotating a key."
+                            )}</span>
+                            <button
+                                class="px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-xs"
+                                on:click=move |_| {
+                                    let asked = keys.recheck_grants();
+                                    status.set(Some(if asked {
+                                        "Asked the relay for your grants again. A key found is adopted automatically.".into()
+                                    } else {
+                                        "Not connected to the relay yet; try again in a moment.".into()
+                                    }));
+                                }
+                            >"Re-check grants"</button>
+                        </div>
+                    }
+                })
+            }}
+
             {move || match mint_plan() {
                 crate::zone_crypto::keyset::MintPlan::Mint { note: Some(note), .. }
                 | crate::zone_crypto::keyset::MintPlan::Blocked(note) => Some(view! {

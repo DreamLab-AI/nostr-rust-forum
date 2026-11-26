@@ -12,6 +12,7 @@
 //! This keeps accounts that share a browser profile apart in the UI; it is not
 //! access control (see the module docs of `key_owner`).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -45,6 +46,9 @@ use crate::stores::indexed_db::{ForumDb, MintPut, ZoneKeyPut};
 /// Most post ids kept per `(zone, epoch, key)` as opening evidence: enough
 /// to pass [`key_owner::MIN_SWAP_EVIDENCE`], bounded however much loads.
 const OPEN_EVIDENCE_CAP: usize = 8;
+
+/// Wait before an automatic re-check, so the normal grant sync lands first.
+const RECHECK_DELAY_MS: u32 = 8_000;
 
 fn kv_processed() -> String {
     format!("processed_wraps:{}", crate::stores::relay_scope::current())
@@ -135,6 +139,12 @@ pub struct ZoneKeyStore {
     /// Slots with an automatic resolution in flight: evidence arriving
     /// meanwhile must not start a second (its compare-and-swap would refuse).
     resolving: StoredValue<HashSet<(String, u32)>>,
+    /// Automatic grant re-checks per `(zone, epoch)` this session
+    /// ([`keyset::recheck_due`]).
+    rechecks: StoredValue<HashMap<(String, u32), keyset::RecheckState>>,
+    /// The signed-in identity's signer, kept while its grant sync runs so a
+    /// re-check can open wraps again. Cleared with the sync.
+    grant_signer: StoredValue<Option<Rc<dyn Signer>>, leptos::prelude::LocalStorage>,
     /// Highest `zk` epoch seen per `(zone named in the tag, channel)`, with the
     /// post id. The Encryption card counts only channels that resolve to the
     /// zone, so a tag in some other channel cannot steer a rotation. Kept
@@ -171,6 +181,8 @@ impl ZoneKeyStore {
             conflicts: RwSignal::new(Vec::new()),
             opened: StoredValue::new(HashMap::new()),
             resolving: StoredValue::new(HashSet::new()),
+            rechecks: StoredValue::new(HashMap::new()),
+            grant_signer: StoredValue::new_local(None),
             epochs_seen: RwSignal::new(HashMap::new()),
         }
     }
@@ -291,6 +303,7 @@ impl ZoneKeyStore {
 
     fn stop_grant_sync(&self) {
         self.sync_for.set_value(None);
+        self.grant_signer.set_value(None);
         let subs = self
             .grant_subs
             .try_update_value(std::mem::take)
@@ -731,6 +744,7 @@ impl ZoneKeyStore {
             super::zk_zone_epoch(&ev.tags),
             super::root_channel(&ev.tags),
         ) {
+            let zone_for_check = zone.clone();
             let slot = (zone, channel);
             if !self
                 .epochs_seen
@@ -740,6 +754,11 @@ impl ZoneKeyStore {
                 self.epochs_seen.update(|m| {
                     m.entry(slot).or_default().insert(epoch, id);
                 });
+                // A post at a key this device does not hold: ask the relay for
+                // this identity's grant wraps again, whatever was marked done.
+                if self.lookup(&zone_for_check, epoch).is_none() {
+                    self.schedule_recheck();
+                }
             }
         }
         let raw = ev;
@@ -755,6 +774,102 @@ impl ZoneKeyStore {
             });
         }
         ev
+    }
+
+    // -- Grant re-check ---------------------------------------------------
+
+    /// The epochs of `zone` that posts name but this device holds no key for,
+    /// ascending. Reactive (reads `epochs_seen` and the keys).
+    pub fn unheld_epochs(&self, zone: &str) -> Vec<u32> {
+        let held = self.keys.get();
+        let seen = self.epochs_seen.get();
+        let slots = keyset::unheld_slots(
+            seen.iter()
+                .filter(|((z, _), _)| z == zone)
+                .flat_map(|((z, _), eps)| eps.keys().map(move |e| (z.as_str(), *e))),
+            |z, e| held.values().any(|k| k.zone == z && k.epoch == e),
+        );
+        slots.into_iter().map(|(_, e)| e).collect()
+    }
+
+    /// After a short delay (so the normal grant sync can land first), re-check
+    /// the grants if any post names an epoch not held and a re-check is due.
+    fn schedule_recheck(&self) {
+        let store = *self;
+        gloo::timers::callback::Timeout::new(RECHECK_DELAY_MS, move || store.recheck_unheld())
+            .forget();
+    }
+
+    fn recheck_unheld(&self) {
+        let held = |z: &str, e: u32| self.lookup(z, e).is_some();
+        let slots = self.epochs_seen.with_untracked(|m| {
+            keyset::unheld_slots(
+                m.iter()
+                    .flat_map(|((z, _), eps)| eps.keys().map(move |e| (z.as_str(), *e))),
+                held,
+            )
+        });
+        let now = js_sys::Date::now();
+        let due = self.rechecks.with_value(|r| {
+            slots
+                .iter()
+                .any(|s| keyset::recheck_due(r.get(s).copied(), now))
+        });
+        if slots.is_empty() || !due {
+            return;
+        }
+        if self.recheck_grants() {
+            self.rechecks.update_value(|r| {
+                for s in slots {
+                    let e = r.entry(s).or_default();
+                    e.attempts += 1;
+                    e.last_ms = now;
+                }
+            });
+        }
+    }
+
+    /// Ask the relay for every kind-1059 wrap addressed to the signed-in
+    /// identity (and its inbox key) again, with no `since`, and process each
+    /// one even if it was marked processed or refused: an earlier pass may
+    /// have settled a grant while the sealer's admin check said no (a stale or
+    /// different relay), or while an older client could not adopt it. Admin
+    /// answers cached as "not an admin" are dropped first. A key found is
+    /// adopted through the normal path, which re-decrypts what is on screen.
+    /// Returns false when no grant sync is running (nothing was asked).
+    pub fn recheck_grants(&self) -> bool {
+        let (Some(relay), Some(signer), Some(lease)) = (
+            self.grant_relay.get_value(),
+            self.grant_signer.get_value(),
+            self.current_lease(),
+        ) else {
+            return false;
+        };
+        if self.sync_for.with_value(|l| l.as_ref() != Some(&lease)) {
+            return false;
+        }
+        self.admin_cache.update_value(|m| m.retain(|_, v| *v));
+        let me = lease.owner().as_str().to_string();
+        let inbox_pk = self
+            .inbox_sk
+            .get_value()
+            .and_then(|sk| super::inbox_key::inbox_signer(&sk).ok())
+            .map(|s| s.public_key().to_string());
+        let handler = self.wrap_handler(&relay, signer, lease, false, true);
+        let sub: Rc<RefCell<Option<String>>> = Rc::default();
+        let (done_sub, done_relay) = (sub.clone(), relay.clone());
+        let eose = Rc::new(move || {
+            if let Some(id) = done_sub.borrow_mut().take() {
+                done_relay.unsubscribe(&id);
+            }
+        });
+        let id = relay.subscribe(
+            vec![wrap_filter(subscription_targets(&me, inbox_pk.as_deref()))],
+            handler,
+            Some(eose),
+        );
+        *sub.borrow_mut() = Some(id);
+        true
     }
 
     /// Re-run decryption over every zone-encrypted message already in the
@@ -1022,6 +1137,10 @@ impl ZoneKeyStore {
         }
         self.sync_for.set_value(Some(lease.clone()));
         self.grant_relay.set_value(Some(relay.clone()));
+        self.grant_signer.set_value(Some(signer.clone()));
+        // Posts already on screen may name an epoch this device lacks, and the
+        // normal sync above may have refused or skipped its wraps.
+        self.schedule_recheck();
         let _ = self.grant_backlog.try_set(Some((
             lease.owner().clone(),
             GrantBacklog::new(recipient_keys_enabled(), js_sys::Date::now()),
@@ -1041,7 +1160,7 @@ impl ZoneKeyStore {
         };
         let id = relay.subscribe(
             vec![wrap_filter(subscription_targets(&me, None))],
-            self.wrap_handler(relay, signer.clone(), lease.clone(), false),
+            self.wrap_handler(relay, signer.clone(), lease.clone(), false, false),
             Some(eose),
         );
         self.grant_subs.update_value(|v| v.push(id));
@@ -1065,7 +1184,8 @@ impl ZoneKeyStore {
             match ensure_inbox_key(&port, &*signer, now_secs()).await {
                 Ok(key) if store.is_current(&lease) => {
                     store.inbox_sk.set_value(Some(key.sk_hex));
-                    let handler = store.wrap_handler(&relay, signer.clone(), lease.clone(), true);
+                    let handler =
+                        store.wrap_handler(&relay, signer.clone(), lease.clone(), true, false);
                     store.note_backlog(&lease, GrantBacklog::inbox_opened);
                     let eose = {
                         let lease = lease.clone();
@@ -1095,6 +1215,7 @@ impl ZoneKeyStore {
         signer: Rc<dyn Signer>,
         lease: Lease,
         inbox: bool,
+        force: bool,
     ) -> EventCallback {
         let store = *self;
         let relay = relay.clone();
@@ -1106,7 +1227,8 @@ impl ZoneKeyStore {
             // With the sweep on, wraps already handled are looked at again
             // when addressed to the identity (an old grant is deleted once its
             // key is safe here) or to its inbox key (see above).
-            let revisit = grant_sweep_enabled() && (inbox || p_tags(&ev).any(|p| p == me));
+            let revisit =
+                force || (grant_sweep_enabled() && (inbox || p_tags(&ev).any(|p| p == me)));
             if !revisit && store.processed.with_value(|s| s.contains(&ev.id)) {
                 return;
             }

@@ -284,6 +284,46 @@ pub fn mint_confirmation(plan: &MintPlan) -> Option<String> {
     ))
 }
 
+// -- Missing-epoch re-check ----------------------------------------------------
+
+/// Most automatic grant re-checks per `(zone, epoch)` per session.
+pub const RECHECK_MAX_ATTEMPTS: u32 = 3;
+/// Least time between automatic re-checks of one slot (ms).
+pub const RECHECK_GAP_MS: f64 = 60_000.0;
+
+/// How often a slot's grant wraps have been re-requested this session.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RecheckState {
+    /// Re-checks started.
+    pub attempts: u32,
+    /// When the last one started (ms since the epoch).
+    pub last_ms: f64,
+}
+
+/// Whether an automatic re-check of a slot is due: never tried, or tried
+/// fewer than [`RECHECK_MAX_ATTEMPTS`] times and not within
+/// [`RECHECK_GAP_MS`]. Bounded so a post naming an epoch nobody will ever
+/// grant (or a forged `zk` tag) costs at most a few relay reads per session.
+pub fn recheck_due(state: Option<RecheckState>, now_ms: f64) -> bool {
+    match state {
+        None => true,
+        Some(s) => s.attempts < RECHECK_MAX_ATTEMPTS && now_ms - s.last_ms >= RECHECK_GAP_MS,
+    }
+}
+
+/// The `(zone, epoch)` slots that posts name (`seen`) and `held` does not
+/// cover, sorted. Posts encrypted at a key this device does not hold are the
+/// trigger for re-requesting the identity's grant wraps.
+pub fn unheld_slots<'a>(
+    seen: impl IntoIterator<Item = (&'a str, u32)>,
+    held: impl Fn(&str, u32) -> bool,
+) -> BTreeSet<(String, u32)> {
+    seen.into_iter()
+        .filter(|(z, e)| !held(z, *e))
+        .map(|(z, e)| (z.to_string(), e))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +751,41 @@ mod tests {
         // grant for one epoch collapses onto the first (last-write-wins).
         assert_eq!(a.store_id_with(false), b.store_id_with(false));
         assert_eq!(a.store_id_with(false), "z:2");
+    }
+}
+
+#[cfg(test)]
+mod recheck_tests {
+    use super::*;
+
+    #[test]
+    fn a_slot_is_rechecked_a_few_times_with_a_gap_then_left_alone() {
+        assert!(recheck_due(None, 0.0));
+        let one = RecheckState {
+            attempts: 1,
+            last_ms: 1_000.0,
+        };
+        assert!(
+            !recheck_due(Some(one), 1_000.0 + RECHECK_GAP_MS - 1.0),
+            "too soon"
+        );
+        assert!(recheck_due(Some(one), 1_000.0 + RECHECK_GAP_MS));
+        let spent = RecheckState {
+            attempts: RECHECK_MAX_ATTEMPTS,
+            last_ms: 0.0,
+        };
+        assert!(!recheck_due(Some(spent), 1e12), "bounded per session");
+    }
+
+    #[test]
+    fn only_epochs_named_by_posts_and_not_held_are_unheld() {
+        let held = |z: &str, e: u32| z == "zone2" && (e == 3 || e == 1);
+        let seen = [("zone2", 3), ("zone2", 5), ("zone3", 1), ("zone2", 5)];
+        let got = unheld_slots(seen, held);
+        assert_eq!(
+            got.into_iter().collect::<Vec<_>>(),
+            vec![("zone2".to_string(), 5), ("zone3".to_string(), 1)]
+        );
+        assert!(unheld_slots([("zone2", 3)], held).is_empty());
     }
 }
