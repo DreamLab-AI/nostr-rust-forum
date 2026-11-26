@@ -469,7 +469,7 @@ mod tests {
             sealed_search_object_cap(&format!("{base}/m.json"), ""),
             None
         );
-        assert!(SEALED_SHARD_MAX_BYTES >= 13 * 1024 * 1024);
+        const { assert!(SEALED_SHARD_MAX_BYTES >= 13 * 1024 * 1024) };
     }
 
     #[test]
