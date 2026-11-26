@@ -304,7 +304,7 @@ pub fn TopicList(
 
 /// Narrow screens (below `sm`) restack the row: the left column takes the
 /// whole width, the title may wrap to two lines, and the byline reads
-/// "last by <name> <pill> • N replies • <time> ago"; the right-hand column
+/// `last by {name} {pill} • N replies • {time} ago`; the right-hand column
 /// (activity over "started by") is hidden. From `sm` up the two-column layout
 /// is unchanged. Literal class strings, so the Tailwind scan sees them.
 ///
@@ -329,7 +329,7 @@ const LAST_BY_PILL_CLASS: &str = "flex items-center gap-1 min-w-0 shrink-[100] o
 /// The topic title: up to two lines on a phone, one from `sm`.
 const TITLE_CLASS: &str = "font-semibold text-white group-hover:text-amber-400 \
      transition-colors line-clamp-2 sm:line-clamp-1";
-/// "• <time> ago" inside the byline, on a phone only (from `sm` the time is
+/// `• {time} ago` inside the byline, on a phone only (from `sm` the time is
 /// in the right-hand column).
 const BYLINE_ACTIVITY_CLASS: &str = "flex-shrink-0 whitespace-nowrap sm:hidden";
 /// The right-hand column (activity over "started by"): hidden below `sm`,
