@@ -123,27 +123,22 @@ pub async fn open(identity: &dyn Signer, ev: &NostrEvent) -> Result<Vec<String>,
 }
 
 thread_local! {
-    /// `(admin, zone, epoch)` already pulled this session: one fetch per key,
-    /// not one per sweep. Only a successful answer (even "no backup") counts.
+    /// `(admin, zone, epoch)` whose backup was found and merged this session:
+    /// one fetch per key, not one per sweep. An answer of "no backup" is not
+    /// cached (a REQ answered before the session settled would otherwise hide
+    /// the real one for the whole session).
     static PULLED: RefCell<HashSet<(String, String, u32)>> = RefCell::new(HashSet::new());
 }
 
-/// Merge the relay-held backup of `(zone, epoch)` into this device's ledger
-/// (once per session). Returns the number of members newly marked granted;
-/// `Err` when the relay could not be asked, in which case the local ledger
-/// stands alone, as before.
-pub async fn pull(
+/// Ask the relay for the admin's newest backup of `(zone, epoch)`. `Err`
+/// means the relay could not be asked, which is not the same as "none".
+async fn fetch_remote(
     relay: &RelayConnection,
     identity: &dyn Signer,
-    store: ZoneKeyStore,
     zone: &str,
     epoch: u32,
-) -> Result<usize, String> {
+) -> Result<Option<NostrEvent>, String> {
     let owner = identity.public_key().to_string();
-    let seen = (owner.clone(), zone.to_string(), epoch);
-    if PULLED.with(|p| p.borrow().contains(&seen)) {
-        return Ok(0);
-    }
     let slot: Rc<Slot<Result<(), String>>> = Slot::new();
     let events: Rc<RefCell<Vec<NostrEvent>>> = Rc::default();
     let sink = events.clone();
@@ -166,19 +161,71 @@ pub async fn pull(
     relay.unsubscribe(&sub);
     outcome?;
     let found = events.borrow().clone();
-    let added = match pick(&found, &owner, zone, epoch) {
-        Some(ev) => {
-            let entries = open(identity, ev).await?;
-            store.merge_grant_backup(zone, epoch, &entries).await
-        }
-        None => 0,
+    Ok(pick(&found, &owner, zone, epoch).cloned())
+}
+
+/// Merge the relay-held backup of `(zone, epoch)` into this device's ledger
+/// (once per session once found). Returns the number of members newly marked
+/// granted; `Err` when the relay could not be asked, in which case the local
+/// ledger stands alone, as before.
+pub async fn pull(
+    relay: &RelayConnection,
+    identity: &dyn Signer,
+    store: ZoneKeyStore,
+    zone: &str,
+    epoch: u32,
+) -> Result<usize, String> {
+    let seen = (identity.public_key().to_string(), zone.to_string(), epoch);
+    if PULLED.with(|p| p.borrow().contains(&seen)) {
+        return Ok(0);
+    }
+    let Some(ev) = fetch_remote(relay, identity, zone, epoch).await? else {
+        return Ok(0);
     };
+    let entries = open(identity, &ev).await?;
+    let added = store.merge_grant_backup(zone, epoch, &entries).await;
     PULLED.with(|p| p.borrow_mut().insert(seen));
     Ok(added)
 }
 
-/// Publish this device's ledger for `(zone, epoch)` as the admin's backup.
-/// `Ok` only when the relay answered OK true.
+/// What a push should publish, given the relay's current copy (`Err`: could
+/// not be fetched, `Ok(None)`: none yet, `Ok(Some((created_at, entries)))`)
+/// and this device's entries. `None`: publish nothing.
+///
+/// The event is replaceable, so the last write wins. Publishing only the local
+/// set could therefore shrink the backup (a fresh browser whose pull had not
+/// finished, or a second browser of the same admin). So the published set is
+/// always remote ∪ local, nothing is published when the remote copy cannot be
+/// read, and `created_at` is at least one second after the remote copy's so a
+/// rewrite in the same second is not lost to the NIP-01 tie-break.
+pub fn plan_publish(
+    remote: Result<Option<(u64, Vec<String>)>, String>,
+    local: &[String],
+    now: u64,
+) -> Option<(u64, Vec<String>)> {
+    let (remote_at, remote_entries) = match remote {
+        Err(_) => return None,
+        Ok(None) => (0, Vec::new()),
+        Ok(Some((at, e))) => (at, e),
+    };
+    let mut all: Vec<String> = remote_entries
+        .into_iter()
+        .chain(local.iter().cloned())
+        .filter(|e| valid_entry(e))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    all.sort();
+    if all.is_empty() {
+        return None;
+    }
+    Some((now.max(remote_at.saturating_add(1)), all))
+}
+
+/// Publish this admin's ledger for `(zone, epoch)`: read the relay's copy
+/// fresh, merge it into the local ledger, publish the union (see
+/// [`plan_publish`]). `Ok` only when the relay answered OK true, or when there
+/// was nothing to publish.
 pub async fn push(
     relay: &RelayConnection,
     identity: &dyn Signer,
@@ -187,11 +234,27 @@ pub async fn push(
     epoch: u32,
     now: u64,
 ) -> Result<(), String> {
-    let entries = store.export_grant_backup(zone, epoch).await;
-    if entries.is_empty() {
-        return Ok(());
+    let remote = match fetch_remote(relay, identity, zone, epoch).await {
+        Ok(None) => Ok(None),
+        Ok(Some(ev)) => match open(identity, &ev).await {
+            Ok(entries) => Ok(Some((ev.created_at, entries))),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    if let Err(e) = &remote {
+        return Err(format!(
+            "not published, the relay copy could not be read: {e}"
+        ));
     }
-    let ev = build(identity, zone, epoch, &entries, now).await?;
+    if let Ok(Some((_, entries))) = &remote {
+        store.merge_grant_backup(zone, epoch, entries).await;
+    }
+    let local = store.export_grant_backup(zone, epoch).await;
+    let Some((at, entries)) = plan_publish(remote, &local, now) else {
+        return Ok(());
+    };
+    let ev = build(identity, zone, epoch, &entries, at).await?;
     let slot: Rc<Slot<Result<(), String>>> = Slot::new();
     let done = slot.clone();
     relay.publish_with_ack(
@@ -311,6 +374,50 @@ mod tests {
         e.push("garbage".into());
         let ev = futures::executor::block_on(build(&a, "z", 1, &e, 1)).unwrap();
         assert_eq!(futures::executor::block_on(open(&a, &ev)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_push_never_shrinks_the_relay_copy_or_publishes_blind() {
+        let remote: Vec<String> = entries(5);
+        let local: Vec<String> = entries(7)[5..].to_vec(); // two new ones
+                                                           // The relay's copy could not be read: publish nothing.
+        assert_eq!(plan_publish(Err("timeout".into()), &local, 500), None);
+        // Remote and local are unioned, never replaced.
+        let (at, all) = plan_publish(Ok(Some((100, remote.clone()))), &local, 500).unwrap();
+        assert_eq!(at, 500);
+        assert_eq!(all.len(), 7);
+        for e in remote.iter().chain(local.iter()) {
+            assert!(all.contains(e));
+        }
+        // A fresh browser with an empty local ledger still keeps the remote set.
+        let (_, all) = plan_publish(Ok(Some((100, remote.clone()))), &[], 500).unwrap();
+        assert_eq!(all.len(), 5);
+        // No remote copy yet: the local set is published.
+        assert_eq!(plan_publish(Ok(None), &local, 500).unwrap().1.len(), 2);
+        // Nothing anywhere: nothing to publish.
+        assert_eq!(plan_publish(Ok(None), &[], 500), None);
+        // Same-second rewrite: created_at moves past the remote copy's.
+        assert_eq!(
+            plan_publish(Ok(Some((500, remote.clone()))), &local, 500)
+                .unwrap()
+                .0,
+            501
+        );
+        // A clock behind the remote copy's still wins the replace.
+        assert_eq!(
+            plan_publish(Ok(Some((900, remote))), &local, 500)
+                .unwrap()
+                .0,
+            901
+        );
+        // Malformed remote entries are dropped, duplicates collapse.
+        let mut dirty = entries(2);
+        dirty.push("junk".into());
+        dirty.push(dirty[0].clone());
+        assert_eq!(
+            plan_publish(Ok(Some((1, dirty))), &[], 5).unwrap().1.len(),
+            2
+        );
     }
 
     #[test]
