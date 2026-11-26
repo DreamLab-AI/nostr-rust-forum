@@ -77,15 +77,70 @@ pub(crate) const COUNT_SUBTRACT_MAX_GAP_SECS: u64 = 86_400;
 /// cheap to redo, and a random id (no messages) must never occupy storage.
 pub(crate) const COUNT_PERSIST_MIN: u64 = 200;
 
-/// Rows per window of a full count, and the pause between windows: each
-/// window is a short statement, and the pause lets other members' queries
-/// run, so D1 is never held for seconds by one count.
-pub(crate) const COUNT_WINDOW_ROWS: u32 = 10_000;
-pub(crate) const COUNT_WINDOW_PAUSE_MS: u64 = 150;
+/// Rows per window of a full count, and the pause between windows. D1's
+/// limit is total work per 10-second window, not per statement: with
+/// 10k-row windows and short pauses the 241k-message channel still spent
+/// ~5 s of D1 time in 10 s, hit "overloaded" midway and never finished
+/// (2026-11-26). 2k rows (~40 ms) then 400 ms keeps a count near 10% of D1.
+pub(crate) const COUNT_WINDOW_ROWS: u32 = 2_000;
+pub(crate) const COUNT_WINDOW_PAUSE_MS: u64 = 400;
 
-/// How long a request waits for a full count of the same key already running
-/// in this isolate before giving up with a retryable error.
-pub(crate) const COUNT_INFLIGHT_WAIT_MS: u64 = 30_000;
+/// Longest one request spends building a first snapshot. The build is
+/// resumable (progress saved after every window), so a big channel is
+/// completed over several requests, each answered "busy, try again".
+pub(crate) const COUNT_BUILD_BUDGET_MS: f64 = 6_000.0;
+
+/// A first snapshot part-way built: windows done so far up to (not
+/// including) `lo`, towards a fixed horizon `hi`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CountPartial {
+    pub(crate) hi: u64,
+    pub(crate) lo: u64,
+    pub(crate) groups: Vec<(String, u64)>,
+    pub(crate) rows: Vec<NostrEvent>,
+    /// More exception rows than a snapshot keeps: stop collecting them; the
+    /// finished snapshot then has `exceptions: None`.
+    pub(crate) overflow: bool,
+}
+
+impl CountPartial {
+    pub(crate) fn start(hi: u64) -> Self {
+        Self {
+            hi,
+            lo: 0,
+            groups: Vec::new(),
+            rows: Vec::new(),
+            overflow: false,
+        }
+    }
+
+    /// Fold in one window's results.
+    pub(crate) fn absorb(&mut self, groups: &[(String, u64)], rows: Vec<NostrEvent>) {
+        self.groups = merge_groups(&self.groups, groups);
+        if !self.overflow {
+            self.rows.extend(rows);
+            if snapshot_exceptions(&self.rows).is_none() {
+                self.overflow = true;
+                self.rows.clear();
+            }
+        }
+    }
+
+    /// The finished snapshot.
+    pub(crate) fn finish(self) -> CountSnapshot {
+        CountSnapshot {
+            as_of: self.hi,
+            groups: self.groups,
+            exceptions: if self.overflow { None } else { Some(self.rows) },
+            windows: 0,
+        }
+    }
+}
+
+/// DO storage key of a part-built snapshot.
+pub(crate) fn partial_storage_key(key: &str) -> String {
+    format!("count_part:v1:{key}")
+}
 
 /// Most snapshots kept in memory before the memory cache is emptied.
 pub(crate) const COUNT_CACHE_MAX: usize = 1024;
@@ -108,9 +163,19 @@ pub(crate) struct CountSnapshot {
     pub(crate) as_of: u64,
     pub(crate) groups: Vec<(String, u64)>,
     pub(crate) exceptions: Option<Vec<NostrEvent>>,
+    /// Windows the first build took (cost to redo); 0 for rolls and older
+    /// stored snapshots.
+    #[serde(default)]
+    pub(crate) windows: u32,
 }
 
 impl CountSnapshot {
+    /// This snapshot, recording that its build took `windows` windows.
+    pub(crate) fn built_in(mut self, windows: u32) -> Self {
+        self.windows = windows;
+        self
+    }
+
     /// Total messages counted.
     pub(crate) fn total(&self) -> u64 {
         self.groups.iter().map(|(_, n)| n).sum()
@@ -371,6 +436,7 @@ mod tests {
             as_of,
             groups: vec![("ch".into(), 200_000)],
             exceptions: None,
+            windows: 0,
         }
     }
 
@@ -416,6 +482,7 @@ mod tests {
             as_of: 1,
             groups: vec![("ch".into(), COUNT_PERSIST_MIN - 1)],
             exceptions: None,
+            windows: 0,
         };
         assert!(!persist_snapshot(&small));
         // A random id: nothing counted, nothing stored.
@@ -423,6 +490,7 @@ mod tests {
             as_of: 1,
             groups: vec![],
             exceptions: None,
+            windows: 0,
         };
         assert!(!persist_snapshot(&empty));
     }
@@ -439,6 +507,27 @@ mod tests {
             subtract_groups(&a, &b),
             vec![("x".to_string(), 7), ("y".to_string(), 0)]
         );
+    }
+
+    #[test]
+    fn a_partial_snapshot_accumulates_and_overflows_exceptions() {
+        let mut p = CountPartial::start(500);
+        p.absorb(&[("x".into(), 3)], vec![ev(1)]);
+        p.absorb(&[("x".into(), 4), ("y".into(), 1)], vec![ev(1)]);
+        let snap = p.clone().finish();
+        assert_eq!(snap.as_of, 500);
+        assert_eq!(
+            snap.groups,
+            vec![("x".to_string(), 7), ("y".to_string(), 1)]
+        );
+        assert_eq!(snap.exceptions.map(|e| e.len()), Some(2));
+        // Too many expiring rows: none kept, and the snapshot says so.
+        p.absorb(&[], vec![ev(1); 70]);
+        assert!(p.overflow && p.rows.is_empty());
+        p.absorb(&[], vec![ev(1)]);
+        assert!(p.rows.is_empty());
+        assert!(p.finish().exceptions.is_none());
+        assert_eq!(partial_storage_key("k"), "count_part:v1:k");
     }
 
     #[test]
