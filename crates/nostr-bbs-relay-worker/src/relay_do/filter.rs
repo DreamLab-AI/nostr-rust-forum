@@ -63,9 +63,20 @@ pub struct FilterQuery {
 
 /// The most values of one tag filter answered as a `UNION ALL` of per-value
 /// index walks. Above it the query falls back to a single `IN` driver, which
-/// scans every match but keeps the statement small: SQLite caps compound
-/// SELECTs at 500 terms and D1 a statement at 100 bound parameters.
-pub const MAX_UNION_BRANCHES: usize = 32;
+/// scans every match but keeps the statement small.
+///
+/// D1 refuses a compound SELECT of more than five terms, although stock
+/// SQLite allows 500: measured on the live relay (2026-11-26), a `#t` or
+/// `#sealed` filter of 1–5 values answered in ~50 ms, 6, 7, 16 and 32 values
+/// failed in D1 (so `query_events_checked` sent no EOSE and the REQ hung),
+/// and 33 values (the `IN` driver) answered again. The cap was 32, so every
+/// tag read of 6–32 values was silently dropped; sealed search resolving
+/// 2–6 hits (5 ids per hit with decoys) was one of them.
+pub const MAX_UNION_BRANCHES: usize = D1_MAX_COMPOUND_SELECT;
+
+/// The most terms D1 accepts in one compound SELECT (see
+/// [`MAX_UNION_BRANCHES`]).
+pub const D1_MAX_COMPOUND_SELECT: usize = 5;
 
 /// The selected columns, qualified: `event_tags` also has `created_at`, so an
 /// unqualified name in a joined query is ambiguous.
@@ -1729,6 +1740,24 @@ mod query_builder_tests {
             .map(|(_, t)| t)
             .collect();
         assert_eq!(got, want, "same timestamps in the same order");
+    }
+
+    #[test]
+    fn no_tag_filter_compiles_to_more_compound_terms_than_d1_accepts() {
+        // D1 fails a compound SELECT above five terms (the relay then sends
+        // no EOSE), while local SQLite accepts 500, so the result-equality
+        // tests cannot catch it: count the terms of every value count.
+        for n in 1..=40 {
+            let values: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+            for key in ["#e", "#t", "#sealed"] {
+                let f = filter(serde_json::json!({"kinds": [42], key: values, "limit": 10}));
+                let terms = build_filter_query(&f, 10).sql.matches("UNION ALL").count() + 1;
+                assert!(
+                    terms <= D1_MAX_COMPOUND_SELECT,
+                    "{key} with {n} values compiles to {terms} compound terms"
+                );
+            }
+        }
     }
 
     #[test]

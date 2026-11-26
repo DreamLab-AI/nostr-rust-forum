@@ -455,16 +455,56 @@ pub fn grant_targets(
 }
 
 /// The keys of `held` a grant may hand out, given the zone's configured
-/// `history_from_epoch` floor: every key at or above the floor, and always the
-/// newest held key (so a floor set too high never stops a zone being granted).
+/// `history_from_epoch` floor: every key at or above the floor, and nothing
+/// below it.
+///
+/// The floor exists so keys from before it (a previous deployment's, say)
+/// never leave this browser. There is no exception for the newest held key:
+/// when even that is below the floor, this device is stale or the floor is
+/// misconfigured, and sending it would hand out exactly the old key the floor
+/// keeps home. Nothing is grantable then; [`floor_block`] says why.
 pub fn grantable_keys(held: Vec<ZoneKey>, floor: Option<u32>) -> Vec<ZoneKey> {
-    let Some(floor) = floor else {
-        return held;
-    };
-    let newest = held.iter().map(|k| k.epoch).max();
-    held.into_iter()
-        .filter(|k| k.epoch >= floor || Some(k.epoch) == newest)
-        .collect()
+    match floor {
+        None => held,
+        Some(floor) => held.into_iter().filter(|k| k.epoch >= floor).collect(),
+    }
+}
+
+/// A zone whose keys this device holds but may not grant, because every one
+/// of them is below the zone's `history_from_epoch` floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorBlock {
+    /// Zone id.
+    pub zone: String,
+    /// The newest epoch this device holds for the zone.
+    pub newest: u32,
+    /// The zone's configured floor.
+    pub floor: u32,
+}
+
+impl FloorBlock {
+    /// Why nothing is granted for the zone, for a log line, toast or card.
+    pub fn explain(&self) -> String {
+        format!(
+            "Zone {}: the newest key on this device (epoch {}) is below the zone's history \
+             floor (epoch {}), so no key is granted. Either this device is out of date \
+             (sign in on a device holding epoch {} or later) or history_from_epoch is set \
+             too high.",
+            self.zone, self.newest, self.floor, self.floor
+        )
+    }
+}
+
+/// `Some` when `held` is not empty but [`grantable_keys`] would leave nothing
+/// of it under `floor`.
+pub fn floor_block(zone: &str, held: &[ZoneKey], floor: Option<u32>) -> Option<FloorBlock> {
+    let floor = floor?;
+    let newest = held.iter().map(|k| k.epoch).max()?;
+    (newest < floor).then(|| FloorBlock {
+        zone: zone.to_string(),
+        newest,
+        floor,
+    })
 }
 
 /// The configured `history_from_epoch` of zone `zone_id`, if any.
@@ -913,8 +953,18 @@ mod tests {
         assert_eq!(epochs(grantable_keys(held.clone(), Some(5))), vec![5]);
         assert_eq!(epochs(grantable_keys(held.clone(), Some(2))), vec![2, 3, 5]);
         assert_eq!(epochs(grantable_keys(held.clone(), None)), vec![1, 2, 3, 5]);
-        // A floor above every held key still leaves the newest grantable.
-        assert_eq!(epochs(grantable_keys(held, Some(9))), vec![5]);
+        // A floor above every held key leaves nothing grantable: the newest
+        // held key is below the floor too, so it is an old key (a stale
+        // device, or a misconfigured floor) and must stay home.
+        assert!(grantable_keys(held.clone(), Some(9)).is_empty());
+        assert!(grantable_keys(held.clone(), Some(6)).is_empty());
+        // ...and the block says so, naming both epochs.
+        let block = floor_block("zone2", &held, Some(9)).expect("blocked");
+        assert_eq!((block.newest, block.floor), (5, 9));
+        assert!(block.explain().contains("epoch 5") && block.explain().contains("epoch 9"));
+        assert_eq!(floor_block("zone2", &held, Some(5)), None);
+        assert_eq!(floor_block("zone2", &held, None), None);
+        assert_eq!(floor_block("zone2", &[], Some(9)), None);
         assert!(grantable_keys(Vec::new(), Some(5)).is_empty());
         // With history on, the plan then carries only the floor's keys.
         let recs = vec!["b".repeat(64)];

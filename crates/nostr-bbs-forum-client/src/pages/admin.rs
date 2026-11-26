@@ -667,8 +667,12 @@ fn UsersTab() -> impl IntoView {
                     .await)
                     .is_ok()
                 {
+                    // Only the cohorts selected here open zones. Cohorts
+                    // inherited through the alias link below come from the
+                    // relay's record of the prior identity, so those zones
+                    // stay pending for an explicit approval.
                     if let Some(g) = auto_grant {
-                        g.after_allocation(&pk_owned);
+                        g.after_allocation(&pk_owned, &cohorts);
                     }
                     // Optional alias link — inherits cohorts + display attribution.
                     if let Some(old_pk) = prior {
@@ -708,10 +712,11 @@ fn UsersTab() -> impl IntoView {
                     .update_cohorts_signer(&pubkey, &add, &remove, &*signer)
                     .await
                     .is_ok();
-                // A cohort added may open an encrypted zone: send its key.
+                // A cohort added may open an encrypted zone: approve and send
+                // the keys of the zones those cohorts open, and only those.
                 if ok && !add.is_empty() {
                     if let Some(g) = auto_grant {
-                        g.after_allocation(&pubkey);
+                        g.after_allocation(&pubkey, &add);
                     }
                 }
             });

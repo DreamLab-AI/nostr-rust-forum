@@ -1613,7 +1613,7 @@ pub fn ThreadPage() -> impl IntoView {
                     )),
                     Lookup::KeysTimedOut => Some((
                         "Topic Unavailable",
-                        "Your keys for this zone are taking too long to arrive. Reload to try again.",
+                        "Your keys for this zone could not all be fetched or checked: the relay or the admin check did not answer, or they are taking too long. Nothing here is missing for certain. Reload to try again.",
                     )),
                     Lookup::Loading | Lookup::KeysLoading | Lookup::Found => None,
                 } {
