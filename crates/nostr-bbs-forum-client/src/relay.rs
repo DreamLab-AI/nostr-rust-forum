@@ -20,6 +20,7 @@ use wasm_bindgen::JsCast;
 use web_sys::WebSocket;
 
 mod receipt;
+mod verified;
 use receipt::{
     classify_auth_ok, explain_write_refusal, logical_id, release_held_writes, req_watch_delay,
     req_wire_id, route, watch_due, wire_id, AuthReply, HandshakeView, ReqLedger, Route, Watch,
@@ -78,6 +79,10 @@ pub struct Filter {
     /// `#d` filter, for addressable events such as kind-30078 app data.
     #[serde(rename = "#d", skip_serializing_if = "Option::is_none")]
     pub d_tags: Option<Vec<String>>,
+    /// `#sealed` filter: a sealed original by its INNER (original) id, which
+    /// the envelope names in its `["sealed", <inner id>, "1"]` tag.
+    #[serde(rename = "#sealed", skip_serializing_if = "Option::is_none")]
+    pub sealed_tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,6 +110,9 @@ pub type EoseCallback = Rc<dyn Fn()>;
 /// call a members-only thing "absent" on an anonymous answer use this.
 pub type ReceiptCallback = Rc<dyn Fn(bool)>;
 
+/// Called with the CLOSED reason (see `subscribe_with_receipt_or_closed`).
+pub type ClosedCallback = Rc<dyn Fn(String)>;
+
 /// Callback for a NIP-45 COUNT answer: the number of events matching the
 /// filters, as the relay counts them for this session.
 pub type CountCallback = Rc<dyn Fn(u64)>;
@@ -123,6 +131,10 @@ struct Subscription {
     on_event: EventCallback,
     on_eose: Option<EoseCallback>,
     on_receipt: Option<ReceiptCallback>,
+    /// Called with the reason when the relay refuses or ends this
+    /// subscription with CLOSED (one-shot history pages take it as their
+    /// answer: an over-cap REQ is refused with CLOSED, not EOSE).
+    on_closed: Option<ClosedCallback>,
     /// REQs sent for this subscription on the current socket and not yet
     /// answered, and whether the latest went out after AUTH was accepted.
     ledger: ReqLedger,
@@ -193,6 +205,9 @@ struct RelayInner {
     /// subscription also needs). Scoping the key to the subscription keeps the
     /// replay/reconnect dedup while delivering each event to every sub once.
     seen_events: HashSet<String>,
+    /// Events whose signature has been verified this session (see
+    /// [`verified`]); a re-delivery skips only the Schnorr check.
+    verified: verified::VerifiedIds,
     /// PRD-010 G4: EVENT (write) frames deferred because the socket is connected
     /// but has not yet completed NIP-42 AUTH. In `nip42` mode the relay rejects
     /// unauthenticated writes with `["OK", id, false, "auth-required: …"]`, so
@@ -380,6 +395,7 @@ impl RelayConnection {
             relay_url,
             immediate_writes,
             seen_events: HashSet::new(),
+            verified: verified::VerifiedIds::default(),
             deferred_writes: Vec::new(),
             auth_signer: None,
             auth_signer_async: None,
@@ -658,7 +674,7 @@ impl RelayConnection {
         on_event: EventCallback,
         on_eose: Option<EoseCallback>,
     ) -> String {
-        self.subscribe_inner(filters, on_event, on_eose, None)
+        self.subscribe_inner(filters, on_event, on_eose, None, None)
     }
 
     /// Like [`subscribe`](Self::subscribe), but the EOSE callback is told
@@ -670,7 +686,20 @@ impl RelayConnection {
         on_event: EventCallback,
         on_receipt: ReceiptCallback,
     ) -> String {
-        self.subscribe_inner(filters, on_event, None, Some(on_receipt))
+        self.subscribe_inner(filters, on_event, None, Some(on_receipt), None)
+    }
+
+    /// [`Self::subscribe_with_receipt`], plus `on_closed` with the reason if
+    /// the relay answers CLOSED instead (it refused the REQ, e.g. too many
+    /// subscriptions on this connection, or ended it).
+    pub fn subscribe_with_receipt_or_closed(
+        &self,
+        filters: Vec<Filter>,
+        on_event: EventCallback,
+        on_receipt: ReceiptCallback,
+        on_closed: ClosedCallback,
+    ) -> String {
+        self.subscribe_inner(filters, on_event, None, Some(on_receipt), Some(on_closed))
     }
 
     fn subscribe_inner(
@@ -679,6 +708,7 @@ impl RelayConnection {
         on_event: EventCallback,
         on_eose: Option<EoseCallback>,
         on_receipt: Option<ReceiptCallback>,
+        on_closed: Option<ClosedCallback>,
     ) -> String {
         let (sub_id, watch) = self.with_inner(|rc| {
             let mut inner = rc.borrow_mut();
@@ -697,6 +727,7 @@ impl RelayConnection {
                     on_event,
                     on_eose,
                     on_receipt,
+                    on_closed,
                     ledger,
                     wire_id: wire_id(&sub_id, 0),
                     wire_gen: 0,
@@ -744,6 +775,37 @@ impl RelayConnection {
         });
         self.send_raw(&count_frame(&id, &filters));
         id
+    }
+
+    /// Forget every verified event id (see `relay/verified.rs`), so the next
+    /// identity's deliveries are all verified afresh and the cache's hit
+    /// pattern says nothing about what the previous identity fetched.
+    /// Called on every identity switch (`ZoneKeyStore::switch_owner`).
+    pub fn clear_verified(&self) {
+        // `switch_owner` runs from an Effect, never inside the socket
+        // handler, so the borrow is free; if it ever is not, say so rather
+        // than panic in the middle of a sign-out.
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner.verified = verified::VerifiedIds::default(),
+            Err(_) => web_sys::console::warn_1(
+                &"[Relay] verified-id cache busy at identity switch; not cleared".into(),
+            ),
+        }
+    }
+
+    /// Sizes of the per-id collections (`alloc-stats` diagnostics).
+    #[cfg(feature = "alloc-stats")]
+    pub fn debug_sizes(&self) -> Vec<(&'static str, usize)> {
+        let inner = self.inner.borrow();
+        vec![
+            ("relay.subscriptions", inner.subscriptions.len()),
+            ("relay.seen_events", inner.seen_events.len()),
+            ("relay.verified", inner.verified.len()),
+            ("relay.verified_queue", inner.verified.queue_len()),
+            ("relay.req_sent_at", inner.req_sent_at.len()),
+            ("relay.counts", inner.counts.len()),
+            ("relay.pending_publishes", inner.pending_publishes.len()),
+        ]
     }
 
     pub fn unsubscribe(&self, sub_id: &str) {
@@ -1339,11 +1401,20 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
 
             // Verify event-id integrity and Schnorr signature before dedup or
             // dispatch. Never hand forged authorship to callbacks — drop it.
-            if let Err(e) = nostr_bbs_core::verify_event_strict(&event) {
-                web_sys::console::warn_1(
-                    &format!("[Relay] Dropping event failing verification: {:?}", e).into(),
-                );
-                return;
+            // An event already verified this session (same id and signature,
+            // id recomputed from its fields) skips only the Schnorr check: see
+            // `relay/verified.rs` for why that is safe. Every new event, and
+            // any re-delivery that differs in a single field, is verified in
+            // full.
+            let known = inner_rc.borrow_mut().verified.already_verified(&event);
+            if !known {
+                if let Err(e) = nostr_bbs_core::verify_event_strict(&event) {
+                    web_sys::console::warn_1(
+                        &format!("[Relay] Dropping event failing verification: {:?}", e).into(),
+                    );
+                    return;
+                }
+                inner_rc.borrow_mut().verified.insert(&event);
             }
 
             {
@@ -1402,13 +1473,18 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
             // receipt, so no callback fires.
             // Under a retired wire id it answers an abandoned REQ: ignored.
             if let Some(wire) = arr.get(1).and_then(Value::as_str) {
-                if let Some(s) = inner_rc
+                let on_closed = inner_rc
                     .borrow_mut()
                     .subscriptions
                     .get_mut(logical_id(wire))
                     .filter(|s| route(wire, &s.wire_id) == Route::Current)
-                {
-                    s.ledger.answered();
+                    .and_then(|s| {
+                        s.ledger.answered();
+                        s.on_closed.clone()
+                    });
+                if let Some(cb) = on_closed {
+                    let reason = arr.get(2).and_then(Value::as_str).unwrap_or("").to_string();
+                    cb(reason);
                 }
             }
         }
@@ -1609,6 +1685,12 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
             );
         }
     }
+}
+
+/// The relay URL connections use (see [`get_relay_url`]); browser data is
+/// scoped to it (`stores::relay_scope`).
+pub(crate) fn configured_relay_url() -> String {
+    get_relay_url()
 }
 
 /// Read the relay URL from the environment or fall back to the default.

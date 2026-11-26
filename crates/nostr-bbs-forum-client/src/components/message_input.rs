@@ -210,6 +210,13 @@ pub(crate) fn MessageInput(
     /// either or both.
     #[prop(optional)]
     enable_image_upload: bool,
+    /// Pod container for an attached image: the channel's zone container
+    /// (`media/zones/<zone>`), from
+    /// [`media_target_for_section`](crate::stores::zones::media_target_for_section).
+    /// Omitted: `media/public` on a deployment without zones, and the upload is
+    /// refused on one with zones (never silently public).
+    #[prop(optional, into)]
+    media_target: Option<Signal<crate::utils::restricted_media::MediaTarget>>,
     /// Optional initial textarea content. Used by the edit flow to pre-fill the
     /// composer with the post being edited. Existing call sites omit it and the
     /// composer opens empty (then restores any saved draft).
@@ -637,6 +644,15 @@ pub(crate) fn MessageInput(
                         return;
                     }
                 };
+                let target = media_target
+                    .map(|t| t.get_untracked())
+                    .unwrap_or_else(|| crate::stores::zones::media_target_for_section(None));
+                if target.container_path().is_none() {
+                    upload_error.set(Some(
+                        "This channel is not in a zone, so images cannot be attached here".into(),
+                    ));
+                    return;
+                }
                 upload_error.set(None);
                 uploading.set(true);
                 let base_text = text.clone();
@@ -663,6 +679,7 @@ pub(crate) fn MessageInput(
                         &file.name(),
                         &pk,
                         signer.as_ref(),
+                        &target,
                     )
                     .await
                     {

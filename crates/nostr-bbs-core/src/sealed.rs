@@ -26,6 +26,7 @@
 //! | `tags[0]`    | `["e", <channel_id>, "", "root"]`, the same channel as the inner event's root `e` tag |
 //! | `tags[1]`    | `["zk", <zone>, "<epoch>", <zone_pk_hex>]`, the existing zone-key tag |
 //! | `tags[2]`    | `["sealed", <inner.id>, "1"]`: marker, inner id and format version |
+//! | `tags[3]`    | only when the inner event replies to a topic: `["e", <topic_root>, "", "reply"]`, copied from the inner event's `reply`-marked `e` tag (see [`reply_root_of`]); only when the inner event IS a topic root (a `root` channel tag and no `reply` tag): the marker `["t", "topic"]` (see [`TOPIC_MARKER`]) |
 //! | `content`    | `nip44_v2_encrypt(migrator_sk, zone_pk, inner_json)` |
 //! | `sig`        | the migrator's Schnorr signature |
 //!
@@ -62,9 +63,18 @@
 //!   (`relay_do/nip_handlers.rs` `validate_event`) therefore needs a narrow
 //!   exemption for sealed kind-42 events, and admin authorship is enforced
 //!   separately.
-//! - **Only the channel `e` tag is exposed.** The original's reply `e` tags
-//!   and `p` tags stay inside the ciphertext. This leaks strictly less
-//!   metadata than a live encrypted post does today.
+//! - **Only the channel and the topic are exposed.** A reply's topic root
+//!   (its `reply`-marked `e` tag) is copied outside so the relay can page one
+//!   topic; the relay and anyone with read access to its database therefore
+//!   learn which envelopes share a topic, and each topic's volume and timing,
+//!   not its name or content (the root is sealed too). `quote` targets, any
+//!   other `e` tags and all `p` tags stay inside the ciphertext. A topic
+//!   root carries no outer topic tag; it carries the outer marker
+//!   `["t", "topic"]` instead, so one `{"#t":["topic"],"#e":[channel]}`
+//!   query lists a section's topics. The relay could already derive the set
+//!   of roots (and their dates to the second) from the replies' topic tags,
+//!   so the marker adds essentially nothing. Additive: the version marker stays
+//!   `1`, and envelopes sealed without the topic tag still open.
 //!
 //! # Trust boundary
 //!
@@ -161,8 +171,11 @@ pub enum SealError {
     NestedZoneKey,
 
     /// The inner event's channel differs from the outer envelope's channel
-    /// (**check 5**).
-    #[error("sealed original: inner channel does not match the envelope channel")]
+    /// (**check 5**), or the envelope's thread placement disagrees with the
+    /// inner event (**check 7**): an outer topic tag that is not the inner
+    /// `reply` root, an outer topic tag on an inner event that replies to
+    /// nothing, or any outer `p` tag or other `e` tag.
+    #[error("sealed original: inner channel or topic does not match the envelope")]
     ChannelMismatch,
 
     /// The inner `created_at` differs from the outer `created_at` (**check 6**).
@@ -291,6 +304,31 @@ pub fn channel_of(ev: &NostrEvent) -> Option<&str> {
         .map(|t| t[1].as_str())
 }
 
+/// The value of the outer `t` tag that marks a sealed topic root
+/// (`["t", "topic"]`), set by [`seal_original`] when the original is a topic
+/// root: a channel `root` tag and no `reply` tag.
+pub const TOPIC_MARKER: &str = "topic";
+
+/// Whether `ev` is shaped as a topic root: a `root`-marked `e` tag and no
+/// `reply`-marked one.
+pub fn is_topic_root(ev: &NostrEvent) -> bool {
+    reply_root_of(ev).is_none()
+        && ev
+            .tags
+            .iter()
+            .any(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
+}
+
+/// The topic root a kind-42 replies to: the value of its first `e` tag whose
+/// marker is exactly `reply` (`["e", <root>, <relay>, "reply"]`), chosen by
+/// marker, never by position. A `quote` or unmarked `e` tag is never a topic.
+pub fn reply_root_of(ev: &NostrEvent) -> Option<&str> {
+    ev.tags
+        .iter()
+        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "reply")
+        .map(|t| t[1].as_str())
+}
+
 /// Seal a plaintext kind-42 `original` into a zone-encrypted envelope signed
 /// by `migrator_sk`.
 ///
@@ -316,6 +354,114 @@ pub fn seal_original(
     zone_pk_hex: &str,
     migrator_sk: &SecretKey,
 ) -> Result<NostrEvent, SealError> {
+    check_original(original)?;
+    let zone_pk = check_zone_key(zone, epoch, zone_pk_hex)?;
+    seal_checked(original, zone, epoch, &zone_pk, migrator_sk, |inner| {
+        nip44::encrypt(migrator_sk.as_bytes(), &zone_pk, inner)
+    })
+}
+
+/// Seals many originals into one zone key: [`seal_original`] with the zone
+/// key validated and the NIP-44 conversation key (migrator x zone pubkey)
+/// derived ONCE, for bulk sealing (e.g. an offline, multi-threaded pass).
+///
+/// Every envelope is exactly what [`seal_original`] would produce for the
+/// same inputs (same checks on each original, same tags, same signer), apart
+/// from the random NIP-44 nonce; [`open_sealed`] accepts both. The
+/// conversation key is derived internally from the key it is used with, so
+/// it cannot be paired with the wrong zone. `Send + Sync`: share one sealer
+/// across threads.
+///
+/// # Example
+///
+/// ```
+/// use nostr_bbs_core::keys::SecretKey;
+/// use nostr_bbs_core::sealed::{open_sealed, OriginalSealer};
+/// use nostr_bbs_core::{sign_event_deterministic, UnsignedEvent};
+///
+/// let author = k256::schnorr::SigningKey::from_bytes(&[0x11u8; 32].into()).unwrap();
+/// let original = sign_event_deterministic(
+///     UnsignedEvent {
+///         pubkey: hex::encode(author.verifying_key().to_bytes()),
+///         created_at: 1_600_000_000,
+///         kind: 42,
+///         tags: vec![vec!["e".into(), "c".repeat(64), "".into(), "root".into()]],
+///         content: "hello".into(),
+///     },
+///     &author,
+/// )
+/// .unwrap();
+/// let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+/// let zone_sk = [0x33u8; 32];
+/// let zone_pk = SecretKey::from_bytes(zone_sk).unwrap().public_key().to_hex();
+/// let sealer = OriginalSealer::new("zone2", 1, &zone_pk, migrator).unwrap();
+/// let outer = sealer.seal(&original).unwrap();
+/// assert_eq!(open_sealed(&outer, &zone_sk).unwrap().id, original.id);
+/// ```
+pub struct OriginalSealer {
+    zone: String,
+    epoch: u32,
+    zone_pk: [u8; 32],
+    migrator_sk: SecretKey,
+    conversation_key: [u8; 32],
+}
+
+impl OriginalSealer {
+    /// Validate the zone key and derive the conversation key once.
+    ///
+    /// # Errors
+    ///
+    /// [`SealError::InvalidZoneKey`] for an empty zone, epoch 0, or a zone
+    /// pubkey that is not 64 hex or not on the curve; [`SealError::Encrypt`]
+    /// if the conversation key cannot be derived.
+    pub fn new(
+        zone: &str,
+        epoch: u32,
+        zone_pk_hex: &str,
+        migrator_sk: SecretKey,
+    ) -> Result<Self, SealError> {
+        let zone_pk = check_zone_key(zone, epoch, zone_pk_hex)?;
+        let conversation_key = nip44::conversation_key(migrator_sk.as_bytes(), &zone_pk)
+            .map_err(|e| SealError::Encrypt(e.to_string()))?;
+        Ok(Self {
+            zone: zone.to_string(),
+            epoch,
+            zone_pk,
+            migrator_sk,
+            conversation_key,
+        })
+    }
+
+    /// Seal one original (the same per-original checks as [`seal_original`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`seal_original`] for the original.
+    pub fn seal(&self, original: &NostrEvent) -> Result<NostrEvent, SealError> {
+        check_original(original)?;
+        seal_checked(
+            original,
+            &self.zone,
+            self.epoch,
+            &self.zone_pk,
+            &self.migrator_sk,
+            |inner| nip44::encrypt_with_conversation_key(&self.conversation_key, inner),
+        )
+    }
+}
+
+impl core::fmt::Debug for OriginalSealer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OriginalSealer")
+            .field("zone", &self.zone)
+            .field("epoch", &self.epoch)
+            .field("zone_pk", &hex::encode(self.zone_pk))
+            .finish_non_exhaustive()
+    }
+}
+
+/// The per-original checks of [`seal_original`].
+fn check_original(original: &NostrEvent) -> Result<(), SealError> {
     if original.kind != KIND_CHANNEL_MESSAGE {
         return Err(SealError::WrongKind(original.kind));
     }
@@ -325,8 +471,12 @@ pub fn seal_original(
     if has_zk_tag(&original.tags) {
         return Err(SealError::NestedZoneKey);
     }
-    let channel = channel_of(original).ok_or(SealError::MissingChannel)?;
+    channel_of(original).ok_or(SealError::MissingChannel)?;
+    Ok(())
+}
 
+/// The zone-key checks of [`seal_original`]; the decoded zone pubkey.
+fn check_zone_key(zone: &str, epoch: u32, zone_pk_hex: &str) -> Result<[u8; 32], SealError> {
     if zone.is_empty() {
         return Err(SealError::InvalidZoneKey("empty zone"));
     }
@@ -337,18 +487,37 @@ pub fn seal_original(
         decode_hex32(zone_pk_hex).ok_or(SealError::InvalidZoneKey("zone pubkey must be 64 hex"))?;
     crate::keys::PublicKey::from_bytes(zone_pk)
         .map_err(|_| SealError::InvalidZoneKey("zone pubkey is not on the curve"))?;
+    Ok(zone_pk)
+}
 
+/// Build the envelope for a checked original with `encrypt` for the content.
+fn seal_checked(
+    original: &NostrEvent,
+    zone: &str,
+    epoch: u32,
+    zone_pk: &[u8; 32],
+    migrator_sk: &SecretKey,
+    encrypt: impl FnOnce(&str) -> Result<String, nip44::Nip44Error>,
+) -> Result<NostrEvent, SealError> {
+    let channel = channel_of(original).ok_or(SealError::MissingChannel)?;
     // `NostrEvent` serialises exactly the seven NIP-01 fields in declaration order.
     let inner_json = serde_json::to_string(original).map_err(|_| SealError::MalformedInner)?;
+    let content = encrypt(&inner_json).map_err(|e| SealError::Encrypt(e.to_string()))?;
 
-    build_envelope(
-        &inner_json,
+    // The only thread metadata exposed: the topic the original replies to, so
+    // the relay can page one topic (`#e:[topic]`). Copied from the original,
+    // never supplied by the caller; `quote` and `p` tags stay inside.
+    let topic = reply_root_of(original);
+    assemble_envelope(
+        content,
         channel,
+        topic,
+        is_topic_root(original),
         original.created_at,
         &original.id,
         zone,
         epoch,
-        &zone_pk,
+        zone_pk,
         migrator_sk,
     )
 }
@@ -373,6 +542,90 @@ pub fn seal_original(
 /// to showing partial data. The outer signature is not verified here; see the
 /// module-level *Trust boundary* section.
 pub fn open_sealed(outer: &NostrEvent, zone_sk: &[u8; 32]) -> Result<NostrEvent, SealError> {
+    open_with(outer, |migrator_pk, content| {
+        nip44::decrypt(zone_sk, migrator_pk, content).map_err(|_| SealError::Decrypt)
+    })
+}
+
+/// [`open_sealed`] with the NIP-44 conversation key of the zone secret and
+/// the envelope's author already derived ([`nip44::conversation_key`]`(zone_sk,
+/// author_pk)`), so a reader opening many envelopes from one migrator pays
+/// the ECDH once instead of per envelope.
+///
+/// `author_pk` is the x-only public key the conversation key was derived
+/// for. The envelope is refused with [`SealError::Decrypt`] unless its outer
+/// `pubkey` is exactly that key, before any decryption, so the key is bound
+/// to its author by the API rather than left to each caller. (A key derived
+/// for another author would also fail the NIP-44 MAC; the explicit check
+/// keeps the binding even if a caller pairs the wrong cached key.)
+///
+/// The result is otherwise identical to [`open_sealed`]'s for the same
+/// envelope and key, and **all six checks** run the same way, including the
+/// inner event's id and BIP-340 signature. As for [`open_sealed`], the outer
+/// signature is not verified here.
+///
+/// # Errors
+///
+/// [`SealError::Decrypt`] when `outer.pubkey` is not `author_pk` or the key
+/// does not open the envelope; otherwise the same errors as [`open_sealed`].
+///
+/// # Example
+///
+/// ```
+/// use nostr_bbs_core::keys::SecretKey;
+/// use nostr_bbs_core::nip44::conversation_key;
+/// use nostr_bbs_core::sealed::{open_sealed, open_sealed_with_conversation_key, seal_original, SealError};
+/// use nostr_bbs_core::{sign_event_deterministic, UnsignedEvent};
+///
+/// let author = k256::schnorr::SigningKey::from_bytes(&[0x11u8; 32].into()).unwrap();
+/// let original = sign_event_deterministic(
+///     UnsignedEvent {
+///         pubkey: hex::encode(author.verifying_key().to_bytes()),
+///         created_at: 1_600_000_000,
+///         kind: 42,
+///         tags: vec![vec!["e".into(), "c".repeat(64), "".into(), "root".into()]],
+///         content: "hello".into(),
+///     },
+///     &author,
+/// )
+/// .unwrap();
+/// let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+/// let migrator_pk = *migrator.public_key().as_bytes();
+/// let zone_sk = [0x33u8; 32];
+/// let zone_pk = SecretKey::from_bytes(zone_sk).unwrap().public_key().to_hex();
+/// let outer = seal_original(&original, "zone2", 1, &zone_pk, &migrator).unwrap();
+///
+/// let ck = conversation_key(&zone_sk, &migrator_pk).unwrap();
+/// let opened = open_sealed_with_conversation_key(&outer, &migrator_pk, &ck).unwrap();
+/// let plain = open_sealed(&outer, &zone_sk).unwrap();
+/// assert_eq!(serde_json::to_string(&opened).unwrap(), serde_json::to_string(&plain).unwrap());
+/// assert_eq!(opened.id, original.id);
+///
+/// // The key is bound to its author: naming anyone else is refused.
+/// let other = *SecretKey::from_bytes([0x44; 32]).unwrap().public_key().as_bytes();
+/// assert_eq!(open_sealed_with_conversation_key(&outer, &other, &ck).unwrap_err(), SealError::Decrypt);
+/// ```
+pub fn open_sealed_with_conversation_key(
+    outer: &NostrEvent,
+    author_pk: &[u8; 32],
+    conversation_key: &[u8; 32],
+) -> Result<NostrEvent, SealError> {
+    open_with(outer, |migrator_pk, content| {
+        if migrator_pk != author_pk {
+            return Err(SealError::Decrypt);
+        }
+        nip44::decrypt_with_conversation_key(conversation_key, content)
+            .map_err(|_| SealError::Decrypt)
+    })
+}
+
+/// The shared body of [`open_sealed`] and [`open_sealed_with_conversation_key`]:
+/// outer shape checks, `decrypt(migrator_pk, content)`, strict inner parse,
+/// then the six checks.
+fn open_with(
+    outer: &NostrEvent,
+    decrypt: impl FnOnce(&[u8; 32], &str) -> Result<String, SealError>,
+) -> Result<NostrEvent, SealError> {
     if outer.kind != KIND_CHANNEL_MESSAGE {
         return Err(SealError::WrongKind(outer.kind));
     }
@@ -383,8 +636,7 @@ pub fn open_sealed(outer: &NostrEvent, zone_sk: &[u8; 32]) -> Result<NostrEvent,
     let outer_channel = channel_of(outer).ok_or(SealError::MissingChannel)?;
     let migrator_pk = decode_hex32(&outer.pubkey).ok_or(SealError::Decrypt)?;
 
-    let text =
-        nip44::decrypt(zone_sk, &migrator_pk, &outer.content).map_err(|_| SealError::Decrypt)?;
+    let text = decrypt(&migrator_pk, &outer.content)?;
     let inner: NostrEvent = serde_json::from_str::<InnerWire>(&text)
         .map_err(|_| SealError::MalformedInner)?
         .into();
@@ -412,6 +664,29 @@ pub fn open_sealed(outer: &NostrEvent, zone_sk: &[u8; 32]) -> Result<NostrEvent,
     // 6. same timestamp
     if inner.created_at != outer.created_at {
         return Err(SealError::CreatedAtMismatch);
+    }
+    // 7. thread placement and outer shape: the outer envelope may name the
+    //    topic the inner event replies to, and nothing else. An outer topic tag must be the
+    //    inner `reply` root, and an inner event that replies to nothing (a
+    //    topic root) carries none. No other outer `e` tag and no `p` tag, so
+    //    quote targets and mentions never leave the ciphertext and a relay
+    //    query cannot file the envelope under another thread. Envelopes
+    //    sealed before the topic tag existed (no outer topic) still open.
+    if !outer_shape_ok(outer, outer_channel) {
+        return Err(SealError::ChannelMismatch);
+    }
+    if let Some(topic) = reply_root_of(outer) {
+        if reply_root_of(&inner) != Some(topic) {
+            return Err(SealError::ChannelMismatch);
+        }
+    }
+    // A topic-root marker only on a root-shaped inner event.
+    let marked = outer
+        .tags
+        .iter()
+        .any(|t| t.len() == 2 && t[0] == "t" && t[1] == TOPIC_MARKER);
+    if marked && !is_topic_root(&inner) {
+        return Err(SealError::ChannelMismatch);
     }
     Ok(inner)
 }
@@ -449,9 +724,12 @@ impl From<InnerWire> for NostrEvent {
 /// Encrypt `inner_json` to the zone key and sign the outer envelope. This does
 /// not validate the plaintext, so tests can craft hostile envelopes with it.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn build_envelope(
     inner_json: &str,
     channel: &str,
+    topic: Option<&str>,
+    root_marker: bool,
     created_at: u64,
     inner_id: &str,
     zone: &str,
@@ -461,34 +739,106 @@ fn build_envelope(
 ) -> Result<NostrEvent, SealError> {
     let content = nip44::encrypt(migrator_sk.as_bytes(), zone_pk, inner_json)
         .map_err(|e| SealError::Encrypt(e.to_string()))?;
+    assemble_envelope(
+        content,
+        channel,
+        topic,
+        root_marker,
+        created_at,
+        inner_id,
+        zone,
+        epoch,
+        zone_pk,
+        migrator_sk,
+    )
+}
+
+/// The envelope for already-encrypted `content`: the tags, the signer.
+#[allow(clippy::too_many_arguments)]
+fn assemble_envelope(
+    content: String,
+    channel: &str,
+    topic: Option<&str>,
+    root_marker: bool,
+    created_at: u64,
+    inner_id: &str,
+    zone: &str,
+    epoch: u32,
+    zone_pk: &[u8; 32],
+    migrator_sk: &SecretKey,
+) -> Result<NostrEvent, SealError> {
+    let mut tags = vec![
+        vec![
+            "e".to_string(),
+            channel.to_string(),
+            String::new(),
+            "root".to_string(),
+        ],
+        vec![
+            ZK_TAG.to_string(),
+            zone.to_string(),
+            epoch.to_string(),
+            hex::encode(zone_pk),
+        ],
+        vec![
+            SEALED_TAG.to_string(),
+            inner_id.to_string(),
+            SEALED_VERSION.to_string(),
+        ],
+    ];
+    if root_marker && topic.is_none() {
+        tags.push(vec!["t".to_string(), TOPIC_MARKER.to_string()]);
+    }
+    if let Some(topic) = topic {
+        tags.push(vec![
+            "e".to_string(),
+            topic.to_string(),
+            String::new(),
+            "reply".to_string(),
+        ]);
+    }
     let unsigned = UnsignedEvent {
         pubkey: migrator_sk.public_key().to_hex(),
         created_at,
         kind: KIND_CHANNEL_MESSAGE,
-        tags: vec![
-            vec![
-                "e".to_string(),
-                channel.to_string(),
-                String::new(),
-                "root".to_string(),
-            ],
-            vec![
-                ZK_TAG.to_string(),
-                zone.to_string(),
-                epoch.to_string(),
-                hex::encode(zone_pk),
-            ],
-            vec![
-                SEALED_TAG.to_string(),
-                inner_id.to_string(),
-                SEALED_VERSION.to_string(),
-            ],
-        ],
+        tags,
         content,
     };
     let signing_key = SigningKey::from_bytes((migrator_sk.as_bytes()).into())
         .map_err(|e| SealError::Sign(e.to_string()))?;
     sign_event(unsigned, &signing_key).map_err(|e| SealError::Sign(e.to_string()))
+}
+
+/// The outer tags are exactly what [`build_envelope`] writes: the channel
+/// `["e", channel, "", "root"]`, the `zk` and `sealed` tags, and at most one
+/// of: a topic `["e", topic, "", "reply"]` or the root marker `["t", "topic"]`, each with exactly those elements (empty
+/// relay hint). Any other tag, hint or extra element is metadata the format
+/// does not expose (check 7).
+fn outer_shape_ok(outer: &NostrEvent, channel: &str) -> bool {
+    let mut channels = 0usize;
+    let mut topics = 0usize;
+    let mut markers = 0usize;
+    for tag in &outer.tags {
+        match tag.first().map(String::as_str) {
+            Some("e")
+                if tag.len() == 4 && tag[2].is_empty() && tag[3] == "root" && tag[1] == channel =>
+            {
+                channels += 1
+            }
+            Some("e")
+                if tag.len() == 4
+                    && tag[2].is_empty()
+                    && tag[3] == "reply"
+                    && is_hex64(&tag[1]) =>
+            {
+                topics += 1
+            }
+            Some("t") if tag.len() == 2 && tag[1] == TOPIC_MARKER => markers += 1,
+            Some(ZK_TAG) | Some(SEALED_TAG) => {}
+            _ => return false,
+        }
+    }
+    channels == 1 && topics <= 1 && markers <= 1 && !(topics == 1 && markers == 1)
 }
 
 fn has_zk_tag(tags: &[Vec<String>]) -> bool {
@@ -561,6 +911,80 @@ mod tests {
 
     /// A threaded reply with a `p` tag, so the test proves the inner tags
     /// survive while only the channel tag is exposed.
+    /// The conversation-key path agrees with `open_sealed` on a good envelope
+    /// and on every rejection: same result, same check failing.
+    #[test]
+    fn opening_with_a_conversation_key_matches_open_sealed() {
+        let zone_sk = *zone().as_bytes();
+        let mpk = *migrator().public_key().as_bytes();
+        let ck = crate::nip44::conversation_key(&zone_sk, &mpk).unwrap();
+        let good = seal_original(&original(), "zone2", 1, &zone_pk_hex(), &migrator()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&open_sealed_with_conversation_key(&good, &mpk, &ck).unwrap())
+                .unwrap(),
+            serde_json::to_string(&open_sealed(&good, &zone_sk).unwrap()).unwrap()
+        );
+
+        let mut variants: Vec<NostrEvent> = Vec::new();
+        let mut v = good.clone();
+        v.kind = 1;
+        variants.push(v);
+        let mut v = good.clone();
+        v.tags.retain(|t| t[0] != "sealed");
+        variants.push(v);
+        let mut v = good.clone();
+        v.created_at += 1;
+        variants.push(v);
+        let mut v = good.clone();
+        v.content = v.content.replacen('A', "B", 1);
+        variants.push(v);
+        let mut v = good.clone();
+        for t in v.tags.iter_mut().filter(|t| t[0] == "sealed") {
+            t[1] = "0".repeat(64);
+        }
+        variants.push(v);
+        for v in &variants {
+            assert_eq!(
+                format!("{:?}", open_sealed_with_conversation_key(v, &mpk, &ck)),
+                format!("{:?}", open_sealed(v, &zone_sk)),
+                "{v:?}"
+            );
+        }
+
+        // A key for another author or another zone secret never opens it.
+        let other_pk = *key(0x77).public_key().as_bytes();
+        let other = crate::nip44::conversation_key(&zone_sk, &other_pk).unwrap();
+        assert!(matches!(
+            open_sealed_with_conversation_key(&good, &mpk, &other),
+            Err(SealError::Decrypt)
+        ));
+    }
+
+    /// The conversation key is bound to `author_pk`: an envelope whose outer
+    /// pubkey is anyone else is refused before decryption, even when the
+    /// caller hands over the right key for that envelope.
+    #[test]
+    fn opening_with_a_conversation_key_refuses_a_mismatched_author() {
+        let zone_sk = *zone().as_bytes();
+        let mpk = *migrator().public_key().as_bytes();
+        let ck = crate::nip44::conversation_key(&zone_sk, &mpk).unwrap();
+        let good = seal_original(&original(), "zone2", 1, &zone_pk_hex(), &migrator()).unwrap();
+        let other_pk = *key(0x77).public_key().as_bytes();
+        assert_eq!(
+            open_sealed_with_conversation_key(&good, &other_pk, &ck).unwrap_err(),
+            SealError::Decrypt,
+            "right key, wrong stated author"
+        );
+        let mut relabelled = good.clone();
+        relabelled.pubkey = hex::encode(other_pk);
+        assert_eq!(
+            open_sealed_with_conversation_key(&relabelled, &mpk, &ck).unwrap_err(),
+            SealError::Decrypt,
+            "envelope claims another author"
+        );
+        assert!(open_sealed_with_conversation_key(&good, &mpk, &ck).is_ok());
+    }
+
     fn original() -> NostrEvent {
         sign(
             &author(),
@@ -581,6 +1005,8 @@ mod tests {
         build_envelope(
             inner_json,
             channel,
+            None,
+            false,
             created_at,
             inner_id,
             "zone3",
@@ -631,9 +1057,11 @@ mod tests {
                 tag(&["e", &channel(), "", "root"]),
                 tag(&["zk", "zone3", "7", &zone_pk_hex()]),
                 tag(&["sealed", &orig.id, "1"]),
+                tag(&["e", &"d".repeat(64), "", "reply"]),
             ]
         );
-        // The original's reply and p tags are hidden inside the ciphertext.
+        // The topic is outside; the original's p tag and text are not.
+        assert!(!outer.content.contains(&"e".repeat(64)));
         assert!(!outer.content.contains(&"d".repeat(64)));
         assert!(!outer.content.contains("plaintext"));
         assert_eq!(
@@ -985,11 +1413,207 @@ mod tests {
         assert_eq!(open(&outer).unwrap().id, orig.id);
     }
 
+    fn inner_with(tags: Vec<Vec<String>>) -> NostrEvent {
+        sign(&author(), 42, CREATED_AT, tags, "thread placement")
+    }
+
+    fn reseal_tags(outer: &NostrEvent, f: impl FnOnce(&mut Vec<Vec<String>>)) -> NostrEvent {
+        // `open_sealed` does not verify the outer signature (the relay does),
+        // so tampered outer tags reach check 7 directly.
+        let mut o = outer.clone();
+        f(&mut o.tags);
+        o
+    }
+
+    #[test]
+    fn the_topic_is_chosen_by_the_reply_marker_and_quotes_stay_inside() {
+        let topic = "a".repeat(64);
+        let quoted = "b".repeat(64);
+        let mention = "f".repeat(64);
+        // Quote listed BEFORE the reply: position must not matter.
+        let orig = inner_with(vec![
+            tag(&["e", &channel(), "", "root"]),
+            tag(&["e", &quoted, "", "quote"]),
+            tag(&["e", &topic, "wss://relay", "reply"]),
+            tag(&["p", &mention]),
+        ]);
+        let outer = seal_original(&orig, "zone3", 1, &zone_pk_hex(), &migrator()).unwrap();
+        let e_values: Vec<&str> = outer
+            .tags
+            .iter()
+            .filter(|t| t[0] == "e")
+            .map(|t| t[1].as_str())
+            .collect();
+        assert_eq!(e_values, vec![channel().as_str(), topic.as_str()]);
+        assert_eq!(reply_root_of(&outer), Some(topic.as_str()));
+        assert!(outer.tags.iter().all(|t| t[0] != "p"), "no p tag outside");
+        assert!(
+            outer
+                .tags
+                .iter()
+                .all(|t| !t.iter().any(|v| v == &quoted || v == &mention)),
+            "the quote target and the mention never leave the ciphertext"
+        );
+        assert!(
+            outer
+                .tags
+                .iter()
+                .all(|t| !t.iter().any(|v| v == "wss://relay")),
+            "the relay hint is not copied"
+        );
+        assert_eq!(open(&outer).unwrap().id, orig.id);
+    }
+
+    #[test]
+    fn the_bulk_sealer_produces_what_seal_original_produces() {
+        let zone_sk = *zone().as_bytes();
+        let sealer = OriginalSealer::new("zone3", 1, &zone_pk_hex(), migrator()).unwrap();
+        let reply = original();
+        let root = inner_with(vec![tag(&["e", &channel(), "", "root"])]);
+        for orig in [&reply, &root] {
+            let a = seal_original(orig, "zone3", 1, &zone_pk_hex(), &migrator()).unwrap();
+            let b = sealer.seal(orig).unwrap();
+            assert_eq!(a.tags, b.tags, "same tags");
+            assert_eq!(
+                (a.pubkey.as_str(), a.created_at, a.kind),
+                (b.pubkey.as_str(), b.created_at, b.kind)
+            );
+            assert_ne!(a.content, b.content, "fresh nonce");
+            let (oa, ob) = (open(&a).unwrap(), open(&b).unwrap());
+            assert_eq!(
+                serde_json::to_string(&oa).unwrap(),
+                serde_json::to_string(&ob).unwrap()
+            );
+            assert_eq!(oa.id, orig.id);
+            let _ = zone_sk;
+        }
+        // Same per-original refusals.
+        let mut bad = original();
+        bad.content.push('x');
+        assert_eq!(sealer.seal(&bad).unwrap_err(), SealError::InvalidSignature);
+        assert!(matches!(
+            OriginalSealer::new("", 1, &zone_pk_hex(), migrator()),
+            Err(SealError::InvalidZoneKey(_))
+        ));
+    }
+
+    #[test]
+    fn a_topic_root_carries_the_marker_and_no_topic_tag() {
+        let root = inner_with(vec![tag(&["e", &channel(), "", "root"])]);
+        let outer = seal_original(&root, "zone3", 1, &zone_pk_hex(), &migrator()).unwrap();
+        assert_eq!(outer.tags.iter().filter(|t| t[0] == "e").count(), 1);
+        assert_eq!(reply_root_of(&outer), None);
+        assert!(outer.tags.contains(&tag(&["t", TOPIC_MARKER])));
+        assert!(open(&outer).is_ok());
+        // A reply never gets the marker.
+        let reply = seal_original(&original(), "zone3", 1, &zone_pk_hex(), &migrator()).unwrap();
+        assert!(reply.tags.iter().all(|t| t[0] != "t"));
+    }
+
+    #[test]
+    fn check_7_refuses_any_other_thread_placement() {
+        let topic = "a".repeat(64);
+        let reply = inner_with(vec![
+            tag(&["e", &channel(), "", "root"]),
+            tag(&["e", &topic, "", "reply"]),
+        ]);
+        let root = inner_with(vec![tag(&["e", &channel(), "", "root"])]);
+        let good = seal_original(&reply, "zone3", 1, &zone_pk_hex(), &migrator()).unwrap();
+        let good_root = seal_original(&root, "zone3", 1, &zone_pk_hex(), &migrator()).unwrap();
+        let topic_tag = tag(&["e", &topic, "", "reply"]);
+        let cases: Vec<(&str, NostrEvent)> = vec![
+            (
+                "outer topic is another thread",
+                reseal_tags(&good, |t| t[3][1] = "9".repeat(64)),
+            ),
+            (
+                "outer topic on a root",
+                reseal_tags(&good_root, |t| t.push(topic_tag.clone())),
+            ),
+            (
+                "a second outer topic",
+                reseal_tags(&good, |t| t.push(tag(&["e", &"9".repeat(64), "", "reply"]))),
+            ),
+            (
+                "an outer quote tag",
+                reseal_tags(&good, |t| t.push(tag(&["e", &"b".repeat(64), "", "quote"]))),
+            ),
+            (
+                "an unmarked outer e tag",
+                reseal_tags(&good, |t| t.push(tag(&["e", &"b".repeat(64)]))),
+            ),
+            (
+                "an outer p tag",
+                reseal_tags(&good, |t| t.push(tag(&["p", &"f".repeat(64)]))),
+            ),
+        ];
+        for (what, outer) in cases {
+            assert_eq!(
+                open(&outer).unwrap_err(),
+                SealError::ChannelMismatch,
+                "{what}"
+            );
+        }
+        // Outer shape is exact (review H1): no other tag kinds, no relay hint,
+        // no extra elements on the channel or topic tag.
+        let shape_cases: Vec<(&str, NostrEvent)> = vec![
+            (
+                "an outer t tag",
+                reseal_tags(&good, |t| t.push(tag(&["t", "x"]))),
+            ),
+            (
+                "an outer q tag",
+                reseal_tags(&good, |t| t.push(tag(&["q", &"b".repeat(64)]))),
+            ),
+            (
+                "a relay hint on the topic",
+                reseal_tags(&good, |t| t[3][2] = "wss://x".into()),
+            ),
+            (
+                "an extra element on the topic",
+                reseal_tags(&good, |t| t[3].push("x".into())),
+            ),
+            (
+                "a relay hint on the channel",
+                reseal_tags(&good, |t| t[0][2] = "wss://x".into()),
+            ),
+            (
+                "a root marker on a reply",
+                reseal_tags(&good, |t| {
+                    t.truncate(3);
+                    t.push(tag(&["t", TOPIC_MARKER]));
+                }),
+            ),
+            (
+                "a root marker beside the topic tag",
+                reseal_tags(&good, |t| t.push(tag(&["t", TOPIC_MARKER]))),
+            ),
+            (
+                "a second root marker",
+                reseal_tags(&good_root, |t| t.push(tag(&["t", TOPIC_MARKER]))),
+            ),
+            (
+                "a non-hex topic",
+                reseal_tags(&good, |t| t[3][1] = "not-an-id".into()),
+            ),
+        ];
+        for (what, outer) in shape_cases {
+            assert_eq!(
+                open(&outer).unwrap_err(),
+                SealError::ChannelMismatch,
+                "{what}"
+            );
+        }
+        // An envelope sealed before the topic tag existed still opens.
+        let legacy = reseal_tags(&good, |t| t.truncate(3));
+        assert_eq!(open(&legacy).unwrap().id, reply.id);
+    }
+
     #[test]
     fn error_display_is_log_friendly() {
         assert_eq!(
             SealError::ChannelMismatch.to_string(),
-            "sealed original: inner channel does not match the envelope channel"
+            "sealed original: inner channel or topic does not match the envelope"
         );
         assert_eq!(
             SealError::UnsupportedVersion(9).to_string(),

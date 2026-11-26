@@ -54,7 +54,7 @@ use crate::stores::channels::ChannelStore;
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zones::{load_zones, section_to_zone};
 use crate::utils::bootstrap::{derive_phase, BootstrapSignals};
-use crate::utils::reconcile::{absent_from, id_set, retain_present, Reconciliation};
+use crate::utils::reconcile::{absent_from, id_set, Reconciliation};
 use crate::utils::slug_hash::section_slug;
 use crate::utils::zone_theme::zone_accent_style_cfg;
 use crate::utils::{arrow_left_svg, set_timeout_once};
@@ -68,7 +68,7 @@ use crate::utils::{arrow_left_svg, set_timeout_once};
 const BOOTSTRAP_DEADLINE_MS: i32 = 8000;
 
 /// Parsed channel metadata from the kind 40 event.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct ChannelHeader {
     name: String,
     description: String,
@@ -224,68 +224,27 @@ pub fn ChannelPage() -> impl IntoView {
         })
     };
 
-    // Whether this channel's owning zone is readable WITHOUT authentication.
-    //
-    // This decides the `public` flag on the semantic-search index entry below,
-    // and it has to be derived rather than assumed in either direction:
-    //
-    //  * The search worker's `/search` endpoint is UNAUTHENTICATED. Indexing a
-    //    gated zone's message as public would expose its content to anyone who
-    //    can reach the worker, bypassing the zone ACL entirely.
-    //  * But the previous code hardcoded `public: false`, and the worker
-    //    fail-closes on exactly that flag — so every vector the client ever
-    //    ingested was unreachable and `/search` could only ever return `[]`.
-    //    That is the "search seems completely broken" report.
-    //
-    // `required_cohorts` empty is the kit's definition of unauthenticated read
-    // (see `stores::zones::Zone::required_cohorts`). Anything we cannot resolve
-    // — unknown channel, unknown zone, store not yet loaded — falls through to
-    // `false`, i.e. indexed but not searchable, which is the safe direction.
-    let zone_is_world_readable = {
-        let store = use_context::<ChannelStore>();
-        Signal::derive(move || {
-            let raw = channel_id();
-            let zones = load_zones();
-            let resolved_zone = store.and_then(|store| {
-                let needle_lower = raw.to_lowercase();
-                store.channels.with(|list| {
-                    list.iter()
-                        .find(|c| {
-                            c.id == raw
-                                || c.name.to_lowercase() == needle_lower
-                                || c.section.to_lowercase() == needle_lower
-                        })
-                        .and_then(|c| {
-                            let section = if c.section.is_empty() {
-                                raw.clone()
-                            } else {
-                                c.section.clone()
-                            };
-                            section_to_zone(&section, &zones)
-                        })
-                })
-            });
-            // NOTE: deliberately no `.unwrap_or_default()` fallback to the first
-            // zone here, unlike `zone_accent` above. An accent guessing wrong is
-            // cosmetic; a visibility flag guessing wrong is a disclosure. If the
-            // zone is unknown we return false.
-            match resolved_zone.or_else(|| section_to_zone(&raw, &zones)) {
-                Some(zone_id) => zones
-                    .iter()
-                    .find(|z| z.id == zone_id)
-                    .map(|z| z.required_cohorts.is_empty())
-                    .unwrap_or(false),
-                None => false,
-            }
-        })
-    };
-
     // Read-position store for mark-as-read
     let read_store = use_read_positions();
 
     // State
     let messages = RwSignal::new(Vec::<MessageData>::new());
-    let channel_info: RwSignal<Option<ChannelHeader>> = RwSignal::new(None);
+    // The kind-40 header as fetched (archived flag, first paint)...
+    let channel_info_raw: RwSignal<Option<ChannelHeader>> = RwSignal::new(None);
+    // ...and what is shown: name and description from the store's channel
+    // entry, which folds the latest kind-41 edit (fold_meta_into), exactly as
+    // the channel list and section/thread headers do. A renamed channel shows
+    // one name everywhere.
+    let store_for_header = use_context::<ChannelStore>();
+    let channel_info = Memo::new(move |_| {
+        let raw = channel_info_raw.get()?;
+        let cid = channel_id();
+        let folded = store_for_header.and_then(|s| {
+            s.channels
+                .with(|list| list.iter().find(|c| c.id == cid).cloned())
+        });
+        Some(effective_header(raw, folded.as_ref()))
+    });
     let pinned = RwSignal::new(Vec::<PinnedMessage>::new());
     // Held in a `StoredValue` (Copy) so the reply-divider closure below can be
     // move-captured into the `Show`-gated flat view without making that view
@@ -293,9 +252,25 @@ pub fn ChannelPage() -> impl IntoView {
     let last_read_event_id = StoredValue::new(read_store.last_read_event_id(&channel_id()));
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let show_export = RwSignal::new(false);
+    // Paged history: the channel id and `#e` needles of the first-page REQ,
+    // reused by every older page, and whether the reader is signed in (only
+    // an authenticated answer then counts; see `ChannelStore::load_older`).
+    let history_needles = StoredValue::new(None::<(String, Vec<String>)>);
+    let signed_in = auth.is_authenticated();
 
     // Derived signals for ChannelStats
-    let message_count = Signal::derive(move || messages.get().len() as u32);
+    // The channel's true total (relay COUNT + live since), not the size of
+    // the history window on screen.
+    let store_for_count = use_context::<ChannelStore>();
+    let message_count = Signal::derive(move || {
+        let held = messages.with(Vec::len) as u32;
+        let Some(store) = store_for_count else {
+            return held;
+        };
+        history_needles
+            .with_value(|n| n.as_ref().map(|(cid, _)| cid.clone()))
+            .map_or(held, |cid| store.total_for(&cid).max(held))
+    });
     let member_count = Signal::derive(move || {
         let msgs = messages.get();
         let mut unique = std::collections::HashSet::new();
@@ -336,6 +311,7 @@ pub fn ChannelPage() -> impl IntoView {
     let relay_for_sub = relay.clone();
     let relay_for_send = relay.clone();
     let zone_writer_for_send = crate::zone_crypto::store::ZoneWriter::capture();
+    let relay_for_history = relay.clone();
     let relay_for_cleanup = relay;
 
     // Reactive header fallback (ADR-092): re-run whenever `store.channels`
@@ -353,7 +329,7 @@ pub fn ChannelPage() -> impl IntoView {
     if let Some(store) = use_context::<ChannelStore>() {
         Effect::new(move |_| {
             // Don't clobber a header already populated by the kind-40 query.
-            if channel_info.with_untracked(|c| c.is_some()) {
+            if channel_info_raw.with_untracked(|c| c.is_some()) {
                 return;
             }
             let cid = channel_id();
@@ -367,7 +343,7 @@ pub fn ChannelPage() -> impl IntoView {
                         || c.name.to_lowercase() == needle_lower
                         || c.section.to_lowercase() == needle_lower
                 }) {
-                    channel_info.set(Some(ChannelHeader {
+                    channel_info_raw.set(Some(ChannelHeader {
                         name: found.name.clone(),
                         description: found.description.clone(),
                         archived: false,
@@ -421,7 +397,7 @@ pub fn ChannelPage() -> impl IntoView {
             ..Default::default()
         };
 
-        let channel_info_sig = channel_info;
+        let channel_info_sig = channel_info_raw;
         let store_for_kind40 = use_context::<ChannelStore>();
         // Captured here, inside the effect's owner: the relay callbacks below
         // run without one (ADR-2016 decryption at ingest).
@@ -463,69 +439,49 @@ pub fn ChannelPage() -> impl IntoView {
                         }
                     });
 
-                    // Replay historical kind-42 events for this channel via a
-                    // narrow filter on all identifier variants. The store's
-                    // on_msg resolver (channels-reactive) will route them.
-                    let last_active = store.last_active;
-                    let channel_msgs = store.channel_messages;
-                    let channels_sig = store.channels;
-                    let cid_for_replay = event.id.clone();
+                    // The channel's newest page of kind-42 history, over all
+                    // identifier variants (hex id + name + section: legacy
+                    // posts may carry slug-style e-tags). It is the first page
+                    // of the paged history (`ChannelStore::load_older` walks
+                    // back from it) and stays open for live posts.
+                    //
+                    // Until the authoritative answer, deliveries are buffered
+                    // and applied in one store update per EOSE instead of one
+                    // per event. The answer counts as authoritative once it is
+                    // authenticated, or at once for a signed-out reader: an
+                    // anonymous answer omits gated zones and must not set the
+                    // "start of history" mark for a member. Deliveries are
+                    // counted before admission, as the relay sent them.
                     let store_for_replay = *store;
                     let zone_keys_for_replay = zone_keys;
+                    let cid_for_replay = event.id.clone();
+                    let wait_auth = signed_in.get_untracked();
+                    #[derive(Default)]
+                    struct FirstPage {
+                        delivered: u64,
+                        oldest: Option<u64>,
+                        buffered: Vec<(String, NostrEvent)>,
+                        live: bool,
+                    }
+                    let first = Rc::new(std::cell::RefCell::new(FirstPage::default()));
+                    let first_for_event = first.clone();
+                    let cid_for_event = cid_for_replay.clone();
                     let on_replay = Rc::new(move |ev: NostrEvent| {
-                        if ev.kind != 42 {
+                        let ts = ev.created_at;
+                        let ingested =
+                            store_for_replay.ingest(zone_keys_for_replay, ev, &cid_for_event);
+                        let mut f = first_for_event.borrow_mut();
+                        if f.live {
+                            drop(f);
+                            if let Some(x) = ingested {
+                                store_for_replay.apply_page(vec![x]);
+                            }
                             return;
                         }
-                        // ADR-092 closeout: apply the SAME deletion semantics as
-                        // the broad store subscription. A kind-5 tombstone can
-                        // arrive before its target in a backfill, so without this
-                        // gate a deleted post is replayed back into view through
-                        // the deep-link path alone — the one entry point that
-                        // used to skip the check.
-                        if !store_for_replay.admits_message(zone_keys_for_replay, &ev) {
-                            return;
-                        }
-                        let tag_val = ev
-                            .tags
-                            .iter()
-                            .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
-                            .or_else(|| ev.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
-                            .map(|t| t[1].clone());
-                        let tag_val = match tag_val {
-                            Some(v) => v,
-                            None => return,
-                        };
-                        let tag_lower = tag_val.to_lowercase();
-                        let resolved = channels_sig.with_untracked(|list| {
-                            list.iter()
-                                .find(|c| {
-                                    c.id == tag_val
-                                        || c.name.to_lowercase() == tag_lower
-                                        || c.section.to_lowercase() == tag_lower
-                                })
-                                .map(|c| c.id.clone())
-                        });
-                        let cid_match = resolved.unwrap_or_else(|| cid_for_replay.clone());
-                        let ev =
-                            crate::zone_crypto::store::prepare_incoming(zone_keys_for_replay, ev);
-                        // A restored sealed original carries the original id,
-                        // which a kind-5 may have tombstoned (ADR-2017).
-                        if !store_for_replay.admits_message(zone_keys_for_replay, &ev) {
-                            return;
-                        }
-                        let mut newly_added = false;
-                        let event_ts = ev.created_at;
-                        channel_msgs.update(|m| {
-                            let events = m.entry(cid_match.clone()).or_insert_with(Vec::new);
-                            newly_added = crate::stores::channels::insert_message(events, ev);
-                        });
-                        if newly_added {
-                            last_active.update(|m| {
-                                let ts = m.entry(cid_match).or_insert(0);
-                                if event_ts > *ts {
-                                    *ts = event_ts;
-                                }
-                            });
+                        f.delivered += 1;
+                        f.oldest = Some(f.oldest.map_or(ts, |o| o.min(ts)));
+                        if let Some(x) = ingested {
+                            f.buffered.push(x);
                         }
                     });
                     let mut needles: Vec<String> = vec![event.id.clone()];
@@ -535,20 +491,40 @@ pub fn ChannelPage() -> impl IntoView {
                     if !section.is_empty() {
                         needles.push(section);
                     }
+                    history_needles.set_value(Some((cid_for_replay.clone(), needles.clone())));
+                    store_for_replay.request_total(&relay_for_retry, &cid_for_replay);
                     // EOSE on the narrow history query is the relay's own
-                    // receipt that it has sent everything it holds for this
-                    // channel — the real bootstrap-success signal (ADR-092).
-                    let on_replay_eose = Rc::new(move || {
+                    // receipt that it has sent the newest page it holds for
+                    // this channel — the real bootstrap-success signal (ADR-092).
+                    let on_replay_eose = Rc::new(move |authed: bool| {
+                        let authoritative = authed || !wait_auth;
+                        let (buffered, page) = {
+                            let mut f = first.borrow_mut();
+                            if f.live {
+                                return;
+                            }
+                            f.live = authoritative;
+                            let page = crate::stores::channels::PageOutcome {
+                                delivered: f.delivered,
+                                oldest: f.oldest,
+                            };
+                            (std::mem::take(&mut f.buffered), page)
+                        };
+                        store_for_replay.apply_page(buffered);
+                        if authoritative {
+                            store_for_replay.record_first_page(&cid_for_replay, page);
+                        }
                         replay_eose.set(true);
                     });
-                    let sub_id = relay_for_retry.subscribe(
+                    let sub_id = relay_for_retry.subscribe_with_receipt(
                         vec![Filter {
                             kinds: Some(vec![42]),
                             e_tags: Some(needles),
+                            limit: Some(crate::stores::channels::HISTORY_PAGE),
                             ..Default::default()
                         }],
                         on_replay,
-                        Some(on_replay_eose),
+                        on_replay_eose,
                     );
                     replay_sub_ids.update(|ids| ids.push(sub_id));
                 }
@@ -603,46 +579,53 @@ pub fn ChannelPage() -> impl IntoView {
         // channel whose entry has disappeared entirely reconciles against an
         // empty snapshot, which clears the view rather than freezing the last
         // state on screen.
-        let all_msgs = store.channel_messages.get();
-        let channel_events: Vec<NostrEvent> = all_msgs
-            .get(&cid)
-            .or_else(|| all_msgs.get(&raw_cid))
-            .cloned()
-            .unwrap_or_default();
-
+        //
         // Work out the diff WITHOUT touching the signal, so a store update that
         // does not affect this channel writes nothing. An unconditional
         // `update` notifies subscribers even when the list is unchanged, which
         // re-runs the auto-scroll effect and pulls the viewport to the bottom
-        // while the reader is scrolled up.
-        let (has_stale, to_add, recontent) = messages.with_untracked(|list| {
-            let present = id_set(&channel_events, |e| e.id.as_str());
-            let stale = list.iter().any(|m| !present.contains(m.id.as_str()));
-            let rendered = id_set(&list[..], |m| m.id.as_str());
-            let to_add: Vec<NostrEvent> =
-                absent_from(&channel_events, &rendered, |e| e.id.as_str())
-                    .into_iter()
-                    .cloned()
+        // while the reader is scrolled up. The store is read in place (`with`),
+        // never cloned: with paged history a channel can hold tens of
+        // thousands of messages, and only the new ones are copied out.
+        let (stale, to_add, recontent) = store.channel_messages.with(|all| {
+            let channel_events: &[NostrEvent] = all
+                .get(&cid)
+                .or_else(|| all.get(&raw_cid))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            messages.with_untracked(|list| {
+                let present = id_set(channel_events, |e| e.id.as_str());
+                let stale: std::collections::HashSet<String> = list
+                    .iter()
+                    .filter(|m| !present.contains(m.id.as_str()))
+                    .map(|m| m.id.clone())
                     .collect();
-            // A survivor whose text changed in the store: a zone key arrived
-            // and its message decrypted (ADR-2016). Patched in place below.
-            let by_id: std::collections::HashMap<&str, &str> = channel_events
-                .iter()
-                .map(|e| (e.id.as_str(), e.content.as_str()))
-                .collect();
-            let recontent: Vec<(String, String)> = list
-                .iter()
-                .filter_map(|m| {
-                    by_id
-                        .get(m.id.as_str())
-                        .filter(|c| **c != m.content)
-                        .map(|c| (m.id.clone(), c.to_string()))
-                })
-                .collect();
-            (stale, to_add, recontent)
+                let rendered = id_set(&list[..], |m| m.id.as_str());
+                let to_add: Vec<NostrEvent> =
+                    absent_from(channel_events, &rendered, |e| e.id.as_str())
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                // A survivor whose text changed in the store: a zone key arrived
+                // and its message decrypted (ADR-2016). Patched in place below.
+                let by_id: std::collections::HashMap<&str, &str> = channel_events
+                    .iter()
+                    .map(|e| (e.id.as_str(), e.content.as_str()))
+                    .collect();
+                let recontent: std::collections::HashMap<String, String> = list
+                    .iter()
+                    .filter_map(|m| {
+                        by_id
+                            .get(m.id.as_str())
+                            .filter(|c| **c != m.content)
+                            .map(|c| (m.id.clone(), c.to_string()))
+                    })
+                    .collect();
+                (stale, to_add, recontent)
+            })
         });
         let outcome = Reconciliation {
-            removed: usize::from(has_stale),
+            removed: stale.len(),
             added: to_add.len(),
         };
         if !outcome.changed() && recontent.is_empty() {
@@ -654,50 +637,27 @@ pub fn ChannelPage() -> impl IntoView {
             //    was missing: without it a NIP-09 deletion (or an EOSE prune)
             //    leaves the post on screen forever and the derived post/member
             //    counts can only ever go up.
-            let present = id_set(&channel_events, |e| e.id.as_str());
-            retain_present(list, &present, |m| m.id.as_str());
-            for (id, content) in &recontent {
-                if let Some(m) = list.iter_mut().find(|m| &m.id == id) {
-                    m.content = content.clone();
+            if !stale.is_empty() {
+                list.retain(|m| !stale.contains(&m.id));
+            }
+            if !recontent.is_empty() {
+                for m in list.iter_mut() {
+                    if let Some(c) = recontent.get(&m.id) {
+                        m.content = c.clone();
+                    }
                 }
             }
 
-            // 2. Append what is new. Survivors are NOT rebuilt, so their
-            //    per-message reactive state (thread replies) and the scroll
-            //    anchor around them are preserved — a streaming append still
-            //    only touches the rows that actually appeared.
-            for event in &to_add {
-                let reply_to = event
-                    .tags
-                    .iter()
-                    .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "reply")
-                    .or_else(|| {
-                        event
-                            .tags
-                            .iter()
-                            .filter(|t| t.len() >= 2 && t[0] == "e")
-                            .nth(1)
-                    })
-                    .map(|t| t[1].clone());
-                let reply_pk = event
-                    .tags
-                    .iter()
-                    .find(|t| t.len() >= 2 && t[0] == "p")
-                    .map(|t| t[1].clone());
-                list.push(MessageData {
-                    id: event.id.clone(),
-                    pubkey: event.pubkey.clone(),
-                    content: event.content.clone(),
-                    created_at: event.created_at,
-                    reply_to_id: reply_to,
-                    reply_to_pubkey: reply_pk,
-                    reply_to_content: None,
-                    is_hidden: false,
-                    channel_id: cid.clone(),
-                    thread_replies: RwSignal::new(Vec::<ThreadReply>::new()),
-                });
-            }
-            list.sort_by_key(|m| m.created_at);
+            // 2. Merge in what is new, in time order. Survivors are NOT
+            //    rebuilt, so their per-message reactive state (thread replies)
+            //    and the scroll anchor around them are preserved. The store
+            //    hands events over sorted, so an older page is one merge of two
+            //    sorted runs and a live post is an append, never a re-sort.
+            let added: Vec<MessageData> = to_add
+                .iter()
+                .map(|event| message_data(event, &cid))
+                .collect();
+            merge_by_time(list, added);
         });
     });
 
@@ -746,24 +706,148 @@ pub fn ChannelPage() -> impl IntoView {
         retry_nonce.update(|n| *n = n.wrapping_add(1));
     };
 
-    // Auto-scroll to bottom when new messages arrive + mark as read
+    // -- Scroll: follow new posts, keep the reader's place across pages ----
+    //
+    // `near_bottom` is kept by the scroll handler: a new post at the bottom
+    // pulls the view down only when the reader was already there and the
+    // window holds the newest messages, never while they read history.
+    //
+    // A history page lands at one end and the bounded window evicts at the
+    // other, so the height above the reader can grow or shrink in the same
+    // update. `utils::scroll_anchor` notes a visible row before the page is
+    // applied and scrolls by however far it moved afterwards; `paging` keeps
+    // the follow-new-posts scroll out of the way meanwhile. The container
+    // sets `overflow-anchor: none` so the browser's own anchoring does not
+    // fight it.
+    let near_bottom = StoredValue::new(true);
+    let paging = StoredValue::new(false);
+    let row_anchor = StoredValue::new_local(None::<crate::utils::scroll_anchor::Anchor>);
+    let store_for_history = use_context::<ChannelStore>();
+    type PageHooks = (Rc<dyn Fn()>, Rc<dyn Fn()>);
+    let page_hooks = move || -> PageHooks {
+        let before: Rc<dyn Fn()> = Rc::new(move || {
+            paging.set_value(true);
+            let container = messages_container
+                .get_untracked()
+                .map(web_sys::Element::from);
+            row_anchor.set_value(crate::utils::scroll_anchor::capture(container.as_ref()));
+        });
+        let after: Rc<dyn Fn()> = Rc::new(move || {
+            let anchor = row_anchor.try_update_value(Option::take).flatten();
+            let container = messages_container
+                .get_untracked()
+                .map(web_sys::HtmlElement::from);
+            if let Some(a) = anchor {
+                crate::utils::scroll_anchor::restore(a, container);
+            }
+            // After the restore's zero-delay timeout.
+            set_timeout_once(move || paging.set_value(false), 0);
+        });
+        (before, after)
+    };
+    let relay_for_newer = relay_for_history.clone();
+    let request_older = StoredValue::new_local(Rc::new(move || {
+        let Some(store) = store_for_history else {
+            return;
+        };
+        let Some((cid, needles)) = history_needles.get_value() else {
+            return;
+        };
+        let (before, after) = page_hooks();
+        store.load_older(
+            &relay_for_history,
+            &cid,
+            needles,
+            signed_in.get_untracked(),
+            before,
+            after,
+        );
+    }) as Rc<dyn Fn()>);
+    let request_newer = {
+        let relay = relay_for_newer;
+        StoredValue::new_local(Rc::new(move || {
+            let Some(store) = store_for_history else {
+                return;
+            };
+            let Some((cid, needles)) = history_needles.get_value() else {
+                return;
+            };
+            let (before, after) = page_hooks();
+            store.load_newer(
+                &relay,
+                &cid,
+                needles,
+                signed_in.get_untracked(),
+                before,
+                after,
+            );
+        }) as Rc<dyn Fn()>)
+    };
+    let on_messages_scroll = move |_: leptos::ev::Event| {
+        let Some(c) = messages_container.get_untracked() else {
+            return;
+        };
+        let el: web_sys::HtmlElement = c.into();
+        let top = el.scroll_top();
+        let from_bottom = el.scroll_height() - top - el.client_height();
+        near_bottom.set_value(from_bottom < 120);
+        if top < 400 {
+            request_older.with_value(|f| f());
+        } else if from_bottom < 400 {
+            // Only does anything while the window is detached from the newest.
+            request_newer.with_value(|f| f());
+        }
+    };
+    // The history state of this channel, for the indicator above the list.
+    let history_state = Signal::derive(move || {
+        let store = store_for_history?;
+        let cid = history_needles.with_value(|n| n.as_ref().map(|(c, _)| c.clone()))?;
+        // Tracks `history` so the indicator follows each page.
+        Some(store.history_cursor(&cid))
+    });
+    // The id of the first message after the reader's last-read one, where the
+    // "New messages" divider goes.
+    let divider_before = Memo::new(move |_| {
+        let last_read = last_read_event_id.get_value();
+        if last_read.is_empty() {
+            return None;
+        }
+        messages.with(|list| {
+            let i = list.iter().position(|m| m.id == last_read)?;
+            list.get(i + 1).map(|m| m.id.clone())
+        })
+    });
+
+    let last_newest = StoredValue::new(None::<String>);
     Effect::new(move |_| {
-        let msgs = messages.get();
-        let count = msgs.len();
+        let (count, newest, last) = messages.with(|m| {
+            (
+                m.len(),
+                m.last().map(|x| x.id.clone()),
+                m.last().map(|x| (x.id.clone(), x.created_at)),
+            )
+        });
+        let prev_newest = last_newest.get_value();
+        last_newest.set_value(newest.clone());
+        let attached =
+            history_state.with_untracked(|c| c.as_ref().is_none_or(|c| c.newer_from.is_none()));
         if let Some(container) = messages_container.get() {
             let el: web_sys::HtmlElement = container.into();
-            set_timeout_once(
-                move || {
-                    el.set_scroll_top(el.scroll_height());
-                },
-                50,
-            );
+            if newest != prev_newest && near_bottom.get_value() && attached && !paging.get_value() {
+                set_timeout_once(
+                    move || {
+                        el.set_scroll_top(el.scroll_height());
+                    },
+                    50,
+                );
+            }
         }
-        // Mark channel as read when messages load or new ones arrive
+        // Mark channel as read when messages load or new ones arrive (never
+        // backwards: `mark_read` only advances).
         if count > 0 {
-            if let Some(last) = msgs.last() {
+            if let Some((id, created_at)) = last {
                 let cid = channel_id();
-                read_store.mark_read(&cid, &last.id, last.created_at);
+                read_store.mark_read(&cid, &id, created_at);
             }
         }
     });
@@ -839,10 +923,6 @@ pub fn ChannelPage() -> impl IntoView {
 
         let relay = relay_for_send.clone();
         let zone_writer = zone_writer_for_send;
-        // Read the visibility decision on THIS side of the spawn: the signal is
-        // Copy but reading it inside the async block would sample it after an
-        // await point, where the reactive owner may already be gone.
-        let is_public_for_index = zone_is_world_readable.get_untracked();
         wasm_bindgen_futures::spawn_local(async move {
             // Encrypted zone (ADR-2016): encrypt to the zone key, or refuse
             // without one — the draft is kept, nothing is sent in plaintext.
@@ -854,37 +934,14 @@ pub fn ChannelPage() -> impl IntoView {
                     return;
                 }
             };
-            // Encrypted text must never reach the (unauthenticated) search
-            // worker as plaintext.
-            let zone_encrypted = crate::zone_crypto::has_zk_tag(&unsigned.tags);
             match auth.sign_event_async(unsigned).await {
                 Ok(signed) => {
-                    let event_id = signed.id.clone();
                     relay.publish(&signed);
 
-                    // Auto-index for semantic search in background.
-                    //
-                    // `public` was hardcoded `false`, and the worker fail-closes
-                    // on that flag — so every vector this client ever ingested
-                    // was filtered out of every search response and `/search`
-                    // could only ever return `[]`. It is now derived from the
-                    // owning zone's read policy (see `zone_is_world_readable`),
-                    // because `/search` is unauthenticated and a gated zone's
-                    // content must not become searchable.
-                    let channel_for_index = cid;
-                    if zone_encrypted {
-                        return;
-                    }
-                    if let Some(signer) = auth.get_signer() {
-                        let _ = crate::utils::search_client::ingest_message_signer(
-                            &event_id,
-                            &content_for_index,
-                            Some(&channel_for_index),
-                            is_public_for_index,
-                            &*signer,
-                        )
-                        .await;
-                    }
+                    // No indexing from the client (sealed-search design):
+                    // encrypted zones are indexed offline into sealed per-zone
+                    // shards searched in the browser, public zones get no
+                    // search, and server mode (Phase 3) indexes server-side.
                 }
                 Err(e) => {
                     error_msg.set(Some(e));
@@ -894,6 +951,16 @@ pub fn ChannelPage() -> impl IntoView {
     };
 
     let send_callback = Callback::new(do_send_text);
+    // Pod container for attached images: this channel's zone (strict).
+    let store_for_media = use_context::<ChannelStore>();
+    let channel_media_target = Signal::derive(move || {
+        let cid = channel_id();
+        let section = store_for_media.and_then(|st| {
+            st.channels
+                .with(|cs| cs.iter().find(|c| c.id == cid).map(|c| c.section.clone()))
+        });
+        crate::stores::zones::media_target_for_section(section.as_deref())
+    });
     // MessageInput fires `on_send` alongside `on_send_with_mentions`; all
     // publish work lives in the mentions path, so the plain path is a no-op.
     let noop_send = Callback::new(|_: String| {});
@@ -1061,7 +1128,9 @@ pub fn ChannelPage() -> impl IntoView {
             // Messages area
             <div
                 class="flex-1 overflow-y-auto bg-gray-900 relative"
+                style="overflow-anchor: none"
                 node_ref=messages_container
+                on:scroll=on_messages_scroll
             >
                 // Top fade gradient to indicate scrollability
                 <div class="sticky top-0 left-0 right-0 h-6 bg-gradient-to-b from-gray-900 to-transparent z-10 pointer-events-none"></div>
@@ -1143,30 +1212,78 @@ pub fn ChannelPage() -> impl IntoView {
                                     </div>
                                 }.into_any()
                             } else {
-                                let last_read = last_read_event_id.get_value();
-                                let mut found_divider = false;
+                                // Keyed by id and content: a page prepended
+                                // above, or a post appended below, renders
+                                // only its own rows, and a message whose text
+                                // changed (a zone key arrived) is re-rendered.
+                                // The VirtualList component is not used: it
+                                // needs one fixed row height, and bubbles vary
+                                // (images, replies, threads, the divider).
                                 view! {
                                     <div class="space-y-1">
-                                        {msgs.into_iter().map(|msg| {
-                                            let show_divider = if !found_divider && !last_read.is_empty() && msg.id == last_read {
-                                                found_divider = true;
-                                                false
+                                        {move || history_state.get().map(|h| {
+                                            let label = if h.loading {
+                                                "Loading older messages…"
+                                            } else if h.exhausted {
+                                                "Start of channel history"
                                             } else {
-                                                std::mem::take(&mut found_divider)
+                                                ""
                                             };
                                             view! {
-                                                <>
-                                                    {show_divider.then(|| view! {
-                                                        <div class="flex items-center gap-3 py-2">
-                                                            <div class="flex-1 h-px" style="background:color-mix(in srgb, var(--zone-accent) 35%, transparent)"></div>
-                                                            <span class="text-xs font-medium text-[color:var(--zone-accent)]">"New messages"</span>
-                                                            <div class="flex-1 h-px" style="background:color-mix(in srgb, var(--zone-accent) 35%, transparent)"></div>
-                                                        </div>
-                                                    })}
-                                                    <MessageBubble message=msg/>
-                                                </>
+                                                <div class="flex justify-center py-2 text-xs text-gray-500" data-history-state=move || if h.exhausted { "start" } else if h.loading { "loading" } else { "more" }>
+                                                    {if label.is_empty() {
+                                                        view! {
+                                                            <button
+                                                                class="text-xs text-gray-400 hover:text-gray-200 underline"
+                                                                on:click=move |_| request_older.with_value(|f| f())
+                                                            >
+                                                                "Load older messages"
+                                                            </button>
+                                                        }.into_any()
+                                                    } else {
+                                                        view! { <span>{label}</span> }.into_any()
+                                                    }}
+                                                </div>
                                             }
-                                        }).collect_view()}
+                                        })}
+                                        <For
+                                            each=move || messages.get()
+                                            key=|m| (m.id.clone(), content_key(&m.content))
+                                            children=move |msg| {
+                                                let id = msg.id.clone();
+                                                let anchor_id = msg.id.clone();
+                                                view! {
+                                                    <>
+                                                        {move || (divider_before.get().as_deref() == Some(id.as_str())).then(|| view! {
+                                                            <div class="flex items-center gap-3 py-2">
+                                                                <div class="flex-1 h-px" style="background:color-mix(in srgb, var(--zone-accent) 35%, transparent)"></div>
+                                                                <span class="text-xs font-medium text-[color:var(--zone-accent)]">"New messages"</span>
+                                                                <div class="flex-1 h-px" style="background:color-mix(in srgb, var(--zone-accent) 35%, transparent)"></div>
+                                                            </div>
+                                                        })}
+                                                        <div data-anchor-id=anchor_id>
+                                                            <MessageBubble message=msg/>
+                                                        </div>
+                                                    </>
+                                                }
+                                            }
+                                        />
+                                        {move || history_state.get().filter(|h| h.newer_from.is_some()).map(|h| view! {
+                                            <div class="flex justify-center py-2 text-xs text-gray-500" data-history-direction="newer" data-history-state=if h.loading { "loading" } else { "newer" }>
+                                                {if h.loading {
+                                                    view! { <span>"Loading\u{2026}"</span> }.into_any()
+                                                } else {
+                                                    view! {
+                                                        <button
+                                                            class="text-xs text-gray-400 hover:text-gray-200 underline"
+                                                            on:click=move |_| request_newer.with_value(|f| f())
+                                                        >
+                                                            "Load newer messages"
+                                                        </button>
+                                                    }.into_any()
+                                                }}
+                                            </div>
+                                        })}
                                     </div>
                                 }.into_any()
                             }
@@ -1183,6 +1300,7 @@ pub fn ChannelPage() -> impl IntoView {
                             on_send=noop_send
                             on_send_with_mentions=send_callback
                             enable_image_upload=true
+                            media_target=channel_media_target
                             channel_id=channel_id()
                             restore_failed=restore_failed
                         />
@@ -1209,7 +1327,114 @@ pub fn ChannelPage() -> impl IntoView {
     }
 }
 
+/// A short fingerprint of a message's text for the list key, so a row is
+/// re-rendered when its content changes (a zone key arrived and it decrypted).
+fn content_key(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    h.finish()
+}
+
+/// The rendered form of one stored kind-42 in channel `cid`.
+fn message_data(event: &NostrEvent, cid: &str) -> MessageData {
+    let reply_to = event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "reply")
+        .or_else(|| {
+            event
+                .tags
+                .iter()
+                .filter(|t| t.len() >= 2 && t[0] == "e")
+                .nth(1)
+        })
+        .map(|t| t[1].clone());
+    let reply_pk = event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == "p")
+        .map(|t| t[1].clone());
+    MessageData {
+        id: event.id.clone(),
+        pubkey: event.pubkey.clone(),
+        content: event.content.clone(),
+        created_at: event.created_at,
+        reply_to_id: reply_to,
+        reply_to_pubkey: reply_pk,
+        reply_to_content: None,
+        is_hidden: false,
+        channel_id: cid.to_string(),
+        thread_replies: RwSignal::new(Vec::<ThreadReply>::new()),
+    }
+}
+
+/// Merge `added` (any order) into `list` (sorted by `created_at`), keeping
+/// it sorted. Rendered messages stay ahead of new ones with the same
+/// timestamp. One linear merge, or a plain append when everything new is
+/// at least as recent as the newest rendered message.
+fn merge_by_time<T: HasCreatedAt>(list: &mut Vec<T>, mut added: Vec<T>) {
+    if added.is_empty() {
+        return;
+    }
+    added.sort_by_key(HasCreatedAt::created_at);
+    if list
+        .last()
+        .is_none_or(|last| last.created_at() <= added[0].created_at())
+    {
+        list.extend(added);
+        return;
+    }
+    let old = std::mem::take(list);
+    list.reserve(old.len() + added.len());
+    let mut a = old.into_iter().peekable();
+    let mut b = added.into_iter().peekable();
+    loop {
+        let take_old = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) => x.created_at() <= y.created_at(),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        let next = if take_old { a.next() } else { b.next() };
+        list.extend(next);
+    }
+}
+
+/// Timestamp accessor for [`merge_by_time`].
+trait HasCreatedAt {
+    fn created_at(&self) -> u64;
+}
+
+impl HasCreatedAt for MessageData {
+    fn created_at(&self) -> u64 {
+        self.created_at
+    }
+}
+
 /// Parse kind 40 event content JSON into channel name, description, and archived status.
+/// The header a channel page shows: the store's channel entry (which folds
+/// the latest kind-41 over the kind-40, last-write-wins) supplies name and
+/// description; the kind-40 header supplies them until the entry exists, and
+/// the archived flag (kind-41 edits do not carry it).
+fn effective_header(
+    raw: ChannelHeader,
+    folded: Option<&crate::stores::channels::ChannelMeta>,
+) -> ChannelHeader {
+    match folded {
+        Some(meta) => ChannelHeader {
+            name: if meta.name.trim().is_empty() {
+                raw.name
+            } else {
+                meta.name.clone()
+            },
+            description: meta.description.clone(),
+            archived: raw.archived,
+        },
+        None => raw,
+    }
+}
+
 fn parse_channel_metadata(content: &str) -> ChannelHeader {
     match serde_json::from_str::<serde_json::Value>(content) {
         Ok(val) => ChannelHeader {
@@ -1233,5 +1458,78 @@ fn parse_channel_metadata(content: &str) -> ChannelHeader {
             description: String::new(),
             archived: false,
         },
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::{merge_by_time, HasCreatedAt};
+
+    #[derive(Debug, PartialEq)]
+    struct M(&'static str, u64);
+    impl HasCreatedAt for M {
+        fn created_at(&self) -> u64 {
+            self.1
+        }
+    }
+
+    #[test]
+    fn an_older_page_merges_in_front_and_a_live_post_appends() {
+        let mut list = vec![M("c", 30), M("d", 40)];
+        merge_by_time(&mut list, vec![M("b", 20), M("a", 10), M("c2", 30)]);
+        assert_eq!(
+            list,
+            vec![M("a", 10), M("b", 20), M("c", 30), M("c2", 30), M("d", 40)],
+            "time order; a rendered message stays ahead of a new one with its timestamp"
+        );
+        merge_by_time(&mut list, vec![M("e", 50)]);
+        assert_eq!(list.last(), Some(&M("e", 50)));
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::{effective_header, ChannelHeader};
+    use crate::stores::channels::{fold_meta_into, ChannelMeta, MetaUpdate};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_kind41_rename_shows_on_the_channel_page_as_in_the_list() {
+        let raw = ChannelHeader {
+            name: "Fairfield Events".into(),
+            description: "old".into(),
+            archived: true,
+        };
+        let mut list = vec![ChannelMeta {
+            id: "c".into(),
+            name: "Fairfield Events".into(),
+            description: "old".into(),
+            section: String::new(),
+            picture: String::new(),
+            created_at: 100,
+        }];
+        let mut ts = HashMap::new();
+        // Before any edit: the kind-40.
+        assert_eq!(
+            effective_header(raw.clone(), Some(&list[0])).name,
+            "Fairfield Events"
+        );
+        // The same fold the channel list uses applies the latest kind-41.
+        let edit = MetaUpdate {
+            channel_id: "c".into(),
+            name: Some("Events".into()),
+            about: Some("new".into()),
+            picture: None,
+            created_at: 200,
+        };
+        assert!(fold_meta_into(&mut list, &mut ts, &edit));
+        let shown = effective_header(raw.clone(), Some(&list[0]));
+        assert_eq!(
+            (shown.name.as_str(), shown.description.as_str()),
+            ("Events", "new")
+        );
+        assert!(shown.archived, "archived still comes from the kind-40");
+        // No store entry yet: the kind-40 header.
+        assert_eq!(effective_header(raw, None).name, "Fairfield Events");
     }
 }

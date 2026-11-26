@@ -148,7 +148,7 @@ pub fn env_override_json(key: &str) -> Option<String> {
     None
 }
 
-fn window_env(key: &str) -> Option<String> {
+pub(crate) fn window_env(key: &str) -> Option<String> {
     let window = web_sys::window()?;
     let env = js_sys::Reflect::get(&window, &"__ENV__".into()).ok()?;
     if env.is_undefined() || env.is_null() {

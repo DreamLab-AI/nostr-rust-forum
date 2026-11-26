@@ -10,26 +10,90 @@ use nostr_bbs_zone_migrate::engine::{self, Hooks, Plan};
 use nostr_bbs_zone_migrate::grants::{fetch_grants_with, GroupBinding, RejectedGrant};
 use nostr_bbs_zone_migrate::identity::{identity_from_env, parse_identity, IDENTITY_ENV};
 use nostr_bbs_zone_migrate::keys::{parse_key_file, KeyRing};
+use nostr_bbs_zone_migrate::offline;
 use nostr_bbs_zone_migrate::relay::{fetch_all, http_origin, Filter, Relay};
 use nostr_bbs_zone_migrate::state::{self, State, Status};
 use serde::Serialize;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use crate::net::NetRelay;
+use nostr_bbs_zone_migrate::net::NetRelay;
 
 /// Declare `$hooks`: engine hooks that save `$path` atomically after each
 /// change and log progress lines to stderr.
 macro_rules! hooks {
-    ($hooks:ident, $path:expr) => {
+    ($hooks:ident, $path:expr, $every:expr) => {
         let path: &Path = $path;
+        let every: usize = ($every).max(1);
         let mut persist = |s: &State| state::save_atomic(path, s);
+        let mut since_save = 0usize;
+        let mut checkpoint = |s: &State| {
+            since_save += 1;
+            if since_save >= every {
+                since_save = 0;
+                state::save_atomic(path, s)
+            } else {
+                Ok(())
+            }
+        };
         let mut progress = |line: &str| eprintln!("{line}");
         let mut $hooks = Hooks {
             persist: &mut persist,
+            checkpoint: &mut checkpoint,
             progress: &mut progress,
         };
     };
+}
+
+/// SIGINT / SIGTERM request a stop for the commands whose loops check
+/// [`engine::STOP`] (`seal`, `purge`, `apply-direct`): they finish the
+/// current entry, chunk or file, save the state and stop. A second signal
+/// exits at once (code 130). Other commands keep the default behaviour
+/// (the handler is not installed for them), so a signal always stops them.
+fn install_stop_handler() {
+    std::thread::spawn(|| {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let (Ok(mut int), Ok(mut term)) = (
+                    signal(SignalKind::interrupt()),
+                    signal(SignalKind::terminate()),
+                ) else {
+                    return;
+                };
+                tokio::select! {
+                    _ = int.recv() => {}
+                    _ = term.recv() => {}
+                }
+                eprintln!(
+                    "stop requested: finishing the current step and saving the state (signal again to exit now)"
+                );
+                engine::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+                tokio::select! {
+                    _ = int.recv() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+                eprintln!(
+                    "stop requested: finishing the current step and saving the state (signal again to exit now)"
+                );
+                engine::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            eprintln!("second stop signal: exiting now");
+            std::process::exit(130);
+        });
+    });
 }
 
 /// Exit code when a step ran to completion but some entries failed.
@@ -47,6 +111,12 @@ const EXIT_ENTRIES_FAILED: u8 = 2;
     )
 )]
 struct Cli {
+    /// Save the state file every N recorded entries (and always at the end of
+    /// each phase and on SIGINT/SIGTERM). Resume after a crash adopts
+    /// anything published but not yet recorded.
+    #[arg(long, global = true, value_name = "N", default_value_t = 2000)]
+    persist_every: usize,
+
     /// Relay WebSocket URL (wss://…); its HTTP API is served on the same origin.
     #[arg(long, global = true, value_name = "URL")]
     relay: Option<String>,
@@ -90,7 +160,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Subcommand, Clone, Copy)]
+#[derive(Subcommand, Clone)]
 enum Command {
     /// Dry run (default): per channel, plaintext count, already-sealed count and ids to seal. Writes nothing.
     Plan,
@@ -99,6 +169,16 @@ enum Command {
         /// Seal at most this many originals in this run.
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
+        /// Allow the FIRST encryption of an all-plaintext zone (no encrypted
+        /// post on the relay to anchor the key). Refused unless the relay holds
+        /// no zone-encrypted post of the zone and the key is the latest grant
+        /// this sealer received.
+        #[arg(long)]
+        allow_unanchored_first_encryption: bool,
+        /// With --allow-unanchored-first-encryption: the key distributed to
+        /// members, ZONE=EPOCH:PUBKEY (repeatable). Required.
+        #[arg(long, value_name = "ZONE=EPOCH:PUBKEY", value_parser = parse_expect_zone_key)]
+        expect_zone_key: Vec<(String, u32, String)>,
     },
     /// Re-fetch and re-open every recorded envelope.
     Verify,
@@ -110,16 +190,108 @@ enum Command {
     },
     /// Print the state file's counts by status.
     Status,
+    /// Seal from the relay's local D1 on all cores and write SQL chunks plus a
+    /// manifest (apply with `wrangler d1 execute --local --file`, then run
+    /// seal-offline-commit). Same key ring and anchor check as seal.
+    SealOffline {
+        /// The relay's D1 SQLite file (under --persist-to .../d1/...).
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// Directory for seal-NNNN.sql and seal-manifest.json.
+        #[arg(long, value_name = "DIR")]
+        sql_out: PathBuf,
+        /// Envelopes per SQL chunk.
+        #[arg(long, default_value_t = offline::DEFAULT_CHUNK)]
+        chunk: usize,
+        /// Sealing threads (default: all cores).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Seal at most this many originals.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+    },
+    /// Apply SQL chunk files (seal-offline / purge-offline output) straight to
+    /// the D1 SQLite file, one transaction per file, triggers firing as under
+    /// wrangler. Every worker using the database must be stopped (the file is
+    /// locked exclusively). Faster than wrangler d1 execute for bulk applies.
+    ApplyDirect {
+        /// The D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// SQL files, applied in the order given.
+        #[arg(required = true, value_name = "SQL")]
+        files: Vec<PathBuf>,
+    },
+    /// Replace this sealer's envelopes that predate the outer topic tag (found
+    /// in D1, recorded or not) with current-format envelopes: writes
+    /// reseal-0001.sql (insert new, then tombstone + delete old, as the admin
+    /// delete) and a seal-manifest.json. Apply it, then run
+    /// seal-offline-commit --reseal, then verify.
+    ResealLegacy {
+        /// The relay's D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// Directory for reseal-0001.sql and seal-manifest.json (must be empty).
+        #[arg(long, value_name = "DIR")]
+        sql_out: PathBuf,
+    },
+    /// After applying seal-offline's chunks: re-read each envelope from D1,
+    /// re-open it, and mark the entry sealed. Unapplied entries stay planned.
+    SealOfflineCommit {
+        /// The relay's D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// seal-manifest.json from seal-offline.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+        /// The manifest is from reseal-legacy: re-record already-sealed entries
+        /// with their replacement envelope (they need verify again).
+        #[arg(long)]
+        reseal: bool,
+    },
+    /// Write SQL that purges the verified plaintext exactly as the relay's
+    /// admin delete does (tombstone, delete, audit row). Re-checks every
+    /// envelope from D1 first. Writes nothing to D1 itself.
+    PurgeOffline {
+        /// The relay's D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// Directory for purge-NNNN.sql and purge-manifest.json.
+        #[arg(long, value_name = "DIR")]
+        sql_out: PathBuf,
+        /// Ids per SQL chunk.
+        #[arg(long, default_value_t = offline::DEFAULT_CHUNK)]
+        chunk: usize,
+        /// Confirm the irreversible deletion the SQL performs.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// After applying purge-offline's chunks: mark entries purged whose
+    /// plaintext is gone from D1 and tombstoned.
+    PurgeOfflineCommit {
+        /// The relay's D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// purge-manifest.json from purge-offline.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+    },
 }
 
 impl Command {
-    fn name(self) -> &'static str {
+    fn name(&self) -> &'static str {
         match self {
             Command::Plan => "plan",
             Command::Seal { .. } => "seal",
             Command::Verify => "verify",
             Command::Purge { .. } => "purge",
             Command::Status => "status",
+            Command::SealOffline { .. } => "seal-offline",
+            Command::SealOfflineCommit { .. } => "seal-offline-commit",
+            Command::ResealLegacy { .. } => "reseal-legacy",
+            Command::ApplyDirect { .. } => "apply-direct",
+            Command::PurgeOffline { .. } => "purge-offline",
+            Command::PurgeOfflineCommit { .. } => "purge-offline-commit",
         }
     }
 }
@@ -135,6 +307,12 @@ impl<E: std::fmt::Display> From<E> for Failure {
 
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
+    if matches!(
+        cli.command,
+        Some(Command::Seal { .. } | Command::Purge { .. } | Command::ApplyDirect { .. })
+    ) {
+        install_stop_handler();
+    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -155,12 +333,33 @@ pub fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Failure> {
-    let command = cli.command.unwrap_or(Command::Plan);
+    let command = cli.command.clone().unwrap_or(Command::Plan);
 
     if !cli.print_channels {
         if let Command::Status = command {
             return status(&cli);
         }
+    }
+    // Needs neither a relay nor a key: it only applies SQL already written.
+    if let Command::ApplyDirect { d1, files } = &command {
+        let t = std::time::Instant::now();
+        let done = offline::apply_sql_direct(d1, files).map_err(Failure)?;
+        for (f, ms) in &done {
+            eprintln!("{} {ms} ms", f.display());
+        }
+        eprintln!(
+            "apply-direct: {} of {} files in {} ms",
+            done.len(),
+            files.len(),
+            t.elapsed().as_millis()
+        );
+        if done.len() < files.len() {
+            return Err(Failure(format!(
+                "stopped by signal after {} files; the rest were not applied (each applied file is complete)",
+                done.len()
+            )));
+        }
+        return Ok(ExitCode::SUCCESS);
     }
 
     let relay_url = cli
@@ -206,13 +405,27 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             out["plan"] = serde_json::to_value(&plan)?;
             ExitCode::SUCCESS
         }
-        Command::Seal { limit } => {
+        Command::Seal {
+            limit,
+            allow_unanchored_first_encryption,
+            expect_zone_key,
+        } => {
             let channels = channels(&cli)?;
             let path = state_path(&cli)?;
             let mut st = load_or_new(path, &relay_url, &me_pk)?;
-            hooks!(hooks, path);
-            let report = engine::seal(
-                &mut relay, &me, &channels, &keys, &mut st, limit, &mut hooks,
+            hooks!(hooks, path, cli.persist_every);
+            let report = engine::seal_with(
+                &mut relay,
+                &me,
+                &channels,
+                &keys,
+                &mut st,
+                engine::SealOptions {
+                    limit,
+                    allow_unanchored_first_encryption,
+                    expect_zone_keys: &expect_zone_key,
+                },
+                &mut hooks,
             )
             .await?;
             print_plan(&report.plan);
@@ -224,6 +437,8 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
                 report.remaining,
                 if report.limit_reached {
                     " (stopped at --limit)"
+                } else if report.stopped {
+                    " (stopped by signal)"
                 } else {
                     ""
                 }
@@ -235,7 +450,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
         Command::Verify => {
             let path = state_path(&cli)?;
             let mut st = load_existing(path, &relay_url, &me_pk)?;
-            hooks!(hooks, path);
+            hooks!(hooks, path, cli.persist_every);
             let report = engine::verify(&mut relay, &keys, &mut st, &mut hooks).await?;
             print_failures(&report.failed);
             out["result"] = serde_json::to_value(&report)?;
@@ -244,19 +459,274 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
         Command::Purge { yes } => {
             let path = state_path(&cli)?;
             let mut st = load_existing(path, &relay_url, &me_pk)?;
-            hooks!(hooks, path);
+            hooks!(hooks, path, cli.persist_every);
             let report = engine::purge(&mut relay, &keys, &mut st, yes, &mut hooks).await?;
             eprintln!(
-                "purge: {} deleted over {} requests, {} already gone, {} skipped (not kind 42)",
+                "purge: {} deleted over {} requests, {} already gone, {} skipped (not kind 42){}",
                 report.deleted,
                 report.requests,
                 report.not_found.len(),
+                report.skipped.len(),
+                if report.stopped {
+                    " (stopped by signal)"
+                } else {
+                    ""
+                }
+            );
+            out["result"] = serde_json::to_value(&report)?;
+            exit_for(report.skipped.is_empty() && !report.stopped)
+        }
+        Command::Status => unreachable!("handled above"),
+        Command::SealOffline {
+            d1,
+            sql_out,
+            chunk,
+            threads,
+            limit,
+        } => {
+            let channels = channels(&cli)?;
+            let path = state_path(&cli)?;
+            let mut st = load_or_new(path, &relay_url, &me_pk)?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            offline::check_schema(&db).map_err(Failure)?;
+            let mut events = std::collections::HashMap::new();
+            for c in &channels {
+                let evs = offline::read_channel_events(&db, &c.id)
+                    .map_err(|e| Failure(format!("reading channel {}: {e}", c.id)))?;
+                eprintln!("read {} kind-42 rows for channel {}", evs.len(), c.id);
+                events.insert(c.id.clone(), evs);
+            }
+            // The relay refuses a sealed envelope into a channel not bound to
+            // the zone; offline checks the binding itself (channel_zones).
+            let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
+            let bound = offline::read_channel_zones(&db, &ids)
+                .map_err(|e| Failure(format!("reading channel_zones: {e}")))?;
+            if let Some(why) = offline::binding_refusal(&channels, &bound) {
+                return Err(Failure(format!("refusing to seal offline: {why}")));
+            }
+            let topic_channels = offline::read_topic_channels(&db, &offline::topics_of(&events))
+                .map_err(|e| Failure(format!("resolving reply topics: {e}")))?;
+            if let Some(n) = threads {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build_global()
+                    .map_err(|e| Failure(format!("--threads {n}: {e}")))?;
+            }
+            hooks!(hooks, path, cli.persist_every);
+            let report = offline::seal_offline(
+                &channels,
+                &events,
+                &topic_channels,
+                &keys,
+                &me,
+                &mut st,
+                limit,
+                &mut hooks,
+            )?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let files = offline::write_seal_sql(&sql_out, &report.sealed, &me_pk, chunk, now)
+                .map_err(|e| Failure(format!("{}: {e}", sql_out.display())))?;
+            let rate = report.sealed.len() as f64 / report.seal_seconds.max(1e-9);
+            eprintln!(
+                "seal-offline: {} sealed in {:.2}s ({rate:.0}/s on {} threads), {} adopted, {} failed; \
+                 {} SQL chunks in {}. Apply them, then run seal-offline-commit.",
+                report.sealed.len(),
+                report.seal_seconds,
+                rayon::current_num_threads(),
+                report.adopted,
+                report.failed.len(),
+                files.len(),
+                sql_out.display()
+            );
+            out["result"] = json!({
+                "sealed": report.sealed.len(), "adopted": report.adopted,
+                "failed": report.failed, "seal_seconds": report.seal_seconds,
+                "events_per_second": rate, "threads": rayon::current_num_threads(),
+                "chunks": files,
+            });
+            exit_for(report.failed.is_empty())
+        }
+        Command::ApplyDirect { .. } => unreachable!("handled above"),
+        Command::ResealLegacy { d1, sql_out } => {
+            let channels = channels(&cli)?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            offline::check_schema(&db).map_err(Failure)?;
+            let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
+            let bound = offline::read_channel_zones(&db, &ids)
+                .map_err(|e| Failure(format!("reading channel_zones: {e}")))?;
+            if let Some(why) = offline::binding_refusal(&channels, &bound) {
+                return Err(Failure(format!("refusing to reseal: {why}")));
+            }
+            let envelopes = offline::read_migrator_envelopes(&db, &channels, &me_pk)
+                .map_err(|e| Failure(format!("reading envelopes: {e}")))?;
+            let mut events = std::collections::HashMap::new();
+            for c in &channels {
+                events.insert(
+                    c.id.clone(),
+                    offline::read_channel_events(&db, &c.id).map_err(|e| Failure(e.to_string()))?,
+                );
+            }
+            // Topics of the ORIGINALS are inside the envelopes: resolve them
+            // after opening, from the channels' plaintext and envelopes.
+            let mut topics = offline::topics_of(&events);
+            let zones: std::collections::HashMap<String, String> = channels
+                .iter()
+                .map(|c| (c.id.clone(), c.zone.clone()))
+                .collect();
+            for (ch, outer) in &envelopes {
+                let key = zones
+                    .get(ch)
+                    .and_then(|z| keys.get(z, offline::envelope_epoch(outer, z)?));
+                if let Some(k) = key {
+                    if let Ok(o) = nostr_bbs_core::sealed::open_sealed(outer, k.secret()) {
+                        if let Some(t) = nostr_bbs_core::sealed::reply_root_of(&o) {
+                            topics.insert(t.to_string());
+                        }
+                    }
+                }
+            }
+            let topic_channels = offline::read_topic_channels(&db, &topics)
+                .map_err(|e| Failure(format!("resolving reply topics: {e}")))?;
+            let (items, failed) =
+                offline::reseal_legacy(&envelopes, &zones, &keys, &me, &topic_channels);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let file = offline::write_reseal_sql(&sql_out, &items, &me_pk, now)
+                .map_err(|e| Failure(format!("{}: {e}", sql_out.display())))?;
+            eprintln!(
+                "reseal-legacy: {} of {} envelopes are legacy and were resealed, {} failed; wrote {}",
+                items.len(),
+                envelopes.len(),
+                failed.len(),
+                file.display()
+            );
+            out["result"] = json!({ "resealed": items.len(), "scanned": envelopes.len(), "failed": failed, "sql": file });
+            exit_for(failed.is_empty())
+        }
+        Command::SealOfflineCommit {
+            d1,
+            manifest,
+            reseal,
+        } => {
+            let path = state_path(&cli)?;
+            let mut st = load_existing(path, &relay_url, &me_pk)?;
+            let entries: Vec<offline::ManifestEntry> = serde_json::from_slice(
+                &std::fs::read(&manifest)
+                    .map_err(|e| Failure(format!("{}: {e}", manifest.display())))?,
+            )?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            let outer_ids: Vec<String> = entries.iter().map(|m| m.outer_id.clone()).collect();
+            let outers = offline::read_events_by_id(&db, &outer_ids)
+                .map_err(|e| Failure(format!("reading envelopes: {e}")))?;
+            let bindings: std::collections::HashMap<String, String> = channels(&cli)?
+                .into_iter()
+                .map(|c| (c.id, c.zone))
+                .collect();
+            let report =
+                offline::commit_sealed_with(&mut st, &entries, &outers, &keys, reseal, &bindings);
+            state::save_atomic(path, &st).map_err(|e| Failure(e.to_string()))?;
+            eprintln!(
+                "seal-offline-commit: {} marked sealed, {} left as they were",
+                report.committed,
                 report.skipped.len()
             );
             out["result"] = serde_json::to_value(&report)?;
             exit_for(report.skipped.is_empty())
         }
-        Command::Status => unreachable!("handled above"),
+        Command::PurgeOffline {
+            d1,
+            sql_out,
+            chunk,
+            yes,
+        } => {
+            if !yes {
+                return Err(Failure(
+                    "purge deletes the plaintext originals irreversibly; re-run with --yes".into(),
+                ));
+            }
+            let path = state_path(&cli)?;
+            let mut st = load_existing(path, &relay_url, &me_pk)?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            offline::check_schema(&db).map_err(Failure)?;
+            let outer_ids: Vec<String> = st
+                .entries
+                .values()
+                .filter_map(|e| e.outer_id.clone())
+                .collect();
+            let outers = offline::read_events_by_id(&db, &outer_ids)
+                .map_err(|e| Failure(format!("reading envelopes: {e}")))?;
+            let mut zone_events = std::collections::HashMap::new();
+            for zone in st.unanchored_zones.keys() {
+                zone_events.insert(
+                    zone.clone(),
+                    offline::read_zone_events(&db, zone)
+                        .map_err(|e| Failure(format!("zone {zone}: {e}")))?,
+                );
+            }
+            let (ids, failed) = offline::purge_candidates(&mut st, &keys, &outers, &zone_events)?;
+            state::save_atomic(path, &st).map_err(|e| Failure(e.to_string()))?;
+            if !failed.is_empty() {
+                return Err(Failure(format!(
+                    "{} envelopes no longer open and match (first: {} — {}); nothing written",
+                    failed.len(),
+                    failed[0].0,
+                    failed[0].1
+                )));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let files = offline::write_purge_sql(&sql_out, &ids, &me_pk, chunk, now)
+                .map_err(|e| Failure(format!("{}: {e}", sql_out.display())))?;
+            eprintln!(
+                "purge-offline: {} ids in {} SQL chunks in {}. Apply them, then run purge-offline-commit.",
+                ids.len(),
+                files.len(),
+                sql_out.display()
+            );
+            out["result"] = json!({ "ids": ids.len(), "chunks": files });
+            ExitCode::SUCCESS
+        }
+        Command::PurgeOfflineCommit { d1, manifest } => {
+            let path = state_path(&cli)?;
+            let mut st = load_existing(path, &relay_url, &me_pk)?;
+            let items: Vec<offline::PurgeItem> = serde_json::from_slice(
+                &std::fs::read(&manifest)
+                    .map_err(|e| Failure(format!("{}: {e}", manifest.display())))?,
+            )?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            let outer_ids: Vec<String> = items.iter().map(|i| i.outer_id.clone()).collect();
+            let envelopes =
+                offline::present_ids(&db, &outer_ids).map_err(|e| Failure(e.to_string()))?;
+            let present = offline::present_ids(&db, &ids).map_err(|e| Failure(e.to_string()))?;
+            let gone: std::collections::HashSet<String> = ids
+                .iter()
+                .filter(|i| !present.contains(*i))
+                .cloned()
+                .collect();
+            let tomb = offline::tombstoned_ids(&db, &ids).map_err(|e| Failure(e.to_string()))?;
+            let report = offline::commit_purged(&mut st, &items, &gone, &tomb, &envelopes);
+            state::save_atomic(path, &st).map_err(|e| Failure(e.to_string()))?;
+            eprintln!(
+                "purge-offline-commit: {} marked purged, {} left as they were",
+                report.committed,
+                report.skipped.len()
+            );
+            out["result"] = serde_json::to_value(&report)?;
+            exit_for(report.skipped.is_empty())
+        }
     };
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -364,7 +834,21 @@ fn state_path(cli: &Cli) -> Result<&Path, Failure> {
         .ok_or_else(|| Failure("--state <path> is required for this command".into()))
 }
 
+fn set_aside_tmp(path: &Path) -> Result<(), Failure> {
+    if let Some(aside) =
+        state::set_aside_stale_tmp(path).map_err(|e| Failure(format!("{}: {e}", path.display())))?
+    {
+        eprintln!(
+            "note: a leftover {}.tmp (an interrupted save) was moved to {}; the state file itself is the last complete save",
+            path.display(),
+            aside.display()
+        );
+    }
+    Ok(())
+}
+
 fn load_or_new(path: &Path, relay: &str, me: &str) -> Result<State, Failure> {
+    set_aside_tmp(path)?;
     match state::load(path)? {
         Some(s) => {
             s.check_matches(relay, me)?;
@@ -375,6 +859,7 @@ fn load_or_new(path: &Path, relay: &str, me: &str) -> Result<State, Failure> {
 }
 
 fn load_existing(path: &Path, relay: &str, me: &str) -> Result<State, Failure> {
+    set_aside_tmp(path)?;
     let s = state::load(path)?.ok_or_else(|| {
         Failure(format!(
             "state file {} does not exist; run seal first",
@@ -502,6 +987,17 @@ fn print_failures(failed: &[(String, String)]) {
     }
 }
 
+/// Parse `ZONE=EPOCH:PUBKEY` for `--expect-zone-key`.
+fn parse_expect_zone_key(s: &str) -> Result<(String, u32, String), String> {
+    let (zone, rest) = s.split_once('=').ok_or("expected ZONE=EPOCH:PUBKEY")?;
+    let (epoch, pk) = rest.split_once(':').ok_or("expected ZONE=EPOCH:PUBKEY")?;
+    let epoch = epoch.parse::<u32>().map_err(|_| "EPOCH must be a number")?;
+    if zone.is_empty() || pk.len() != 64 || !pk.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("ZONE must be non-empty and PUBKEY 64 hex characters".into());
+    }
+    Ok((zone.to_string(), epoch, pk.to_ascii_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,12 +1023,34 @@ mod tests {
         assert!(cli.fetch_grants);
         assert!(matches!(
             parse(&format!("{m} seal --limit 20")).command,
-            Some(Command::Seal { limit: Some(20) })
+            Some(Command::Seal {
+                limit: Some(20),
+                allow_unanchored_first_encryption: false,
+                ..
+            })
         ));
         assert!(matches!(
             parse(&format!("{m} seal")).command,
-            Some(Command::Seal { limit: None })
+            Some(Command::Seal {
+                limit: None,
+                allow_unanchored_first_encryption: false,
+                ..
+            })
         ));
+        assert!(matches!(
+            parse(&format!(
+                "{m} seal --allow-unanchored-first-encryption --expect-zone-key zone3=2:{}",
+                "a".repeat(64)
+            ))
+            .command,
+            Some(Command::Seal {
+                limit: None,
+                allow_unanchored_first_encryption: true,
+                ref expect_zone_key,
+            }) if expect_zone_key.len() == 1 && expect_zone_key[0].1 == 2
+        ));
+        assert!(parse_expect_zone_key("zone3=x:abc").is_err());
+        assert!(parse_expect_zone_key("zone3:2").is_err());
         assert!(matches!(
             parse(&format!("{m} verify")).command,
             Some(Command::Verify)

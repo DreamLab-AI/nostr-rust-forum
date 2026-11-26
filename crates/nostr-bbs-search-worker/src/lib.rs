@@ -17,12 +17,12 @@
 
 mod auth;
 mod embed;
-mod rerank;
+mod index_v2;
+mod shard;
 mod store;
 
 use embed::DIM;
 use serde::Deserialize;
-use store::VectorStore;
 use worker::*;
 
 // ---------------------------------------------------------------------------
@@ -230,11 +230,11 @@ struct IngestEntry {
     /// visibility fails closed for legacy callers.
     #[serde(default)]
     public: bool,
-    /// Jev option (NF-07-S1-01): short public text used only by the opt-in
-    /// reranker. Stored only when `JEV_SEARCH_RERANK` is on AND `public` is
-    /// true; ignored (and never persisted) otherwise.
+    /// Zone the event belongs to (`[a-z0-9-]{1,32}`); routes it to that
+    /// zone's shards. Defaults to the unzoned shard set. Search is still
+    /// gated only by `public`.
     #[serde(default)]
-    snippet: Option<String>,
+    zone: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -291,73 +291,56 @@ struct EmbedRequest {
 // Store lifecycle (R2 + KV)
 // ---------------------------------------------------------------------------
 
-/// Load the vector store from R2, or create empty if none exists.
-async fn load_store(env: &Env) -> Result<VectorStore> {
-    let store_key = env
-        .var("RVF_STORE_KEY")
+fn store_key(env: &Env) -> String {
+    env.var("RVF_STORE_KEY")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "nostr-bbs.rvf".to_string());
+        .unwrap_or_else(|_| "nostr-bbs.rvf".to_string())
+}
 
+/// First-stage candidates rescored exactly per query (`SEARCH_RESCORE`, default
+/// [`index_v2::DEFAULT_RESCORE`], clamped to 10..=1000).
+fn rescore_n(env: &Env) -> usize {
+    env.var("SEARCH_RESCORE")
+        .ok()
+        .and_then(|v| v.to_string().trim().parse::<usize>().ok())
+        .unwrap_or(index_v2::DEFAULT_RESCORE)
+        .clamp(10, 1000)
+}
+
+/// Vector count of a v1 store from its first segment header only (64 bytes),
+/// so `/status` never downloads the whole object.
+async fn v1_count(env: &Env, key: &str) -> Result<usize> {
+    let obj = env
+        .bucket("VECTORS")?
+        .get(key)
+        .range(Range::OffsetWithLength {
+            offset: 0,
+            length: 64,
+        })
+        .execute()
+        .await?;
+    let Some(body) = obj.as_ref().and_then(|o| o.body()) else {
+        return Ok(0);
+    };
+    Ok(store::rvf_count_from_first_header(&body.bytes().await?))
+}
+
+/// Fetch the raw RVF bytes from R2 (empty when the object does not exist).
+async fn load_store_bytes(env: &Env) -> Result<Vec<u8>> {
     let bucket = env.bucket("VECTORS")?;
-    let obj = bucket.get(&store_key).execute().await?;
-
-    if let Some(obj) = obj {
+    match bucket.get(store_key(env)).execute().await? {
         // Sprint v9 D5: never panic on a missing body. R2 can in principle
         // return an object with no body (e.g. zero-length write race or
         // bucket inconsistency); surface a typed worker::Error instead so
         // the caller returns a 5xx rather than crashing the isolate.
-        let body = obj
-            .body()
-            .ok_or_else(|| worker::Error::RustError("R2 object missing body".into()))?;
-        let bytes = body.bytes().await?;
-        if let Some(store) = VectorStore::from_rvf_bytes(&bytes) {
-            return Ok(store);
+        Some(obj) => {
+            obj.body()
+                .ok_or_else(|| worker::Error::RustError("R2 object missing body".into()))?
+                .bytes()
+                .await
         }
+        None => Ok(Vec::new()),
     }
-
-    Ok(VectorStore::new())
-}
-
-/// Persist the vector store to R2 as RVF binary + mapping to KV.
-///
-/// `model` is the embedding model identity that produced `store`'s vectors
-/// (or `MODEL_UNKNOWN` when not known) -- recorded so a later query can
-/// verify it is searching in the same embedding space.
-async fn persist_store(
-    store: &VectorStore,
-    id_to_label: &std::collections::HashMap<String, u64>,
-    next_label: u64,
-    model: &str,
-    public_labels: &std::collections::HashSet<u64>,
-    env: &Env,
-) -> Result<()> {
-    let store_key = env
-        .var("RVF_STORE_KEY")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "nostr-bbs.rvf".to_string());
-
-    // Persist RVF bytes to R2
-    let rvf_bytes = store.to_rvf_bytes();
-    let bucket = env.bucket("VECTORS")?;
-    bucket.put(&store_key, rvf_bytes).execute().await?;
-
-    // Persist id↔label mapping (+ index-time model identity) to KV
-    let kv = env.kv("SEARCH_CONFIG")?;
-    let pairs: Vec<(&str, u64)> = id_to_label.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    let mapping = serde_json::json!({
-        "pairs": pairs,
-        "next": next_label,
-        "model": model,
-        "publicLabels": public_labels,
-    });
-    kv.put(
-        &format!("{store_key}:mapping"),
-        serde_json::to_string(&mapping).map_err(|e| Error::RustError(e.to_string()))?,
-    )?
-    .execute()
-    .await?;
-
-    Ok(())
 }
 
 /// Load id↔label mapping (+ recorded index-time model identity) from KV.
@@ -418,6 +401,12 @@ async fn load_mapping(
 // ---------------------------------------------------------------------------
 
 async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
+    // No public search (sealed-search design): zone1 gets no search, encrypted
+    // zones are searched in the browser, and server mode for unencrypted
+    // private zones (Phase 3) will add the cohort check. Until then: admins.
+    if let Some(denied) = require_admin(req, env).await? {
+        return Ok(denied);
+    }
     let mut req_clone = req.clone()?;
     let body: SearchRequest = match req_clone.json().await {
         Ok(b) => b,
@@ -433,7 +422,6 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
 
     // Track the model that actually produced `embedding` so we can verify
     // it matches the model the index was built with (see `check_model_match`).
-    let mut jev_query: Option<String> = None;
     let (embedding, query_model): (Vec<f32>, String) = if !body.embedding.is_empty() {
         // Caller supplied a raw vector; its model is only known if they told
         // us via the optional `model` field.
@@ -455,7 +443,6 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         // Embed the *trimmed* query with the same model used at ingest time so
         // the query vector lives in the same space as the stored vectors.
         let text = text.to_string();
-        jev_query = Some(text.clone());
         let (mut embs, model) = embed::embed_texts(env, std::slice::from_ref(&text)).await;
         (embs.pop().unwrap_or_default(), model.to_string())
     } else {
@@ -476,87 +463,89 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         );
     }
 
-    let store = load_store(env).await?;
     let k = body.k.clamp(1, 100);
+    let key = store_key(env);
 
-    if store.count() == 0 {
-        return json_response(
-            req,
-            env,
-            &serde_json::json!({ "results": [], "totalVectors": 0 }),
-            200,
-        );
-    }
-
-    let (_, label_to_id, _, indexed_model, public_labels) = load_mapping(env).await?;
-
-    // Fail loudly rather than returning numerically valid but semantically
-    // meaningless cosine scores across mismatched embedding spaces.
-    if let Err(err_body) = check_model_match(&indexed_model, &query_model) {
-        console_error!(
-            "Search worker: embedding model mismatch (index={indexed_model}, query={query_model})"
-        );
-        return json_response(req, env, &err_body, 409);
-    }
-
-    // Over-fetch candidates, THEN apply the public-visibility filter, THEN cut
-    // to `k`. Filtering a set the store had already truncated to `k` could only
-    // shrink it -- an index whose top-`k` neighbours are private returned
-    // nothing at all while public matches sat just below the cut.
-    let candidates = store.search(&embedding, overfetch_k(k), body.min_score);
-    let results = visible_top_k(&candidates, &public_labels, k);
-
-    // Jev option (NF-07-S1-01): off by default. Runs after the model-match gate
-    // and the visibility filter, and can only permute the visible head.
-    let (results, jev_note, jev_fallback) = match (&jev_query, jev_enabled(env)) {
-        (Some(q), true) => {
-            let snippets = load_snippets(env).await;
-            let lookup = nostr_bbs_jev::fetch::env_lookup(env);
-            let cfg = nostr_bbs_jev::resolve(
-                &lookup,
-                rerank::FLAG,
-                nostr_bbs_jev::local_only(&lookup, rerank::LOCAL_ONLY_FLAG),
-            );
-            let min_conf = lookup("JEV_SEARCH_MIN_CONFIDENCE")
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(rerank::DEFAULT_MIN_CONFIDENCE);
-            rerank_or_keep(
-                &nostr_bbs_jev::fetch::WorkersFetch,
-                cfg,
-                q,
-                results,
-                &label_to_id,
-                &snippets,
-                min_conf,
-            )
-            .await
+    // RVF v2 (sharded, quantised) when a manifest exists; otherwise the v1
+    // single-object store, read in place.
+    let (results, label_to_id, total_vectors) = match index_v2::search(
+        env,
+        &key,
+        &embedding,
+        k,
+        body.min_score,
+        rescore_n(env),
+    )
+    .await?
+    {
+        Some(out) => {
+            if let Err(err_body) = check_model_match(&out.model, &query_model) {
+                console_error!(
+                    "Search worker: embedding model mismatch (index={}, query={query_model})",
+                    out.model
+                );
+                return json_response(req, env, &err_body, 409);
+            }
+            // v2 hits are already visible (the first stage skips non-public
+            // rows) and cut to k; give them positional labels so the response
+            // code below stays shared with v1.
+            let mut label_to_id = std::collections::HashMap::new();
+            let mut results = Vec::with_capacity(out.hits.len());
+            for (i, (id, score)) in out.hits.into_iter().enumerate() {
+                label_to_id.insert(i as u64, id);
+                results.push((i as u64, score));
+            }
+            (results, label_to_id, out.total)
         }
-        _ => (results, None, None),
+        None => {
+            // Search the persisted bytes in place: decoding them into a
+            // VectorStore first doubled peak memory for no benefit.
+            let store_bytes = load_store_bytes(env).await?;
+            let total_vectors = store::rvf_count(&store_bytes);
+            if total_vectors == 0 {
+                return json_response(
+                    req,
+                    env,
+                    &serde_json::json!({ "results": [], "totalVectors": 0 }),
+                    200,
+                );
+            }
+            let (_, label_to_id, _, indexed_model, public_labels) = load_mapping(env).await?;
+            // Fail loudly rather than returning numerically valid but
+            // semantically meaningless cosine scores across mismatched spaces.
+            if let Err(err_body) = check_model_match(&indexed_model, &query_model) {
+                console_error!(
+                    "Search worker: embedding model mismatch (index={indexed_model}, query={query_model})"
+                );
+                return json_response(req, env, &err_body, 409);
+            }
+            // Over-fetch candidates, THEN apply the public-visibility filter,
+            // THEN cut to `k` (filtering a set already truncated to `k` could
+            // only shrink it).
+            let candidates =
+                store::search_rvf(&store_bytes, &embedding, overfetch_k(k), body.min_score);
+            drop(store_bytes);
+            (
+                visible_top_k(&candidates, &public_labels, k),
+                label_to_id,
+                total_vectors,
+            )
+        }
     };
-    if let Some(why) = jev_fallback {
-        console_log!("jev search-rerank fallback: {}", why.tag());
-    } else if jev_note.is_some() {
-        console_log!(
-            "jev search-rerank accepted: question_set={}",
-            rerank::QUESTION_SET_VERSION
-        );
-    }
 
     json_response(
         req,
         env,
-        &search_body(&results, &label_to_id, store.count(), jev_note),
+        &search_body(&results, &label_to_id, total_vectors),
         200,
     )
 }
 
-/// Build the `/search` 200 body. With `jev_note == None` this is exactly the
-/// pre-Jev body (no extra keys).
+/// Build the `/search` 200 body.
 fn search_body(
     results: &[(u64, f32)],
     label_to_id: &std::collections::HashMap<u64, String>,
     total_vectors: usize,
-    jev_note: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let results_json: Vec<serde_json::Value> = results
         .iter()
@@ -572,89 +561,20 @@ fn search_body(
             })
         })
         .collect();
-    let mut body = serde_json::json!({
+    serde_json::json!({
         "results": results_json,
         "totalVectors": total_vectors,
         "engine": "rvf-rust",
         "dimensions": DIM,
-    });
-    if let (Some(note), Some(obj)) = (jev_note, body.as_object_mut()) {
-        obj.insert("jev".to_string(), note);
-    }
-    body
-}
-
-/// Whether the Jev rerank flag is on. The resolver is never consulted when it
-/// is off, so nothing is built and nothing leaves the Worker.
-fn jev_enabled(env: &Env) -> bool {
-    env.var(rerank::FLAG)
-        .map(|v| matches!(v.to_string().trim(), "1" | "true"))
-        .unwrap_or(false)
-}
-
-/// Try the rerank; on any fallback return the input untouched with no note.
-async fn rerank_or_keep<T: nostr_bbs_jev::JevTransport + ?Sized>(
-    transport: &T,
-    cfg: std::result::Result<nostr_bbs_jev::JevConfig, nostr_bbs_jev::Fallback>,
-    query: &str,
-    results: Vec<(u64, f32)>,
-    label_to_id: &std::collections::HashMap<u64, String>,
-    snippets: &std::collections::HashMap<String, String>,
-    min_confidence: f64,
-) -> (
-    Vec<(u64, f32)>,
-    Option<serde_json::Value>,
-    Option<nostr_bbs_jev::Fallback>,
-) {
-    // The caller logs the one reason token (never request content); no JS
-    // calls here so this stays natively testable.
-    let keep = |results: Vec<(u64, f32)>, why: nostr_bbs_jev::Fallback| (results, None, Some(why));
-    let cfg = match cfg {
-        Ok(c) => c,
-        Err(why) => return keep(results, why),
-    };
-    let ids: Vec<(String, f32)> = results
-        .iter()
-        .map(|(l, sc)| {
-            (
-                label_to_id.get(l).cloned().unwrap_or_else(|| l.to_string()),
-                *sc,
-            )
-        })
-        .collect();
-    match rerank::rerank(transport, &cfg, query, &ids, snippets, min_confidence).await {
-        Ok(r) => {
-            let reordered = rerank::apply_order(&results, &r.order);
-            (
-                reordered,
-                Some(serde_json::json!({
-                    "reranked": true,
-                    "questionSet": rerank::QUESTION_SET_VERSION,
-                    "noUsefulMatch": r.no_useful_match,
-                })),
-                None,
-            )
-        }
-        Err(why) => keep(results, why),
-    }
-}
-
-/// Load public snippets stored at ingest (Jev option only).
-async fn load_snippets(env: &Env) -> std::collections::HashMap<String, String> {
-    let store_key = env
-        .var("RVF_STORE_KEY")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "nostr-bbs.rvf".to_string());
-    let Ok(kv) = env.kv("SEARCH_CONFIG") else {
-        return Default::default();
-    };
-    match kv.get(&format!("{store_key}:snippets")).text().await {
-        Ok(Some(s)) => serde_json::from_str(&s).unwrap_or_default(),
-        _ => Default::default(),
-    }
+    })
 }
 
 async fn handle_embed(req: &Request, env: &Env) -> Result<Response> {
+    // The browser embeds queries on the device; only operators may spend
+    // embedding capacity here.
+    if let Some(denied) = require_admin(req, env).await? {
+        return Ok(denied);
+    }
     let mut req_clone = req.clone()?;
     let body: EmbedRequest = req_clone.json().await?;
 
@@ -689,7 +609,7 @@ async fn handle_embed(req: &Request, env: &Env) -> Result<Response> {
     }
 
     let (embeddings, model) = embed::embed_texts(env, &texts).await;
-    let semantic = model == embed::MODEL_LABEL_SEMANTIC;
+    let semantic = model != embed::MODEL_LABEL_FALLBACK;
 
     json_response(
         req,
@@ -699,8 +619,10 @@ async fn handle_embed(req: &Request, env: &Env) -> Result<Response> {
             "dimensions": DIM,
             "model": model,
             "semantic": semantic,
-            "note": if semantic {
+            "note": if model == embed::MODEL_LABEL_SEMANTIC {
                 "Cloudflare Workers AI bge-small-en-v1.5 (384-dim, L2-normalized)."
+            } else if semantic {
+                "OpenAI-compatible EMBED_URL backend (384-dim, L2-normalized)."
             } else {
                 "Hash-based fallback embedding (AI binding unavailable). Vectors are NOT semantic."
             },
@@ -741,47 +663,24 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         );
     }
 
-    let mut store = load_store(env).await?;
-    let (mut id_to_label, _, mut next_label, indexed_model, mut public_labels) =
-        load_mapping(env).await?;
-
     // The caller-declared model for these entries' embeddings; falls back to
     // this worker's currently-active embedding model for older callers that
     // pre-date the `model` field (best-effort -- matches historical behavior
     // where ingested vectors were assumed to come from whatever `/embed`
     // would currently produce).
-    let ingest_model = body.model.clone().unwrap_or_else(|| {
-        if embed::ai_binding_available(env) {
-            embed::MODEL_LABEL_SEMANTIC.to_string()
-        } else {
-            embed::MODEL_LABEL_FALLBACK.to_string()
-        }
-    });
-
-    // Fail loudly instead of silently mixing embedding spaces: if the index
-    // already holds vectors from a known, different model, reject the
-    // ingest rather than corrupting the index with incomparable vectors.
-    if store.count() > 0 {
-        if let Err(err_body) = check_model_match(&indexed_model, &ingest_model) {
-            console_error!(
-                "Search worker: ingest rejected, embedding model mismatch (index={indexed_model}, ingest={ingest_model})"
-            );
-            return json_response(req, env, &err_body, 409);
-        }
-    }
+    let ingest_model = body
+        .model
+        .clone()
+        .unwrap_or_else(|| embed::active_model_label(env));
 
     // Refuse a batch that could never be found before mutating anything. The
     // check runs on the caller's declared flags (not on post-insert state) so
     // nothing is written to R2/KV when it fails.
-    let valid_entries = body
-        .entries
-        .iter()
-        .filter(|e| !e.id.is_empty() && e.embedding.len() == DIM)
-        .count() as u32;
+    let valid_entries = body.entries.iter().filter(|e| entry_valid(e)).count() as u32;
     let public_entries = body
         .entries
         .iter()
-        .filter(|e| !e.id.is_empty() && e.embedding.len() == DIM && e.public)
+        .filter(|e| entry_valid(e) && e.public)
         .count() as u32;
     if let Some(err_body) =
         all_private_ingest_rejection(valid_entries, public_entries, body.allow_private)
@@ -793,69 +692,72 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         return json_response(req, env, &err_body, 400);
     }
 
-    let mut accepted = 0u32;
     let mut rejected = 0u32;
-    // Jev option: only touch the snippet store when the flag is on.
-    let jev_snippets = jev_enabled(env);
-    let mut snippets = if jev_snippets {
-        load_snippets(env).await
-    } else {
-        Default::default()
-    };
-
+    let mut entries: Vec<index_v2::NewEntry> = Vec::with_capacity(body.entries.len());
     for entry in &body.entries {
-        if entry.id.is_empty() || entry.embedding.len() != DIM {
+        if !entry_valid(entry) {
             rejected += 1;
             continue;
         }
-
-        let label = *id_to_label.entry(entry.id.clone()).or_insert_with(|| {
-            let l = next_label;
-            next_label += 1;
-            l
+        let mut vec = [0f32; DIM];
+        vec.copy_from_slice(&entry.embedding);
+        entries.push(index_v2::NewEntry {
+            id: entry.id.clone(),
+            zone: entry
+                .zone
+                .clone()
+                .unwrap_or_else(|| shard::DEFAULT_ZONE.to_string()),
+            public: entry.public,
+            vec,
         });
+    }
+    let accepted = entries.len() as u32;
+    drop(body);
+    if entries.is_empty() {
+        // Nothing valid to store: answer without touching the index (a commit
+        // here would rewrite the manifest for no change).
+        return json_response(
+            req,
+            env,
+            &serde_json::json!({ "accepted": 0, "rejected": rejected, "public": 0, "engine": "rvf-rust" }),
+            200,
+        );
+    }
 
-        store.insert(label, &entry.embedding);
-        if entry.public {
-            public_labels.insert(label);
-        } else {
-            public_labels.remove(&label);
+    // RVF v2: copy-on-write shards + conditional manifest commit. The first
+    // v2 ingest migrates an existing v1 store (object + KV mapping).
+    let store_key = store_key(env);
+    // Write-attempt nonce for shard keys: uniqueness, not secrecy, is needed.
+    let nonce = format!(
+        "{:x}{:08x}",
+        js_sys::Date::now() as u64,
+        (js_sys::Math::random() * f64::from(u32::MAX)) as u32
+    );
+    let outcome = match index_v2::ingest(env, &store_key, &ingest_model, entries, &nonce, || {
+        v1_rows(env)
+    })
+    .await
+    {
+        Ok(o) => o,
+        Err(index_v2::IngestError::ModelMismatch(indexed)) => {
+            console_error!(
+                "Search worker: ingest rejected, embedding model mismatch (index={indexed}, ingest={ingest_model})"
+            );
+            let err_body = check_model_match(&indexed, &ingest_model)
+                .err()
+                .unwrap_or_else(|| serde_json::json!({ "error": "Embedding model mismatch" }));
+            return json_response(req, env, &err_body, 409);
         }
-        if jev_snippets {
-            rerank::apply_snippet(
-                &mut snippets,
-                &entry.id,
-                entry.public,
-                entry.snippet.as_deref(),
+        Err(index_v2::IngestError::Conflict) => {
+            return json_response(
+                req,
+                env,
+                &serde_json::json!({ "error": "Concurrent ingest; retry" }),
+                409,
             );
         }
-        accepted += 1;
-    }
-
-    // Persist to R2 + KV, recording the model identity used for this ingest.
-    persist_store(
-        &store,
-        &id_to_label,
-        next_label,
-        &ingest_model,
-        &public_labels,
-        env,
-    )
-    .await?;
-
-    if jev_snippets {
-        let store_key = env
-            .var("RVF_STORE_KEY")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "nostr-bbs.rvf".to_string());
-        env.kv("SEARCH_CONFIG")?
-            .put(
-                &format!("{store_key}:snippets"),
-                serde_json::to_string(&snippets).map_err(|e| Error::RustError(e.to_string()))?,
-            )?
-            .execute()
-            .await?;
-    }
+        Err(index_v2::IngestError::Worker(e)) => return Err(e),
+    };
 
     json_response(
         req,
@@ -866,25 +768,133 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
             // Surfaced so a caller can see at a glance how many of its entries
             // are actually reachable by /search.
             "public": public_entries,
-            "totalVectors": store.count(),
+            "totalVectors": outcome.total,
+            "shards": outcome.shards,
+            "migratedFromV1": outcome.migrated,
             "engine": "rvf-rust",
+            "format": shard::MANIFEST_FORMAT,
             "model": ingest_model,
         }),
         200,
     )
 }
 
+/// Whether an ingest entry can be stored: non-empty id that fits a v2 row,
+/// a 384-dim vector, and (if given) a valid zone name.
+fn entry_valid(e: &IngestEntry) -> bool {
+    !e.id.is_empty()
+        && e.id.len() <= shard::MAX_ID_LEN
+        && e.embedding.len() == DIM
+        && e.zone.as_deref().is_none_or(shard::valid_zone)
+}
+
+/// Rows of the v1 store (R2 object + KV mapping), for migration to v2.
+/// Vectors whose label has no id in the mapping cannot be addressed and are
+/// skipped; ids too long for a v2 row are skipped too.
+async fn v1_rows(env: &Env) -> Result<Vec<shard::Row>> {
+    let bytes = load_store_bytes(env).await?;
+    if store::rvf_count(&bytes) == 0 {
+        return Ok(Vec::new());
+    }
+    let (_, label_to_id, _, _, public_labels) = load_mapping(env).await?;
+    Ok(store::rvf_entries(&bytes)
+        .filter_map(|(label, vec)| {
+            let id = label_to_id.get(&label)?;
+            (id.len() <= shard::MAX_ID_LEN).then(|| shard::Row {
+                id: id.clone(),
+                public: public_labels.contains(&label),
+                vec,
+            })
+        })
+        .collect())
+}
+
+/// NIP-98 admin check for a request (body hashed when present). `Ok(None)`
+/// lets the request through; `Ok(Some(resp))` is the 401/403 to return.
+async fn require_admin(req: &Request, env: &Env) -> Result<Option<Response>> {
+    let url = req.url()?.to_string();
+    let auth = req.headers().get("Authorization")?;
+    let mut clone = req.clone()?;
+    let body = clone.bytes().await.unwrap_or_default();
+    let method = req.method().to_string();
+    match auth::require_nip98_admin(
+        auth.as_deref(),
+        &url,
+        &method,
+        (!body.is_empty()).then_some(body.as_slice()),
+        env,
+    )
+    .await
+    {
+        Ok(_) => Ok(None),
+        Err((err_body, status)) => Ok(Some(json_response(req, env, &err_body, status)?)),
+    }
+}
+
+/// `POST /admin/purge` (NIP-98 admin): delete every stored vector, id
+/// mapping and snippet — the v1 object, its KV mapping and snippet keys, and
+/// every v2 shard and manifest (security review H2: locking `/search` does
+/// not remove what was already indexed).
+async fn handle_purge(req: &Request, env: &Env) -> Result<Response> {
+    if let Some(denied) = require_admin(req, env).await? {
+        return Ok(denied);
+    }
+    let key = store_key(env);
+    let bucket = env.bucket("VECTORS")?;
+    let mut deleted = 0u32;
+    if bucket.head(key.clone()).await?.is_some() {
+        bucket.delete(key.clone()).await?;
+        deleted += 1;
+    }
+    let prefix = format!("{key}.v2/");
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut list = bucket.list().prefix(prefix.clone()).limit(1000);
+        if let Some(c) = cursor.take() {
+            list = list.cursor(c);
+        }
+        let page = list.execute().await?;
+        for o in page.objects() {
+            bucket.delete(o.key()).await?;
+            deleted += 1;
+        }
+        match page.cursor() {
+            Some(c) if page.truncated() => cursor = Some(c),
+            _ => break,
+        }
+    }
+    let kv = env.kv("SEARCH_CONFIG")?;
+    for k in [format!("{key}:mapping"), format!("{key}:snippets")] {
+        kv.delete(&k).await?;
+    }
+    console_log!("Search worker: purged {deleted} R2 objects and KV mapping/snippets");
+    json_response(
+        req,
+        env,
+        &serde_json::json!({ "purged": deleted, "kv": ["mapping", "snippets"] }),
+        200,
+    )
+}
+
 async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
-    let store = load_store(env).await?;
+    let key = store_key(env);
+    let (total_vectors, format, shards) = match index_v2::manifest(env, &key, false).await? {
+        Some(m) => (m.total(), shard::MANIFEST_FORMAT, m.shards.len()),
+        None => (v1_count(env, &key).await?, "rvf-v1", 0),
+    };
 
     // Report the model actually in use, not a hardcoded string. When the
     // Workers AI binding is configured we serve real BGE-small embeddings;
     // otherwise the worker degrades to the deterministic hash fallback.
     let ai_live = embed::ai_binding_available(env);
-    let model = if ai_live {
-        embed::MODEL_LABEL_SEMANTIC
+    let model = embed::active_model_label(env);
+    let semantic = model != embed::MODEL_LABEL_FALLBACK;
+    let embed_backend = if embed::openai_config(env).is_some() {
+        "openai-compat"
+    } else if ai_live {
+        "workers-ai"
     } else {
-        embed::MODEL_LABEL_FALLBACK
+        "hash"
     };
 
     json_response(
@@ -892,15 +902,17 @@ async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
         env,
         &serde_json::json!({
             "status": "healthy",
-            "totalVectors": store.count(),
+            "totalVectors": total_vectors,
             "dimensions": DIM,
             "metric": "cosine",
             "model": model,
-            "semantic": ai_live,
+            "semantic": semantic,
             "aiBinding": ai_live,
+            "embedBackend": embed_backend,
             "engine": "rvf-rust",
             "runtime": "workers-rs",
-            "format": "rvf-v1",
+            "format": format,
+            "shards": shards,
         }),
         200,
     )
@@ -938,9 +950,23 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
     let path = url.path();
 
+    index_v2::take_r2_ops();
     let result = route(&req, &env, path).await;
     match result {
-        Ok(resp) => Ok(resp),
+        Ok(mut resp) => {
+            // Measurement aid, off unless SEARCH_DEBUG_OPS=1: R2 calls made
+            // through the v2 index during this request. The counter is per
+            // isolate, so concurrent requests on one isolate blur it.
+            let ops = index_v2::take_r2_ops();
+            if env
+                .var("SEARCH_DEBUG_OPS")
+                .map(|v| v.to_string() == "1")
+                .unwrap_or(false)
+            {
+                let _ = resp.headers_mut().set("X-Search-R2-Ops", &ops.to_string());
+            }
+            Ok(resp)
+        }
         Err(e) => {
             console_error!("Search worker error: {e}");
             let msg = e.to_string();
@@ -992,6 +1018,11 @@ async fn route(req: &Request, env: &Env, path: &str) -> Result<Response> {
         return handle_ingest(req, env).await;
     }
 
+    // Purge every stored vector (NIP-98 admin only)
+    if path == "/admin/purge" && method == Method::Post {
+        return handle_purge(req, env).await;
+    }
+
     json_response(req, env, &serde_json::json!({ "error": "Not found" }), 404)
 }
 
@@ -1004,8 +1035,11 @@ async fn route(req: &Request, env: &Env, path: &str) -> Result<Response> {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    // Touch R2 to keep the connection warm
-    let _ = load_store(&env).await;
+    // Touch R2 to keep the connection warm. A HEAD, not a full GET: the
+    // object is ~1.5 KB per vector, and this fires every 5 minutes.
+    if let Ok(bucket) = env.bucket("VECTORS") {
+        let _ = bucket.head(store_key(&env)).await;
+    }
 }
 
 #[cfg(test)]
@@ -1143,120 +1177,5 @@ mod model_match_tests {
         public.insert(7);
         assert!(is_search_visible(&public, 7));
         assert!(!is_search_visible(&public, 8));
-    }
-}
-
-#[cfg(test)]
-mod jev_rerank_tests {
-    use super::*;
-
-    #[test]
-    fn reingest_overwrites_or_clears_the_snippet() {
-        let mut m = HashMap::new();
-        rerank::apply_snippet(&mut m, "a", true, Some("v1"));
-        assert_eq!(m.get("a").map(String::as_str), Some("v1"));
-        rerank::apply_snippet(&mut m, "a", true, Some("v2"));
-        assert_eq!(
-            m.get("a").map(String::as_str),
-            Some("v2"),
-            "edit overwrites"
-        );
-        rerank::apply_snippet(&mut m, "a", false, Some("v3"));
-        assert!(!m.contains_key("a"), "un-publish deletes");
-        rerank::apply_snippet(&mut m, "b", true, None);
-        assert!(!m.contains_key("b"));
-    }
-    use nostr_bbs_jev::testutil::{block_on, Mock};
-    use nostr_bbs_jev::{Fallback, JevConfig, TransportError};
-    use std::collections::{HashMap, HashSet};
-
-    fn cfg() -> JevConfig {
-        JevConfig {
-            endpoint: "http://e".into(),
-            model: "m".into(),
-            bearer: None,
-            deadline_ms: 10,
-        }
-    }
-    type Fixture = (
-        Vec<(u64, f32)>,
-        HashMap<u64, String>,
-        HashMap<String, String>,
-    );
-    fn fixture() -> Fixture {
-        let cands: Vec<(u64, f32)> = (1..=5).map(|l| (l, 1.0 - l as f32 * 0.1)).collect();
-        let public: HashSet<u64> = [1, 2, 3, 5].into_iter().collect();
-        let visible = visible_top_k(&cands, &public, 3);
-        let l2i: HashMap<u64, String> = (1..=5).map(|l| (l, format!("id{l}"))).collect();
-        let sn: HashMap<String, String> = (1..=5)
-            .map(|l| (format!("id{l}"), format!("t{l}")))
-            .collect();
-        (visible, l2i, sn)
-    }
-    fn reply(scores: &[f64], conf: f64) -> String {
-        let mut a = serde_json::Map::new();
-        for (i, s) in scores.iter().enumerate() {
-            a.insert(
-                format!("rel_{i}"),
-                serde_json::json!({"type":"score","score":s,"confidence":conf,"legend":{}}),
-            );
-        }
-        a.insert("none".into(), serde_json::json!({"type":"noul","noul":0.1}));
-        serde_json::json!({"model":"m","answers":a,"usage":{"input_tokens":1,"output_tokens":1}})
-            .to_string()
-    }
-    fn go(
-        rep: std::result::Result<(u16, String), TransportError>,
-        c: std::result::Result<JevConfig, Fallback>,
-    ) -> (Vec<(u64, f32)>, Option<serde_json::Value>) {
-        let (v, l2i, sn) = fixture();
-        let (r, note, _why) = block_on(rerank_or_keep(&Mock::new(rep), c, "q", v, &l2i, &sn, 0.5));
-        (r, note)
-    }
-
-    #[test]
-    fn every_fallback_equals_the_pre_change_body() {
-        let (v, l2i, _) = fixture();
-        let old = search_body(&v, &l2i, 5, None);
-        assert!(old.get("jev").is_none());
-        let cases = vec![
-            (
-                Ok((200, reply(&[1.0, 2.0, 3.0], 0.9))),
-                Err(Fallback::FlagOff),
-            ),
-            (
-                Ok((200, reply(&[1.0, 2.0, 3.0], 0.9))),
-                Err(Fallback::NoEndpoint),
-            ),
-            (Err(TransportError::Other), Ok(cfg())),
-            (Err(TransportError::Timeout), Ok(cfg())),
-            (Ok((500, String::new())), Ok(cfg())),
-            (Ok((200, "garbage".into())), Ok(cfg())),
-            (Ok((200, reply(&[1.0, 2.0, 3.0], 0.1))), Ok(cfg())),
-        ];
-        for (rep, c) in cases {
-            let (out, note) = go(rep, c);
-            assert_eq!(out, v);
-            assert_eq!(search_body(&out, &l2i, 5, note), old);
-        }
-    }
-
-    #[test]
-    fn accepted_rerank_only_permutes_visible_hits() {
-        let (v, l2i, _) = fixture();
-        let (out, note) = go(Ok((200, reply(&[0.5, 1.0, 3.0], 0.9))), Ok(cfg()));
-        let mut a: Vec<u64> = out.iter().map(|x| x.0).collect();
-        let mut b: Vec<u64> = v.iter().map(|x| x.0).collect();
-        assert_eq!(out[0].0, v[2].0, "highest-scored candidate first");
-        a.sort();
-        b.sort();
-        assert_eq!(a, b, "same set as the visible hits");
-        assert!(
-            !out.iter().any(|(l, _)| *l == 4),
-            "hidden label never appears"
-        );
-        let body = search_body(&out, &l2i, 5, note);
-        assert_eq!(body["jev"]["reranked"], true);
-        assert_eq!(body["jev"]["questionSet"], rerank::QUESTION_SET_VERSION);
     }
 }

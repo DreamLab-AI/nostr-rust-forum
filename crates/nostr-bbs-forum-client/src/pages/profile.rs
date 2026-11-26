@@ -39,6 +39,29 @@ pub fn ProfilePage() -> impl IntoView {
     let pubkey = Memo::new(move |_| params.read().get("pubkey").unwrap_or_default());
     let navigate = StoredValue::new(use_navigate());
 
+    // A replaced key (an archive signing key linked to a live key) opens its
+    // successor's profile: replace the URL once the successor map is known
+    // (one hop; tracked, so it fires when the map loads after first render).
+    Effect::new(move |_| {
+        let pk = pubkey.get();
+        if pk.is_empty() {
+            return;
+        }
+        let next = crate::components::user_display::canonical_pubkey(&pk);
+        if next != pk {
+            let href = format!("/profile/{next}");
+            navigate.with_value(|nav| {
+                nav(
+                    &href,
+                    NavigateOptions {
+                        replace: true,
+                        ..Default::default()
+                    },
+                )
+            });
+        }
+    });
+
     let meta = RwSignal::new(ProfileMeta::default());
     let is_loading = RwSignal::new(true);
     let copied = RwSignal::new(false);

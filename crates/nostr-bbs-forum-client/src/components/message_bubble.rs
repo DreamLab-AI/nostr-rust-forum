@@ -182,6 +182,14 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
     let pk_delete = msg_pubkey.clone();
     let pk_thread = msg_pubkey.clone();
     let channel_id_pin = channel_id.clone();
+    // Comments (NIP-22 kind 1111) are published as plaintext, and the relay
+    // refuses plaintext comments in an encrypted zone (zone text is stored
+    // only as zone-key ciphertext), so no comment composer is offered there.
+    // Existing comments still show (the relay gates them by the message's
+    // zone).
+    let comments_allowed = use_context::<crate::stores::channels::ChannelStore>()
+        .and_then(|store| crate::zone_crypto::store::channel_zone(store, &channel_id))
+        .is_none_or(|(_, _, encrypted)| !encrypted);
     let channel_id_thread = channel_id;
 
     view! {
@@ -264,8 +272,8 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
                 })}
 
                 // Media embeds (images, YouTube)
-                {media_urls.into_iter().map(|url| {
-                    view! { <MediaEmbed url=url /> }
+                {media_urls.into_iter().enumerate().map(|(position, url)| {
+                    view! { <MediaEmbed url=url position=position /> }
                 }).collect_view()}
 
                 // Link preview (first non-media URL only)
@@ -288,7 +296,7 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
                     parent_event_id=event_id_thread
                     parent_pubkey=pk_thread
                     replies=thread_replies
-                    allow_reply=!has_reply
+                    allow_reply=!has_reply && comments_allowed
                 />
             </div>
         </div>

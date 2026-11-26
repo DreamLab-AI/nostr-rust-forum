@@ -203,7 +203,11 @@ pub fn KeyName(
     move || match name.get() {
         Some(n) => n.into_any(),
         None if pubkey.is_empty() => ().into_any(),
-        None => view! { <CopyKey full=pubkey.clone() class=key_class.clone() /> }.into_any(),
+        // The person's key, not an archive signing key (successor, one hop).
+        None => {
+            let full = crate::components::user_display::canonical_pubkey(&pubkey);
+            view! { <CopyKey full=full class=key_class.clone() /> }.into_any()
+        }
     }
 }
 
@@ -230,7 +234,8 @@ pub fn KeyGlyph(
     );
     move || {
         unnamed.get().then(|| {
-            view! { <CopyKey full=pubkey.clone() icon=true class=class.clone() /> }
+            let full = crate::components::user_display::canonical_pubkey(&pubkey);
+            view! { <CopyKey full=full icon=true class=class.clone() /> }
         })
     }
 }

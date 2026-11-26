@@ -1444,12 +1444,53 @@ impl NostrRelayDO {
             return;
         }
 
+        // A `sealed` tag belongs only on a kind-42 envelope (finding 1: any
+        // other kind carrying one could steer sealed-target resolution), and
+        // the topic marker only on a topic root, never beside a reply tag.
+        if event.kind != 42 && nostr_bbs_core::sealed::has_sealed_tag(&event.tags) {
+            Self::send_ok(
+                ws,
+                &event.id,
+                false,
+                "invalid: sealed tag on a non-channel-message kind",
+            );
+            return;
+        }
+        if event.kind == 42
+            && nostr_bbs_core::sealed::reply_root_of(&event).is_some()
+            && event.tags.iter().any(|t| {
+                t.len() >= 2 && t[0] == "t" && t[1] == nostr_bbs_core::sealed::TOPIC_MARKER
+            })
+        {
+            Self::send_ok(ws, &event.id, false, "invalid: topic marker on a reply");
+            return;
+        }
+
         // Zone enforcement for channel messages (kind-42)
         if event.kind == 42 {
             let Some(channel_id) = filter::channel_tag(&event) else {
                 Self::send_ok(ws, &event.id, false, "invalid: missing channel tag");
                 return;
             };
+            // F2: the channel must be a stored kind-40 and a reply's topic
+            // must be a stored message in that same channel, so nothing can
+            // be filed under a zone topic (`#e:[topic]`) from outside it, or
+            // posted into a made-up "channel" (which would read as unscoped).
+            //
+            // Ids are matched EXACTLY (stored ids are lowercase hex): a
+            // mixed-case alias of a zone channel would miss its channel_zones
+            // row and read as unscoped (review finding 3).
+            let channel_known = self.reference_target_channels(&channel_id, 0).await;
+            let reply_target = match nostr_bbs_core::sealed::reply_root_of(&event) {
+                Some(root) => Some(self.reply_topic_channels(root).await),
+                None => None,
+            };
+            if let Some(reason) =
+                channel_write_rejection(&channel_id, &channel_known, reply_target.as_ref())
+            {
+                Self::send_ok(ws, &event.id, false, reason);
+                return;
+            }
             // Only a channel EXPLICITLY bound to a zone (a `channel_zones` row,
             // written solely by the admin-only /api/admin/channel-zone endpoint)
             // is write-gated. An undeclared channel is UNSCOPED: it belongs to no
@@ -1466,7 +1507,14 @@ impl NostrRelayDO {
             // own new channel. Writes route through the write gate
             // (write_cohorts ?? required_cohorts) so a public zone can still be
             // read-by-all yet write-restricted.
-            let zone = self.cached_channel_zone(&channel_id).await;
+            // F3: an unanswered lookup refuses the write (fail closed).
+            let zone = match zone_for_write(self.cached_channel_zone(&channel_id).await) {
+                Ok(zone) => zone,
+                Err(reason) => {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+            };
             // ADR-2017: sealed originals are admin-only and belong to encrypted
             // zones. They are exempt from the drift check in `validate_event`,
             // so this gate must reject every other shape, including a sealed
@@ -1499,6 +1547,40 @@ impl NostrRelayDO {
                     );
                     return;
                 }
+            }
+        }
+
+        // F4 (write side): a reaction, comment or report on a message needs
+        // write access to that message's zone, and an encrypted zone takes no
+        // plaintext comment. The target is resolved from D1.
+        if is_reference_kind(event.kind) {
+            let scope = self.resolve_reference_scope(&event).await;
+            let mut writable: Vec<String> = Vec::new();
+            if let RefScope::Zones(zs) = &scope {
+                for z in zs {
+                    if is_admin || trust::has_zone_write_access(&principal, z, &self.env).await {
+                        writable.push(z.clone());
+                    }
+                }
+            }
+            let cfg = ZoneConfig::load(&self.env);
+            let (author_cohorts, author_cohort_admin) =
+                self.cached_viewer_cohorts(&principal).await;
+            if let Some(reason) = reference_write_rejection(
+                &scope,
+                event.kind,
+                is_admin,
+                |z| {
+                    author_cohort_admin
+                        || cfg.is_public_read(z)
+                        || cfg.cohorts_can_read(z, &author_cohorts)
+                },
+                |z| writable.iter().any(|w| w == z),
+                |z| cfg.is_encrypted(z),
+                |z| crate::zone_config::is_zone_ciphertext(z, &event.tags, &event.content),
+            ) {
+                Self::send_ok(ws, &event.id, false, reason);
+                return;
             }
         }
 
@@ -1629,7 +1711,13 @@ impl NostrRelayDO {
         {
             let bound: Option<String> = if event.kind == 42 {
                 match filter::channel_tag(&event) {
-                    Some(cid) => self.cached_channel_zone(&cid).await,
+                    Some(cid) => match zone_for_write(self.cached_channel_zone(&cid).await) {
+                        Ok(zone) => zone,
+                        Err(reason) => {
+                            Self::send_ok(ws, &event.id, false, reason);
+                            return;
+                        }
+                    },
                     None => None,
                 }
             } else {
@@ -1952,7 +2040,16 @@ impl NostrRelayDO {
                     session.subscriptions.len(),
                     session.subscriptions.contains_key(sub_id),
                 ) {
-                    Self::send_notice(&ws, "too many subscriptions");
+                    // CLOSED, not only a NOTICE: NIP-01 clients treat CLOSED
+                    // as the answer to this REQ; a bare NOTICE left them
+                    // waiting for an EOSE that never came.
+                    drop(sessions);
+                    self.end_sub_id(session_id, sub_id);
+                    Self::send_closed(
+                        &ws,
+                        sub_id,
+                        "error: too many subscriptions on this connection",
+                    );
                     return;
                 }
             }
@@ -1982,6 +2079,7 @@ impl NostrRelayDO {
         // live events against the un-gated filter. The historical read was
         // refused and every subsequent matching event was delivered anyway.
         if nip42::protected_read_blocked(&filters, session_pubkey.is_some(), self.auth_mode()) {
+            self.end_sub_id(session_id, sub_id);
             Self::send_closed(
                 &ws,
                 sub_id,
@@ -1993,6 +2091,9 @@ impl NostrRelayDO {
         // NIP-59: kind-1059 (Sealed DM) read gate + mandatory #p rewrite. Shared
         // with the COUNT path so both reject unauthenticated kind-1059 reads and
         // bind results to the authed recipient identically.
+        //
+        // Before the first await: a CLOSE for this id from now on cancels it.
+        let pending_token = self.pending_reqs.borrow_mut().begin(session_id, sub_id);
         let read_set = self.wrap_read_set(&session_pubkey).await;
         let filters = match Self::gate_kind_1059_filters_with(
             filters,
@@ -2001,13 +2102,42 @@ impl NostrRelayDO {
         ) {
             Some(f) => f,
             None => {
-                Self::send_notice(
+                self.pending_reqs
+                    .borrow_mut()
+                    .finish(session_id, sub_id, pending_token);
+                self.end_sub_id(session_id, sub_id);
+                Self::send_closed(
                     &ws,
+                    sub_id,
                     "auth-required: must authenticate to receive kind-1059 DMs",
                 );
                 return;
             }
         };
+
+        // The client may have CLOSEd this id while we awaited (a page request
+        // it gave up on), or reused it in a newer REQ: then store nothing.
+        if !self
+            .pending_reqs
+            .borrow_mut()
+            .finish(session_id, sub_id, pending_token)
+        {
+            return;
+        }
+
+        // Re-check the cap at insert time: concurrent REQs with distinct ids
+        // all passed the first check before any of them stored.
+        let over_cap = self.sessions.borrow().get(&session_id).is_some_and(|s| {
+            subscription_cap_reached(s.subscriptions.len(), s.subscriptions.contains_key(sub_id))
+        });
+        if over_cap {
+            Self::send_closed(
+                &ws,
+                sub_id,
+                "error: too many subscriptions on this connection",
+            );
+            return;
+        }
 
         // Store the AUTHORISED subscription — never the raw client filter — so
         // the live broadcast path matches against exactly what the gates above
@@ -2186,7 +2316,19 @@ impl NostrRelayDO {
         Some((zone, venue))
     }
 
+    /// A REQ refused with CLOSED ends its id: a pending REQ for it must not
+    /// store afterwards, and a subscription it held under that id stops (the
+    /// client was just told it is closed).
+    pub(crate) fn end_sub_id(&self, session_id: u64, sub_id: &str) {
+        self.pending_reqs.borrow_mut().cancel(session_id, sub_id);
+        if let Some(s) = self.sessions.borrow_mut().get_mut(&session_id) {
+            s.subscriptions.remove(sub_id);
+        }
+    }
+
     pub(crate) async fn handle_close(&self, session_id: u64, sub_id: &str) {
+        // A REQ for this id still awaiting must not store it afterwards.
+        self.pending_reqs.borrow_mut().cancel(session_id, sub_id);
         {
             let mut sessions = self.sessions.borrow_mut();
             if let Some(session) = sessions.get_mut(&session_id) {
@@ -2280,6 +2422,231 @@ pub(crate) enum ReadDecision {
     DeliverAs(NostrEvent),
     /// Withhold the event from this viewer (zone/cohort/projection denial).
     Withhold,
+}
+
+/// The read decision for channel-scoped content (kind 40/41/42) in a channel
+/// bound to `zone` (`None`: the channel is not bound to a zone, so it is
+/// unscoped, public read). This is the whole channel branch of
+/// `authorize_event`, factored out so COUNT can apply it once per channel and
+/// tests can pin it:
+///
+/// - admins and members of the zone read everything;
+/// - for a non-member, kind-40 definitions and kind-41 metadata are served
+///   only when the zone's definitions are visible (Locked/Public tiles);
+/// - kind-42 content is withheld from non-members of Locked/Hidden zones.
+///
+/// ADR-2018: membership comes from the cohorts already resolved into `ctx`;
+/// `zone_read_permitted` is the same rule `trust::has_zone_access` applies.
+pub(crate) fn channel_read_decision_for(
+    kind: u64,
+    lookup: &Result<Option<String>, trust::ZoneLookupError>,
+    zones: &ZoneConfig,
+    ctx: &ViewerContext,
+) -> ReadDecision {
+    match lookup {
+        // F3: an unanswered zone lookup withholds (fail closed). "No zone"
+        // is only ever a successful lookup that found no row.
+        Err(_) => ReadDecision::Withhold,
+        Ok(zone) => channel_read_decision(kind, zone.as_deref(), zones, ctx),
+    }
+}
+
+/// Kinds whose visibility follows the message they reference (security
+/// review F4): NIP-25 reactions (7), NIP-22 comments (1111) and NIP-56
+/// reports (1984). They name their target in `e`/`E` tags, and a reaction,
+/// comment or report on an encrypted-zone post was served to anyone.
+pub(crate) fn is_reference_kind(kind: u64) -> bool {
+    matches!(kind, 7 | 1111 | 1984)
+}
+
+/// Sealed envelopes wrapping the original whose id is `?1`, by their whole
+/// wire shape (kind 42, a well-formed `sealed` tag naming `?1` with a decimal
+/// version, a `zk` tag) and an admin author, as the ingest gate requires of
+/// every envelope. A bare `sealed` tag on any other event never matches
+/// (review finding 1; mirrors `SEALED_ENVELOPES_FOR_SQL`).
+const SEALED_TARGET_SQL: &str =
+    "SELECT s.id AS id, s.pubkey AS pubkey, s.created_at AS created_at, \
+     s.kind AS kind, s.tags AS tags, s.content AS content, s.sig AS sig \
+     FROM event_tags t JOIN events s ON s.id = t.event_id AND s.kind = 42 \
+     WHERE t.name = 'sealed' AND t.value = ?1 \
+       AND EXISTS (SELECT 1 FROM json_each(s.tags) st \
+                   WHERE json_extract(st.value, '$[0]') = 'sealed' \
+                     AND json_extract(st.value, '$[1]') = ?1 \
+                     AND json_type(st.value, '$[2]') = 'text' \
+                     AND json_extract(st.value, '$[2]') <> '' \
+                     AND json_extract(st.value, '$[2]') NOT GLOB '*[^0-9]*') \
+       AND EXISTS (SELECT 1 FROM event_tags z WHERE z.event_id = s.id AND z.name = 'zk') \
+       AND s.pubkey IN (SELECT pubkey FROM whitelist WHERE is_admin = 1)";
+
+/// The most targets one reference-kind event may name; more is treated as
+/// unknown (gated), which bounds the lookups per event.
+pub(crate) const MAX_REFERENCE_TARGETS: usize = 8;
+
+/// The ids a reference-kind event points at: every `e` and `E` tag value,
+/// lower-cased and deduplicated (NIP-25 puts the target last, NIP-22 the
+/// root in `E` and the parent in `e`, NIP-56 the reported event in `e`;
+/// gating on all of them is never weaker than on any one).
+pub(crate) fn reference_targets(event: &NostrEvent) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in &event.tags {
+        if t.len() >= 2 && (t[0] == "e" || t[0] == "E") && !t[1].is_empty() {
+            let id = t[1].to_ascii_lowercase();
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Where a reference-kind event's targets live, as far as reading goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefScope {
+    /// No target, or every target is stored and not in a zone-bound channel.
+    Unscoped,
+    /// The zones of the targets' channels (each must be readable).
+    Zones(Vec<String>),
+    /// A target is not stored, a lookup failed, or there are too many
+    /// targets: treated as gated (F4, fail closed).
+    Unknown,
+}
+
+/// The read decision for a reference-kind event given where its targets
+/// live: unscoped is delivered; zone targets need read access to every zone
+/// (the kind-42 rule, `channel_read_decision`); an unknown target is served
+/// only to its author and admins.
+pub(crate) fn reference_read_decision(
+    scope: &RefScope,
+    zones: &ZoneConfig,
+    ctx: &ViewerContext,
+    is_author: bool,
+) -> ReadDecision {
+    match scope {
+        RefScope::Unscoped => ReadDecision::Deliver,
+        RefScope::Unknown => {
+            if ctx.is_admin || is_author {
+                ReadDecision::Deliver
+            } else {
+                ReadDecision::Withhold
+            }
+        }
+        RefScope::Zones(zs) => {
+            if zs.iter().all(|z| {
+                matches!(
+                    channel_read_decision(42, Some(z), zones, ctx),
+                    ReadDecision::Deliver
+                )
+            }) {
+                ReadDecision::Deliver
+            } else {
+                ReadDecision::Withhold
+            }
+        }
+    }
+}
+
+/// Why a reference-kind write is refused, if it is: an unknown target, a
+/// zone the author may not write, or a plaintext comment (kind 1111) into an
+/// encrypted zone (which stores no readable text). Admins pass the access
+/// check but not the ciphertext rule, as for kind 42.
+pub(crate) fn reference_write_rejection(
+    scope: &RefScope,
+    kind: u64,
+    is_admin: bool,
+    can_read: impl Fn(&str) -> bool,
+    can_write: impl Fn(&str) -> bool,
+    encrypted: impl Fn(&str) -> bool,
+    is_ciphertext: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    match scope {
+        RefScope::Unscoped => None,
+        RefScope::Unknown if is_admin => None,
+        RefScope::Unknown => Some("blocked: referenced event unknown"),
+        RefScope::Zones(zs) => {
+            for z in zs {
+                // A report needs only to see what it reports (finding 5): a
+                // read-only member of a zone can still flag abuse in it.
+                let permitted = if kind == 1984 {
+                    can_read(z)
+                } else {
+                    can_write(z)
+                };
+                if !is_admin && !permitted {
+                    return Some("zone access denied");
+                }
+                if kind == 1111 && encrypted(z) && !is_ciphertext(z) {
+                    return Some("blocked: encrypted zone requires zone-key ciphertext");
+                }
+            }
+            None
+        }
+    }
+}
+
+/// The channel a stored target event belongs to (`None`: not
+/// channel-scoped): a kind-40 is its own channel, kind 41/42 name theirs
+/// through the root-marked tag.
+pub(crate) fn stored_target_channel(target: &NostrEvent) -> Option<String> {
+    filter::zone_channel_id(target)
+}
+
+/// Why a kind-42 write is refused on its placement (security review F2), if
+/// it is. `channel_known` is the stored-event lookup of the channel tag's
+/// target (a kind-40 resolves to its own id); `reply_target` that of the
+/// reply topic, when the event replies to one (`Ok(Some(c))`: stored, in
+/// channel `c`). Unknown or failed lookups refuse (fail closed).
+pub(crate) fn channel_write_rejection(
+    channel_id: &str,
+    channel_known: &Result<Vec<String>, ()>,
+    reply_target: Option<&Result<Vec<String>, ()>>,
+) -> Option<&'static str> {
+    // A stored kind-40 resolves to exactly its own id.
+    match channel_known {
+        Ok(cs) if cs.len() == 1 && cs[0] == channel_id => {}
+        _ => return Some("invalid: channel is not a known channel"),
+    }
+    match reply_target {
+        None => None,
+        Some(Ok(cs)) if !cs.is_empty() && cs.iter().all(|c| c == channel_id) => None,
+        Some(_) => Some("invalid: reply target is not a message in this channel"),
+    }
+}
+
+/// The zone a write is gated by, or the rejection when the lookup could not
+/// be answered (F3: a write is never treated as going to an unscoped channel
+/// because D1 failed).
+pub(crate) fn zone_for_write(
+    lookup: Result<Option<String>, trust::ZoneLookupError>,
+) -> Result<Option<String>, &'static str> {
+    lookup.map_err(|_| "error: zone lookup failed, try again")
+}
+
+/// [`channel_read_decision_for`] once the lookup has answered.
+pub(crate) fn channel_read_decision(
+    kind: u64,
+    zone: Option<&str>,
+    zones: &ZoneConfig,
+    ctx: &ViewerContext,
+) -> ReadDecision {
+    let Some(zone) = zone else {
+        // Only a channel EXPLICITLY bound to a zone is read-gated. An
+        // undeclared channel is UNSCOPED (public read), mirroring the write
+        // path that lets any whitelisted member post to it (Finding-5 fix).
+        return ReadDecision::Deliver;
+    };
+    if ctx.is_admin || zone_read_permitted(zones, zone, ctx) {
+        return ReadDecision::Deliver;
+    }
+    if matches!(kind, 40 | 41) {
+        // Channel definition or its metadata update (a rename must agree with
+        // the definition the tile shows).
+        if zones.defs_visible_to_nonmember(zone) {
+            return ReadDecision::Deliver;
+        }
+        return ReadDecision::Withhold;
+    }
+    // Channel content (kind-42): withheld from non-members of Locked/Hidden zones.
+    ReadDecision::Withhold
 }
 
 /// Zone read rule shared by the REQ, COUNT and broadcast gates (ADR-2018).
@@ -2398,15 +2765,196 @@ impl NostrRelayDO {
     /// `channel_zones` lookup through the 60s per-DO memo. Only a bound zone is
     /// remembered: an unbound channel goes back to D1 every time, so a channel
     /// bound moments after its first read is never served as unscoped.
-    pub(crate) async fn cached_channel_zone(&self, channel_id: &str) -> Option<String> {
+    /// The zone `channel_id` is bound to, through the 60 s per-DO memo
+    /// (bound channels only). `Err` when D1 could not answer: callers fail
+    /// closed (see [`trust::ZoneLookupError`]).
+    pub(crate) async fn cached_channel_zone(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<String>, trust::ZoneLookupError> {
         let now = auth::js_now_secs();
         if let Some(zone) = self.channel_zone_cache.get(channel_id, now) {
-            return Some(zone);
+            return Ok(Some(zone));
+        }
+        // "No zone" is memoised for a few seconds only (review finding 4: a
+        // REQ of reactions on public channels re-queried every one), so a new
+        // binding takes effect within NEGATIVE_LOOKUP_TTL_SECS.
+        if self.channel_zone_none_cache.get(channel_id, now).is_some() {
+            return Ok(None);
         }
         let zone = trust::get_channel_zone(channel_id, &self.env).await?;
-        self.channel_zone_cache
-            .insert(channel_id, zone.clone(), now);
-        Some(zone)
+        match &zone {
+            Some(z) => self.channel_zone_cache.insert(channel_id, z.clone(), now),
+            None => self.channel_zone_none_cache.insert(channel_id, (), now),
+        }
+        Ok(zone)
+    }
+
+    /// Where a reference-kind event's targets live (see [`RefScope`]). Each
+    /// target is resolved from D1, never from tags the event mirrors (see
+    /// [`Self::reference_target_channels`]). Lookups fail closed.
+    pub(crate) async fn resolve_reference_scope(&self, event: &NostrEvent) -> RefScope {
+        let targets = reference_targets(event);
+        if targets.is_empty() {
+            return RefScope::Unscoped;
+        }
+        if targets.len() > MAX_REFERENCE_TARGETS {
+            return RefScope::Unknown;
+        }
+        let mut zones: Vec<String> = Vec::new();
+        for target in &targets {
+            let Ok(channels) = self.reference_target_channels(target, 1).await else {
+                return RefScope::Unknown;
+            };
+            for channel in channels {
+                match self.cached_channel_zone(&channel).await {
+                    Ok(Some(zone)) => {
+                        if !zones.contains(&zone) {
+                            zones.push(zone);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => return RefScope::Unknown,
+                }
+            }
+        }
+        if zones.is_empty() {
+            RefScope::Unscoped
+        } else {
+            RefScope::Zones(zones)
+        }
+    }
+
+    /// The stored event(s) id `id` names: the event with that id if stored;
+    /// otherwise the sealed envelopes wrapping an original of that id, matched
+    /// on the whole envelope shape and an admin author (never a bare `sealed`
+    /// tag, which any kind can carry: review finding 1). `Err` when nothing
+    /// is stored, on a D1 failure, or for more than `MAX_REFERENCE_TARGETS`
+    /// envelope matches.
+    async fn lookup_target_events(&self, id: &str) -> Result<Vec<NostrEvent>, ()> {
+        let db = self.env.d1("DB").map_err(|_| ())?;
+        let by_id: Vec<super::storage::EventRow> = db
+            .prepare(
+                "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1",
+            )
+            .bind(&[JsValue::from_str(id)])
+            .map_err(|_| ())?
+            .all()
+            .await
+            .map_err(|_| ())?
+            .results()
+            .map_err(|_| ())?;
+        let found: Vec<NostrEvent> = by_id
+            .into_iter()
+            .filter_map(super::storage::EventRow::into_nostr_event)
+            .collect();
+        if !found.is_empty() {
+            return Ok(found);
+        }
+        let sealed: Vec<super::storage::EventRow> = db
+            .prepare(format!(
+                "{SEALED_TARGET_SQL} LIMIT {}",
+                MAX_REFERENCE_TARGETS + 1
+            ))
+            .bind(&[JsValue::from_str(id)])
+            .map_err(|_| ())?
+            .all()
+            .await
+            .map_err(|_| ())?
+            .results()
+            .map_err(|_| ())?;
+        let found: Vec<NostrEvent> = sealed
+            .into_iter()
+            .filter_map(super::storage::EventRow::into_nostr_event)
+            .collect();
+        if found.is_empty() || found.len() > MAX_REFERENCE_TARGETS {
+            return Err(());
+        }
+        Ok(found)
+    }
+
+    /// The channels stored target `id` belongs to (empty: stored, not
+    /// channel-scoped). A target that is itself a reference kind (a reaction
+    /// to a comment) contributes the channels of ALL its own targets, one hop
+    /// deep (review finding 2). Several envelope matches that disagree on
+    /// their channel, an unknown target at any depth, or a D1 failure ->
+    /// `Err`. Only direct resolutions are memoised (60 s positive, 5 s
+    /// unknown), so a result never depends on the hop budget left.
+    pub(crate) async fn reference_target_channels(
+        &self,
+        id: &str,
+        hops: u8,
+    ) -> Result<Vec<String>, ()> {
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.ref_target_cache.get(id, now) {
+            return Ok(hit);
+        }
+        if self.ref_unknown_cache.get(id, now).is_some() {
+            return Err(());
+        }
+        let targets = match self.lookup_target_events(id).await {
+            Ok(t) => t,
+            Err(()) => {
+                self.ref_unknown_cache.insert(id, (), now);
+                return Err(());
+            }
+        };
+        let mut channels: Vec<String> = Vec::new();
+        let mut direct = true;
+        let mut direct_channels: Vec<Option<String>> = Vec::new();
+        for target in &targets {
+            if is_reference_kind(target.kind) {
+                direct = false;
+                if hops == 0 {
+                    return Err(());
+                }
+                let next_targets = reference_targets(target);
+                if next_targets.is_empty() || next_targets.len() > MAX_REFERENCE_TARGETS {
+                    return Err(());
+                }
+                for next in next_targets {
+                    for c in Box::pin(self.reference_target_channels(&next, hops - 1)).await? {
+                        if !channels.contains(&c) {
+                            channels.push(c);
+                        }
+                    }
+                }
+            } else {
+                let c = stored_target_channel(target);
+                direct_channels.push(c.clone());
+                if let Some(c) = c {
+                    if !channels.contains(&c) {
+                        channels.push(c);
+                    }
+                }
+            }
+        }
+        // Several envelopes for one original must agree on where it lives.
+        if direct_channels.windows(2).any(|w| w[0] != w[1]) {
+            return Err(());
+        }
+        if direct {
+            self.ref_target_cache.insert(id, channels.clone(), now);
+        }
+        Ok(channels)
+    }
+
+    /// The channel(s) a reply's topic `root` lives in, for the F2 placement
+    /// check: every stored match must be a kind-42 (a live root, or a sealed
+    /// envelope wrapping it). `Err` otherwise.
+    async fn reply_topic_channels(&self, root: &str) -> Result<Vec<String>, ()> {
+        let targets = self.lookup_target_events(root).await?;
+        if targets.iter().any(|t| t.kind != 42) {
+            return Err(());
+        }
+        let mut channels: Vec<String> = Vec::new();
+        for t in &targets {
+            let c = stored_target_channel(t).ok_or(())?;
+            if !channels.contains(&c) {
+                channels.push(c);
+            }
+        }
+        Ok(channels)
     }
 
     /// Whitelist `(cohorts, is_admin)` through the 60s per-DO memo. A missing
@@ -2782,6 +3330,15 @@ impl NostrRelayDO {
             };
         }
 
+        // Reactions, comments and reports follow the message they reference
+        // (F4), resolved from D1 by the target's own channel.
+        if is_reference_kind(event.kind) {
+            let scope = self.resolve_reference_scope(event).await;
+            let is_author = ctx.access_pubkey.as_deref() == Some(event.pubkey.as_str())
+                || ctx.session_pubkey.as_deref() == Some(event.pubkey.as_str());
+            return reference_read_decision(&scope, zones, ctx, is_author);
+        }
+
         // Zone-scoped channel kinds: kind-40 defs (channel id == event id),
         // kind-41 metadata and kind-42 content (channel id == root/first `e` tag).
         let channel_id: Option<String> = filter::zone_channel_id(event);
@@ -2802,26 +3359,8 @@ impl NostrRelayDO {
             // `trust::has_zone_access` applies (public read, or whitelist
             // admin, or a required cohort); `ctx.viewer_is_admin` carries the
             // whitelist admin flag that function used to re-read.
-            if let Some(zone) = self.cached_channel_zone(&cid).await {
-                if !ctx.is_admin {
-                    let is_member = zone_read_permitted(zones, &zone, ctx);
-                    if !is_member {
-                        if matches!(event.kind, 40 | 41) {
-                            // Channel definition or its metadata update (a rename
-                            // must agree with the definition the tile shows):
-                            // served only if the zone is not Hidden
-                            // (Locked/Public tiles render).
-                            if !zones.defs_visible_to_nonmember(&zone) {
-                                return ReadDecision::Withhold;
-                            }
-                        } else {
-                            // Channel content (kind-42): withheld from non-members
-                            // of Locked/Hidden zones.
-                            return ReadDecision::Withhold;
-                        }
-                    }
-                }
-            }
+            let zone = self.cached_channel_zone(&cid).await;
+            return channel_read_decision_for(event.kind, &zone, zones, ctx);
         }
 
         ReadDecision::Deliver
@@ -2887,9 +3426,85 @@ impl NostrRelayDO {
             }
         };
 
-        let events = self.query_events(&filters).await;
         let zones = ZoneConfig::load(&self.env);
         let ctx = self.resolve_viewer_context(session_pubkey.clone()).await;
+
+        // Fast path for one channel's or one topic's messages
+        // (`{"kinds":[42],"#e":[value]}`), which the forum asks for every
+        // section's and topic's true total. The generic path below
+        // materialises every match and is capped at the filter's `limit`
+        // (500 by default), so it cannot report a large channel. Here SQL
+        // groups the matches without an expiration tag by each event's OWN
+        // channel (root-marked `e` tag, else the first), and each group gets
+        // one read decision, `channel_read_decision` on that channel's zone:
+        // exactly what `authorize_event` decides per event. The `#e` value
+        // itself never selects a zone, so a topic root (which has no
+        // channel_zones row) cannot open its replies. Expiring events go
+        // through the per-event path as before.
+        // Admin Overview "Messages"/"Channels": every kind-42 (or kind-40) the
+        // relay holds, no `#e`.
+        // An administrator reads every zone, so no per-zone decision exists
+        // to apply and one aggregate is exact (the generic path below stops
+        // at the filter's row limit and reported 500 for ~242k messages).
+        // Strictly gated on a real whitelist admin (`ctx.is_admin`, not the
+        // zone-scoped `viewer_is_admin`): a non-admin keeps the zone-gated,
+        // row-capped generic path. One aggregate statement, so it is as
+        // bounded as the per-channel fast path, and COUNT stays behind the
+        // per-IP rate limit above.
+        if ctx.is_admin {
+            if let Some((kind, since, until)) = filter::admin_global_count_target(&filters) {
+                let q = filter::build_admin_kind_count(kind, since, until);
+                if let Some((groups, exceptions)) = self.count_channel_messages(&q).await {
+                    let mut count: u64 = groups.iter().map(|(_, n)| *n).sum();
+                    // Expiring events (rare): NIP-40-filtered in
+                    // `count_channel_messages`, then read-authorised per event.
+                    for event in &exceptions {
+                        if matches!(
+                            self.authorize_event(event, &ctx, &zones).await,
+                            ReadDecision::Deliver | ReadDecision::DeliverAs(_)
+                        ) {
+                            count += 1;
+                        }
+                    }
+                    Self::send_count(ws, sub_id, count);
+                    return;
+                }
+            }
+        }
+
+        if let Some((value, since, until)) = filter::channel_count_target(&filters) {
+            let q = filter::build_channel_count(&value, since, until);
+            // More own channels than COUNT_MAX_GROUPS (one zone lookup each)
+            // means crafted spread; the generic path's row cap bounds that.
+            if let Some((groups, exceptions)) = self
+                .count_channel_messages(&q)
+                .await
+                .filter(|(g, _)| g.len() <= filter::COUNT_MAX_GROUPS)
+            {
+                let mut count = 0u64;
+                for (channel, n) in groups {
+                    let zone = self.cached_channel_zone(&channel).await;
+                    if matches!(
+                        channel_read_decision_for(42, &zone, &zones, &ctx),
+                        ReadDecision::Deliver
+                    ) {
+                        count += n;
+                    }
+                }
+                for event in &exceptions {
+                    if matches!(
+                        self.authorize_event(event, &ctx, &zones).await,
+                        ReadDecision::Deliver | ReadDecision::DeliverAs(_)
+                    ) {
+                        count += 1;
+                    }
+                }
+                Self::send_count(ws, sub_id, count);
+                return;
+            }
+        }
+
+        let events = self.query_events(&filters).await;
 
         let mut count: u64 = 0;
         for event in &events {
@@ -7774,7 +8389,7 @@ mod subscription_cap_tests {
 mod deletion_gate_sql_tests {
     //! The kind-5 gate's batched lookup and the moderator's sealed-envelope
     //! removal, run against the real `events` / `event_tags` schema (migration
-    //! 0004 plus the live v2 tag trigger) so the triggers behave as on D1.
+    //! 0004 plus the live v3 tag trigger) so the triggers behave as on D1.
     use super::*;
     use rusqlite::{params, Connection};
 
@@ -7794,6 +8409,8 @@ mod deletion_gate_sql_tests {
         c.execute_batch(crate::DELETED_ADDRESSES_CREATE_SQL)
             .unwrap();
         c.execute_batch(MIGRATION_0004).unwrap();
+        // As `ensure_schema`: the column the v3 writer fills, then the writer.
+        let _ = c.execute_batch(crate::EVENT_TAGS_TIME_COLUMN_SQL);
         for s in crate::PROBE_BLIND_STMTS {
             c.execute_batch(s).unwrap();
         }
@@ -8170,5 +8787,578 @@ mod deletion_gate_sql_tests {
         store(&c, &id(2), THEM, 42, serde_json::json!([]));
         assert!(moderator_removes_envelopes(&c, &[&id(2)], &[ADMIN], 1_000).is_empty());
         assert_eq!(count(&c, "SELECT count(*) FROM events"), 1);
+    }
+}
+
+#[cfg(test)]
+mod topic_tag_gate_tests {
+    //! Sealed replies carry their topic as an outer `["e", topic, "", "reply"]`
+    //! tag (nostr-bbs-core sealed.rs, check 7). A `#e:[topic]` REQ or COUNT
+    //! therefore selects them, and these tests pin that every read decision
+    //! still comes from the root-marked CHANNEL tag, never from the topic id
+    //! (which has no channel_zones row and would be "unscoped", i.e. open).
+    use super::*;
+    use crate::zone_config::ZoneConfig;
+    use nostr_bbs_core::keys::SecretKey;
+    use nostr_bbs_core::sealed::{reply_root_of, seal_original};
+    use nostr_bbs_core::{sign_event, UnsignedEvent};
+
+    fn tag(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn zones() -> ZoneConfig {
+        ZoneConfig::from_json(
+            r#"[{"id":"zone2","required_cohorts":["minimoonoir"],"visibility":"locked","encrypted":true}]"#,
+        )
+    }
+
+    fn viewer(cohorts: &[&str], authed: bool) -> ViewerContext {
+        ViewerContext {
+            session_pubkey: authed.then(|| "s".repeat(64)),
+            access_pubkey: authed.then(|| "s".repeat(64)),
+            is_admin: false,
+            viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
+            viewer_is_admin: false,
+            recipient_keys: vec![],
+        }
+    }
+
+    /// A real sealed reply: channel `chan`, topic `topic`, plus a quote and a
+    /// mention that must stay inside.
+    fn sealed_reply(chan: &str, topic: &str) -> NostrEvent {
+        let author = SecretKey::from_bytes([0x11; 32]).unwrap();
+        let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+        let zone = SecretKey::from_bytes([0x33; 32]).unwrap();
+        let signing_key = nostr_bbs_core::keys::signing_key_from_bytes(author.as_bytes()).unwrap();
+        let original = sign_event(
+            UnsignedEvent {
+                pubkey: author.public_key().to_hex(),
+                created_at: 1_700_000_000,
+                kind: 42,
+                tags: vec![
+                    tag(&["e", chan, "", "root"]),
+                    tag(&["e", &"b".repeat(64), "", "quote"]),
+                    tag(&["e", topic, "", "reply"]),
+                    tag(&["p", &"f".repeat(64)]),
+                ],
+                content: "a reply".into(),
+            },
+            &signing_key,
+        )
+        .unwrap();
+        seal_original(
+            &original,
+            "zone2",
+            1,
+            &zone.public_key().to_hex(),
+            &migrator,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_sealed_reply_is_governed_by_its_channel_never_its_topic() {
+        let chan = "c".repeat(64);
+        let topic = "a".repeat(64);
+        let env = sealed_reply(&chan, &topic);
+        assert_eq!(
+            reply_root_of(&env),
+            Some(topic.as_str()),
+            "the topic is outside"
+        );
+        // Read path (authorize_event) and COUNT grouping use channel_tag.
+        assert_eq!(
+            filter::zone_channel_id(&env).as_deref(),
+            Some(chan.as_str())
+        );
+        assert_eq!(filter::channel_tag(&env).as_deref(), Some(chan.as_str()));
+        // Readers that take the first `e` tag still see the channel: the
+        // topic tag is appended last. (The write gate uses channel_tag.)
+        assert_eq!(filter::tag_value(&env, "e").as_deref(), Some(chan.as_str()));
+    }
+
+    #[test]
+    fn a_topic_req_matches_the_reply_and_the_channel_gate_decides() {
+        let chan = "c".repeat(64);
+        let topic = "a".repeat(64);
+        let env = sealed_reply(&chan, &topic);
+        let f: NostrFilter =
+            serde_json::from_value(serde_json::json!({"kinds": [42], "#e": [topic]})).unwrap();
+        assert!(
+            filter::event_matches_filters(&env, &[f]),
+            "#e:[topic] selects it"
+        );
+
+        // Its channel is bound to zone2 (Locked): the decision per viewer.
+        let zone = Some("zone2");
+        let decide = |ctx: &ViewerContext| {
+            matches!(
+                channel_read_decision(env.kind, zone, &zones(), ctx),
+                ReadDecision::Deliver
+            )
+        };
+        assert!(!decide(&viewer(&[], false)), "anonymous: withheld");
+        assert!(!decide(&viewer(&["other"], true)), "non-member: withheld");
+        assert!(decide(&viewer(&["minimoonoir"], true)), "member: delivered");
+        let mut admin = viewer(&[], true);
+        admin.is_admin = true;
+        assert!(decide(&admin), "admin: delivered");
+    }
+
+    #[test]
+    fn a_topic_root_list_query_is_gated_by_the_roots_channel() {
+        // A sealed root carries ["t","topic"] (decision ii); the section's
+        // root list is {"kinds":[42],"#t":["topic"],"#e":[channel]}.
+        let chan = "c".repeat(64);
+        let author = SecretKey::from_bytes([0x11; 32]).unwrap();
+        let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+        let zone = SecretKey::from_bytes([0x33; 32]).unwrap();
+        let signing_key = nostr_bbs_core::keys::signing_key_from_bytes(author.as_bytes()).unwrap();
+        let root = sign_event(
+            UnsignedEvent {
+                pubkey: author.public_key().to_hex(),
+                created_at: 1_700_000_000,
+                kind: 42,
+                tags: vec![tag(&["e", &chan, "", "root"])],
+                content: "#economics".into(),
+            },
+            &signing_key,
+        )
+        .unwrap();
+        let env = seal_original(&root, "zone2", 1, &zone.public_key().to_hex(), &migrator).unwrap();
+        assert!(env.tags.contains(&tag(&["t", "topic"])));
+        let f: NostrFilter = serde_json::from_value(
+            serde_json::json!({"kinds": [42], "#t": ["topic"], "#e": [chan]}),
+        )
+        .unwrap();
+        assert!(filter::event_matches_filters(&env, &[f]));
+        assert_eq!(
+            filter::zone_channel_id(&env).as_deref(),
+            Some(chan.as_str())
+        );
+        let decide = |ctx: &ViewerContext| {
+            matches!(
+                channel_read_decision(env.kind, Some("zone2"), &zones(), ctx),
+                ReadDecision::Deliver
+            )
+        };
+        assert!(!decide(&viewer(&[], false)), "anonymous: no roots");
+        assert!(!decide(&viewer(&["other"], true)), "non-member: no roots");
+        assert!(decide(&viewer(&["minimoonoir"], true)), "member: the roots");
+    }
+
+    #[test]
+    fn the_topic_id_would_fail_open_which_is_why_it_is_never_looked_up() {
+        // Documents the hazard the tests above exclude: a channel id with no
+        // channel_zones row is unscoped, so deciding by the TOPIC id would
+        // deliver zone content to anyone.
+        assert!(matches!(
+            channel_read_decision(42, None, &zones(), &viewer(&[], false)),
+            ReadDecision::Deliver
+        ));
+    }
+
+    #[test]
+    fn channel_definitions_follow_zone_visibility_for_non_members() {
+        let z = ZoneConfig::from_json(
+            r#"[{"id":"locked","required_cohorts":["m"],"visibility":"locked"},
+                {"id":"hidden","required_cohorts":["m"],"visibility":"hidden"}]"#,
+        );
+        let anon = viewer(&[], false);
+        assert!(matches!(
+            channel_read_decision(40, Some("locked"), &z, &anon),
+            ReadDecision::Deliver
+        ));
+        assert!(matches!(
+            channel_read_decision(40, Some("hidden"), &z, &anon),
+            ReadDecision::Withhold
+        ));
+        assert!(matches!(
+            channel_read_decision(42, Some("locked"), &z, &anon),
+            ReadDecision::Withhold
+        ));
+    }
+}
+
+#[cfg(test)]
+mod zone_lookup_failure_tests {
+    //! Security review F3: an unanswered channel_zones lookup must fail
+    //! closed. "No row" (unscoped, public) is only ever a lookup that ran.
+    use super::*;
+    use crate::trust::ZoneLookupError;
+    use crate::zone_config::ZoneConfig;
+
+    fn zones() -> ZoneConfig {
+        ZoneConfig::from_json(r#"[{"id":"zone2","required_cohorts":["m"],"visibility":"locked"}]"#)
+    }
+
+    fn viewer(cohorts: &[&str], authed: bool) -> ViewerContext {
+        ViewerContext {
+            session_pubkey: authed.then(|| "s".repeat(64)),
+            access_pubkey: authed.then(|| "s".repeat(64)),
+            is_admin: false,
+            viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
+            viewer_is_admin: false,
+            recipient_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn an_injected_lookup_error_withholds_every_channel_kind_from_everyone() {
+        let failed: Result<Option<String>, ZoneLookupError> = Err(ZoneLookupError);
+        for kind in [40, 41, 42] {
+            for ctx in [
+                viewer(&[], false),
+                viewer(&["x"], true),
+                viewer(&["m"], true),
+            ] {
+                assert!(
+                    matches!(
+                        channel_read_decision_for(kind, &failed, &zones(), &ctx),
+                        ReadDecision::Withhold
+                    ),
+                    "kind {kind}"
+                );
+            }
+        }
+        // Whereas a lookup that ran and found no row is unscoped, and one
+        // that found zone2 gates by membership.
+        let none: Result<Option<String>, ZoneLookupError> = Ok(None);
+        assert!(matches!(
+            channel_read_decision_for(42, &none, &zones(), &viewer(&[], false)),
+            ReadDecision::Deliver
+        ));
+        let bound: Result<Option<String>, ZoneLookupError> = Ok(Some("zone2".into()));
+        assert!(matches!(
+            channel_read_decision_for(42, &bound, &zones(), &viewer(&["m"], true)),
+            ReadDecision::Deliver
+        ));
+        assert!(matches!(
+            channel_read_decision_for(42, &bound, &zones(), &viewer(&[], false)),
+            ReadDecision::Withhold
+        ));
+    }
+
+    #[test]
+    fn an_injected_lookup_error_refuses_the_write() {
+        assert!(zone_for_write(Err(ZoneLookupError)).is_err());
+        assert_eq!(zone_for_write(Ok(None)), Ok(None));
+        assert_eq!(
+            zone_for_write(Ok(Some("zone2".into()))),
+            Ok(Some("zone2".into()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod reference_kind_gate_tests {
+    //! Security review F4: reactions (7), comments (1111) and reports (1984)
+    //! on zone messages follow the referenced message's zone.
+    use super::*;
+    use crate::zone_config::ZoneConfig;
+
+    fn zones() -> ZoneConfig {
+        ZoneConfig::from_json(
+            r#"[{"id":"zone2","required_cohorts":["m"],"visibility":"locked","encrypted":true},
+                {"id":"pub","required_cohorts":[],"visibility":"public"}]"#,
+        )
+    }
+
+    fn viewer(cohorts: &[&str], authed: bool) -> ViewerContext {
+        ViewerContext {
+            session_pubkey: authed.then(|| "s".repeat(64)),
+            access_pubkey: authed.then(|| "s".repeat(64)),
+            is_admin: false,
+            viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
+            viewer_is_admin: false,
+            recipient_keys: vec![],
+        }
+    }
+
+    fn ev(kind: u64, tags: Vec<Vec<&str>>) -> NostrEvent {
+        NostrEvent {
+            id: "1".repeat(64),
+            pubkey: "a".repeat(64),
+            created_at: 1,
+            kind,
+            tags: tags
+                .into_iter()
+                .map(|t| t.into_iter().map(String::from).collect())
+                .collect(),
+            content: "x".into(),
+            sig: "0".repeat(128),
+        }
+    }
+
+    #[test]
+    fn reference_targets_cover_e_and_uppercase_e_deduplicated() {
+        let target = "B".repeat(64);
+        let c = ev(
+            1111,
+            vec![
+                vec!["E", &target],
+                vec!["e", &"b".repeat(64)],
+                vec!["e", &"c".repeat(64)],
+                vec!["p", "x"],
+            ],
+        );
+        assert_eq!(reference_targets(&c), vec!["b".repeat(64), "c".repeat(64)]);
+        assert!(reference_targets(&ev(1984, vec![vec!["p", "x", "spam"]])).is_empty());
+        for kind in [7, 1111, 1984] {
+            assert!(is_reference_kind(kind));
+        }
+        assert!(!is_reference_kind(42));
+    }
+
+    #[test]
+    fn each_reference_kind_on_a_zone_message_is_read_by_members_only() {
+        let scope = RefScope::Zones(vec!["zone2".into()]);
+        for _kind in [7u64, 1111, 1984] {
+            let d = |ctx: &ViewerContext| reference_read_decision(&scope, &zones(), ctx, false);
+            assert!(
+                matches!(d(&viewer(&[], false)), ReadDecision::Withhold),
+                "anonymous"
+            );
+            assert!(
+                matches!(d(&viewer(&["x"], true)), ReadDecision::Withhold),
+                "non-member"
+            );
+            assert!(
+                matches!(d(&viewer(&["m"], true)), ReadDecision::Deliver),
+                "member"
+            );
+        }
+        // Every referenced zone must be readable.
+        let two = RefScope::Zones(vec!["pub".into(), "zone2".into()]);
+        assert!(matches!(
+            reference_read_decision(&two, &zones(), &viewer(&[], false), false),
+            ReadDecision::Withhold
+        ));
+        // Public and unscoped targets stay readable to anyone.
+        let public = RefScope::Zones(vec!["pub".into()]);
+        assert!(matches!(
+            reference_read_decision(&public, &zones(), &viewer(&[], false), false),
+            ReadDecision::Deliver
+        ));
+        assert!(matches!(
+            reference_read_decision(&RefScope::Unscoped, &zones(), &viewer(&[], false), false),
+            ReadDecision::Deliver
+        ));
+    }
+
+    #[test]
+    fn an_unknown_target_is_gated_except_for_its_author_and_admins() {
+        let u = RefScope::Unknown;
+        assert!(matches!(
+            reference_read_decision(&u, &zones(), &viewer(&["m"], true), false),
+            ReadDecision::Withhold
+        ));
+        assert!(
+            matches!(
+                reference_read_decision(&u, &zones(), &viewer(&[], true), true),
+                ReadDecision::Deliver
+            ),
+            "author"
+        );
+        let mut admin = viewer(&[], true);
+        admin.is_admin = true;
+        assert!(matches!(
+            reference_read_decision(&u, &zones(), &admin, false),
+            ReadDecision::Deliver
+        ));
+    }
+
+    #[test]
+    fn writes_need_zone_access_and_comments_in_encrypted_zones_need_ciphertext() {
+        let z = RefScope::Zones(vec!["zone2".into()]);
+        let enc = |zone: &str| zone == "zone2";
+        let yes = |_: &str| true;
+        let no = |_: &str| false;
+        // Neither reader nor writer: refused for every kind.
+        for kind in [7u64, 1111, 1984] {
+            assert_eq!(
+                reference_write_rejection(&z, kind, false, no, no, enc, yes),
+                Some("zone access denied")
+            );
+        }
+        // Read-only member: may report (finding 5), may not react or comment.
+        assert_eq!(
+            reference_write_rejection(&z, 1984, false, yes, no, enc, no),
+            None
+        );
+        assert!(reference_write_rejection(&z, 7, false, yes, no, enc, yes).is_some());
+        assert!(reference_write_rejection(&z, 1111, false, yes, no, enc, yes).is_some());
+        // Writer: a reaction passes; a plaintext comment does not.
+        assert_eq!(
+            reference_write_rejection(&z, 7, false, yes, yes, enc, no),
+            None
+        );
+        assert_eq!(
+            reference_write_rejection(&z, 1111, false, yes, yes, enc, no),
+            Some("blocked: encrypted zone requires zone-key ciphertext")
+        );
+        assert_eq!(
+            reference_write_rejection(&z, 1111, false, yes, yes, enc, yes),
+            None
+        );
+        // Admins skip the access check but not the ciphertext rule.
+        assert!(reference_write_rejection(&z, 1111, true, no, no, enc, no).is_some());
+        // Unknown targets: refused unless admin.
+        assert!(
+            reference_write_rejection(&RefScope::Unknown, 7, false, yes, yes, enc, yes).is_some()
+        );
+        assert_eq!(
+            reference_write_rejection(&RefScope::Unknown, 7, true, yes, yes, enc, yes),
+            None
+        );
+        assert_eq!(
+            reference_write_rejection(&RefScope::Unscoped, 1111, false, no, no, enc, no),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stored_target_resolves_to_its_root_marked_channel() {
+        let chan = "c".repeat(64);
+        let msg = ev(
+            42,
+            vec![
+                vec!["e", &"t".repeat(64), "", "reply"],
+                vec!["e", &chan, "", "root"],
+            ],
+        );
+        assert_eq!(stored_target_channel(&msg).as_deref(), Some(chan.as_str()));
+        let def = ev(40, vec![]);
+        assert_eq!(
+            stored_target_channel(&def).as_deref(),
+            Some("1".repeat(64).as_str())
+        );
+        assert_eq!(stored_target_channel(&ev(1, vec![])), None);
+    }
+}
+
+#[cfg(test)]
+mod channel_placement_tests {
+    //! Security review F2 (and finding 3): a kind-42 must be placed in a real
+    //! channel named by its exact id, and a reply's topic must be a kind-42
+    //! in that same channel.
+    use super::channel_write_rejection;
+
+    fn ok(c: &[&str]) -> Result<Vec<String>, ()> {
+        Ok(c.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_message_in_a_known_channel_with_a_same_channel_topic_is_accepted() {
+        assert_eq!(channel_write_rejection("chan", &ok(&["chan"]), None), None);
+        assert_eq!(
+            channel_write_rejection("chan", &ok(&["chan"]), Some(&ok(&["chan"]))),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_non_channel_target_is_refused() {
+        for known in [Err(()), ok(&[]), ok(&["other"]), ok(&["chan", "other"])] {
+            assert!(
+                channel_write_rejection("chan", &known, None).is_some(),
+                "{known:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mixed_case_alias_of_a_channel_is_refused() {
+        // The stored kind-40 id is lowercase; the tag must equal it exactly.
+        assert!(channel_write_rejection("CHAN", &ok(&["chan"]), None).is_some());
+    }
+
+    #[test]
+    fn a_topic_outside_the_channel_or_unknown_is_refused() {
+        for target in [Err(()), ok(&[]), ok(&["other"]), ok(&["chan", "other"])] {
+            assert!(
+                channel_write_rejection("chan", &ok(&["chan"]), Some(&target)).is_some(),
+                "{target:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sealed_target_sql_tests {
+    //! Review finding 1: resolving a reference by an original's inner id must
+    //! match only real sealed envelopes (kind 42, well-formed sealed tag, zk
+    //! tag, admin author), never a planted `sealed` tag.
+    use super::SEALED_TARGET_SQL;
+    use rusqlite::{params, Connection};
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::EVENTS_CREATE_SQL).unwrap();
+        c.execute_batch(include_str!("../../migrations/0004_event_tags.sql"))
+            .unwrap();
+        let _ = c.execute_batch(crate::EVENT_TAGS_TIME_COLUMN_SQL);
+        for s in crate::PROBE_BLIND_STMTS {
+            c.execute_batch(s).unwrap();
+        }
+        c.execute_batch(
+            "CREATE TABLE whitelist (pubkey TEXT PRIMARY KEY, is_admin INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO whitelist VALUES ('admin', 1), ('member', 0);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn put(c: &Connection, id: &str, pubkey: &str, kind: i64, tags: serde_json::Value) {
+        c.execute(
+            "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES (?1, ?2, 1, ?3, ?4, 'x', 'sig')",
+            params![id, pubkey, kind, tags.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn matches(c: &Connection, inner: &str) -> Vec<String> {
+        let mut s = c.prepare(SEALED_TARGET_SQL).unwrap();
+        s.query_map([inner], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn only_a_real_admin_envelope_resolves_an_inner_id() {
+        let c = db();
+        let inner = "a".repeat(64);
+        let env_tags = serde_json::json!([
+            ["e", "chan", "", "root"],
+            ["zk", "zone2", "1", "pk"],
+            ["sealed", inner, "1"]
+        ]);
+        put(&c, "real", "admin", 42, env_tags.clone());
+        // Planted: a kind-1 by a member, a kind-42 by a member, a kind-42 by
+        // an admin without zk, and one with a malformed version.
+        put(&c, "planted-k1", "member", 1, env_tags.clone());
+        put(&c, "planted-member", "member", 42, env_tags);
+        put(
+            &c,
+            "planted-nozk",
+            "admin",
+            42,
+            serde_json::json!([["e", "evil", "", "root"], ["sealed", inner, "1"]]),
+        );
+        put(
+            &c,
+            "planted-ver",
+            "admin",
+            42,
+            serde_json::json!([
+                ["e", "evil", "", "root"],
+                ["zk", "z", "1", "p"],
+                ["sealed", inner, "v1"]
+            ]),
+        );
+        assert_eq!(matches(&c, &inner), vec!["real".to_string()]);
+        assert!(matches(&c, &"b".repeat(64)).is_empty());
     }
 }

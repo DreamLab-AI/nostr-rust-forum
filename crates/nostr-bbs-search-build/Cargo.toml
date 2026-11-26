@@ -1,0 +1,27 @@
+[package]
+name = "nostr-bbs-search-build"
+version = "0.1.0"
+publish = false           # operator tool: builds and uploads a zone's sealed search index
+edition = "2021"
+description = "Offline builder for sealed per-zone search indexes (local bge-small embeddings, age-sealed shards)"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+rust-version = "1.85"
+
+[[bin]]
+name = "nostr-bbs-search-build"
+path = "src/main.rs"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+nostr-bbs-sealed-search = { path = "../nostr-bbs-sealed-search", version = "0.1.0" }
+nostr-bbs-zone-migrate = { path = "../nostr-bbs-zone-migrate", version = "1.0.0-beta.11" }
+nostr-bbs-core = { workspace = true }
+k256 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

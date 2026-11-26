@@ -75,6 +75,52 @@ pub fn encrypt(
     upstream_encrypt(&sk, &pk, plaintext, Version::V2).map_err(map_upstream_err)
 }
 
+/// Encrypt `plaintext` with NIP-44 v2 under a conversation key the caller
+/// already derived ([`conversation_key`]): the counterpart of
+/// [`decrypt_with_conversation_key`] for a sender encrypting many messages to
+/// one peer. Same length rules and output as [`encrypt`] (base64 of
+/// `nostr::nips::nip44::v2::encrypt_to_bytes`, fresh random nonce); only the
+/// per-message ECDH is skipped.
+///
+/// # Errors
+///
+/// [`Nip44Error::PlaintextTooShort`] / [`Nip44Error::PlaintextTooLong`] for
+/// out-of-range input; an upstream encryption failure otherwise.
+///
+/// # Example
+///
+/// ```
+/// use nostr_bbs_core::nip44::{conversation_key, decrypt, encrypt_with_conversation_key};
+/// use nostr_bbs_core::keys::SecretKey;
+///
+/// let alice = [0x11u8; 32];
+/// let bob = [0x22u8; 32];
+/// let alice_pk = *SecretKey::from_bytes(alice).unwrap().public_key().as_bytes();
+/// let bob_pk = *SecretKey::from_bytes(bob).unwrap().public_key().as_bytes();
+///
+/// let ck = conversation_key(&alice, &bob_pk).unwrap();
+/// let payload = encrypt_with_conversation_key(&ck, "hello").unwrap();
+/// assert_eq!(decrypt(&bob, &alice_pk, &payload).unwrap(), "hello");
+/// ```
+pub fn encrypt_with_conversation_key(
+    conversation_key: &[u8; 32],
+    plaintext: &str,
+) -> Result<String, Nip44Error> {
+    use base64::Engine;
+
+    let pt_bytes = plaintext.as_bytes();
+    if pt_bytes.is_empty() {
+        return Err(Nip44Error::PlaintextTooShort);
+    }
+    if pt_bytes.len() > MAX_PLAINTEXT_LEN {
+        return Err(Nip44Error::PlaintextTooLong);
+    }
+    let ck = ConversationKey::new(*conversation_key);
+    let bytes =
+        nostr::nips::nip44::v2::encrypt_to_bytes(&ck, pt_bytes).map_err(map_upstream_err)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 /// Decrypt a base64-encoded NIP-44 v2 ciphertext.
 ///
 /// Wraps `nostr::nips::nip44::decrypt`. Returns the plaintext UTF-8 string.
@@ -87,6 +133,71 @@ pub fn decrypt(
     let pk = PublicKey::from_byte_array(*sender_pk);
 
     upstream_decrypt(&sk, &pk, payload).map_err(map_upstream_err)
+}
+
+/// Upper bound on a base64 NIP-44 v2 payload, checked before decoding so an
+/// oversized string is refused without allocating for it. The largest v2
+/// payload is 65,603 bytes (version, nonce, 65,538-byte padded ciphertext,
+/// MAC), 87,472 base64 characters; upstream applies the same limit.
+const MAX_ENCODED_PAYLOAD_LEN: usize = 87_472;
+
+/// Decrypt a base64-encoded NIP-44 v2 ciphertext with a conversation key the
+/// caller already holds (see [`conversation_key`]).
+///
+/// [`decrypt`] derives the conversation key (an ECDH plus HKDF-Extract) on
+/// every call. When one key pair decrypts many messages, as a reader opening
+/// a channel of sealed history does, deriving it once and passing it here
+/// gives the same result for a fraction of the cost. Nothing cryptographic is
+/// added: the payload checks match upstream's `nip44::decrypt` (size bound,
+/// base64, version byte `0x02`), then `nostr::nips::nip44::v2::decrypt_to_bytes`
+/// does the MAC check and decryption, and the plaintext must be UTF-8.
+///
+/// The conversation key is as sensitive as the secret key it came from for
+/// that peer: keep it in memory only, scoped to the identity that derived it.
+///
+/// # Errors
+///
+/// [`Nip44Error::PlaintextTooLong`] for an oversized payload,
+/// [`Nip44Error::InvalidBase64`], [`Nip44Error::UnsupportedVersion`] or
+/// [`Nip44Error::InvalidPayload`] for a malformed one, and
+/// [`Nip44Error::HmacMismatch`] when the key does not open it.
+///
+/// # Example
+///
+/// ```
+/// use nostr_bbs_core::nip44::{conversation_key, decrypt, decrypt_with_conversation_key, encrypt};
+/// use nostr_bbs_core::keys::SecretKey;
+///
+/// let alice = [0x11u8; 32];
+/// let bob = [0x22u8; 32];
+/// let alice_pk = *SecretKey::from_bytes(alice).unwrap().public_key().as_bytes();
+/// let bob_pk = *SecretKey::from_bytes(bob).unwrap().public_key().as_bytes();
+///
+/// let payload = encrypt(&alice, &bob_pk, "hello").unwrap();
+/// let ck = conversation_key(&bob, &alice_pk).unwrap();
+/// assert_eq!(decrypt_with_conversation_key(&ck, &payload).unwrap(), "hello");
+/// assert_eq!(decrypt(&bob, &alice_pk, &payload).unwrap(), "hello");
+/// ```
+pub fn decrypt_with_conversation_key(
+    conversation_key: &[u8; 32],
+    payload: &str,
+) -> Result<String, Nip44Error> {
+    use base64::Engine;
+
+    if payload.len() > MAX_ENCODED_PAYLOAD_LEN {
+        return Err(Nip44Error::PlaintextTooLong);
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| Nip44Error::InvalidBase64)?;
+    match bytes.first() {
+        None => return Err(Nip44Error::InvalidPayload("missing version byte")),
+        Some(2) => {}
+        Some(v) => return Err(Nip44Error::UnsupportedVersion(*v)),
+    }
+    let ck = ConversationKey::new(*conversation_key);
+    let plain = nostr::nips::nip44::v2::decrypt_to_bytes(&ck, &bytes).map_err(map_upstream_err)?;
+    String::from_utf8(plain).map_err(|_| Nip44Error::InvalidPayload("invalid UTF-8 in plaintext"))
 }
 
 /// Compute the conversation key via ECDH + HKDF-Extract.
@@ -314,5 +425,121 @@ mod tests {
                 prop_assert_eq!(decrypted, plaintext);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod conversation_key_decrypt_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn pk(sk: [u8; 32]) -> [u8; 32] {
+        *crate::keys::SecretKey::from_bytes(sk)
+            .unwrap()
+            .public_key()
+            .as_bytes()
+    }
+
+    const A: [u8; 32] = [0x31; 32];
+    const B: [u8; 32] = [0x42; 32];
+
+    #[test]
+    fn matches_decrypt_for_many_messages() {
+        let ck = conversation_key(&B, &pk(A)).unwrap();
+        for len in [1usize, 31, 32, 33, 300, 4_000, 60_000] {
+            let text: String = "é".repeat(len / 2) + &"x".repeat(len % 2);
+            let payload = encrypt(&A, &pk(B), &text).unwrap();
+            assert_eq!(
+                decrypt_with_conversation_key(&ck, &payload).unwrap(),
+                decrypt(&B, &pk(A), &payload).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn the_conversation_key_is_symmetric_as_nip44_requires() {
+        assert_eq!(
+            conversation_key(&A, &pk(B)).unwrap(),
+            conversation_key(&B, &pk(A)).unwrap()
+        );
+    }
+
+    #[test]
+    fn encrypting_with_a_conversation_key_round_trips_both_ways() {
+        let ck = conversation_key(&A, &pk(B)).unwrap();
+        for text in ["x", "hello world", &"é".repeat(5_000)] {
+            let payload = encrypt_with_conversation_key(&ck, text).unwrap();
+            assert_eq!(decrypt(&B, &pk(A), &payload).unwrap(), text);
+            assert_eq!(decrypt_with_conversation_key(&ck, &payload).unwrap(), text);
+        }
+        // Fresh nonce per message.
+        assert_ne!(
+            encrypt_with_conversation_key(&ck, "same").unwrap(),
+            encrypt_with_conversation_key(&ck, "same").unwrap()
+        );
+        assert!(matches!(
+            encrypt_with_conversation_key(&ck, ""),
+            Err(Nip44Error::PlaintextTooShort)
+        ));
+    }
+
+    #[test]
+    fn a_wrong_key_fails_the_mac() {
+        let payload = encrypt(&A, &pk(B), "secret").unwrap();
+        let wrong = conversation_key(&B, &pk([0x55; 32])).unwrap();
+        assert!(matches!(
+            decrypt_with_conversation_key(&wrong, &payload),
+            Err(Nip44Error::HmacMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_tampered_payload_fails_like_decrypt() {
+        let ck = conversation_key(&B, &pk(A)).unwrap();
+        let payload = encrypt(&A, &pk(B), "secret").unwrap();
+        let mut raw = base64::engine::general_purpose::STANDARD
+            .decode(&payload)
+            .unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 1; // MAC
+        let bad_mac = base64::engine::general_purpose::STANDARD.encode(&raw);
+        assert!(decrypt_with_conversation_key(&ck, &bad_mac).is_err());
+        assert!(decrypt(&B, &pk(A), &bad_mac).is_err());
+
+        raw[last] ^= 1;
+        raw[0] = 1; // version
+        let bad_version = base64::engine::general_purpose::STANDARD.encode(&raw);
+        assert!(matches!(
+            decrypt_with_conversation_key(&ck, &bad_version),
+            Err(Nip44Error::UnsupportedVersion(1))
+        ));
+        assert!(decrypt(&B, &pk(A), &bad_version).is_err());
+
+        assert!(matches!(
+            decrypt_with_conversation_key(&ck, "not base64!"),
+            Err(Nip44Error::InvalidBase64)
+        ));
+        assert!(decrypt_with_conversation_key(&ck, "").is_err());
+
+        // The size bound sits exactly at upstream's: a well-formed payload of
+        // MAX_ENCODED_PAYLOAD_LEN characters is decoded (and fails only the
+        // MAC), one base64 group more is refused before decoding.
+        // The largest v2 payload is 65,603 bytes, 87,472 base64 characters.
+        let mut at_limit_raw = vec![0u8; 65_603];
+        at_limit_raw[0] = 2;
+        let at_limit = base64::engine::general_purpose::STANDARD.encode(&at_limit_raw);
+        assert_eq!(at_limit.len(), MAX_ENCODED_PAYLOAD_LEN);
+        assert!(!matches!(
+            decrypt_with_conversation_key(&ck, &at_limit),
+            Err(Nip44Error::PlaintextTooLong)
+        ));
+        let over = at_limit.clone() + "AAAA";
+        assert!(matches!(
+            decrypt_with_conversation_key(&ck, &over),
+            Err(Nip44Error::PlaintextTooLong)
+        ));
+        assert!(
+            decrypt_with_conversation_key(&ck, &"A".repeat(MAX_ENCODED_PAYLOAD_LEN + 4)).is_err()
+        );
     }
 }

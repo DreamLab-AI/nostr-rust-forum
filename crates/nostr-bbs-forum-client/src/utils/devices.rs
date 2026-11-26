@@ -5,7 +5,7 @@
 //! It is registered to its owner in the auth-worker `device_keys` registry and
 //! honoured by our relay/forum, revocable from Settings. The master key never
 //! leaves the browser and never reaches the phone: only the *device* key rides
-//! the `/connect#k=` magic link (ADR-098) onto the phone.
+//! the `#k=` sign-in link (ADR-098) onto the phone.
 //!
 //! All three registry endpoints are NIP-98-authed **by the master** — the
 //! owner is derived from the NIP-98 author server-side. We sign exactly the way
@@ -21,7 +21,7 @@
 //!
 //! ## What never crosses the wire
 //!
-//! The derived device secret is bech32-encoded **in-WASM** for the `/connect`
+//! The derived device secret is bech32-encoded **in-WASM** for the sign-in
 //! QR and never POSTed. Only the device *pubkey* (64-hex) + a label are
 //! registered.
 
@@ -62,7 +62,7 @@ impl DeviceKey {
 pub struct RegisteredDevice {
     /// 64-hex device pubkey (registered).
     pub device_pubkey: String,
-    /// bech32 `nsec1…` of the **device** key — for the `/connect#k=` QR only.
+    /// bech32 `nsec1…` of the **device** key — for the `#k=` sign-in QR only.
     pub device_nsec: String,
     /// The `device:<uuid>` derivation tag (diagnostic / not load-bearing).
     pub tag: String,
@@ -118,7 +118,7 @@ pub fn device_keys_enabled() -> bool {
 ///
 /// The master secret is taken from the auth store's in-memory key (the same
 /// `get_privkey_bytes` path Settings already uses for nsec export). The derived
-/// device secret is bech32-encoded in-WASM and returned for the `/connect` QR;
+/// device secret is bech32-encoded in-WASM and returned for the sign-in QR;
 /// only the device *pubkey* is POSTed.
 pub async fn register_device(
     auth: AuthStore,
@@ -163,7 +163,7 @@ pub async fn register_device(
 ///
 /// `master_hex` is the same 64-hex master the recovery sheet already renders —
 /// no auth-store coupling, so this works mid-signup before a session settles.
-/// The device secret is bech32-encoded in-WASM and returned for the `/connect`
+/// The device secret is bech32-encoded in-WASM and returned for the sign-in
 /// QR; only the device *pubkey* is POSTed.
 pub async fn register_device_with_master(
     master_hex: &str,
@@ -241,7 +241,7 @@ pub fn today_utc() -> String {
 /// Render `data` as a self-contained SVG QR-code string (pure-Rust, in-WASM).
 ///
 /// Mirrors the recovery-sheet helper so the Settings "add a device" flow can
-/// render the device `/connect` QR without crossing the WASM/JS boundary.
+/// render the device sign-in QR without crossing the WASM/JS boundary.
 /// Returns an empty string on the (practically impossible) encode failure.
 pub fn qr_svg(data: &str) -> String {
     use qrcode::render::svg;
@@ -258,14 +258,17 @@ pub fn qr_svg(data: &str) -> String {
     }
 }
 
-/// Build the ADR-098 `/connect#k=<device-nsec>` URL from the live browser
-/// origin, with the FORUM_BASE prefix applied. The device secret rides the URL
-/// *fragment* — never transmitted to the server. Returns `None` off-browser.
+/// Build the root-form sign-in link `{origin}{FORUM_BASE}/#k=<device-nsec>`
+/// ([`crate::utils::connect_link::connect_url`]) from the live browser
+/// origin. The device secret rides the URL *fragment*, never transmitted to
+/// the server, and the root path needs no 404 redirect on a static host.
+/// Returns `None` off-browser.
 pub fn device_connect_url(device_nsec: &str) -> Option<String> {
     let origin = web_sys::window()?.location().origin().ok()?;
-    Some(format!(
-        "{origin}{}#k={device_nsec}",
-        crate::app::base_href("/connect")
+    Some(crate::utils::connect_link::connect_url(
+        &origin,
+        &crate::app::base_href(""),
+        device_nsec,
     ))
 }
 

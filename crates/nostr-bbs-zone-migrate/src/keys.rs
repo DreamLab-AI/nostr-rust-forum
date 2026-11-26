@@ -249,6 +249,13 @@ impl KeyRing {
         self.keys.get(&(zone.to_string(), epoch))
     }
 
+    /// Every key held for `zone`, lowest epoch first.
+    pub fn keys_for(&self, zone: &str) -> impl Iterator<Item = &ZoneKey> {
+        self.keys
+            .range((zone.to_string(), 0)..=(zone.to_string(), u32::MAX))
+            .map(|(_, k)| k)
+    }
+
     /// The highest-epoch key held for `zone`: the one used for sealing.
     ///
     /// ```

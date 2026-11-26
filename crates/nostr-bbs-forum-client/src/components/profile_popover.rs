@@ -83,6 +83,8 @@ pub(crate) fn ProfilePopover(
 
     // "Send DM" navigates to the DM chat route for this user — same target as
     // the ProfileModal's DM action (`/dm/{pubkey}` via the router).
+    // Link and DM go to the person: an archive key's successor (one hop).
+    let pubkey = crate::components::user_display::canonical_pubkey(&pubkey);
     let navigate = StoredValue::new(use_navigate());
     let pk_dm = pubkey.clone();
     let on_dm = move |ev: leptos::ev::MouseEvent| {

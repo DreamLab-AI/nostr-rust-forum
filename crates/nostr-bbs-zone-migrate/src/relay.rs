@@ -39,6 +39,9 @@ pub struct Filter {
     /// `#p` tag values.
     #[serde(rename = "#p", skip_serializing_if = "Option::is_none")]
     pub p_tags: Option<Vec<String>>,
+    /// `#zk` tag values (zone ids): every zone-encrypted event of a zone.
+    #[serde(rename = "#zk", skip_serializing_if = "Option::is_none")]
+    pub zk_tags: Option<Vec<String>>,
     /// Inclusive upper bound on `created_at` (the relay uses `created_at <= until`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until: Option<u64>,
@@ -110,6 +113,14 @@ pub trait Relay {
 
     /// Publish an event and return the relay's `OK`.
     async fn publish(&mut self, event: &NostrEvent) -> Result<PublishOutcome, RelayError>;
+
+    /// Whether the session completed NIP-42 AUTH as the migrator. Reads made
+    /// without it are gated as an anonymous viewer and may omit whole zones,
+    /// so decisions that rely on "the relay holds nothing" require it.
+    /// Defaults to `false` (fail closed).
+    fn session_authenticated(&self) -> bool {
+        false
+    }
 
     /// `GET /api/check-whitelist?pubkey=` → `isAdmin`.
     async fn is_admin(&mut self, pubkey: &str) -> Result<bool, RelayError>;

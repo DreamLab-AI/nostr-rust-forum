@@ -38,7 +38,10 @@ use crate::zone_config::ZoneConfig;
 
 /// Kinds counted as authored posts: NIP-01 notes, kind-9 chat, NIP-28
 /// channel messages and NIP-22 comments.
-const POST_KINDS: [u32; 4] = [1, 9, 42, 1111];
+// Kind 1111 (comments) is not counted: a comment on a zone message would be
+// counted as public activity (review finding 6); its target's zone is not
+// resolved here.
+const POST_KINDS: [u32; 3] = [1, 9, 42];
 
 /// Upper bound on rows scanned per identity. The response flags `truncated`
 /// when the cap is hit so the card can say "at least".
@@ -77,16 +80,24 @@ pub struct Activity {
     pub top_channels: Vec<ChannelActivity>,
 }
 
-/// Channel id of a kind-42 message: its first `e` tag, matching
-/// `filter::tag_value(event, "e")` on the REQ read path.
+/// Channel id of a kind-42 message: its root-marked `e` tag, else its first,
+/// matching `filter::channel_tag` on the read path.
 pub fn channel_of(kind: u32, tags_json: &str) -> Option<String> {
     if kind != 42 {
         return None;
     }
     let tags: Vec<Vec<String>> = serde_json::from_str(tags_json).ok()?;
-    tags.into_iter()
-        .find(|t| t.len() >= 2 && t[0] == "e")
-        .map(|mut t| t.swap_remove(1))
+    // The same rule as the read gate (`relay_do::filter::channel_tag`): the
+    // root-marked `e` tag, else the first. Taking the first `e` tag alone
+    // would read a reply whose topic (`reply`) tag comes first as posted in
+    // an unbound, public "channel" named by the topic id, and count zone
+    // activity for viewers who may not read the zone.
+    let is_e = |t: &&Vec<String>| t.len() >= 2 && t[0] == "e";
+    tags.iter()
+        .filter(is_e)
+        .find(|t| t.get(3).map(String::as_str) == Some("root"))
+        .or_else(|| tags.iter().find(is_e))
+        .map(|t| t[1].clone())
 }
 
 /// Aggregate `rows` into viewer-visible activity.
@@ -287,7 +298,9 @@ pub async fn handle_profile_stats(req: &Request, env: &Env) -> Result<Response> 
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let channel_zone = load_channel_zones(&db, &channel_ids).await;
+    let Ok(channel_zone) = load_channel_zones(&db, &channel_ids).await else {
+        return cors_json_response(env, &json!({ "error": "Zone lookup failed" }), 503);
+    };
 
     // Viewer scope.
     let viewer = resolve_viewer(req, env).await;
@@ -337,7 +350,12 @@ pub async fn handle_profile_stats(req: &Request, env: &Env) -> Result<Response> 
     )
 }
 
-async fn load_channel_zones(db: &D1Database, ids: &[String]) -> HashMap<String, String> {
+/// Zone bindings for `ids`. `Err` if any chunk could not be read: the caller
+/// fails closed rather than counting a zone channel as unbound/public (F3).
+async fn load_channel_zones(
+    db: &D1Database,
+    ids: &[String],
+) -> Result<HashMap<String, String>, ()> {
     #[derive(Deserialize)]
     struct Row {
         channel_id: String,
@@ -350,15 +368,13 @@ async fn load_channel_zones(db: &D1Database, ids: &[String]) -> HashMap<String, 
             placeholders(1, chunk.len())
         );
         let binds: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
-        if let Ok(stmt) = db.prepare(&sql).bind(&binds) {
-            if let Ok(r) = stmt.all().await {
-                for row in r.results::<Row>().unwrap_or_default() {
-                    out.insert(row.channel_id, row.zone);
-                }
-            }
+        let stmt = db.prepare(&sql).bind(&binds).map_err(|_| ())?;
+        let r = stmt.all().await.map_err(|_| ())?;
+        for row in r.results::<Row>().map_err(|_| ())? {
+            out.insert(row.channel_id, row.zone);
         }
     }
-    out
+    Ok(out)
 }
 
 async fn load_channel_names(db: &D1Database, ids: &[String]) -> HashMap<String, String> {
@@ -460,6 +476,15 @@ mod tests {
     fn kind_9_is_a_counted_post_kind() {
         assert!(POST_KINDS.contains(&9));
         assert!(POST_KINDS.contains(&42));
+    }
+
+    #[test]
+    fn channel_of_prefers_the_root_marker_like_the_read_gate() {
+        assert_eq!(
+            channel_of(42, r#"[["e","topic","","reply"],["e","chan","","root"]]"#),
+            Some("chan".into()),
+            "a topic tag listed first never stands in for the channel"
+        );
     }
 
     #[test]

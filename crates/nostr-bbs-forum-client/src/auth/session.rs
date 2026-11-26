@@ -32,8 +32,9 @@ use nostr_bbs_core::signer::Signer;
 /// is re-derived from the authenticator on every authenticate.
 const SESSION_PRIVKEY_KEY: &str = "nostr_bbs_sk";
 
-/// localStorage flag controlling privkey persistence scope. Anything other
-/// than the literal string "false" means "remember me" (the default).
+/// localStorage flag controlling privkey persistence scope. Only the literal
+/// string "true" means "remember me"; anything else, including absent, keeps
+/// the key session-scoped (the default, see [`remember_me`]).
 const REMEMBER_ME_KEY: &str = "nostr_bbs_remember";
 
 // -- Persisted session data ---------------------------------------------------
@@ -212,6 +213,30 @@ impl AuthStore {
             }
         }
         (None, None, AccountStatus::Incomplete, false)
+    }
+
+    /// Like [`Self::read_existing_metadata`], but only when the stored session
+    /// belongs to `pubkey`. Signing in as a DIFFERENT key must not inherit the
+    /// previous account's nickname and avatar: the welcome screen and the
+    /// sign-in sheet's "check your name is shown" step would otherwise confirm
+    /// the wrong identity.
+    pub(super) fn read_metadata_for(
+        &self,
+        pubkey: &str,
+    ) -> (Option<String>, Option<String>, AccountStatus, bool) {
+        match self.stored_session_pubkey() {
+            Some(stored) if stored.eq_ignore_ascii_case(pubkey) => self.read_existing_metadata(),
+            _ => (None, None, AccountStatus::Incomplete, false),
+        }
+    }
+
+    /// Pubkey of the session persisted in localStorage (any login method),
+    /// if one exists. Public data only.
+    pub(super) fn stored_session_pubkey(&self) -> Option<String> {
+        let json: String = LocalStorage::get(STORAGE_KEY).ok()?;
+        serde_json::from_str::<StoredSession>(&json)
+            .ok()?
+            .public_key
     }
 
     /// Persist session data to localStorage (never includes private keys).

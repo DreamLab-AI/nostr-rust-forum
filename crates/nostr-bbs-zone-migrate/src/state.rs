@@ -128,6 +128,23 @@ pub struct State {
     pub migrator: String,
     /// Entries keyed by original event id.
     pub entries: BTreeMap<String, Entry>,
+    /// Zones first encrypted with `--allow-unanchored-first-encryption`:
+    /// zone -> the key sealed to. `purge` refuses these zones until a live,
+    /// member-authored post at that key proves members hold it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unanchored_zones: BTreeMap<String, UnanchoredZone>,
+}
+
+/// A zone sealed without an anchoring encrypted post (see
+/// [`State::unanchored_zones`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnanchoredZone {
+    /// Epoch sealed to.
+    pub epoch: u32,
+    /// Zone pubkey (x-only hex) sealed to.
+    pub pubkey: String,
+    /// Admin that granted the key to the sealer.
+    pub granted_by: String,
 }
 
 /// Why a state file could not be used.
@@ -186,6 +203,7 @@ impl State {
             relay: relay.to_string(),
             migrator: migrator.to_string(),
             entries: BTreeMap::new(),
+            unanchored_zones: BTreeMap::new(),
         }
     }
 
@@ -240,6 +258,29 @@ impl State {
         }
         Ok(state)
     }
+}
+
+/// A leftover `<state>.tmp` from a save that was killed before its rename.
+/// The real file is still the last complete save, so the leftover is never
+/// used; it is moved aside to `<state>.tmp.stale-<unix seconds>` (kept for
+/// inspection, never deleted) so the next save starts clean. Returns the new
+/// path, if there was one.
+pub fn set_aside_stale_tmp(path: &Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    if !tmp.exists() {
+        return Ok(None);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut aside = tmp.as_os_str().to_owned();
+    aside.push(format!(".stale-{now}"));
+    let aside = std::path::PathBuf::from(aside);
+    std::fs::rename(&tmp, &aside)?;
+    Ok(Some(aside))
 }
 
 /// Load a state file; `Ok(None)` if it does not exist yet.

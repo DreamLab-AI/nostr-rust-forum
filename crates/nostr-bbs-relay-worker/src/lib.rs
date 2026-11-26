@@ -467,6 +467,9 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
     if path == "/api/admin/aliases" && method == Method::Get {
         return user_admin::handle_aliases_list(&req, env).await;
     }
+    if path == "/api/admin/alias/delete" && method == Method::Post {
+        return user_admin::handle_alias_delete(req, env).await;
+    }
     if path == "/api/admin/alias" && method == Method::Post {
         return user_admin::handle_alias_set(req, env).await;
     }
@@ -579,8 +582,10 @@ async fn handle_channel_zone_upsert(mut req: Request, env: &Env) -> Result<Respo
     };
 
     let channel_id = match &body.channel_id {
+        // Stored ids are lowercase hex and zone lookups match exactly
+        // (finding 3): store the binding lowercased.
         Some(c) if !c.is_empty() && c.len() <= 128 && c.bytes().all(|b| b.is_ascii_hexdigit()) => {
-            c.clone()
+            c.to_ascii_lowercase()
         }
         _ => {
             return json_response(
@@ -678,31 +683,42 @@ async fn handle_channel_zone_upsert(mut req: Request, env: &Env) -> Result<Respo
 }
 
 /// The statements that keep seeded probes out of `event_tags` (DDD §6
-/// invariant 7, FR6.4), mirroring migration 0006.
+/// invariant 7, FR6.4), mirroring migration 0006, and that keep
+/// `event_tags.created_at` in step with `events.created_at` for paged reads.
 ///
 /// `event_tags` backs every `#tag` REQ filter, so one `probe` row there lets any
 /// client enumerate the seeded probes by subscription and destroys the catch
 /// rate they exist to measure.
 ///
 /// The blinding lives in the tag-WRITING trigger, not in a second trigger
-/// watching it. `event_tags` is written only by `trg_event_tags_ai` (0004), an
-/// `AFTER INSERT ON events`; in SQLite a trigger fired by a modification made
-/// inside another trigger runs only under `PRAGMA recursive_triggers = ON`,
-/// which defaults OFF and is set nowhere here. A watcher trigger therefore never
-/// fired for the only path that writes probe rows: the control read as
-/// enforcement and was inert. Filtering at the source needs no recursion.
+/// watching it. `event_tags` is written only by the `trg_event_tags_ai*`
+/// writer, an `AFTER INSERT ON events`; in SQLite a trigger fired by a
+/// modification made inside another trigger runs only under
+/// `PRAGMA recursive_triggers = ON`, which defaults OFF and is set nowhere
+/// here. A watcher trigger therefore never fired for the only path that writes
+/// probe rows: the control read as enforcement and was inert. Filtering at the
+/// source needs no recursion.
 ///
-/// Order matters: drop the old writer, create the filtering one, keep the
-/// watcher for any other writer, then purge rows written before any of this
-/// existed. The last statement is the one the original migration failed to
-/// mirror here, so a deployed relay kept every probe row it had already indexed.
-pub(crate) const PROBE_BLIND_STMTS: [&str; 4] = [
+/// The writer is versioned so a deployed relay upgrades in place: 0004 created
+/// `trg_event_tags_ai`, 0006 and earlier boots `trg_event_tags_ai_v2`, and v3
+/// also copies `NEW.created_at` (the column [`EVENT_TAGS_TIME_COLUMN_SQL`] adds)
+/// and writes each distinct `(name, value)` pair of an event once, so the
+/// per-value branches of `relay_do::filter::build_filter_query` never see the
+/// same event twice. Exactly one writer exists after the sequence; it runs in
+/// one D1 batch (a transaction), so no insert lands between the drop of the old
+/// writer and the creation of the new one. Rows written before v3 have
+/// `created_at = 0` until migration 0015 backfills them.
+///
+/// Order matters: drop the old writers, create v3, keep the watcher for any
+/// other writer, then purge probe rows written before any of this existed.
+pub(crate) const PROBE_BLIND_STMTS: [&str; 5] = [
     "DROP TRIGGER IF EXISTS trg_event_tags_ai",
-    "CREATE TRIGGER IF NOT EXISTS trg_event_tags_ai_v2 AFTER INSERT ON events \
+    "DROP TRIGGER IF EXISTS trg_event_tags_ai_v2",
+    "CREATE TRIGGER IF NOT EXISTS trg_event_tags_ai_v3 AFTER INSERT ON events \
      BEGIN \
-       INSERT INTO event_tags (event_id, name, value) \
-       SELECT NEW.id, json_extract(je.value, '$[0]'), \
-              COALESCE(json_extract(je.value, '$[1]'), '') \
+       INSERT INTO event_tags (event_id, name, value, created_at) \
+       SELECT DISTINCT NEW.id, json_extract(je.value, '$[0]'), \
+              COALESCE(json_extract(je.value, '$[1]'), ''), NEW.created_at \
        FROM json_each(NEW.tags) je \
        WHERE json_type(je.value) = 'array' \
          AND json_extract(je.value, '$[0]') IS NOT NULL \
@@ -712,6 +728,62 @@ pub(crate) const PROBE_BLIND_STMTS: [&str; 4] = [
      AFTER INSERT ON event_tags WHEN NEW.name = 'probe' \
      BEGIN DELETE FROM event_tags WHERE event_id = NEW.event_id AND name = 'probe'; END",
     "DELETE FROM event_tags WHERE name = 'probe'",
+];
+
+/// Adds `event_tags.created_at`, which the v3 writer in [`PROBE_BLIND_STMTS`]
+/// fills. Run before that sequence; the duplicate-column error on every later
+/// boot is ignored, as for the `events` ALTERs.
+pub(crate) const EVENT_TAGS_TIME_COLUMN_SQL: &str =
+    "ALTER TABLE event_tags ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0";
+
+/// Whether a `pubkey_aliases` table definition (its `sqlite_master.sql`) is
+/// the earlier shape with `new_pubkey` as the primary key, which allowed one
+/// predecessor per successor. Whitespace and case insensitive.
+pub(crate) fn pubkey_aliases_need_upgrade(table_sql: &str) -> bool {
+    let squashed: String = table_sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    squashed.contains("new_pubkey text primary key")
+}
+
+/// Rebuild `pubkey_aliases` with `old_pubkey` as the primary key (also
+/// migration 0016), keys lowercased (and enforced by CHECK) and self-links
+/// dropped. Rows are copied oldest first with REPLACE, so a key that
+/// the earlier shape linked to several successors keeps its LATEST link (an
+/// old key now resolves to exactly one successor). Idempotent: on the new
+/// shape it rebuilds the same rows.
+pub(crate) const PUBKEY_ALIASES_UPGRADE_STMTS: [&str; 6] = [
+    "DROP TABLE IF EXISTS pubkey_aliases_v2",
+    "CREATE TABLE pubkey_aliases_v2 (\
+        old_pubkey TEXT PRIMARY KEY NOT NULL CHECK (old_pubkey = lower(old_pubkey)), \
+        new_pubkey TEXT NOT NULL CHECK (new_pubkey = lower(new_pubkey)), \
+        created_by TEXT NOT NULL, \
+        created_at INTEGER NOT NULL, \
+        reason TEXT)",
+    "INSERT OR REPLACE INTO pubkey_aliases_v2 (old_pubkey, new_pubkey, created_by, created_at, reason) \
+     SELECT lower(old_pubkey), lower(new_pubkey), created_by, created_at, reason FROM pubkey_aliases \
+     WHERE lower(old_pubkey) <> lower(new_pubkey) \
+     ORDER BY created_at ASC, rowid ASC",
+    "DROP TABLE pubkey_aliases",
+    "ALTER TABLE pubkey_aliases_v2 RENAME TO pubkey_aliases",
+    "CREATE INDEX IF NOT EXISTS idx_pubkey_aliases_new ON pubkey_aliases(new_pubkey)",
+];
+
+/// The indexes that let a paged history read stop after `limit` rows.
+///
+/// - `idx_event_tags_time` delivers one tag value's rows newest-first and
+///   covers the join key, so a `#e:[channel]` page walks about `limit` index
+///   entries instead of every message in the channel and sorting them.
+/// - `idx_events_kind_time` does the same for a filter with one kind and no
+///   tag (the client's kind-42 catch-all).
+///
+/// `CREATE INDEX IF NOT EXISTS` builds each once per database.
+pub(crate) const PAGING_INDEX_STMTS: [&str; 2] = [
+    "CREATE INDEX IF NOT EXISTS idx_event_tags_time \
+     ON event_tags(name, value, created_at, event_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_kind_time ON events(kind, created_at)",
 ];
 
 /// The `events` table, as `relay_do/storage.rs` writes it. `d_tag` and
@@ -1341,10 +1413,12 @@ async fn ensure_schema(env: &Env) -> bool {
         // inheritance is modelled as an alias: a newly-joining `new_pubkey` is
         // linked to a prior `old_pubkey` so the DISPLAY layer attributes the new
         // key's posts under the prior handle and cohorts can be inherited.
-        // `new_pubkey` is the PK (a joining key maps to at most one prior id).
+        // `old_pubkey` is the PK: a replaced key has exactly one successor, a
+        // successor may replace several keys (see PUBKEY_ALIASES_UPGRADE_STMTS
+        // for deployments created with the earlier new_pubkey PK).
         "CREATE TABLE IF NOT EXISTS pubkey_aliases (\
-            new_pubkey TEXT PRIMARY KEY NOT NULL, \
-            old_pubkey TEXT NOT NULL, \
+            old_pubkey TEXT PRIMARY KEY NOT NULL CHECK (old_pubkey = lower(old_pubkey)), \
+            new_pubkey TEXT NOT NULL CHECK (new_pubkey = lower(new_pubkey)), \
             created_by TEXT NOT NULL, \
             created_at INTEGER NOT NULL, \
             reason TEXT\
@@ -1383,10 +1457,47 @@ async fn ensure_schema(env: &Env) -> bool {
         }
     }
 
-    // DDD §6 invariant 7 — probe blinding. Ordered, so run as its own sequence
-    // rather than folded into the unordered `create_stmts` above.
-    for stmt in PROBE_BLIND_STMTS {
+    // DDD §6 invariant 7 — probe blinding, and the tag writer that keeps
+    // `event_tags.created_at` for paged reads. Ordered, so run as its own
+    // sequence rather than folded into the unordered `create_stmts` above, and
+    // as one batch so the writer swap is atomic. Should the batch fail (no
+    // `event_tags` yet on a database built without migrations), the statements
+    // run one by one with errors ignored, as they always did.
+    let _ = db.prepare(EVENT_TAGS_TIME_COLUMN_SQL).run().await;
+    let blind: Vec<D1PreparedStatement> =
+        PROBE_BLIND_STMTS.iter().map(|s| db.prepare(*s)).collect();
+    if let Err(e) = db.batch(blind).await {
+        console_error!("ensure_schema: tag writer batch failed, running singly: {e}");
+        for stmt in PROBE_BLIND_STMTS {
+            let _ = db.prepare(stmt).run().await;
+        }
+    }
+    for stmt in PAGING_INDEX_STMTS {
         let _ = db.prepare(stmt).run().await;
+    }
+
+    // pubkey_aliases: rebuild a table created with the earlier new_pubkey
+    // primary key (one predecessor per successor) as old_pubkey-keyed, in one
+    // batch, keeping every row (a key replaced twice keeps its latest link).
+    #[derive(serde::Deserialize)]
+    struct TableSql {
+        sql: Option<String>,
+    }
+    let shape = db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pubkey_aliases'")
+        .first::<TableSql>(None)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.sql);
+    if shape.as_deref().is_some_and(pubkey_aliases_need_upgrade) {
+        let stmts: Vec<D1PreparedStatement> = PUBKEY_ALIASES_UPGRADE_STMTS
+            .iter()
+            .map(|s| db.prepare(*s))
+            .collect();
+        if let Err(e) = db.batch(stmts).await {
+            console_error!("ensure_schema: pubkey_aliases upgrade failed: {e}");
+        }
     }
 
     // --- Indexes (idempotent via IF NOT EXISTS) ---
@@ -1422,9 +1533,8 @@ async fn ensure_schema(env: &Env) -> bool {
         "CREATE INDEX IF NOT EXISTS idx_governance_receipts_stage ON governance_receipts(stage)",
         "CREATE INDEX IF NOT EXISTS idx_governance_receipts_request ON governance_receipts(request_event_id)",
         "CREATE INDEX IF NOT EXISTS idx_governance_receipts_signer ON governance_receipts(signer_pubkey)",
-        // Task #7: reverse lookup old_pubkey -> new_pubkey for display/cohort
-        // resolution (the forward new_pubkey lookup uses the PK).
-        "CREATE INDEX IF NOT EXISTS idx_pubkey_aliases_old ON pubkey_aliases(old_pubkey)",
+        // Task #7: a successor's predecessors (old_pubkey is the PK).
+        "CREATE INDEX IF NOT EXISTS idx_pubkey_aliases_new ON pubkey_aliases(new_pubkey)",
         // ADR-2011 (migration 0006). `idx_broker_cases_pending_age` serves the
         // ageing sweep's state filter; the sweep orders by a computed deadline
         // expression, which SQLite cannot index, so this narrows rather than
@@ -1835,7 +1945,7 @@ mod probe_blinding_tests {
         // writer needs no recursion.
         let writer = PROBE_BLIND_STMTS
             .iter()
-            .find(|s| s.contains("trg_event_tags_ai_v2"))
+            .find(|s| s.contains("CREATE TRIGGER IF NOT EXISTS trg_event_tags_ai_v3"))
             .expect("a replacement tag-writing trigger exists");
         let w = squash(writer);
         assert!(w.contains("AFTER INSERT ON events"));
@@ -1855,7 +1965,12 @@ mod probe_blinding_tests {
             PROBE_BLIND_STMTS[0], "DROP TRIGGER IF EXISTS trg_event_tags_ai",
             "the old writer must be dropped first"
         );
-        assert!(PROBE_BLIND_STMTS[1].contains("trg_event_tags_ai_v2"));
+        // v2 (0006 and earlier boots) is superseded by v3 the same way.
+        assert_eq!(
+            PROBE_BLIND_STMTS[1], "DROP TRIGGER IF EXISTS trg_event_tags_ai_v2",
+            "the v2 writer must be dropped before v3 exists"
+        );
+        assert!(PROBE_BLIND_STMTS[2].contains("CREATE TRIGGER IF NOT EXISTS trg_event_tags_ai_v3"));
     }
 
     #[test]
@@ -1875,8 +1990,14 @@ mod probe_blinding_tests {
     #[test]
     fn every_live_statement_is_mirrored_in_migration_0006() {
         // The mirror claim is now checkable rather than asserted in a comment.
+        // The versioned writer is the exception: 0006 carries v2, the boot
+        // path replaces it with v3 (same probe predicate, asserted above, plus
+        // `created_at`), so the writer statements are not expected in 0006.
         let migration = squash(MIGRATION_0006);
-        for stmt in PROBE_BLIND_STMTS {
+        for stmt in PROBE_BLIND_STMTS
+            .iter()
+            .filter(|s| !s.contains("trg_event_tags_ai"))
+        {
             assert!(
                 migration.contains(&squash(stmt)),
                 "migration 0006 does not carry: {}",
@@ -1900,6 +2021,173 @@ mod probe_blinding_tests {
                 >= 3,
             "blinding must be enforced at the writer, the watcher and the purge"
         );
+    }
+}
+
+#[cfg(test)]
+mod event_tags_time_tests {
+    //! The boot-time upgrade of `event_tags` for paged reads, run against
+    //! SQLite with the real migration files: one writer after any number of
+    //! boots, `created_at` copied, duplicates and probes kept out, and the
+    //! one-off backfill (0015) fixing rows written before the upgrade.
+    use super::{
+        EVENTS_CREATE_SQL, EVENT_TAGS_TIME_COLUMN_SQL, PAGING_INDEX_STMTS, PROBE_BLIND_STMTS,
+    };
+    use rusqlite::{params, Connection};
+
+    const MIGRATION_0004: &str = include_str!("../migrations/0004_event_tags.sql");
+    const MIGRATION_0015: &str = include_str!("../migrations/0015_event_tags_time_backfill.sql");
+
+    /// The v2 writer exactly as 0006 and the previous `ensure_schema` made it.
+    const LEGACY_V2: &str =
+        "CREATE TRIGGER IF NOT EXISTS trg_event_tags_ai_v2 AFTER INSERT ON events \
+     BEGIN \
+       INSERT INTO event_tags (event_id, name, value) \
+       SELECT NEW.id, json_extract(je.value, '$[0]'), \
+              COALESCE(json_extract(je.value, '$[1]'), '') \
+       FROM json_each(NEW.tags) je \
+       WHERE json_type(je.value) = 'array' \
+         AND json_extract(je.value, '$[0]') IS NOT NULL \
+         AND json_extract(je.value, '$[0]') <> 'probe'; \
+     END";
+
+    /// A database as a deployed relay has it before this change: 0009, 0004,
+    /// then the v2 writer in place of 0004's.
+    fn legacy_db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(EVENTS_CREATE_SQL).unwrap();
+        c.execute_batch(MIGRATION_0004).unwrap();
+        c.execute_batch("DROP TRIGGER IF EXISTS trg_event_tags_ai")
+            .unwrap();
+        c.execute_batch(LEGACY_V2).unwrap();
+        c
+    }
+
+    /// The `ensure_schema` sequence for `event_tags`, in its order: the
+    /// ALTER (error ignored), the writer batch as one transaction, the indexes.
+    fn boot(c: &Connection) {
+        let _ = c.execute_batch(EVENT_TAGS_TIME_COLUMN_SQL);
+        c.execute_batch("BEGIN").unwrap();
+        for s in PROBE_BLIND_STMTS {
+            c.execute_batch(s).unwrap();
+        }
+        c.execute_batch("COMMIT").unwrap();
+        for s in PAGING_INDEX_STMTS {
+            c.execute_batch(s).unwrap();
+        }
+    }
+
+    fn insert(c: &Connection, id: &str, created_at: i64, tags: &str) {
+        c.execute(
+            "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) \
+             VALUES (?1, 'pk', ?2, 42, ?3, 'x', 'sig')",
+            params![id, created_at, tags],
+        )
+        .unwrap();
+    }
+
+    fn writers(c: &Connection) -> Vec<String> {
+        let mut s = c
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' \
+                 AND tbl_name = 'events' AND name LIKE 'trg_event_tags_ai%' ORDER BY name",
+            )
+            .unwrap();
+        s.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn tag_rows(c: &Connection, id: &str) -> Vec<(String, String, i64)> {
+        let mut s = c
+            .prepare(
+                "SELECT name, value, created_at FROM event_tags WHERE event_id = ?1 \
+                 ORDER BY name, value",
+            )
+            .unwrap();
+        s.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    const TAGS: &str = r#"[["e","chan"],["e","chan"],["p","bob"],["probe","1"]]"#;
+
+    #[test]
+    fn repeated_boots_leave_exactly_the_v3_writer() {
+        let c = legacy_db();
+        boot(&c);
+        boot(&c);
+        boot(&c);
+        assert_eq!(writers(&c), vec!["trg_event_tags_ai_v3".to_string()]);
+    }
+
+    #[test]
+    fn the_v3_writer_copies_created_at_once_per_pair_and_blinds_probes() {
+        let c = legacy_db();
+        boot(&c);
+        boot(&c);
+        insert(&c, "new", 1_700_000_123, TAGS);
+        assert_eq!(
+            tag_rows(&c, "new"),
+            vec![
+                ("e".into(), "chan".into(), 1_700_000_123),
+                ("p".into(), "bob".into(), 1_700_000_123),
+            ],
+            "one row per distinct pair, with the event's time, and no probe"
+        );
+    }
+
+    #[test]
+    fn the_paging_indexes_exist_after_boot() {
+        let c = legacy_db();
+        boot(&c);
+        for name in ["idx_event_tags_time", "idx_events_kind_time"] {
+            let n: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{name} missing");
+        }
+    }
+
+    #[test]
+    fn migration_0015_backfills_and_dedupes_rows_from_before_the_upgrade() {
+        let c = legacy_db();
+        insert(&c, "old", 1_600_000_000, TAGS);
+        boot(&c);
+        // Written by v2: no time, and the repeated e tag twice.
+        assert_eq!(
+            tag_rows(&c, "old"),
+            vec![
+                ("e".into(), "chan".into(), 0),
+                ("e".into(), "chan".into(), 0),
+                ("p".into(), "bob".into(), 0),
+            ]
+        );
+        insert(&c, "new", 1_700_000_000, TAGS);
+        c.execute_batch(MIGRATION_0015).unwrap();
+        assert_eq!(
+            tag_rows(&c, "old"),
+            vec![
+                ("e".into(), "chan".into(), 1_600_000_000),
+                ("p".into(), "bob".into(), 1_600_000_000),
+            ]
+        );
+        assert_eq!(tag_rows(&c, "new").len(), 2, "v3 rows are untouched");
+        // Idempotent: a second run changes nothing.
+        let before: i64 = c
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        c.execute_batch(MIGRATION_0015).unwrap();
+        let after: i64 = c
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "a second run must not write");
     }
 }
 
@@ -2388,5 +2676,178 @@ mod tombstone_tests {
             vec![(30023, A.to_string(), "post".to_string(), 100)],
             "own addressable refs only: not another author's, a regular kind, or a malformed kind"
         );
+    }
+}
+
+#[cfg(test)]
+mod pubkey_alias_many_to_one_tests {
+    //! pubkey_aliases keyed by old_pubkey: several old keys -> one successor,
+    //! an old key -> exactly one successor, upgraded in place from the 0003
+    //! shape without losing rows.
+    use super::{pubkey_aliases_need_upgrade, PUBKEY_ALIASES_UPGRADE_STMTS};
+    use rusqlite::{params, Connection};
+
+    const MIGRATION_0003: &str = include_str!("../migrations/0003_pubkey_aliases.sql");
+    const MIGRATION_0016: &str = include_str!("../migrations/0016_pubkey_aliases_many_to_one.sql");
+
+    fn table_sql(c: &Connection) -> String {
+        c.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pubkey_aliases'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn upgrade(c: &Connection) {
+        if pubkey_aliases_need_upgrade(&table_sql(c)) {
+            c.execute_batch("BEGIN").unwrap();
+            for s in PUBKEY_ALIASES_UPGRADE_STMTS {
+                c.execute_batch(s).unwrap();
+            }
+            c.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    /// The handler's guarded upsert (user_admin.rs); returns rows written.
+    fn try_link(c: &Connection, old: &str, new: &str, at: i64) -> usize {
+        c.execute(
+            crate::user_admin::ALIAS_UPSERT_GUARDED_SQL,
+            params![new, old, "admin", at, Option::<String>::None],
+        )
+        .unwrap()
+    }
+
+    fn link(c: &Connection, old: &str, new: &str, at: i64) {
+        assert_eq!(try_link(c, old, new, at), 1, "{old} -> {new}");
+    }
+
+    fn successors(c: &Connection) -> Vec<(String, String)> {
+        let mut s = c
+            .prepare("SELECT old_pubkey, new_pubkey FROM pubkey_aliases ORDER BY old_pubkey")
+            .unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.into(), b.into())
+    }
+
+    #[test]
+    fn the_0003_shape_is_detected_and_the_new_one_is_not() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        assert!(pubkey_aliases_need_upgrade(&table_sql(&c)));
+        upgrade(&c);
+        assert!(!pubkey_aliases_need_upgrade(&table_sql(&c)));
+    }
+
+    #[test]
+    fn upgrading_keeps_every_row_and_the_latest_link_of_a_twice_replaced_key() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        // 0003 shape: new_pubkey PK; one old key linked to two successors.
+        for (new, old, at) in [("live1", "a", 1), ("live2", "b", 2), ("live3", "a", 3)] {
+            c.execute(
+                "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at) VALUES (?1, ?2, 'x', ?3)",
+                params![new, old, at],
+            )
+            .unwrap();
+        }
+        upgrade(&c);
+        assert_eq!(successors(&c), vec![pair("a", "live3"), pair("b", "live2")]);
+        // Re-running is harmless (ensure_schema skips; 0016 rebuilds the same rows).
+        upgrade(&c);
+        c.execute_batch(MIGRATION_0016).unwrap();
+        assert_eq!(successors(&c), vec![pair("a", "live3"), pair("b", "live2")]);
+    }
+
+    #[test]
+    fn the_guarded_write_refuses_chains_and_loops_at_write_time() {
+        // Review C2: the guards are re-checked in the INSERT itself, so a
+        // call that passed its reads before another committed cannot chain.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        upgrade(&c);
+        link(&c, "a", "b", 1);
+        assert_eq!(try_link(&c, "b", "a", 2), 0, "loop b -> a refused");
+        assert_eq!(try_link(&c, "b", "c", 3), 0, "chain a -> b -> c refused");
+        assert_eq!(
+            try_link(&c, "x", "a", 4),
+            0,
+            "successor a is itself replaced"
+        );
+        assert_eq!(successors(&c), vec![pair("a", "b")]);
+    }
+
+    #[test]
+    fn keys_are_stored_lowercase_and_the_upgrade_normalises_old_rows() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        for (new, old, at) in [("LIVE", "Arch", 1), ("same", "SAME", 2)] {
+            c.execute(
+                "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at) VALUES (?1, ?2, 'x', ?3)",
+                params![new, old, at],
+            )
+            .unwrap();
+        }
+        upgrade(&c);
+        assert_eq!(
+            successors(&c),
+            vec![pair("arch", "live")],
+            "lowercased, self-link dropped"
+        );
+        // Review C1: a mixed-case key can no longer be stored.
+        assert!(c
+            .execute(
+                "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at) VALUES ('ok', 'MIXED', 'x', 1)",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn several_old_keys_resolve_to_one_successor_and_relinking_moves_one() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        upgrade(&c);
+        // The operator's three old keys and Jezbot's two.
+        for old in ["op1", "op2", "op3"] {
+            link(&c, old, "bfcf20d4", 10);
+        }
+        link(&c, "jez1", "jezlive", 11);
+        link(&c, "jez2", "jezlive", 12);
+        assert_eq!(successors(&c).len(), 5, "no predecessor overwritten");
+        let preds: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pubkey_aliases WHERE new_pubkey = 'bfcf20d4'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(preds, 3);
+        // An old key has exactly one successor: re-linking replaces it.
+        link(&c, "op3", "other", 13);
+        let s: String = c
+            .query_row(
+                "SELECT new_pubkey FROM pubkey_aliases WHERE old_pubkey = 'op3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s, "other");
+        assert_eq!(successors(&c).len(), 5);
+        // The predecessor lookup is served by the index.
+        let plan: String = c
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT old_pubkey FROM pubkey_aliases WHERE new_pubkey = 'x'",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_pubkey_aliases_new"), "{plan}");
     }
 }

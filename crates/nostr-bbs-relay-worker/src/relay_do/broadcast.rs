@@ -60,6 +60,18 @@ fn protected_recipients(event: &NostrEvent) -> Option<Vec<String>> {
 /// WebSocket, and a snapshot of its (sub_id, filters) subscriptions.
 type DeliveryCandidate = (Option<String>, WebSocket, Vec<(String, Vec<NostrFilter>)>);
 
+/// Whether live delivery of `kind` must pass the per-recipient read gate
+/// (`authorize_event`), as REQ does. Zone-scoped channel kinds (40
+/// definitions, 41 metadata, 42 content), NIP-52 calendar and kanban kinds.
+/// Kind 41 was missing (review F5): REQ withheld Hidden-zone channel
+/// metadata but the live push served it to any `{"kinds":[41]}` subscriber.
+pub(crate) fn needs_read_gate(kind: u64) -> bool {
+    matches!(kind, 40..=42)
+        || super::nip_handlers::is_reference_kind(kind)
+        || calendar_projection::is_projected_calendar_kind(kind)
+        || nostr_bbs_core::is_kanban_kind(kind)
+}
+
 impl NostrRelayDO {
     pub(crate) async fn broadcast_event(&self, event: &NostrEvent) {
         // NIP-59: kind-1059 (Sealed DMs) must only be delivered to the session
@@ -74,10 +86,7 @@ impl NostrRelayDO {
         // kanban boards/cards) require the per-recipient read gate. Everything
         // else broadcasts to every matching subscriber as before, so the common
         // hot path adds no async work.
-        let needs_gate = event.kind == 40
-            || event.kind == 42
-            || calendar_projection::is_projected_calendar_kind(event.kind)
-            || nostr_bbs_core::is_kanban_kind(event.kind);
+        let needs_gate = needs_read_gate(event.kind);
 
         // Snapshot delivery candidates so we never hold the `sessions` borrow
         // across the async zone/cohort lookups in the read gate below.
@@ -547,5 +556,21 @@ mod tests {
             Some("anyone-authed"),
             AuthMode::Nip42
         ));
+    }
+}
+
+#[cfg(test)]
+mod read_gate_kind_tests {
+    use super::needs_read_gate;
+
+    #[test]
+    fn every_zone_scoped_channel_kind_is_gated_live() {
+        for kind in [40, 41, 42] {
+            assert!(needs_read_gate(kind), "kind {kind}");
+        }
+        for kind in [7, 1111, 1984] {
+            assert!(needs_read_gate(kind), "reference kind {kind} (F4)");
+        }
+        assert!(!needs_read_gate(1), "an ordinary note is not zone-scoped");
     }
 }

@@ -57,6 +57,13 @@ pub struct BootProfile {
     pub zone: String,
     /// Unix seconds when the bake was consented to and performed.
     pub created_at: i64,
+    /// x-only hex pubkey of the baked identity (public). Optional and
+    /// omitted when absent, so profiles written before it existed still
+    /// parse. Lets the app notice that the signed-in account no longer
+    /// matches the bake (an account switch) and re-bake instead of
+    /// adopting the old account on the next launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
 }
 
 impl BootProfile {
@@ -67,7 +74,14 @@ impl BootProfile {
             mode: BOOTPROFILE_MODE.to_string(),
             zone,
             created_at,
+            pubkey: None,
         }
+    }
+
+    /// The same profile, bound to the identity `pubkey` (64-hex).
+    pub fn with_pubkey(mut self, pubkey: String) -> Self {
+        self.pubkey = Some(pubkey);
+        self
     }
 
     /// Structural validity — version, mode, non-blank zone, sane timestamp.
@@ -76,6 +90,10 @@ impl BootProfile {
             && self.mode == BOOTPROFILE_MODE
             && !self.zone.trim().is_empty()
             && self.created_at > 0
+            && self
+                .pubkey
+                .as_deref()
+                .is_none_or(|p| p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit()))
     }
 }
 
@@ -143,6 +161,24 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let back = parse_boot_profile(&json).expect("roundtrip");
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn pubkey_is_optional_and_backward_compatible() {
+        // A profile written before the field existed still parses.
+        let old = r#"{"v":1,"mode":"zone-app","zone":"z","created_at":5}"#;
+        let p = parse_boot_profile(old).expect("old profile parses");
+        assert_eq!(p.pubkey, None);
+        // A bound profile round-trips; an unbound one omits the field.
+        let bound = BootProfile::new("z".into(), 5).with_pubkey("ab".repeat(32));
+        let json = serde_json::to_string(&bound).unwrap();
+        assert_eq!(parse_boot_profile(&json), Some(bound));
+        assert!(!serde_json::to_string(&BootProfile::new("z".into(), 5))
+            .unwrap()
+            .contains("pubkey"));
+        // A malformed pubkey invalidates the profile.
+        let bad = BootProfile::new("z".into(), 5).with_pubkey("xyz".into());
+        assert!(!bad.validate());
     }
 
     #[test]

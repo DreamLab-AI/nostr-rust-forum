@@ -78,7 +78,7 @@ WHERE pubkey = ?2 AND kind = ?4 AND id <> ?1 \
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-pub(super) struct EventRow {
+pub(crate) struct EventRow {
     id: String,
     pubkey: String,
     created_at: f64,
@@ -89,7 +89,7 @@ pub(super) struct EventRow {
 }
 
 impl EventRow {
-    pub(super) fn into_nostr_event(self) -> Option<NostrEvent> {
+    pub(crate) fn into_nostr_event(self) -> Option<NostrEvent> {
         let tags: Vec<Vec<String>> = serde_json::from_str(&self.tags).ok()?;
         Some(NostrEvent {
             id: self.id,
@@ -338,6 +338,68 @@ impl NostrRelayDO {
         }
     }
 
+    /// Run a tag-scoped message count (`filter::build_channel_count`): the
+    /// per-channel groups `(own channel, n)`, and the exception rows (those
+    /// with an `expiration` tag) with NIP-40 expiry already applied as in
+    /// [`Self::query_events`]. Exception rows are capped at
+    /// `MAX_ROWS_PER_FRAME` (the same DoS bound as every read); they are
+    /// normally none. `None` when D1 is unavailable or a statement fails, so
+    /// the caller can fall back to the generic path.
+    pub(crate) async fn count_channel_messages(
+        &self,
+        q: &filter::ChannelCountQueries,
+    ) -> Option<(Vec<(String, u64)>, Vec<NostrEvent>)> {
+        #[derive(Deserialize)]
+        struct Group {
+            ch: Option<String>,
+            n: f64,
+        }
+        let db = self.env.d1("DB").ok()?;
+        let bind = |p: &[filter::SqlParam]| -> Vec<JsValue> {
+            p.iter()
+                .map(|p| match p {
+                    filter::SqlParam::Text(s) => JsValue::from_str(s),
+                    filter::SqlParam::Int(n) => JsValue::from_f64(*n as f64),
+                })
+                .collect()
+        };
+        let groups: Vec<Group> = db
+            .prepare(&q.grouped.sql)
+            .bind(&bind(&q.grouped.params))
+            .ok()?
+            .all()
+            .await
+            .ok()?
+            .results()
+            .ok()?;
+        let groups = groups
+            .into_iter()
+            .filter_map(|g| g.ch.map(|ch| (ch, g.n as u64)))
+            .collect();
+
+        let sql = format!("{} LIMIT {}", q.exceptions.sql, MAX_ROWS_PER_FRAME);
+        let rows: Vec<EventRow> = db
+            .prepare(&sql)
+            .bind(&bind(&q.exceptions.params))
+            .ok()?
+            .all()
+            .await
+            .ok()?
+            .results()
+            .ok()?;
+        let now = auth::js_now_secs();
+        let exceptions = rows
+            .into_iter()
+            .filter_map(EventRow::into_nostr_event)
+            .filter(|event| {
+                !filter::tag_value(event, "expiration")
+                    .and_then(|exp| exp.parse::<u64>().ok())
+                    .is_some_and(|exp_ts| exp_ts < now)
+            })
+            .collect();
+        Some((groups, exceptions))
+    }
+
     pub(crate) async fn query_events(&self, filters: &[NostrFilter]) -> Vec<NostrEvent> {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
@@ -357,45 +419,26 @@ impl NostrRelayDO {
                 break;
             }
 
-            let mut conditions: Vec<String> = Vec::new();
-            let mut params: Vec<JsValue> = Vec::new();
-            let mut param_idx = 1u32;
-
-            let tag_driver =
-                Self::build_filter_conditions(filter, &mut conditions, &mut params, &mut param_idx);
-
-            let where_clause = if conditions.is_empty() {
-                String::new()
-            } else {
-                format!("WHERE {}", conditions.join(" AND "))
-            };
-
             let limit = filter
                 .limit
                 .unwrap_or(500)
                 .min(MAX_QUERY_LIMIT)
                 .min(rows_budget);
             rows_budget -= limit;
-            let limit_placeholder = format!("?{param_idx}");
-            params.push(JsValue::from_f64(limit as f64));
 
-            // With a tag filter, drive from the event_tags subquery: CROSS
-            // JOIN pins it as the outer loop, so cost is O(tag matches) — one
-            // covering-index read per match plus a PK lookup — instead of
-            // walking the whole kind per REQ (see build_filter_conditions).
-            let sql = match &tag_driver {
-                Some(driver) => format!(
-                    "SELECT id, pubkey, created_at, kind, tags, content, sig \
-                     FROM {driver} m CROSS JOIN events ON events.id = m.event_id \
-                     {where_clause} \
-                     ORDER BY created_at DESC LIMIT {limit_placeholder}"
-                ),
-                None => format!(
-                    "SELECT id, pubkey, created_at, kind, tags, content, sig \
-                     FROM events {where_clause} \
-                     ORDER BY created_at DESC LIMIT {limit_placeholder}"
-                ),
-            };
+            // One statement per filter; see `filter::build_filter_query` for
+            // how a tag filter walks `idx_event_tags_time` newest-first so a
+            // page costs about `limit` rows, not the whole channel.
+            let query = filter::build_filter_query(filter, limit);
+            let sql = query.sql;
+            let params: Vec<JsValue> = query
+                .params
+                .iter()
+                .map(|p| match p {
+                    filter::SqlParam::Text(s) => JsValue::from_str(s),
+                    filter::SqlParam::Int(n) => JsValue::from_f64(*n as f64),
+                })
+                .collect();
 
             let result = match db.prepare(&sql).bind(&params) {
                 Ok(stmt) => match stmt.all().await {

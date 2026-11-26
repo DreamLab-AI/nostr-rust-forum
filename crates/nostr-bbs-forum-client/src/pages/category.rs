@@ -90,6 +90,7 @@ pub fn CategoryPage() -> impl IntoView {
     // Copy for the zone-first breadcrumb (ADR-107); `ZoneAccess` is `Copy`.
     let za_breadcrumb = zone_access;
     let store = use_channel_store();
+    let relay_for_totals = StoredValue::new(expect_context::<RelayConnection>());
     let toasts = use_toasts();
 
     let params = use_params_map();
@@ -594,7 +595,10 @@ pub fn CategoryPage() -> impl IntoView {
                         // modal seeded with that section's current metadata.
                         let is_admin = za_admin.get();
                         let cards: Vec<_> = secs.iter().map(|s| {
-                            let mc = store.count_for(&s.id);
+                            // True total (relay COUNT + live since), not
+                            // the size of the history window held.
+                            relay_for_totals.with_value(|r| store.request_total(r, &s.id));
+                            let mc = store.total_for(&s.id);
                             let la = last_active.get(&s.id).copied().unwrap_or(0);
                             let on_edit = if is_admin {
                                 let meta = s.clone();
@@ -684,13 +688,21 @@ async fn publish_topic_root(
         .ok_or_else(|| "Not authenticated".to_string())?;
 
     let now = (js_sys::Date::now() / 1000.0) as u64;
-    // NIP-10 root marker pointing at the section channel (kind-40) id.
-    let mut tags = vec![vec![
-        "e".to_string(),
-        section_channel_id.to_string(),
-        String::new(),
-        "root".to_string(),
-    ]];
+    // NIP-10 root marker pointing at the section channel (kind-40) id, and
+    // the topic marker that lists the root in the section's root list
+    // (`#t:["topic"]`), as sealed roots are.
+    let mut tags = vec![
+        vec![
+            "e".to_string(),
+            section_channel_id.to_string(),
+            String::new(),
+            "root".to_string(),
+        ],
+        vec![
+            "t".to_string(),
+            nostr_bbs_core::sealed::TOPIC_MARKER.to_string(),
+        ],
+    ];
     // @handles typed into the topic title/body get ["p", pubkey] tags so
     // mentioned users / agents (e.g. @junkiejarvis) are addressable and
     // reachable via the relay's #p-filtered subscriptions.

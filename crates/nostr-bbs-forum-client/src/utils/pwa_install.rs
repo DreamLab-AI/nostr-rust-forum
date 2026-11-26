@@ -223,8 +223,91 @@ pub fn ios_instructions() -> [&'static str; 3] {
 /// re-establishes your identity once. UK English.
 pub fn ios_rebind_note() -> &'static str {
     "On iPhone and iPad the app keeps its own separate storage, so the first \
-     time you open it you'll confirm once — a passkey tap, or pasting your \
-     recovery key. After that it opens straight into your zone."
+     time you open it you sign in once more: tap Scan your sheet, or use a \
+     passkey or your recovery key. After that it opens straight into your zone."
+}
+
+/// The scan-again instruction shown after the iOS Add-to-Home-Screen steps
+/// in the post-sign-in onboarding. UK English.
+pub fn ios_scan_again_note() -> &'static str {
+    "Then open the new app and tap \"Scan your sheet\". Your iPhone keeps the \
+     app's sign-in separate from Safari, so you scan the same code once more \
+     inside the app."
+}
+
+/// Whether the page runs as an installed app (home-screen / standalone
+/// display mode): `display-mode: standalone` (or `fullscreen` /
+/// `minimal-ui`), or iOS Safari's legacy `navigator.standalone`.
+pub fn is_standalone() -> bool {
+    let Some(w) = web_sys::window() else {
+        return false;
+    };
+    let mode = |q: &str| {
+        w.match_media(q)
+            .ok()
+            .flatten()
+            .map(|m| m.matches())
+            .unwrap_or(false)
+    };
+    if mode("(display-mode: standalone)")
+        || mode("(display-mode: fullscreen)")
+        || mode("(display-mode: minimal-ui)")
+    {
+        return true;
+    }
+    js_sys::Reflect::get(&w.navigator(), &"standalone".into())
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// The user's answer to a shown install prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptOutcome {
+    /// No stashed prompt was available.
+    Unavailable,
+    /// The browser reported `accepted`.
+    Accepted,
+    /// Dismissed, or the outcome could not be read.
+    Dismissed,
+}
+
+/// Like [`trigger_prompt`], but reports the user's choice by reading the
+/// event's `userChoice.outcome`, so the caller can undo a bake when the
+/// install is dismissed (no durable key should sit at rest without an app).
+pub async fn trigger_prompt_outcome() -> PromptOutcome {
+    let event = DEFERRED_PROMPT.with(|slot| slot.borrow_mut().take());
+    let Some(event) = event else {
+        return PromptOutcome::Unavailable;
+    };
+    installable().set(false);
+    let event: JsValue = event.take().into();
+    let Some(func) = js_sys::Reflect::get(&event, &"prompt".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+    else {
+        return PromptOutcome::Unavailable;
+    };
+    if func.call0(&event).is_err() {
+        return PromptOutcome::Unavailable;
+    }
+    let Some(choice) = js_sys::Reflect::get(&event, &"userChoice".into())
+        .ok()
+        .and_then(|c| c.dyn_into::<js_sys::Promise>().ok())
+    else {
+        return PromptOutcome::Dismissed;
+    };
+    match JsFuture::from(choice).await {
+        Ok(v) => match js_sys::Reflect::get(&v, &"outcome".into())
+            .ok()
+            .and_then(|o| o.as_string())
+            .as_deref()
+        {
+            Some("accepted") => PromptOutcome::Accepted,
+            _ => PromptOutcome::Dismissed,
+        },
+        Err(_) => PromptOutcome::Dismissed,
+    }
 }
 
 /// Coarse browser family for install-guidance copy. UA sniffing is acceptable
@@ -350,6 +433,7 @@ mod tests {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         }
     }
 
@@ -367,6 +451,7 @@ mod tests {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         }
     }
 
@@ -457,5 +542,8 @@ mod tests {
             .any(|s| s.contains("Add to Home Screen")));
         let note = ios_rebind_note();
         assert!(note.contains("passkey") && note.contains("recovery key"));
+        assert!(note.contains("Scan your sheet"));
+        let again = ios_scan_again_note();
+        assert!(again.contains("Scan your sheet") && again.contains("separate from Safari"));
     }
 }

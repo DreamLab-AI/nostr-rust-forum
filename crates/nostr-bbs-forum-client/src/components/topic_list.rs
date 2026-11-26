@@ -26,7 +26,7 @@ use crate::utils::format_relative_time;
 use crate::utils::slug_hash::{section_slug, topic_slug};
 
 /// A single topic (kind-42 root) plus its derived thread stats.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopicSummary {
     /// The kind-42 root event id (the thread anchor).
     pub id: String,
@@ -158,6 +158,12 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
     // Lower-cased views for the parent walk: the root ids, and every event
     // by id, so each hop is a lookup and not a scan of the channel.
     let root_lower: HashSet<String> = roots.keys().map(|k| k.to_lowercase()).collect();
+    // Lower-cased id -> stored id, so attributing a reply is a lookup rather
+    // than a scan of every root (quadratic over a paged-in channel).
+    let root_by_lower: HashMap<String, String> = roots
+        .keys()
+        .map(|k| (k.to_lowercase(), k.clone()))
+        .collect();
     let by_id: HashMap<String, &NostrEvent> =
         events.iter().map(|e| (e.id.to_lowercase(), e)).collect();
 
@@ -192,7 +198,10 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
         if !root_lower.contains(&root_key) {
             continue; // orphaned reply: its chain never reaches a root here
         }
-        if let Some((_, summary)) = roots.iter_mut().find(|(k, _)| k.to_lowercase() == root_key) {
+        if let Some(summary) = root_by_lower
+            .get(&root_key)
+            .and_then(|id| roots.get_mut(id))
+        {
             summary.reply_count += 1;
             if ev.created_at > summary.last_activity {
                 summary.last_activity = ev.created_at;
@@ -208,6 +217,29 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
         .collect();
     out.sort_by_key(|b| std::cmp::Reverse(b.last_activity));
     out
+}
+
+/// Fold the relay's per-topic stats into window-derived summaries: the
+/// reply count becomes the exact total when that is larger (the window may
+/// hold a fraction of the topic), and a newer reply than any held sets the
+/// last activity and last participant. Re-sorted, newest activity first.
+/// `stats` returns (exact total, newest reply as (created_at, author)).
+pub fn with_topic_stats(
+    mut topics: Vec<TopicSummary>,
+    mut stats: impl FnMut(&TopicSummary) -> (u32, Option<(u64, String)>),
+) -> Vec<TopicSummary> {
+    for t in &mut topics {
+        let (total, latest) = stats(t);
+        t.reply_count = t.reply_count.max(total);
+        if let Some((ts, pk)) = latest {
+            if ts > t.last_activity {
+                t.last_activity = ts;
+                t.last_pubkey = pk;
+            }
+        }
+    }
+    topics.sort_by_key(|b| std::cmp::Reverse(b.last_activity));
+    topics
 }
 
 /// Render the section as a list of topic rows.
@@ -226,11 +258,15 @@ pub fn TopicList(
     let category = StoredValue::new(category);
     let section_hash = StoredValue::new(section_hash);
 
+    // The outer view tracks only EMPTINESS, so it re-renders when the list
+    // becomes empty or non-empty, never per change: re-running it per change
+    // built a fresh <For> and re-rendered every row on each page of history.
+    let is_empty = Memo::new(move |_| topics.with(Vec::is_empty));
+
     view! {
         <div class="space-y-2">
             {move || {
-                let rows = topics.get();
-                if rows.is_empty() {
+                if is_empty.get() {
                     view! {
                         <div class="flex flex-col items-center justify-center py-16 text-center">
                             <div class="w-14 h-14 rounded-full bg-gray-800 flex items-center justify-center mb-4 animate-gentle-float">
@@ -243,15 +279,23 @@ pub fn TopicList(
                         </div>
                     }.into_any()
                 } else {
-                    rows.into_iter().map(|t| {
-                        let href = base_href(&format!(
-                            "/forums/{}/{}/{}",
-                            category.get_value(),
-                            section_hash.get_value(),
-                            topic_slug(&t.id),
-                        ));
-                        view! { <TopicRow topic=t href=href /> }
-                    }).collect_view().into_any()
+                    // Keyed: a page of older topics renders only its own
+                    // rows; a row re-renders when what it shows changes.
+                    view! {
+                        <For
+                            each=move || topics.get()
+                            key=|t| (t.id.clone(), t.reply_count, t.last_activity, t.content.len(), t.last_pubkey.clone())
+                            children=move |t| {
+                                let href = base_href(&format!(
+                                    "/forums/{}/{}/{}",
+                                    category.get_value(),
+                                    section_hash.get_value(),
+                                    topic_slug(&t.id),
+                                ));
+                                view! { <TopicRow topic=t href=href /> }
+                            }
+                        />
+                    }.into_any()
                 }
             }}
         </div>
@@ -289,8 +333,10 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
     // so the card stays one click target, while an author's abridged key (no
     // profile name) sits above that overlay as its own click-to-copy button —
     // never a button nested inside a link.
+    // Scroll anchor for history paging (utils/scroll_anchor.rs).
+    let anchor_id = topic.id.clone();
     view! {
-        <div class="relative block bg-gray-800/60 hover:bg-gray-800 border border-gray-700/60 hover:border-amber-500/30 rounded-lg p-4 text-inherit transition-colors group">
+        <div data-anchor-id=anchor_id class="relative block bg-gray-800/60 hover:bg-gray-800 border border-gray-700/60 hover:border-amber-500/30 rounded-lg p-4 text-inherit transition-colors group">
             <div class="flex items-start gap-3">
                 <div class="flex-shrink-0 mt-0.5">
                     <Avatar pubkey=pk size=AvatarSize::Md />
@@ -515,5 +561,55 @@ mod tests {
         assert_eq!(topic_title(""), "(untitled topic)");
         let long: String = "x".repeat(200);
         assert!(topic_title(&long).ends_with('\u{2026}'));
+    }
+
+    fn summary(id: &str, replies: u32, last: u64, last_pk: &str) -> TopicSummary {
+        TopicSummary {
+            id: id.into(),
+            pubkey: "root".into(),
+            content: id.into(),
+            created_at: 1,
+            reply_count: replies,
+            last_activity: last,
+            last_pubkey: last_pk.into(),
+        }
+    }
+
+    #[test]
+    fn exact_totals_and_newest_reply_replace_window_figures() {
+        // Wartracker: 26 replies held in the window, ~24k on the relay, its
+        // newest reply newer than anything held; a quiet topic is untouched.
+        let topics = vec![
+            summary("quiet", 3, 500, "ann"),
+            summary("wartracker", 26, 100, "bob"),
+        ];
+        let out = with_topic_stats(topics, |t| match t.id.as_str() {
+            "wartracker" => (24_013, Some((900, "cat".to_string()))),
+            _ => (3, Some((400, "old".to_string()))),
+        });
+        assert_eq!(out[0].id, "wartracker", "re-sorted by true activity");
+        assert_eq!(
+            (
+                out[0].reply_count,
+                out[0].last_activity,
+                out[0].last_pubkey.as_str()
+            ),
+            (24_013, 900, "cat")
+        );
+        assert_eq!(
+            (
+                out[1].reply_count,
+                out[1].last_activity,
+                out[1].last_pubkey.as_str()
+            ),
+            (3, 500, "ann"),
+            "an older relay answer never replaces a newer held reply"
+        );
+    }
+
+    #[test]
+    fn stats_not_in_yet_leave_the_window_figures() {
+        let out = with_topic_stats(vec![summary("t", 5, 50, "dan")], |_| (0, None));
+        assert_eq!((out[0].reply_count, out[0].last_activity), (5, 50));
     }
 }

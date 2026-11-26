@@ -2,9 +2,13 @@
 //!
 //! One card per zone whose `ZONE_CONFIG` entry has `"encrypted": true`:
 //! create the first key, grant it to members who are missing it, or rotate to
-//! a new epoch. Grants are NIP-59 gift wraps sealed by this admin; which
-//! members hold a key can only be known for grants sent from this device, so
-//! the card says exactly that. Agents (cohort `agent`) receive a key only in a
+//! a new epoch. Grants are NIP-59 gift wraps sealed by this admin. The relay
+//! cannot be asked who holds a key (wraps are readable only by their
+//! recipient and signed by throwaway keys), so "granted" is this admin's own
+//! ledger: kept on this device and backed up to the relay, encrypted to the
+//! admin ([`crate::zone_crypto::grant_backup`]), so it survives clearing site
+//! data. Grants sent by another admin, or before the backup existed, read as
+//! "missing" until re-granted; re-sending is harmless. Agents (cohort `agent`) receive a key only in a
 //! zone configured with `agent_keys`. Granting to a member who is missing the
 //! current key can also send the earlier keys this admin holds, so someone
 //! who joins after a rotation can read the zone's history.
@@ -231,25 +235,47 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         crate::zone_crypto::keyset::MintPlan::Mint { epoch, .. } => epoch.to_string(),
         _ => "…".into(),
     };
+    // Refused (or displaced) keys for this zone, with the key held for the
+    // same slot when there is one: (offered, held pubkey).
     let zone_conflicts = move || {
         let zone_id = zone.with_value(|z| z.id.clone());
+        let held = keys.keys.get();
         keys.conflicts.with(|v| {
             v.iter()
-                .filter(|(z, _, _)| *z == zone_id)
-                .map(|(_, e, by)| (*e, by.clone()))
+                .filter(|r| r.key.zone == zone_id)
+                .filter_map(|r| {
+                    let h = held.get(&r.key.store_id())?;
+                    crate::zone_crypto::conflicts(h, &r.key).then(|| (r.clone(), h.pubkey.clone()))
+                })
                 .collect::<Vec<_>>()
         })
     };
 
     // Reload "granted from this device" whenever the current epoch changes.
+    let relay_for_ledger = relay.clone();
     Effect::new(move |_| {
         let Some(key) = latest() else {
             sent.set(HashSet::new());
             return;
         };
+        let relay = relay_for_ledger.clone();
+        let signer = auth.get_signer();
         spawn_local(async move {
-            let s = keys.grants_sent(&key.zone, key.epoch).await;
-            sent.set(s);
+            // Show what this device knows straight away, then fold in the
+            // relay-held record (grants sent before site data was cleared, or
+            // from another browser of this admin) and show that.
+            sent.set(keys.grants_sent(&key.zone, key.epoch).await);
+            if let Some(signer) = signer {
+                if let Ok(n) = crate::zone_crypto::grant_backup::pull(
+                    &relay, &*signer, keys, &key.zone, key.epoch,
+                )
+                .await
+                {
+                    if n > 0 {
+                        let _ = sent.try_set(keys.grants_sent(&key.zone, key.epoch).await);
+                    }
+                }
+            }
         });
     });
 
@@ -506,6 +532,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
     let grant = StoredValue::new_local(grant);
     let fresh_roster = StoredValue::new_local(fresh_roster);
 
+    let relay_btn = StoredValue::new_local(relay.clone());
     let title = zone.with_value(|z| {
         if z.display_name.is_empty() {
             z.id.clone()
@@ -549,10 +576,15 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                                     let history = include_history.get_untracked();
                                     let zone_id = zone.with_value(|z| z.id.clone());
                                     let held = keys.all_for_zone(&zone_id);
+                                    let relay_btn = relay_btn.get_value();
+                                    let signer_btn = auth.get_signer();
                                     spawn_local(async move {
                                         let mut earlier = std::collections::HashMap::new();
                                         if history {
                                             for k in &held {
+                                                if let Some(sg) = &signer_btn {
+                                                    let _ = crate::zone_crypto::grant_backup::pull(&relay_btn, &**sg, keys, &k.zone, k.epoch).await;
+                                                }
                                                 earlier.insert(k.epoch, keys.grants_sent(&k.zone, k.epoch).await);
                                             }
                                         }
@@ -584,6 +616,31 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 </label>
             })}
 
+            {move || {
+                let missing = keys.unheld_epochs(&zone.with_value(|z| z.id.clone()));
+                (!missing.is_empty() && keys_ready()).then(|| {
+                    let list = missing.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
+                    view! {
+                        <div class="flex flex-wrap items-center gap-2 text-sm text-amber-300">
+                            <span>{format!(
+                                "Messages here use key epoch {list}, which this device does not hold. A grant for it may already be waiting on the relay: re-check before creating or rotating a key."
+                            )}</span>
+                            <button
+                                class="px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-xs"
+                                on:click=move |_| {
+                                    let asked = keys.recheck_grants();
+                                    status.set(Some(if asked {
+                                        "Asked the relay for your grants again. A key found is adopted automatically.".into()
+                                    } else {
+                                        "Not connected to the relay yet; try again in a moment.".into()
+                                    }));
+                                }
+                            >"Re-check grants"</button>
+                        </div>
+                    }
+                })
+            }}
+
             {move || match mint_plan() {
                 crate::zone_crypto::keyset::MintPlan::Mint { note: Some(note), .. }
                 | crate::zone_crypto::keyset::MintPlan::Blocked(note) => Some(view! {
@@ -595,12 +652,49 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             {move || {
                 let c = zone_conflicts();
                 (!c.is_empty()).then(|| view! {
-                    <p class="text-sm text-red-300" role="alert">
-                        {c.iter().map(|(e, by)| format!(
-                            "Refused a second, different key for epoch {e} from {}…: this device keeps the one it already holds. Someone created that epoch from a device without it.",
-                            by.get(..8).unwrap_or(by)
-                        )).collect::<Vec<_>>().join(" ")}
-                    </p>
+                    <div class="space-y-2" role="alert">
+                        {c.into_iter().map(|(entry, held_pk)| {
+                            let offered = entry.key.clone();
+                            let short = |s: &str| s.get(..8).unwrap_or(s).to_string();
+                            let origin = if entry.displaced {
+                                "the key used before".to_string()
+                            } else {
+                                format!("granted by {}…", short(&offered.granted_by))
+                            };
+                            let text = format!(
+                                "Two different keys for epoch {}: this device uses {}…; {}… ({}) was set aside. Posts that \"could not be decrypted\" usually mean the key in use is the stale one.",
+                                offered.epoch,
+                                short(&held_pk),
+                                short(&offered.pubkey),
+                                origin,
+                            );
+                            let label = if entry.displaced { "Use the earlier key" } else { "Use the granted key" };
+                            view! {
+                                <div class="flex flex-wrap items-center gap-2 text-sm text-red-300">
+                                    <span>{text}</span>
+                                    <button
+                                        class="px-2 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-200 text-xs"
+                                        on:click=move |_| {
+                                            let entry = entry.clone();
+                                            spawn_local(async move {
+                                                let key = entry.key.clone();
+                                                match keys.use_refused(&entry).await {
+                                                    Ok(()) => status.set(Some(format!(
+                                                        "Now using {}… for epoch {}; the other key is kept here in case you need it back.",
+                                                        key.pubkey.get(..8).unwrap_or(&key.pubkey),
+                                                        key.epoch
+                                                    ))),
+                                                    Err(why) => status.set(Some(why)),
+                                                }
+                                            });
+                                        }
+                                    >
+                                        {label}
+                                    </button>
+                                </div>
+                            }
+                        }).collect_view()}
+                    </div>
                 })
             }}
 
@@ -612,7 +706,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 {move || {
                     let t = targets().len();
                     let s = sent.with(|s| targets().iter().filter(|pk| s.contains(*pk)).count());
-                    format!("{s} of {t} eligible members granted from this device (including you).")
+                    format!("{s} of {t} eligible members recorded as granted by you (including you). Grants sent by other admins show as missing.")
                 }}
             </p>
 

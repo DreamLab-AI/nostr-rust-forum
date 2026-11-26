@@ -8,6 +8,9 @@
 --   * cohort/access can be INHERITED (the new whitelist row copies the old
 --     pubkey's cohorts at link time — see /api/admin/alias).
 --
+-- SUPERSEDED by 0016 (old_pubkey is the primary key; many old keys -> one
+-- successor). Kept as applied history.
+--
 -- `new_pubkey` is the PRIMARY KEY: a joining key maps to at most one prior
 -- identity; re-linking overwrites. Set/listed via the NIP-98 admin endpoints
 -- POST /api/admin/alias and GET /api/admin/aliases.

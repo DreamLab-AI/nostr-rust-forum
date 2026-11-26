@@ -23,6 +23,13 @@ pub struct ForumConfig {
     /// Zone definitions (display names + access rules).
     #[serde(default)]
     pub zones: Vec<Zone>,
+    /// Pubkeys (64-char lowercase hex) allowed, besides admins, to publish
+    /// sealed search indexes (`pods/<pk>/media/zones/<zone>/search/`) and
+    /// whose signed manifests clients accept. Projected to the pod
+    /// (`SEARCH_ARCHIVISTS`) and the client (`__ENV__.SEARCH_ARCHIVISTS`) from
+    /// this one source.
+    #[serde(default)]
+    pub search_archivists: Vec<String>,
     /// Trust thresholds.
     #[serde(default)]
     pub trust: Trust,
@@ -269,6 +276,52 @@ pub struct Zone {
     /// board entry; the relay gates by zone tag regardless of this flag.
     #[serde(default)]
     pub kanban: bool,
+    /// Search mode for this zone (sealed-search design). Absent ⇒ derived by
+    /// [`Zone::effective_search`]: encrypted → `sealed`, private unencrypted →
+    /// `server`, public → `off`. Validation refuses `server` on an encrypted
+    /// zone (the server would see plaintext), `sealed` on an unencrypted
+    /// zone, and any mode but `off` on a public zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchMode>,
+}
+
+/// Per-zone search mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// No search for this zone.
+    Off,
+    /// Server-side RVF index behind NIP-98 + cohort auth (unencrypted private
+    /// zones only).
+    Server,
+    /// Per-zone index sealed to the zone key, searched in the member's browser
+    /// (encrypted zones).
+    Sealed,
+}
+
+impl SearchMode {
+    /// Lowercase name as projected into `ZONE_CONFIG`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchMode::Off => "off",
+            SearchMode::Server => "server",
+            SearchMode::Sealed => "sealed",
+        }
+    }
+}
+
+impl Zone {
+    /// The search mode in force: the configured one, else the default derived
+    /// from `encrypted` and `visibility`.
+    pub fn effective_search(&self) -> SearchMode {
+        self.search.unwrap_or(if self.encrypted {
+            SearchMode::Sealed
+        } else if self.visibility == ZoneVisibility::Public {
+            SearchMode::Off
+        } else {
+            SearchMode::Server
+        })
+    }
 }
 
 /// Trust system thresholds.

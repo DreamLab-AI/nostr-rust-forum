@@ -19,9 +19,14 @@ path = "src/main.rs"
 [features]
 default = []
 dev-auth = []
+# Heap accounting for memory investigations (src/alloc_stats.rs). Never in release.
+alloc-stats = []
 
 [dependencies]
 nostr-bbs-core = { workspace = true }
+# Sealed per-zone search: manifest verification + key derivation only (no age,
+# no model: those live in the separate search Web Worker).
+nostr-bbs-sealed-search = { path = "../nostr-bbs-sealed-search", version = "0.1.0", default-features = false }
 # `EventBuilder::relay_list` builds the NIP-65 tags for the public-inbox opt-in.
 # Already in the wasm graph through nostr-bbs-core, so no new code ships.
 nostr = { workspace = true }
@@ -50,6 +55,7 @@ js-sys = { workspace = true }
 web-sys = { workspace = true, features = [
     "WebSocket",
     "MessageEvent",
+    "Worker",
     "CloseEvent",
     "ErrorEvent",
     "BinaryType",
@@ -87,6 +93,10 @@ web-sys = { workspace = true, features = [
     "RequestInit",
     # The wallet fetches the mirror's block file with the cache bypassed.
     "RequestCache",
+    # Zone media: CORS fetch without credentials (utils/restricted_media.rs).
+    "RequestMode",
+    "RequestCredentials",
+    "RequestRedirect",
     "Request",
     "Response",
     "PageTransitionEvent",
@@ -144,6 +154,15 @@ web-sys = { workspace = true, features = [
     "Url",
     # /connect magic-link: strip the nsec-bearing fragment from history on mount (ADR-098)
     "History",
+    # In-app "Scan your sheet" (components/sheet_scanner.rs): camera frames
+    # via getUserMedia into a <video>, drawn to a canvas and read back as RGBA.
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamTrack",
+    "MediaStreamConstraints",
+    "HtmlMediaElement",
+    "HtmlVideoElement",
+    "ImageData",
 ] }
 gloo = { workspace = true }
 comrak = { workspace = true }
@@ -170,6 +189,10 @@ bech32 = { workspace = true }
 # Pure-Rust QR generator (no_std-friendly, wasm32-clean). Renders QR codes to
 # SVG strings entirely in-WASM so the nsec never crosses into JS (ADR-095).
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Pure-Rust QR *decoder* for the in-app "Scan your sheet" flow (iOS Safari
+# has no BarcodeDetector). MIT OR Apache-2.0, a port of quirc with no unsafe
+# code; `img` (the image crate) is off: frames arrive as canvas RGBA.
+rqrr = { version = "0.8", default-features = false }
 async-trait = { workspace = true }
 uuid = { version = "1", features = ["js"] }
 # Member wallets on sidestr:dreamlab (testnet4) and DREAM tips (ADR-2015).

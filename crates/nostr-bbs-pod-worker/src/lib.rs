@@ -29,6 +29,7 @@ mod provision;
 mod quota;
 mod remote_storage;
 mod webid;
+mod zone_media;
 
 // JSS Phase 1 staging (ADR-086/087): inert re-export shim for the upstream
 // `export-jsonld` feature. Compiles to an empty surface today; activation is
@@ -323,7 +324,9 @@ fn add_wac_allow(
 /// `max-age=300` with `must-revalidate` since they are mutable Solid pod
 /// resources (profile cards, ACLs, type indexes, etc.).
 fn add_cache_control(headers: &Headers, resource_path: &str) {
-    let value = if resource_path.starts_with("/media/") {
+    let value = if zone_media::classify(resource_path).is_some() {
+        zone_media::ZONE_CACHE_CONTROL
+    } else if resource_path.starts_with("/media/") {
         "public, max-age=31536000, immutable"
     } else {
         "public, max-age=300, must-revalidate"
@@ -361,6 +364,26 @@ fn public_pod_base_url(env: &Env, fallback_origin: &str) -> String {
 }
 
 /// Create a JSON error response with CORS headers.
+/// Answer a failed quota reservation: a real overflow is 413; a busy/locked
+/// or otherwise failing D1 is 503 with Retry-After (transient under load; a
+/// client must not report it as a quota error).
+fn reserve_error(env: &Env, message: &str) -> Result<Response> {
+    match quota::classify_reserve_error(message) {
+        quota::ReserveFailure::OverQuota => json_error(env, message, 413),
+        failure => {
+            let reason = if failure == quota::ReserveFailure::Busy {
+                "storage busy, retry shortly"
+            } else {
+                "storage temporarily unavailable, retry shortly"
+            };
+            let mut resp =
+                json_error_with_reason(env, reason, 503, Some("quota_store_unavailable"))?;
+            resp.headers_mut().set("Retry-After", "2").ok();
+            Ok(resp)
+        }
+    }
+}
+
 fn json_error(env: &Env, message: &str, status: u16) -> Result<Response> {
     json_error_with_reason(env, message, status, None)
 }
@@ -456,19 +479,118 @@ fn json_ok(env: &Env, body: &serde_json::Value, status: u16) -> Result<Response>
     Ok(resp)
 }
 
+/// How often (per isolate) the schema bootstrap and replay prune run.
+const SCHEMA_RECHECK_MS: f64 = 60_000.0;
+
+thread_local! {
+    /// When this isolate last ran the schema bootstrap (ms since epoch).
+    static SCHEMA_CHECKED_AT: std::cell::Cell<f64> =
+        const { std::cell::Cell::new(f64::NEG_INFINITY) };
+}
+
+/// Whether the schema bootstrap is due: never run yet in this isolate, or
+/// last run at least [`SCHEMA_RECHECK_MS`] ago (or the clock went backwards).
+fn schema_check_due(last_ms: f64, now_ms: f64) -> bool {
+    !(now_ms >= last_ms && now_ms - last_ms < SCHEMA_RECHECK_MS)
+}
+
 // Invoked via wasm-bindgen as the worker's wasm entry point; on native builds
 // nothing calls it directly, so it would otherwise be flagged dead-code there.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(fetch)]
-async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
-    payments::ensure_payment_schema(&env, "REPLAY_DB").await;
+async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // Zone media paths get their serving rules applied to EVERY response,
+    // preflights and errors included, so no early return can miss them.
+    let zone_acao = match req.url() {
+        Ok(u) if is_zone_media_route(u.path()) => {
+            let allowed = zone_media::allowed_origins(
+                env.var("ALLOWED_ORIGINS")
+                    .ok()
+                    .map(|v| v.to_string())
+                    .as_deref(),
+                env.var("EXPECTED_ORIGIN")
+                    .ok()
+                    .map(|v| v.to_string())
+                    .as_deref(),
+            );
+            let origin = req.headers().get("Origin").ok().flatten();
+            Some(zone_media::select_origin(&allowed, origin.as_deref()))
+        }
+        _ => None,
+    };
+    match zone_acao {
+        None => fetch_inner(req, env).await,
+        Some(acao) => {
+            let err_env = env.clone();
+            // An internal error on a zone path still leaves through the
+            // finaliser (no-store, origin-scoped CORS), as a plain 500.
+            let resp = match fetch_inner(req, env).await {
+                Ok(resp) => resp,
+                Err(_) => json_error(&err_env, "Internal error", 500)?,
+            };
+            Ok(finalise_zone_response(resp, acao))
+        }
+    }
+}
 
-    // CORS preflight
+/// Whether a request path addresses a zone media container or object.
+fn is_zone_media_route(path: &str) -> bool {
+    parse_pod_route(path).is_some_and(|(_, rp)| zone_media::classify(rp).is_some())
+}
+
+/// Apply the zone serving rules to a response: never cached by anyone but the
+/// requesting browser's memory, varied on the credentials and origin, CORS
+/// reflected only to an allowed origin (no wildcard), no sniffing, no active
+/// content, no cross-site no-cors embedding, and anything that is not an
+/// allow-listed raster type downloaded rather than rendered.
+fn finalise_zone_response(resp: Response, acao: Option<String>) -> Response {
+    let h = resp.headers();
+    h.set("Cache-Control", zone_media::ZONE_CACHE_CONTROL).ok();
+    h.set("Vary", zone_media::ZONE_VARY).ok();
+    h.set("X-Content-Type-Options", "nosniff").ok();
+    h.set("Content-Security-Policy", "default-src 'none'; sandbox")
+        .ok();
+    h.set("Cross-Origin-Resource-Policy", "same-site").ok();
+    match acao {
+        Some(origin) => {
+            h.set("Access-Control-Allow-Origin", &origin).ok();
+        }
+        None => {
+            h.delete("Access-Control-Allow-Origin").ok();
+            h.delete("Access-Control-Allow-Credentials").ok();
+        }
+    }
+    let is_octet = h.get("Content-Type").ok().flatten().is_some_and(|ct| {
+        ct.to_ascii_lowercase()
+            .starts_with("application/octet-stream")
+    });
+    if is_octet {
+        h.set("Content-Disposition", "attachment").ok();
+    }
+    resp
+}
+
+/// The request handler proper; [`fetch`] wraps it with the zone serving rules.
+async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
+    // CORS preflight: answered before any D1 work. A preflight never touches
+    // storage, and every authenticated pod GET (zone media) is preceded by one.
     if req.method() == Method::Options {
         return Ok(Response::empty()?
             .with_status(204)
             .with_headers(cors_headers(&env)));
+    }
+
+    // Idempotent schema bootstrap plus replay-table prune: five D1 statements,
+    // so run them at most once per `SCHEMA_RECHECK_MS` per isolate rather than
+    // on every request. The replay table stays bounded by its 120 s TTL.
+    // The timestamp is set only once both have run, so a request that
+    // arrives during a cold isolate's first bootstrap runs it too rather than
+    // racing ahead of the tables (both are idempotent).
+    let now_ms = js_sys::Date::now();
+    if SCHEMA_CHECKED_AT.with(|t| schema_check_due(t.get(), now_ms)) {
+        nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
+        payments::ensure_payment_schema(&env, "REPLAY_DB").await;
+        SCHEMA_CHECKED_AT.with(|t| t.set(now_ms));
     }
 
     let url = req.url()?;
@@ -630,6 +752,81 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // JSS-compatible pod creation surface: POST /.pods {"name":"<pubkey>"}.
     //
     // Unlike the native server's anonymous development path, the Worker keeps
+    // Admin: set or clear one pod's storage limit (e.g. for a migration's
+    // media backfill). POST {"pubkey": "<hex>", "limit_mb": <n> | null}; null
+    // returns the pod to the configured default (POD_QUOTA_MB). NIP-98 with
+    // body binding and replay protection; static ADMIN_PUBKEYS or the relay
+    // whitelist admin bit. The inbox quota is not affected.
+    if path == "/.quota" {
+        if req.method() != Method::Post {
+            return json_error(&env, "Method not allowed; use POST", 405);
+        }
+        let body = req.bytes().await.unwrap_or_default();
+        let auth_header = req.headers().get("Authorization").ok().flatten();
+        let request_url = url.to_string();
+        let Some(admin) = (match auth_header.as_deref() {
+            Some(header) => {
+                auth::verify_nip98_replay(header, &request_url, "POST", Some(&body), &env)
+                    .await
+                    .ok()
+                    .map(|token| token.pubkey)
+            }
+            None => None,
+        }) else {
+            return json_error(&env, "NIP-98 authentication required", 401);
+        };
+        let static_admin = zone_media::is_static_admin(
+            env.var("ADMIN_PUBKEYS")
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+            &admin,
+        );
+        if !static_admin && !is_admin_user(&env, &admin).await {
+            return json_error(&env, "Admin required", 403);
+        }
+        let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => return json_error(&env, "Invalid JSON body", 400),
+        };
+        let pubkey = parsed
+            .get("pubkey")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !is_valid_worker_pod_name(&pubkey) {
+            return json_error(&env, "pubkey must be a 64-character hex key", 400);
+        }
+        let limit = match parsed.get("limit_mb") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v
+                .as_u64()
+                .and_then(|mb| mb.checked_mul(1024 * 1024))
+                .filter(|b| *b <= quota::MAX_QUOTA)
+            {
+                Some(b) => Some(b),
+                None => {
+                    return json_error(
+                        &env,
+                        "limit_mb must be a whole number of MiB up to 1 TiB, or null",
+                        400,
+                    )
+                }
+            },
+        };
+        let quota_db = env
+            .d1("REPLAY_DB")
+            .map_err(|e| Error::RustError(format!("REPLAY_DB D1 binding missing: {e}")))?;
+        let info =
+            quota::set_quota_d1(&quota_db, &pubkey, limit, quota::default_quota(&env)).await?;
+        console_log!("[pod] admin {admin} set quota for {pubkey}: {:?}", limit);
+        return json_ok(
+            &env,
+            &serde_json::json!({ "pubkey": pubkey, "limit_bytes": info.limit, "used_bytes": info.used, "explicit": limit.is_some() }),
+            200,
+        );
+    }
+
     // creation authenticated and bound to the signing pubkey because its ACLs
     // and DID identities are keyed by did:nostr:<pubkey>.
     if path == "/.pods" {
@@ -971,7 +1168,13 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // Release the freed bytes from the owner's quota (best-effort — a stale
         // quota row must not fail the teardown).
         if bytes_freed > 0 {
-            let _ = quota::update_usage_d1(&quota_db, &owner_pubkey, -bytes_freed).await;
+            let _ = quota::update_usage_d1(
+                &quota_db,
+                &owner_pubkey,
+                -bytes_freed,
+                quota::default_quota(&env),
+            )
+            .await;
         }
 
         return json_ok(
@@ -984,6 +1187,40 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }),
             200,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Zone media gate: `/media/zones/<zone>/<name>` (see `zone_media`).
+    //
+    // Authoritative for the whole prefix and evaluated before any R2 read:
+    // the WAC walk below is skipped for these paths, and a refused requester
+    // gets the same answer whether or not the object exists.
+    // -----------------------------------------------------------------------
+    let zone_path = zone_media::classify(&resource_path);
+    if let Some(ref zp) = zone_path {
+        // One canonical spelling per zone object: lower-case owner hex (a
+        // mixed-case pubkey would otherwise be a separate R2 namespace).
+        if owner_pubkey.bytes().any(|b| b.is_ascii_uppercase()) {
+            return json_error(&env, "Not found", 404);
+        }
+        if let Some(resp) = zone_media_gate(
+            &env,
+            zp,
+            &method,
+            &owner_pubkey,
+            requester_pubkey.as_deref(),
+            nip98_reason.as_deref(),
+            &content_type,
+            req.headers()
+                .get("Content-Length")
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<u64>().ok()),
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1012,15 +1249,20 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // For `.acl` sidecars we coerce write-class methods up to acl:Control so
     // a principal with mere acl:Write cannot escalate by overwriting the
     // sidecar (audit C3). Non-acl resources retain the standard mapping.
-    let required_mode = coerce_required_mode_for_acl(&resource_path, method_str(&method));
-    let acl_doc = find_effective_acl(&bucket, &kv, &owner_pubkey, &resource_path).await;
-
-    let has_access = evaluate_access(
-        acl_doc.as_ref(),
-        agent_uri.as_deref(),
-        &resource_path,
-        required_mode,
-    );
+    let (acl_doc, has_access) = if zone_path.is_some() {
+        // Already decided by the zone gate above; no ACL document applies.
+        (None, true)
+    } else {
+        let required_mode = coerce_required_mode_for_acl(&resource_path, method_str(&method));
+        let acl_doc = find_effective_acl(&bucket, &kv, &owner_pubkey, &resource_path).await;
+        let has_access = evaluate_access(
+            acl_doc.as_ref(),
+            agent_uri.as_deref(),
+            &resource_path,
+            required_mode,
+        );
+        (acl_doc, has_access)
+    };
 
     if !has_access {
         return if requester_pubkey.is_some() {
@@ -1111,8 +1353,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .unwrap_or_else(|| "application/octet-stream".to_string());
             // Recover a real image type for legacy octet-stream uploads so they
             // render in `<img>` (nosniff) and reach the image→ASCII transform.
-            let stored_content_type =
-                refine_image_content_type(&resource_path, stored_content_type);
+            let stored_content_type = match &zone_path {
+                // Zone objects: allow-listed rasters only, never SVG; anything
+                // else is octet-stream (the wrapper adds the attachment header).
+                Some(zone_media::ZoneMediaPath::Object { name, .. })
+                | Some(zone_media::ZoneMediaPath::Search { name, .. }) => {
+                    zone_media::served_content_type(&stored_content_type, name).0
+                }
+                _ => refine_image_content_type(&resource_path, stored_content_type),
+            };
             let obj_content_type = match content_negotiation::negotiate(
                 accept_header.as_deref(),
                 &stored_content_type,
@@ -1199,7 +1448,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     }
                 }
 
-                if ascii_requested(format_param.as_deref(), accept_header.as_deref()) {
+                // Never on zone media: a member viewing a post would otherwise
+                // render server-side ASCII of an image on the poster's terms.
+                if zone_path.is_none()
+                    && ascii_requested(format_param.as_deref(), accept_header.as_deref())
+                {
                     if let Ok(art) = nostr_bbs_ascii::render_bytes(&bytes, &opts) {
                         // We are now emitting HTML built from pod bytes, so apply
                         // the same active-content neutralization the worker uses
@@ -1291,6 +1544,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     413,
                 );
             }
+            if matches!(zone_path, Some(zone_media::ZoneMediaPath::Search { .. }))
+                && data_len > zone_media::MAX_SEARCH_OBJECT_BYTES
+            {
+                return json_error(&env, "Search object exceeds 32 MB", 413);
+            }
 
             // Conditional check: If-Match for safe overwrites
             if let Ok(Some(existing)) = bucket.get(&r2_key).execute().await {
@@ -1309,8 +1567,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
 
             // Atomic quota check + reserve (D1)
-            if let Err(e) = quota::check_and_reserve_d1(&quota_db, &owner_pubkey, data_len).await {
-                return json_error(&env, &e.to_string(), 413);
+            if let Err(e) = quota::check_and_reserve_d1(
+                &quota_db,
+                &owner_pubkey,
+                data_len,
+                quota::default_quota(&env),
+            )
+            .await
+            {
+                return reserve_error(&env, &e.to_string());
             }
 
             // WebID profile: validate HTML with JSON-LD before storing
@@ -1370,6 +1635,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     &owner_pubkey,
                     requester_pubkey.as_deref(),
                     &resource_path,
+                    quota::default_quota(&env),
                 );
                 if let Err(e) = quota::check_and_reserve_with_limit_d1(
                     &quota_db,
@@ -1379,7 +1645,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 )
                 .await
                 {
-                    return json_error(&env, &e.to_string(), 413);
+                    return reserve_error(&env, &e.to_string());
                 }
 
                 bucket
@@ -1429,6 +1695,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 &owner_pubkey,
                 requester_pubkey.as_deref(),
                 &resource_path,
+                quota::default_quota(&env),
             );
             if let Err(e) = quota::check_and_reserve_with_limit_d1(
                 &quota_db,
@@ -1438,7 +1705,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             )
             .await
             {
-                return json_error(&env, &e.to_string(), 413);
+                return reserve_error(&env, &e.to_string());
             }
 
             let child_path = container::resolve_slug(&resource_path, slug_header.as_deref());
@@ -1520,6 +1787,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 &owner_pubkey,
                 requester_pubkey.as_deref(),
                 &resource_path,
+                quota::default_quota(&env),
             );
             if size_delta > 0 {
                 if let Err(e) = quota::check_and_reserve_with_limit_d1(
@@ -1530,7 +1798,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 )
                 .await
                 {
-                    return json_error(&env, &e.to_string(), 413);
+                    return reserve_error(&env, &e.to_string());
                 }
             }
 
@@ -1552,7 +1820,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             // Release quota for shrinkage
             if size_delta < 0 {
-                quota::update_usage_d1(&quota_db, &quota_account, size_delta)
+                quota::update_usage_d1(&quota_db, &quota_account, size_delta, quota_limit)
                     .await
                     .ok();
             }
@@ -1582,14 +1850,20 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             bucket.delete(&r2_key).await?;
 
             // Release quota (negative delta, D1 atomic)
-            let (quota_account, _) = quota::reservation_account(
+            let (quota_account, quota_limit) = quota::reservation_account(
                 &owner_pubkey,
                 requester_pubkey.as_deref(),
                 &resource_path,
+                quota::default_quota(&env),
             );
-            quota::update_usage_d1(&quota_db, &quota_account, -(deleted_size as i64))
-                .await
-                .ok();
+            quota::update_usage_d1(
+                &quota_db,
+                &quota_account,
+                -(deleted_size as i64),
+                quota_limit,
+            )
+            .await
+            .ok();
 
             // Fire notification webhooks (non-blocking)
             notifications::notify_change(&kv, &owner_pubkey, &resource_path, "Delete").await;
@@ -2003,6 +2277,211 @@ fn load_pay_config(env: &Env) -> payments::PayConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Zone media gate
+// ---------------------------------------------------------------------------
+
+/// Decide a request on a zone media path. `Ok(None)` lets the request through
+/// to the ordinary resource handling (with the WAC walk skipped); `Ok(Some)` is
+/// the refusal to return.
+#[allow(clippy::too_many_arguments)]
+async fn zone_media_gate(
+    env: &Env,
+    path: &zone_media::ZoneMediaPath<'_>,
+    method: &Method,
+    owner_pubkey: &str,
+    requester: Option<&str>,
+    nip98_reason: Option<&str>,
+    content_type: &str,
+    content_length: Option<u64>,
+) -> Result<Option<Response>> {
+    use zone_media::{Access, AccessRequest, Decision};
+
+    let method_name = method_str(method);
+    let access = zone_media::access_for_method(method_name);
+    let zones = zone_media::parse_zone_config(
+        env.var("ZONE_CONFIG")
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
+    let static_admin = requester.is_some_and(|pk| {
+        zone_media::is_static_admin(
+            env.var("ADMIN_PUBKEYS")
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+            pk,
+        )
+    });
+    let now = (js_sys::Date::now() / 1000.0) as i64;
+    let archivist = requester.is_some_and(|pk| {
+        zone_media::is_static_admin(
+            env.var("SEARCH_ARCHIVISTS")
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+            pk,
+        )
+    });
+
+    let mut req = AccessRequest {
+        access,
+        owner: owner_pubkey,
+        requester,
+        static_admin,
+        archivist,
+        requester_row: None,
+        device_owner_row: None,
+        zones: zones.as_deref(),
+        now,
+    };
+
+    // Rows only when the decision can depend on them; a failed authority read
+    // refuses (503) rather than guessing.
+    let requester_row;
+    let device_owner_row;
+    if zone_media::needs_whitelist(path, &req) {
+        let Ok(db) = env.d1("RELAY_DB") else {
+            return json_error(env, "Membership authority unavailable", 503).map(Some);
+        };
+        let pk = requester.unwrap_or_default();
+        requester_row = match load_whitelist_row(&db, pk).await {
+            Ok(r) => r,
+            Err(_) => return json_error(env, "Membership authority unavailable", 503).map(Some),
+        };
+        let device_keys_enabled = env
+            .var("DEVICE_KEYS_ENABLED")
+            .map(|v| v.to_string().trim() == "true")
+            .unwrap_or(false);
+        device_owner_row = if device_keys_enabled {
+            match device_owner_of(&db, pk).await {
+                Some(owner) => match load_whitelist_row(&db, &owner).await {
+                    Ok(r) => Some(r),
+                    Err(_) => {
+                        return json_error(env, "Membership authority unavailable", 503).map(Some)
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        req.requester_row = requester_row.as_ref();
+        req.device_owner_row = device_owner_row.as_ref().map(|r| r.as_ref());
+    }
+
+    match zone_media::decide(path, &req) {
+        Decision::Allow => {}
+        Decision::Unauthenticated => {
+            return json_error_with_reason(env, "Authentication required", 401, nip98_reason)
+                .map(Some)
+        }
+        Decision::Forbidden => return json_error(env, "Forbidden", 403).map(Some),
+        Decision::NotFound => return json_error(env, "Not found", 404).map(Some),
+    }
+
+    if access == Access::Write {
+        // Objects in a zone container are written whole (PUT) or removed
+        // (DELETE, its own access class); POST/PATCH have no meaning here.
+        if *method != Method::Put {
+            return json_error(env, "Method not allowed; use PUT or DELETE", 405).map(Some);
+        }
+        if let zone_media::ZoneMediaPath::Search { zone, name } = path {
+            if !zone_media::is_allowed_search_upload_type(content_type, name) {
+                return json_error(
+                    env,
+                    "Search objects: application/octet-stream (.age) or application/json (m.json)",
+                    415,
+                )
+                .map(Some);
+            }
+            if content_length.is_some_and(|n| n > zone_media::MAX_SEARCH_OBJECT_BYTES) {
+                return json_error(env, "Search object exceeds 32 MB", 413).map(Some);
+            }
+            let known = zones
+                .as_deref()
+                .is_some_and(|zs| zs.iter().any(|z| z.id == *zone));
+            if !known {
+                return json_error(env, "Unknown zone", 400).map(Some);
+            }
+            return Ok(None);
+        }
+        if !zone_media::is_allowed_upload_type(content_type) {
+            return json_error(
+                env,
+                "Zone media accepts image/jpeg, image/png, image/webp, image/gif or image/avif",
+                415,
+            )
+            .map(Some);
+        }
+        let zone_known = match path {
+            zone_media::ZoneMediaPath::Object { zone, .. } => zones
+                .as_deref()
+                .is_some_and(|zs| zs.iter().any(|z| z.id == *zone)),
+            _ => false,
+        };
+        if !zone_known {
+            return json_error(env, "Unknown zone", 400).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The relay `whitelist` row for `pubkey` (via `RELAY_DB`), or `None` when
+/// there is none. A D1 error is an `Err`, which the gate turns into a 503.
+async fn load_whitelist_row(
+    db: &D1Database,
+    pubkey: &str,
+) -> std::result::Result<Option<zone_media::WhitelistRow>, String> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        cohorts: Option<String>,
+        is_admin: Option<f64>,
+        suspended_until: Option<f64>,
+        expires_at: Option<f64>,
+    }
+    let stmt = db
+        .prepare(
+            "SELECT cohorts, is_admin, suspended_until, expires_at FROM whitelist WHERE pubkey = ?1",
+        )
+        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
+        .map_err(|e| e.to_string())?;
+    let row = stmt.first::<Row>(None).await.map_err(|e| e.to_string())?;
+    Ok(row.map(|r| zone_media::WhitelistRow {
+        cohorts: r
+            .cohorts
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or_default(),
+        is_admin: r.is_admin.is_some_and(|v| v as i64 == 1),
+        suspended_until: r.suspended_until.map(|v| v as i64),
+        expires_at: r.expires_at.map(|v| v as i64),
+    }))
+}
+
+/// The owner of a registered, unrevoked device key (relay `device_keys`), as
+/// the relay's `device_owner`. A missing table or query error reads as "not a
+/// device", which then needs the key's own whitelist row (fail-safe).
+async fn device_owner_of(db: &D1Database, pubkey: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct OwnerRow {
+        owner_pubkey: String,
+    }
+    let stmt = db
+        .prepare(
+            "SELECT owner_pubkey FROM device_keys WHERE device_pubkey = ?1 AND revoked = 0 LIMIT 1",
+        )
+        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
+        .ok()?;
+    stmt.first::<OwnerRow>(None)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.owner_pubkey)
+        .filter(|o| o.len() == 64 && o.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+// ---------------------------------------------------------------------------
 // Admin check helper
 // ---------------------------------------------------------------------------
 
@@ -2082,6 +2561,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn schema_bootstrap_runs_once_per_window() {
+        assert!(schema_check_due(f64::NEG_INFINITY, 1_000.0));
+        assert!(!schema_check_due(1_000.0, 1_000.0));
+        assert!(!schema_check_due(1_000.0, 60_999.0));
+        assert!(schema_check_due(1_000.0, 61_000.0));
+        // A clock that steps backwards re-arms the check.
+        assert!(schema_check_due(61_000.0, 1_000.0));
+    }
 
     #[test]
     fn refine_image_content_type_recovers_from_octet_stream() {

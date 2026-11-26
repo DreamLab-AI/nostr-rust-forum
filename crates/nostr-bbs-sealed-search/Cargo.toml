@@ -1,0 +1,39 @@
+[package]
+name = "nostr-bbs-sealed-search"
+version = "0.1.0"
+publish = false           # app crate: sealed per-zone search (format, sealing, model); not a crates.io dependency
+edition = "2021"
+description = "Sealed per-zone vector search for end-to-end-encrypted forum zones (browser + builder)"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+rust-version = "1.85"
+
+[features]
+default = ["seal", "model"]
+# age sealing, the resident index and the builder's object encoder.
+seal = ["dep:age", "dep:bech32"]
+# bge-small in candle + the WordPiece tokeniser (browser worker, builder).
+model = ["dep:getrandom3", "dep:candle-core", "dep:candle-nn", "dep:unicode-normalization", "dep:unicode-general-category"]
+
+[dependencies]
+candle-core = { version = "0.9", default-features = false, optional = true }
+candle-nn = { version = "0.9", default-features = false, optional = true }
+age = { version = "0.11", default-features = false, optional = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+unicode-normalization = { version = "0.1", optional = true }
+unicode-general-category = { version = "1", optional = true }
+bech32 = { version = "0.9", optional = true }
+nostr-bbs-core = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true }
+getrandom3 = { package = "getrandom", version = "0.3", features = ["wasm_js"], optional = true }
+
+[dev-dependencies]
+k256 = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

@@ -34,7 +34,7 @@ mod storage;
 
 use crate::auth::AdminCache;
 pub(crate) use mod_cache::ModCache;
-use read_cache::{ActivityLedger, TtlCache, LOOKUP_TTL_SECS};
+use read_cache::{ActivityLedger, TtlCache, LOOKUP_TTL_SECS, NEGATIVE_LOOKUP_TTL_SECS};
 
 #[cfg(feature = "test-exports")]
 #[doc(hidden)]
@@ -88,6 +88,10 @@ pub struct NostrRelayDO {
     pub(crate) state: State,
     pub(crate) env: Env,
     pub(crate) sessions: RefCell<HashMap<u64, SessionInfo>>,
+    /// REQs between their cap check and storing their subscription (see
+    /// [`session::PendingReqs`]): a CLOSE that lands while one awaits
+    /// cancels it, so no orphan subscription is left behind.
+    pub(crate) pending_reqs: RefCell<session::PendingReqs>,
     pub(crate) next_session_id: RefCell<u64>,
     pub(crate) rate_limits: RefCell<HashMap<String, Vec<f64>>>,
     /// Lazily-resolved per-IP message budget per rolling second (EVENT/REQ/
@@ -102,6 +106,14 @@ pub struct NostrRelayDO {
     pub(crate) admin_cache: AdminCache,
     /// ADR-2018: 60s-TTL memo of channel → zone (positive results only).
     pub(crate) channel_zone_cache: TtlCache<String>,
+    /// F4: 60s-TTL memo of a referenced event id -> its channel (`None`: the
+    /// target is stored but not channel-scoped). Unknown targets are not
+    /// cached (they may arrive later).
+    pub(crate) ref_target_cache: TtlCache<Vec<String>>,
+    /// F4: short-TTL memo of referenced ids that resolved to nothing stored.
+    pub(crate) ref_unknown_cache: TtlCache<()>,
+    /// Short-TTL memo of channels with no channel_zones row (finding 4).
+    pub(crate) channel_zone_none_cache: TtlCache<()>,
     /// ADR-2018: 60s-TTL memo of pubkey → (cohorts, whitelist is_admin).
     pub(crate) cohort_cache: TtlCache<(Vec<String>, bool)>,
     /// ADR-2018: 60s-TTL memo of device pubkey → owner (None = not a device key).
@@ -127,6 +139,7 @@ impl DurableObject for NostrRelayDO {
             state,
             env,
             sessions: RefCell::new(HashMap::new()),
+            pending_reqs: RefCell::new(session::PendingReqs::default()),
             next_session_id: RefCell::new(1),
             rate_limits: RefCell::new(HashMap::new()),
             rate_limit_per_sec: std::cell::Cell::new(None),
@@ -134,6 +147,9 @@ impl DurableObject for NostrRelayDO {
             mod_cache: ModCache::new(),
             admin_cache: AdminCache::new(),
             channel_zone_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            ref_target_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            ref_unknown_cache: TtlCache::new(NEGATIVE_LOOKUP_TTL_SECS),
+            channel_zone_none_cache: TtlCache::new(NEGATIVE_LOOKUP_TTL_SECS),
             cohort_cache: TtlCache::new(LOOKUP_TTL_SECS),
             device_owner_cache: TtlCache::new(LOOKUP_TTL_SECS),
             recipient_row_cache: TtlCache::new(LOOKUP_TTL_SECS),
@@ -285,7 +301,7 @@ impl DurableObject for NostrRelayDO {
                 self.handle_event(session_id, &ws, &ip, event).await;
             }
             "REQ" => {
-                let sub_id = match arr[1].as_str() {
+                let sub_id = match arr[1].as_str().filter(|s| sub_id_ok(s)) {
                     Some(s) => s.to_string(),
                     None => {
                         Self::send_notice(&ws, "Invalid subscription ID");
@@ -306,12 +322,16 @@ impl DurableObject for NostrRelayDO {
                 // CLOSE and AUTH are frames too: leaving them off the limiter let
                 // a client flood the DO for free. A CLOSE for a subscription the
                 // session holds is exempt: it only sheds load.
-                let sub_id = arr[1].as_str();
+                let sub_id = arr[1].as_str().filter(|s| sub_id_ok(s));
+                // A REQ still awaiting counts as held: its CLOSE must reach
+                // handle_close to cancel it even when the client is at its
+                // frame budget (review: a rate-limited CLOSE left the orphan).
                 let holds = sub_id.is_some_and(|id| {
                     self.sessions
                         .borrow()
                         .get(&session_id)
                         .is_some_and(|s| s.subscriptions.contains_key(id))
+                        || self.pending_reqs.borrow().contains(session_id, id)
                 });
                 if !close_admitted(holds, || self.check_rate_limit(&ip)) {
                     Self::send_notice(&ws, "rate limit exceeded");
@@ -341,7 +361,7 @@ impl DurableObject for NostrRelayDO {
                 self.handle_auth(session_id, &ws, auth_event).await;
             }
             "COUNT" => {
-                let sub_id = match arr[1].as_str() {
+                let sub_id = match arr[1].as_str().filter(|s| sub_id_ok(s)) {
                     Some(s) => s.to_string(),
                     None => {
                         Self::send_notice(&ws, "Invalid subscription ID");
@@ -467,5 +487,25 @@ mod connection_slot_tests {
         assert!(counts.is_empty());
         release_connection_slot(&mut counts, "9.9.9.9");
         assert!(counts.is_empty());
+    }
+}
+
+/// NIP-01/NIP-11: subscription ids are 1..=64 bytes (`max_subid_length` in
+/// our NIP-11 document). Longer ids were accepted and copied into session
+/// state, pending-REQ keys and persisted subscription records.
+pub(crate) fn sub_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64
+}
+
+#[cfg(test)]
+mod sub_id_tests {
+    use super::sub_id_ok;
+
+    #[test]
+    fn sub_ids_are_one_to_sixty_four_bytes() {
+        assert!(sub_id_ok("a"));
+        assert!(sub_id_ok(&"x".repeat(64)));
+        assert!(!sub_id_ok(""));
+        assert!(!sub_id_ok(&"x".repeat(65)));
     }
 }

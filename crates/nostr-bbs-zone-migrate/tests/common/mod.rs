@@ -118,15 +118,20 @@ pub struct Sink {
 
 impl Sink {
     pub fn run<T>(&mut self, f: impl FnOnce(&mut Hooks<'_>) -> T) -> T {
-        let saves = &mut self.saves;
+        let saves = std::cell::RefCell::new(&mut self.saves);
         let lines = &mut self.lines;
         let mut persist = |s: &State| -> Result<(), StateError> {
-            saves.push(s.clone());
+            saves.borrow_mut().push(s.clone());
+            Ok(())
+        };
+        let mut checkpoint = |s: &State| -> Result<(), StateError> {
+            saves.borrow_mut().push(s.clone());
             Ok(())
         };
         let mut progress = |l: &str| lines.push(l.to_string());
         let mut hooks = Hooks {
             persist: &mut persist,
+            checkpoint: &mut checkpoint,
             progress: &mut progress,
         };
         f(&mut hooks)
@@ -146,6 +151,8 @@ pub struct FakeRelay {
     pub tamper_next_store: bool,
     /// Accept the next event with OK true but do not store it.
     pub drop_next_store: bool,
+    /// Pretend NIP-42 AUTH did not happen.
+    pub unauthenticated: bool,
 }
 
 impl FakeRelay {
@@ -177,11 +184,16 @@ impl FakeRelay {
             && f.kinds.as_ref().is_none_or(|k| k.contains(&ev.kind))
             && tag_match("e", &f.e_tags)
             && tag_match("p", &f.p_tags)
+            && tag_match("zk", &f.zk_tags)
             && f.until.is_none_or(|u| ev.created_at <= u)
     }
 }
 
 impl Relay for FakeRelay {
+    fn session_authenticated(&self) -> bool {
+        !self.unauthenticated
+    }
+
     async fn query(&mut self, filter: &Filter) -> Result<Vec<NostrEvent>, RelayError> {
         self.queries.push(filter.clone());
         let limit = filter.limit.unwrap_or(500).min(MAX_REQ_LIMIT) as usize;

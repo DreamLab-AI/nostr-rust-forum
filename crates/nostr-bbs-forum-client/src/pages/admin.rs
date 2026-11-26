@@ -442,6 +442,12 @@ fn ChannelsTab() -> impl IntoView {
     let admin = use_admin();
     let auth = use_auth();
     let channels = admin.state.channels;
+    let bind_status = admin.state.channel_bind;
+    // Zones the deployment declares (None on a generic kit): only then can a
+    // channel be bound to a zone.
+    let zones = crate::stores::zones::configured_zones();
+    let admin_for_bind = admin.clone();
+    let auth_for_bind = auth;
 
     // Resolved here, in component scope: context is NOT reachable from inside
     // the spawn_local below (no reactive owner), so the store method takes the
@@ -462,6 +468,7 @@ fn ChannelsTab() -> impl IntoView {
                         data.zone,
                         data.cohort.as_deref(),
                         &*signer,
+                        Some(signer.clone()),
                         relay,
                     )
                     .await
@@ -499,6 +506,56 @@ fn ChannelsTab() -> impl IntoView {
                                     let section = if ch.section.is_empty() { "none".to_string() } else { ch.section.clone() };
                                     let section_dot_class = section_color_dot(&section);
                                     let id_short = format!("ID: {}...{}", &ch.id[..8], &ch.id[ch.id.len().saturating_sub(4)..]);
+                                    // Strict: a section that names no configured zone is not bindable.
+                                    let bind_zone = zones.as_ref().and_then(|z| {
+                                        crate::stores::zones::zone_id_for_section(&ch.section, z)
+                                    });
+                                    let bind_row = bind_zone.map(|zone_id| {
+                                        let ch_id = ch.id.clone();
+                                        let status_id = ch.id.clone();
+                                        let admin_b = admin_for_bind.clone();
+                                        let zone_for_click = zone_id.clone();
+                                        let on_bind = move |_| {
+                                            let Some(signer) = auth_for_bind.get_signer() else {
+                                                admin_b.state.error.set(Some("No signer available".into()));
+                                                return;
+                                            };
+                                            let admin_c = admin_b.clone();
+                                            let cid = ch_id.clone();
+                                            let zid = zone_for_click.clone();
+                                            spawn_local(async move {
+                                                let _ = admin_c
+                                                    .bind_channel_zone_signer(&cid, &zid, &*signer)
+                                                    .await;
+                                            });
+                                        };
+                                        view! {
+                                            <div class="flex items-center gap-2 mt-2 flex-wrap">
+                                                {move || match bind_status.with(|m| m.get(&status_id).cloned()) {
+                                                    Some(crate::admin::BindStatus::Bound(z)) => view! {
+                                                        <span class="text-xs text-emerald-400">{format!("Bound to zone {z}")}</span>
+                                                    }.into_any(),
+                                                    Some(crate::admin::BindStatus::Binding) => view! {
+                                                        <span class="text-xs text-gray-400">"Binding\u{2026}"</span>
+                                                    }.into_any(),
+                                                    Some(crate::admin::BindStatus::Failed(e)) => view! {
+                                                        <span class="text-xs text-red-400">{format!("Not bound: {e}")}</span>
+                                                    }.into_any(),
+                                                    None => view! {
+                                                        <span class="text-xs text-gray-500">{format!("Binding to {zone_id} not confirmed in this session")}</span>
+                                                    }.into_any(),
+                                                }}
+                                                <button
+                                                    type="button"
+                                                    on:click=on_bind
+                                                    disabled=move || matches!(bind_status.with(|m| m.get(&ch.id).cloned()), Some(crate::admin::BindStatus::Binding))
+                                                    class="text-xs px-2 py-0.5 rounded border border-amber-500 text-amber-400 hover:bg-amber-500 hover:text-gray-900 disabled:opacity-50 transition-colors"
+                                                >
+                                                    "Bind to zone"
+                                                </button>
+                                            </div>
+                                        }
+                                    });
                                     view! {
                                         <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 hover:border-gray-600 transition-colors">
                                             <h4 class="font-semibold text-white truncate">{ch.name.clone()}</h4>
@@ -512,6 +569,7 @@ fn ChannelsTab() -> impl IntoView {
                                                 </span>
                                                 <span class="text-xs text-gray-600">{id_short}</span>
                                             </div>
+                                            {bind_row}
                                         </div>
                                     }
                                 }).collect_view()}

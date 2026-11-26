@@ -1,0 +1,25 @@
+[package]
+name = "nostr-bbs-sealed-search-worker"
+version = "0.1.0"
+publish = false           # browser Web Worker for sealed per-zone search (built by Trunk as a worker)
+edition = "2021"
+description = "Dedicated Web Worker: on-device query embedding and sealed index search"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+rust-version = "1.85"
+
+[[bin]]
+name = "nostr-bbs-sealed-search-worker"
+path = "src/main.rs"
+
+[dependencies]
+nostr-bbs-sealed-search = { path = "../nostr-bbs-sealed-search", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = ["DedicatedWorkerGlobalScope", "MessageEvent", "Blob", "console"] }

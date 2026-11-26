@@ -103,7 +103,106 @@ struct AliasBody {
     /// new pubkey's whitelist row so the new key inherits zone access.
     #[serde(default = "default_true")]
     inherit_cohorts: bool,
+    /// Alias an old key that is whitelisted in its own right (an account,
+    /// not just a key that signed history). Refused without it.
+    #[serde(default)]
+    force: bool,
+    /// Re-point an old key that already has a DIFFERENT successor. Refused
+    /// without it (a silent overwrite moves someone's history and DMs).
+    #[serde(default)]
+    replace: bool,
+    /// Also merge an `admin` cohort from the old key. Stripped without it.
+    #[serde(default)]
+    inherit_admin_cohort: bool,
 }
+
+/// What the alias guards know about the two keys (see [`alias_refusal`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AliasFacts {
+    /// The old key is a static admin or a config-declared ingress (DM)
+    /// recipient: a system identity, never aliased, even with force.
+    pub old_is_system: bool,
+    /// The old key is a live identity in its own right: a whitelist row, a
+    /// registered device key (or device owner), an active agent.
+    pub old_is_live: bool,
+    /// The old key is itself someone's successor.
+    pub old_is_a_successor: bool,
+    /// The new key is itself replaced.
+    pub new_is_replaced: bool,
+    /// The old key's current successor, if any.
+    pub old_current_successor: Option<String>,
+}
+
+/// Why an alias `old -> new` is refused, if it is. One hop only, so neither
+/// end may already be in a chain: an old key that is itself someone's
+/// successor would leave its own predecessors resolving to it, not to `new`;
+/// a successor that is itself replaced would never be shown. Neither is
+/// overridable. A system identity is never aliased. A live identity hands its
+/// display identity and DMs to `new`, so that takes `force`; re-pointing an
+/// old key already linked elsewhere takes `replace`.
+pub(crate) fn alias_refusal(
+    f: &AliasFacts,
+    new_pk: &str,
+    force: bool,
+    replace: bool,
+) -> Option<&'static str> {
+    if f.old_is_system {
+        return Some("old_pubkey is a static admin or ingress recipient: it cannot be aliased");
+    }
+    if f.old_is_a_successor {
+        return Some(
+            "old_pubkey is itself a successor of other keys: re-point those first (one hop only)",
+        );
+    }
+    if f.new_is_replaced {
+        return Some("new_pubkey is itself replaced by another key: link to its successor instead");
+    }
+    if f.old_is_live && !force {
+        return Some("old_pubkey is a live identity in its own right (whitelist, device or agent): pass force=true to alias it");
+    }
+    if f.old_current_successor
+        .as_deref()
+        .is_some_and(|s| s != new_pk)
+        && !replace
+    {
+        return Some(
+            "old_pubkey already has a different successor: pass replace=true to re-point it",
+        );
+    }
+    None
+}
+
+/// Whether an optional-table check marks a key live: an absent table holds
+/// no identity (false); a present table's failed lookup (`None`) is live
+/// (fail closed); otherwise the lookup's answer.
+pub(crate) fn live_from_optional_lookup(table_present: bool, found: Option<bool>) -> bool {
+    table_present && found.unwrap_or(true)
+}
+
+/// The cohorts inherited from the old key: its whitelist cohorts minus
+/// `admin` unless explicitly allowed. `None` for unparseable JSON.
+pub(crate) fn inheritable_cohorts(cohorts_json: &str, allow_admin: bool) -> Option<String> {
+    let list: Vec<String> = serde_json::from_str(cohorts_json).ok()?;
+    let kept: Vec<String> = list
+        .into_iter()
+        .filter(|c| allow_admin || c != "admin")
+        .collect();
+    serde_json::to_string(&kept).ok()
+}
+
+/// Insert or re-point an alias atomically with the chain guards, so two
+/// concurrent calls cannot create a chain or loop between the guard reads
+/// and the write: the row is written only if `old` is nobody's successor and
+/// `new` is not replaced at write time. Binds: new, old, created_by,
+/// created_at, reason.
+pub(crate) const ALIAS_UPSERT_GUARDED_SQL: &str = "INSERT INTO pubkey_aliases \
+     (new_pubkey, old_pubkey, created_by, created_at, reason) \
+     SELECT ?1, ?2, ?3, ?4, ?5 \
+     WHERE NOT EXISTS (SELECT 1 FROM pubkey_aliases WHERE new_pubkey = ?2) \
+       AND NOT EXISTS (SELECT 1 FROM pubkey_aliases WHERE old_pubkey = ?1) \
+     ON CONFLICT (old_pubkey) DO UPDATE SET \
+        new_pubkey = excluded.new_pubkey, created_by = excluded.created_by, \
+        created_at = excluded.created_at, reason = excluded.reason";
 
 fn default_true() -> bool {
     true
@@ -565,8 +664,10 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
     let body: AliasBody =
         serde_json::from_slice(&body_bytes).map_err(|e| worker::Error::RustError(e.to_string()))?;
 
+    // Keys are stored lowercase: every reader and the client compare exactly
+    // (review C1: a mixed-case key slipped past every guard).
     let old_pk = match body.old_pubkey {
-        Some(ref pk) if valid_pubkey(pk) => pk.clone(),
+        Some(ref pk) if valid_pubkey(pk) => pk.to_ascii_lowercase(),
         _ => {
             return json_response(
                 env,
@@ -576,7 +677,7 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
         }
     };
     let new_pk = match body.new_pubkey {
-        Some(ref pk) if valid_pubkey(pk) => pk.clone(),
+        Some(ref pk) if valid_pubkey(pk) => pk.to_ascii_lowercase(),
         _ => {
             return json_response(
                 env,
@@ -596,54 +697,171 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
     let now = auth::js_now_secs();
     let db = env.d1("DB")?;
 
-    // Persist the alias (new_pubkey is the PK: a joining key maps to at most one
-    // prior identity; re-linking overwrites).
+    // Guards (see alias_refusal). Lookup errors refuse (fail closed).
+    #[derive(Deserialize)]
+    struct N {
+        n: f64,
+    }
+    let exists = |sql: &'static str, pk: String| {
+        let db = &db;
+        async move {
+            db.prepare(sql)
+                .bind(&[js_str(&pk)])?
+                .first::<N>(None)
+                .await
+                .map(|r| r.map_or(0.0, |r| r.n) > 0.0)
+        }
+    };
+    #[derive(Deserialize)]
+    struct Succ {
+        new_pubkey: String,
+    }
+    let static_admin = env
+        .var(nostr_bbs_core::ADMIN_PUBKEYS_VAR)
+        .map(|v| nostr_bbs_core::is_static_admin(&old_pk, &v.to_string()))
+        .unwrap_or(false);
+    let ingress = nostr_bbs_config::ingress::is_ingress_recipient(
+        &crate::ingress::ingress_from_env(env),
+        &old_pk,
+    );
+    // device_keys exists only where device keys were ever used (the auth
+    // worker creates it on first registration, behind DEVICE_KEYS_ENABLED),
+    // and the relay itself treats its absence as "no device keys". An ABSENT
+    // table therefore holds no live identity and its check is skipped; a
+    // lookup on a table that exists and fails still counts as live (fail
+    // closed). Previously a missing table failed every lookup, so every old
+    // key was treated as live and needed force. agent_registry is always
+    // created by ensure_schema, so it stays strict.
+    #[derive(Deserialize)]
+    struct Name {
+        #[allow(dead_code)]
+        name: String,
+    }
+    let device_table = match db
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND lower(name) = 'device_keys'",
+        )
+        .all()
+        .await
+        .and_then(|r| r.results::<Name>())
+    {
+        Ok(rows) => !rows.is_empty(),
+        Err(_) => return json_response(env, &json!({ "error": "Alias lookup failed" }), 503),
+    };
+    let device_live = live_from_optional_lookup(
+        device_table,
+        if device_table {
+            exists(
+                "SELECT COUNT(*) AS n FROM device_keys WHERE (device_pubkey = ?1 OR owner_pubkey = ?1) AND revoked = 0",
+                old_pk.clone(),
+            )
+            .await
+            .ok()
+        } else {
+            None
+        },
+    );
+    let facts = match (
+        exists(
+            "SELECT COUNT(*) AS n FROM whitelist WHERE pubkey = ?1",
+            old_pk.clone(),
+        )
+        .await,
+        device_live,
+        exists(
+            "SELECT COUNT(*) AS n FROM agent_registry WHERE pubkey = ?1 AND active = 1",
+            old_pk.clone(),
+        )
+        .await
+        .unwrap_or(true),
+        exists(
+            "SELECT COUNT(*) AS n FROM pubkey_aliases WHERE new_pubkey = ?1",
+            old_pk.clone(),
+        )
+        .await,
+        exists(
+            "SELECT COUNT(*) AS n FROM pubkey_aliases WHERE old_pubkey = ?1",
+            new_pk.clone(),
+        )
+        .await,
+        db.prepare("SELECT new_pubkey FROM pubkey_aliases WHERE old_pubkey = ?1")
+            .bind(&[js_str(&old_pk)])?
+            .first::<Succ>(None)
+            .await,
+    ) {
+        (Ok(wl), dev, agent, Ok(succ), Ok(repl), Ok(cur)) => AliasFacts {
+            old_is_system: static_admin || ingress,
+            old_is_live: wl || dev || agent,
+            old_is_a_successor: succ,
+            new_is_replaced: repl,
+            old_current_successor: cur.map(|c| c.new_pubkey),
+        },
+        _ => return json_response(env, &json!({ "error": "Alias lookup failed" }), 503),
+    };
+    if let Some(reason) = alias_refusal(&facts, &new_pk, body.force, body.replace) {
+        return json_response(env, &json!({ "error": reason }), 409);
+    }
+
+    // Persist the alias, re-checking the chain guards in the same statement.
     let reason_val = match body.reason.as_deref() {
         Some(r) if !r.is_empty() => js_str(r),
         _ => JsValue::NULL,
     };
-    db.prepare(
-        "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at, reason) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT (new_pubkey) DO UPDATE SET \
-            old_pubkey = excluded.old_pubkey, \
-            created_by = excluded.created_by, \
-            created_at = excluded.created_at, \
-            reason = excluded.reason",
-    )
-    .bind(&[
-        js_str(&new_pk),
-        js_str(&old_pk),
-        js_str(&admin_pubkey),
-        js_f64(now as f64),
-        reason_val,
-    ])?
-    .run()
-    .await?;
+    let written = db
+        .prepare(ALIAS_UPSERT_GUARDED_SQL)
+        .bind(&[
+            js_str(&new_pk),
+            js_str(&old_pk),
+            js_str(&admin_pubkey),
+            js_f64(now as f64),
+            reason_val,
+        ])?
+        .run()
+        .await?
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|m| m.changes)
+        .unwrap_or(0);
+    if written == 0 {
+        return json_response(
+            env,
+            &json!({ "error": "alias would create a chain (changed concurrently): retry" }),
+            409,
+        );
+    }
 
-    // Cohort inheritance: merge the old pubkey's cohorts into the new pubkey's
-    // whitelist row (creating it if absent). Access (which zones the new key can
-    // read/write) is cohort-driven, so this is the realistic "inherit access".
-    // A merge, not a copy: anything the new key was already granted survives.
+    // Cohort inheritance: merge the old pubkey's cohorts (minus `admin`
+    // unless inherit_admin_cohort) into the new pubkey's whitelist row. A
+    // merge, not a copy: anything the new key was already granted survives.
+    // Not reversed on unlink or re-point (documented).
     let mut inherited_cohorts: Option<String> = None;
     if body.inherit_cohorts {
         let stmt = db.prepare("SELECT cohorts FROM whitelist WHERE pubkey = ?1");
         let bound = stmt.bind(&[js_str(&old_pk)])?;
         if let Ok(Some(row)) = bound.first::<CohortsRow>(None).await {
-            let cohorts_json = row.cohorts;
-            db.prepare(WHITELIST_GRANT_COHORTS_SQL)
-                .bind(&[
-                    js_str(&new_pk),
-                    js_str(&cohorts_json),
-                    js_f64(now as f64),
-                    js_str(&admin_pubkey),
-                ])?
-                .run()
-                .await?;
-            inherited_cohorts = Some(cohorts_json);
+            if let Some(cohorts_json) = inheritable_cohorts(&row.cohorts, body.inherit_admin_cohort)
+            {
+                db.prepare(WHITELIST_GRANT_COHORTS_SQL)
+                    .bind(&[
+                        js_str(&new_pk),
+                        js_str(&cohorts_json),
+                        js_f64(now as f64),
+                        js_str(&admin_pubkey),
+                    ])?
+                    .run()
+                    .await?;
+                inherited_cohorts = Some(cohorts_json);
+            }
         }
     }
 
+    let audit_reason = format!(
+        "{}{}{}",
+        body.reason.as_deref().unwrap_or(""),
+        if body.force { " [force]" } else { "" },
+        if body.replace { " [replace]" } else { "" }
+    );
     let _ = audit::log_admin_action(
         env,
         &admin_pubkey,
@@ -652,7 +870,7 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
         Some(&old_pk),
         None,
         inherited_cohorts.as_deref(),
-        body.reason.as_deref(),
+        Some(audit_reason.trim()),
     )
     .await;
 
@@ -664,6 +882,76 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
             "new_pubkey": new_pk,
             "inherited_cohorts": inherited_cohorts,
         }),
+        200,
+    )
+}
+
+#[derive(Deserialize)]
+struct AliasDeleteBody {
+    old_pubkey: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Remove one alias: `old_pubkey` no longer resolves to a successor (review
+/// C4: undoing a wrong link needed a re-point or a user delete). Cohorts the
+/// successor inherited are NOT revoked (they may also have come from
+/// elsewhere); revoke them explicitly if needed.
+///
+/// Body: `{ "old_pubkey": "<hex>", "reason": "..." }`
+pub async fn handle_alias_delete(mut req: Request, env: &Env) -> Result<Response> {
+    let request_url = request_url(&req)?;
+    let auth_header = req.headers().get("Authorization").ok().flatten();
+    let body_bytes = req.bytes().await?;
+    let admin_pubkey = match auth::require_nip98_admin(
+        auth_header.as_deref(),
+        &request_url,
+        "POST",
+        Some(&body_bytes),
+        env,
+    )
+    .await
+    {
+        Ok(pk) => pk,
+        Err((body, status)) => return json_response(env, &body, status),
+    };
+    let body: AliasDeleteBody =
+        serde_json::from_slice(&body_bytes).map_err(|e| worker::Error::RustError(e.to_string()))?;
+    let old_pk = match body.old_pubkey {
+        Some(ref pk) if valid_pubkey(pk) => pk.to_ascii_lowercase(),
+        _ => {
+            return json_response(
+                env,
+                &json!({ "error": "Invalid or missing old_pubkey" }),
+                400,
+            )
+        }
+    };
+    let db = env.d1("DB")?;
+    let removed = db
+        .prepare("DELETE FROM pubkey_aliases WHERE old_pubkey = ?1")
+        .bind(&[js_str(&old_pk)])?
+        .run()
+        .await?
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|m| m.changes)
+        .unwrap_or(0);
+    let _ = audit::log_admin_action(
+        env,
+        &admin_pubkey,
+        "pubkey_alias_delete",
+        None,
+        Some(&old_pk),
+        None,
+        None,
+        body.reason.as_deref(),
+    )
+    .await;
+    json_response(
+        env,
+        &json!({ "success": true, "old_pubkey": old_pk, "removed": removed > 0 }),
         200,
     )
 }
@@ -682,5 +970,73 @@ mod tests {
         assert!(!valid_pubkey(&"a".repeat(65)));
         assert!(!valid_pubkey(&format!("g{}", "a".repeat(63))));
         assert!(!valid_pubkey(""));
+    }
+}
+
+#[cfg(test)]
+mod alias_refusal_tests {
+    use super::{alias_refusal, inheritable_cohorts, AliasFacts};
+
+    #[test]
+    fn chains_and_system_keys_are_refused_live_accounts_need_force() {
+        let f = |g: fn(&mut AliasFacts)| {
+            let mut x = AliasFacts::default();
+            g(&mut x);
+            x
+        };
+        assert_eq!(
+            alias_refusal(&AliasFacts::default(), "new", false, false),
+            None,
+            "an archive key"
+        );
+        assert!(alias_refusal(&f(|x| x.old_is_a_successor = true), "new", true, true).is_some());
+        assert!(alias_refusal(&f(|x| x.new_is_replaced = true), "new", true, true).is_some());
+        assert!(
+            alias_refusal(&f(|x| x.old_is_system = true), "new", true, true).is_some(),
+            "static admin / ingress"
+        );
+        assert!(alias_refusal(&f(|x| x.old_is_live = true), "new", false, false).is_some());
+        assert_eq!(
+            alias_refusal(&f(|x| x.old_is_live = true), "new", true, false),
+            None,
+            "forced"
+        );
+        // Re-pointing to a different successor needs replace; same successor is idempotent.
+        let linked = AliasFacts {
+            old_current_successor: Some("other".into()),
+            ..Default::default()
+        };
+        assert!(alias_refusal(&linked, "new", true, false).is_some());
+        assert_eq!(alias_refusal(&linked, "new", false, true), None);
+        let same = AliasFacts {
+            old_current_successor: Some("new".into()),
+            ..Default::default()
+        };
+        assert_eq!(alias_refusal(&same, "new", false, false), None);
+    }
+
+    #[test]
+    fn an_absent_optional_table_never_makes_a_key_live_a_failed_lookup_does() {
+        use super::live_from_optional_lookup as live;
+        assert!(!live(false, None), "no device_keys table: skipped");
+        assert!(
+            live(true, None),
+            "table present, lookup failed: fail closed"
+        );
+        assert!(live(true, Some(true)));
+        assert!(!live(true, Some(false)));
+    }
+
+    #[test]
+    fn the_admin_cohort_is_not_inherited_without_the_flag() {
+        assert_eq!(
+            inheritable_cohorts(r#"["members","admin","zone2"]"#, false).as_deref(),
+            Some(r#"["members","zone2"]"#)
+        );
+        assert_eq!(
+            inheritable_cohorts(r#"["admin"]"#, true).as_deref(),
+            Some(r#"["admin"]"#)
+        );
+        assert_eq!(inheritable_cohorts("nope", false), None);
     }
 }

@@ -41,6 +41,10 @@ use std::collections::HashMap;
 /// Time-to-live for the lookup caches (seconds).
 pub(crate) const LOOKUP_TTL_SECS: u64 = 60;
 
+/// TTL of negative memo entries ("no zone row", "target not stored"): short,
+/// so a new binding or a late-arriving target takes effect within seconds.
+pub(crate) const NEGATIVE_LOOKUP_TTL_SECS: u64 = 5;
+
 /// Minimum interval between trust-ledger flushes for one pubkey (seconds).
 pub(crate) const ACTIVITY_FLUSH_SECS: u64 = 300;
 

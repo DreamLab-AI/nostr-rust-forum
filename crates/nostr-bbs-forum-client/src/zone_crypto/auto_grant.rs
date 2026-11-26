@@ -33,6 +33,7 @@ use leptos::prelude::*;
 use nostr_bbs_core::signer::Signer;
 use wasm_bindgen_futures::spawn_local;
 
+use super::grant_backup::AckCounter;
 use super::inbox_key::{grant_target, lookup_inbox_key, recipient_keys_enabled, Lookup};
 use super::store::{try_use_zone_key_store, ZoneKeyStore};
 use super::{build_grant_wrap, grant_plan, grant_targets, ZoneKey};
@@ -40,6 +41,10 @@ use crate::auth::{use_auth, AuthStore};
 use crate::components::toast::{ToastStore, ToastVariant};
 use crate::relay::RelayConnection;
 use crate::stores::zones::load_zones;
+
+/// How long a grant batch waits for the relay's acknowledgements before the
+/// ledger backup is published with whatever was recorded.
+const BACKUP_ACK_WAIT_MS: u32 = 10_000;
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
@@ -242,6 +247,20 @@ pub async fn send_grants(
             web_sys::console::warn_1(&format!("[zone-key] bindings: {e}").into());
         }
     }
+    // Which `(zone, epoch)` ledgers this batch touches, and how many of its
+    // grants the relay has accepted and the ledger recorded: the backup is
+    // published once they are in (see `grant_backup`).
+    let touched: Vec<(String, u32)> = {
+        let mut t: Vec<(String, u32)> = plan
+            .iter()
+            .filter(|(_, r)| !r.is_empty())
+            .map(|(k, _)| (k.zone.clone(), k.epoch))
+            .collect();
+        t.sort();
+        t.dedup();
+        t
+    };
+    let acks = AckCounter::new();
     for (key, recipients) in plan {
         for pk in recipients {
             // A failed lookup is not "no inbox key": wrapping to the identity
@@ -282,10 +301,12 @@ pub async fn send_grants(
             };
             let key_for_ack = key.clone();
             let on_recorded = on_recorded.clone();
+            let acks_for_ack = acks.clone();
             let on_ok = Rc::new(move |ok: bool, _msg: String| {
                 if !ok {
                     return;
                 }
+                let acks = acks_for_ack.clone();
                 let key = key_for_ack.clone();
                 let pk = pk.clone();
                 let target = target.clone();
@@ -295,12 +316,26 @@ pub async fn send_grants(
                         .record_grants(&key.zone, key.epoch, &[(pk.clone(), target)])
                         .await;
                     on_recorded(&key, &pk);
+                    acks.ack();
                 });
             });
             if relay.publish_with_ack(&wrap, Some(on_ok)).is_err() {
                 report.failed += 1;
             } else {
                 report.sent += 1;
+            }
+        }
+    }
+    // Keep the ledger on the relay too, so "granted" survives clearing site
+    // data. Best effort: the local ledger stays authoritative on failure.
+    acks.expect(report.sent);
+    if !touched.is_empty() && report.sent > 0 {
+        acks.wait(BACKUP_ACK_WAIT_MS).await;
+        for (zone, epoch) in touched {
+            if let Err(e) =
+                super::grant_backup::push(relay, signer, store, &zone, epoch, now_secs()).await
+            {
+                web_sys::console::warn_1(&format!("[zone-key] grant backup: {e}").into());
             }
         }
     }
@@ -381,6 +416,13 @@ impl AutoGrant {
         let mut known: HashMap<String, HashSet<String>> = HashMap::new();
         for (zone, keys) in &held {
             for k in keys {
+                // Restore this admin's relay-held record first (once per
+                // session): after clearing site data the local ledger is empty
+                // and everyone would otherwise look ungranted. A relay that
+                // cannot answer leaves the local ledger standing alone.
+                let _ =
+                    super::grant_backup::pull(&self.relay, signer, self.store, &k.zone, k.epoch)
+                        .await;
                 let s = self.store.grants_sent_to(&k.zone, k.epoch, &targets).await;
                 sent.insert((k.zone.clone(), k.epoch), s);
             }

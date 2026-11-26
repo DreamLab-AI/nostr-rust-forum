@@ -60,7 +60,7 @@ use crate::utils::zone_theme::zone_accent_style_cfg;
 use super::section::{category_display_name, resolve_channel};
 
 /// A single rendered reply within a thread.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplyView {
     /// The ORIGINAL event id (the reply users reply to / thread against). Stays
     /// stable across edits so reply threading and the edit target never drift.
@@ -84,7 +84,7 @@ struct ReplyView {
 }
 
 /// A quoted parent shown inline above a quote-reply.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct QuotedRef {
     pubkey: String,
     snippet: String,
@@ -178,6 +178,7 @@ fn latest_version(original: &NostrEvent, events: &[NostrEvent]) -> (String, u64,
 /// Every event id in the edit-chain rooted at `original` (the original plus all
 /// transitive edits by its author). Used to exclude edit events from the reply
 /// list so an edit never shows up as its own reply.
+#[cfg(test)]
 fn edit_chain_ids(original: &NostrEvent, events: &[NostrEvent]) -> Vec<String> {
     let mut ids = vec![original.id.to_lowercase()];
     let mut frontier = vec![original.id.to_lowercase()];
@@ -374,6 +375,246 @@ fn resolve_section_channel(
     resolve_channel(channels, category_slug, section_slug_param, zones)
 }
 
+/// The replies of the topic `root` among `events`, oldest first, in one
+/// O(n) pass with id, edit-target and reverse-reference indexes:
+///
+/// - candidates: kind-42/1111 that are not the root, not in the root's edit
+///   chain, and not themselves edits;
+/// - membership is transitive: a candidate referencing the root or any reply
+///   already in the topic (a reply to a reply, as JunkieJarvis threads);
+/// - each reply shows its author's latest edit, and a `quote` marker to a
+///   sibling resolves the sibling's author and first line.
+///
+/// Same result as the previous fixpoint (kept as the test reference
+/// `thread_replies_reference`), which rescanned all events per pass and per
+/// reply.
+fn thread_replies(root: &NostrEvent, events: &[NostrEvent]) -> Vec<ReplyView> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let lower = |s: &str| s.to_lowercase();
+    let mut by_id: HashMap<String, &NostrEvent> = HashMap::with_capacity(events.len());
+    let mut edits_of: HashMap<String, Vec<&NostrEvent>> = HashMap::new();
+    for e in events {
+        by_id.entry(lower(&e.id)).or_insert(e);
+        if let Some(target) = edit_target(e) {
+            edits_of.entry(target).or_default().push(e);
+        }
+    }
+    // The newest same-author edit of `id`, as `latest_version` picks it.
+    let newest_edit = |id: &str, author: &str| -> Option<&NostrEvent> {
+        edits_of.get(id).and_then(|v| {
+            v.iter()
+                .copied()
+                .filter(|e| e.pubkey.eq_ignore_ascii_case(author))
+                .max_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then_with(|| a.id.cmp(&b.id))
+                })
+        })
+    };
+    let latest = |original: &NostrEvent| -> (String, u64, bool) {
+        let mut current = lower(&original.id);
+        let mut content = &original.content;
+        let mut edited = false;
+        for _ in 0..64 {
+            match newest_edit(&current, &original.pubkey) {
+                Some(e) => {
+                    content = &e.content;
+                    edited = true;
+                    current = lower(&e.id);
+                }
+                None => break,
+            }
+        }
+        (content.clone(), original.created_at, edited)
+    };
+    // The root's edit chain (every transitive same-author edit).
+    let mut root_chain: HashSet<String> = HashSet::new();
+    root_chain.insert(lower(&root.id));
+    let mut frontier = vec![lower(&root.id)];
+    for _ in 0..64 {
+        let mut next = Vec::new();
+        for target in &frontier {
+            for e in edits_of.get(target).into_iter().flatten() {
+                if e.pubkey.eq_ignore_ascii_case(&root.pubkey) && root_chain.insert(lower(&e.id)) {
+                    next.push(lower(&e.id));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    let is_candidate = |e: &NostrEvent| -> bool {
+        !e.id.eq_ignore_ascii_case(&root.id)
+            && (e.kind == 42 || e.kind == 1111)
+            && !root_chain.contains(&lower(&e.id))
+            && edit_target(e).is_none()
+    };
+    // Reverse references: id -> candidates that reference it.
+    let mut referenced_by: HashMap<String, Vec<String>> = HashMap::new();
+    for e in events.iter().filter(|e| is_candidate(e)) {
+        let id = lower(&e.id);
+        for r in referenced_event_ids(e) {
+            referenced_by.entry(r).or_default().push(id.clone());
+        }
+    }
+    let root_id = lower(&root.id);
+    let mut thread: HashSet<String> = HashSet::new();
+    thread.insert(root_id.clone());
+    let mut queue: VecDeque<String> = VecDeque::from([root_id.clone()]);
+    while let Some(id) = queue.pop_front() {
+        for child in referenced_by.get(&id).into_iter().flatten() {
+            if thread.insert(child.clone()) {
+                queue.push_back(child.clone());
+            }
+        }
+    }
+    let mut out: Vec<ReplyView> = events
+        .iter()
+        .filter(|e| !e.id.eq_ignore_ascii_case(&root.id) && thread.contains(&lower(&e.id)))
+        .map(|e| {
+            let (content, created_at, edited) = latest(e);
+            let quote = quoted_e_tag(e)
+                .map(|id| lower(&id))
+                .filter(|id| *id != root_id)
+                .and_then(|target| by_id.get(&target).copied())
+                .map(|tgt| QuotedRef {
+                    pubkey: tgt.pubkey.clone(),
+                    snippet: first_line(&latest(tgt).0),
+                });
+            ReplyView {
+                id: e.id.clone(),
+                pubkey: e.pubkey.clone(),
+                content,
+                created_at,
+                edited,
+                quote,
+                tags: e.tags.clone(),
+            }
+        })
+        .collect();
+    out.sort_by_key(|r| r.created_at);
+    out
+}
+
+/// A fingerprint of what a reply card shows, for its list key.
+fn view_key(r: &ReplyView) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    r.content.hash(&mut h);
+    r.edited.hash(&mut h);
+    r.quote
+        .as_ref()
+        .map(|q| (&q.pubkey, &q.snippet))
+        .hash(&mut h);
+    h.finish()
+}
+
+/// The previous O(n^2) derivation, kept verbatim as the reference
+/// `thread_replies` is tested against.
+#[cfg(test)]
+fn thread_replies_reference(root: &NostrEvent, events: &[NostrEvent]) -> Vec<ReplyView> {
+    let root = root.clone();
+    let channel_events: &[NostrEvent] = events;
+    let mut out: Vec<ReplyView> = {
+        let events = channel_events;
+        let root_id_lower = root.id.to_lowercase();
+        // Ids that belong to the ROOT's edit chain — never replies.
+        let root_chain = edit_chain_ids(&root, events);
+        // First pass: the genuine replies (reference the root, are not edits
+        // of anything, and are not part of the root's edit chain).
+        // A reply candidate: a kind-42/1111 that is neither the root, an edit
+        // of the root, nor an edit of another reply.
+        let is_candidate = |e: &NostrEvent| -> bool {
+            if e.id.eq_ignore_ascii_case(&root.id) {
+                return false; // the root itself is not a reply
+            }
+            if e.kind != 42 && e.kind != 1111 {
+                return false;
+            }
+            if root_chain.contains(&e.id.to_lowercase()) {
+                return false; // an edit of the root
+            }
+            edit_target(e).is_none() // an edit of another reply is not a reply
+        };
+        // Transitive thread membership. A reply belongs to this topic if it
+        // references the ROOT *or any event already in the topic*. The old
+        // one-level test (references-root-directly) silently dropped nested
+        // replies — a reply to a reply — most visibly JunkieJarvis, which
+        // (per standard NIP-10) threads under the specific message that tagged
+        // it rather than the topic root, so its answers never rendered.
+        // Fixpoint over the channel's candidate events; converges in
+        // max-reply-depth passes.
+        let mut thread_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        thread_ids.insert(root_id_lower.clone());
+        loop {
+            let mut added = false;
+            for e in events.iter() {
+                let lid = e.id.to_lowercase();
+                if thread_ids.contains(&lid) || !is_candidate(e) {
+                    continue;
+                }
+                if referenced_event_ids(e)
+                    .iter()
+                    .any(|r| thread_ids.contains(r))
+                {
+                    thread_ids.insert(lid);
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        let originals: Vec<&NostrEvent> = events
+            .iter()
+            .filter(|e| {
+                !e.id.eq_ignore_ascii_case(&root.id) && thread_ids.contains(&e.id.to_lowercase())
+            })
+            .collect();
+
+        originals
+            .into_iter()
+            .map(|e| {
+                let (content, created_at, edited) = latest_version(e, events);
+                // Quote target: a "reply" e-tag pointing at a SIBLING reply
+                // (not the topic root). Resolve the quoted author + snippet so
+                // the card can show what it is answering, inline, no nesting.
+                let quote = quoted_e_tag(e)
+                    .map(|id| id.to_lowercase())
+                    .filter(|id| *id != root_id_lower)
+                    .and_then(|target_id| {
+                        events
+                            .iter()
+                            .find(|ev| ev.id.to_lowercase() == target_id)
+                            .map(|tgt| {
+                                let (tgt_content, _, _) = latest_version(tgt, events);
+                                QuotedRef {
+                                    pubkey: tgt.pubkey.clone(),
+                                    snippet: first_line(&tgt_content),
+                                }
+                            })
+                    });
+                ReplyView {
+                    id: e.id.clone(),
+                    pubkey: e.pubkey.clone(),
+                    content,
+                    created_at,
+                    edited,
+                    quote,
+                    tags: e.tags.clone(),
+                }
+            })
+            .collect()
+    };
+
+    out.sort_by_key(|r| r.created_at);
+    out
+}
+
 /// Thread page: topic root + threaded replies + reply composer.
 #[component]
 pub fn ThreadPage() -> impl IntoView {
@@ -425,6 +666,18 @@ pub fn ThreadPage() -> impl IntoView {
         resolve_section_channel(&chans, &category_slug(), &section_param(), &zones)
     });
 
+    // Whether the deep-link walk has restarted the channel's history window
+    // from the newest page (see the walk below). Absence is only concluded
+    // after the walk covered the newest messages too.
+    let restarted = StoredValue::new(false);
+
+    // Pod container for images attached in this thread: the channel's zone.
+    let thread_media_target = Signal::derive(move || {
+        crate::stores::zones::media_target_for_section(
+            resolved_channel.get().map(|c| c.section).as_deref(),
+        )
+    });
+
     // Top up the per-channel history once the channel id is known (idempotent).
     {
         let relay = relay.clone();
@@ -436,14 +689,39 @@ pub fn ThreadPage() -> impl IntoView {
     }
 
     // All kind-42/kind-1111 events for the resolved channel from the store.
+    // The topic's own paged list (`topic:<root>`), once the root is known.
+    // A topic is paged on its own (`#e:[root]`): sealed replies carry the
+    // root as an outer `reply` tag. Live posts still arrive through the
+    // channel's subscription, into the channel list.
+    let topic_list = RwSignal::new(None::<String>);
     let channel_events = Signal::derive(move || {
         let cid = match resolved_channel.get() {
             Some(ch) => ch.id,
             None => return Vec::<NostrEvent>::new(),
         };
-        store
-            .channel_messages
-            .with(|m| m.get(&cid).cloned().unwrap_or_default())
+        let mut channel = store.list_events(&cid);
+        // The section's topic roots (one root-list REQ, not windowed), so a
+        // root found there survives eviction from the channel window.
+        let roots = store.list_events(&crate::stores::channels::roots_key(&cid));
+        if !roots.is_empty() {
+            let held: std::collections::HashSet<String> =
+                channel.iter().map(|e| e.id.clone()).collect();
+            channel.extend(roots.into_iter().filter(|r| !held.contains(&r.id)));
+        }
+        let Some(key) = topic_list.get() else {
+            return channel;
+        };
+        let mut events = store.list_events(&key);
+        // While the topic window is detached in older replies, newer live
+        // posts wait for its reload (as the channel window does).
+        let cutoff = store.history_cursor(&key).newer_from;
+        let held: std::collections::HashSet<String> = events.iter().map(|e| e.id.clone()).collect();
+        events.extend(
+            channel
+                .into_iter()
+                .filter(|e| !held.contains(&e.id) && cutoff.is_none_or(|t| e.created_at < t)),
+        );
+        events
     });
 
     // Mark the channel read when a topic in it is opened (BBS reading flow).
@@ -484,13 +762,17 @@ pub fn ThreadPage() -> impl IntoView {
     }
 
     // The topic root event whose id maps to the :topic slug.
+    // The root, once seen, is kept: the bounded history window evicts the
+    // channel's oldest messages as the reader pages towards newer replies,
+    // and a topic root is usually the oldest message of its topic.
+    let pinned_root = StoredValue::new(None::<NostrEvent>);
     let topic_root = Signal::derive(move || {
         let cid = match resolved_channel.get() {
             Some(ch) => ch.id.to_lowercase(),
             None => return Option::<NostrEvent>::None,
         };
         let slug = topic_param();
-        channel_events.with(|events| {
+        let found = channel_events.with(|events| {
             events
                 .iter()
                 .find(|e| {
@@ -504,7 +786,16 @@ pub fn ThreadPage() -> impl IntoView {
                     is_root && matches_topic_slug(&e.id, &slug)
                 })
                 .cloned()
-        })
+        });
+        match found {
+            Some(root) => {
+                pinned_root.set_value(Some(root.clone()));
+                Some(root)
+            }
+            None => pinned_root
+                .get_value()
+                .filter(|r| matches_topic_slug(&r.id, &slug)),
+        }
     });
 
     // Replies: kind-42 / kind-1111 events that reference the topic root id.
@@ -512,106 +803,36 @@ pub fn ThreadPage() -> impl IntoView {
     // Edit events are folded into the post they replace rather than shown as
     // their own replies: the root's edits are dropped outright, and each
     // surviving reply renders its latest authored version (see `latest_version`).
-    let replies = Signal::derive(move || {
-        let root = match topic_root.get() {
-            Some(r) => r,
-            None => return Vec::<ReplyView>::new(),
+    // A Memo over one O(n) pass (see `thread_replies`): with paged history a
+    // topic can hold thousands of replies, and the derivation used to rescan
+    // every event per reply (O(n^2)) once per reader per store change.
+    let replies = Memo::new(move |_| {
+        let Some(root) = topic_root.get() else {
+            return Vec::<ReplyView>::new();
         };
-        let root_id_lower = root.id.to_lowercase();
-        let mut out: Vec<ReplyView> = channel_events.with(|events| {
-            // Ids that belong to the ROOT's edit chain — never replies.
-            let root_chain = edit_chain_ids(&root, events);
-            // First pass: the genuine replies (reference the root, are not edits
-            // of anything, and are not part of the root's edit chain).
-            // A reply candidate: a kind-42/1111 that is neither the root, an edit
-            // of the root, nor an edit of another reply.
-            let is_candidate = |e: &NostrEvent| -> bool {
-                if e.id.eq_ignore_ascii_case(&root.id) {
-                    return false; // the root itself is not a reply
-                }
-                if e.kind != 42 && e.kind != 1111 {
-                    return false;
-                }
-                if root_chain.contains(&e.id.to_lowercase()) {
-                    return false; // an edit of the root
-                }
-                edit_target(e).is_none() // an edit of another reply is not a reply
-            };
-            // Transitive thread membership. A reply belongs to this topic if it
-            // references the ROOT *or any event already in the topic*. The old
-            // one-level test (references-root-directly) silently dropped nested
-            // replies — a reply to a reply — most visibly JunkieJarvis, which
-            // (per standard NIP-10) threads under the specific message that tagged
-            // it rather than the topic root, so its answers never rendered.
-            // Fixpoint over the channel's candidate events; converges in
-            // max-reply-depth passes.
-            let mut thread_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            thread_ids.insert(root_id_lower.clone());
-            loop {
-                let mut added = false;
-                for e in events.iter() {
-                    let lid = e.id.to_lowercase();
-                    if thread_ids.contains(&lid) || !is_candidate(e) {
-                        continue;
-                    }
-                    if referenced_event_ids(e)
-                        .iter()
-                        .any(|r| thread_ids.contains(r))
-                    {
-                        thread_ids.insert(lid);
-                        added = true;
-                    }
-                }
-                if !added {
-                    break;
-                }
-            }
-            let originals: Vec<&NostrEvent> = events
-                .iter()
-                .filter(|e| {
-                    !e.id.eq_ignore_ascii_case(&root.id)
-                        && thread_ids.contains(&e.id.to_lowercase())
-                })
-                .collect();
-
-            originals
-                .into_iter()
-                .map(|e| {
-                    let (content, created_at, edited) = latest_version(e, events);
-                    // Quote target: a "reply" e-tag pointing at a SIBLING reply
-                    // (not the topic root). Resolve the quoted author + snippet so
-                    // the card can show what it is answering, inline, no nesting.
-                    let quote = quoted_e_tag(e)
-                        .map(|id| id.to_lowercase())
-                        .filter(|id| *id != root_id_lower)
-                        .and_then(|target_id| {
-                            events
-                                .iter()
-                                .find(|ev| ev.id.to_lowercase() == target_id)
-                                .map(|tgt| {
-                                    let (tgt_content, _, _) = latest_version(tgt, events);
-                                    QuotedRef {
-                                        pubkey: tgt.pubkey.clone(),
-                                        snippet: first_line(&tgt_content),
-                                    }
-                                })
-                        });
-                    ReplyView {
-                        id: e.id.clone(),
-                        pubkey: e.pubkey.clone(),
-                        content,
-                        created_at,
-                        edited,
-                        quote,
-                        tags: e.tags.clone(),
-                    }
-                })
-                .collect()
-        });
-        out.sort_by_key(|r| r.created_at);
-        out
+        channel_events.with(|events| thread_replies(&root, events))
     });
+
+    // Start the topic's own paged list once its root is known: register it,
+    // load its newest page, and ask the relay for its true reply count.
+    {
+        let relay = relay.clone();
+        Effect::new(move |_| {
+            let (Some(ch), Some(root)) = (resolved_channel.get(), topic_root.get()) else {
+                return;
+            };
+            let key = store.register_topic(&ch.id, &root.id);
+            if topic_list.get_untracked().as_deref() != Some(key.as_str()) {
+                topic_list.set(Some(key.clone()));
+            }
+            let gated = zone_is_gated(&category_slug(), &load_zones());
+            let cursor = store.history_cursor(&key);
+            if !cursor.started && !cursor.loading {
+                store.reload_newest(&relay, &key, vec![root.id.to_lowercase()], gated);
+            }
+            store.request_total_of(&relay, &key, &root.id.to_lowercase());
+        });
+    }
 
     // The root post's latest content + edited flag, folding in any author edits.
     let root_view = Signal::derive(move || {
@@ -665,15 +886,146 @@ pub fn ThreadPage() -> impl IntoView {
         )
         .then(|| {
             let cid = channel.map(|c| c.id).unwrap_or_default();
+            // With paged history a receipt only means the NEWEST page is in:
+            // the topic is absent only once the walk below has reached the
+            // start of the channel's history.
+            let cursor = store.history_cursor(&cid);
+            let settled = store.history_receipt(&cid).settles(gated)
+                && cursor.exhausted
+                && (cursor.newer_from.is_none() || restarted.get_value());
             Lookup::decide_with_keys(
                 topic_root.with(Option::is_some),
-                store.history_receipt(&cid).settles(gated),
+                settled,
                 keys.get(),
                 deadline_passed,
             )
         })
     });
     let loading = Memo::new(move |_| lookup.get().is_loading());
+
+    // Deep links into history not loaded yet.
+    //
+    // - A `?focus=<reply>` in a known topic: page the TOPIC's own list back
+    //   (restarting from its newest page once if it is detached) until that
+    //   reply is loaded or the topic's history is exhausted.
+    // - A missing root: a topic slug is a prefix of the root's id, which the
+    //   relay cannot match, but any loaded reply names the full root id in
+    //   its topic (`reply`) tag; fetch the root by that id (a sealed root by
+    //   the inner id in its `sealed` tag). Failing that, page the CHANNEL
+    //   back until the root appears (slow on a channel holding many topics:
+    //   roots carry no outer marker).
+    let fetched_root = StoredValue::new(None::<String>);
+    let topic_restarted = StoredValue::new(false);
+    {
+        let relay = relay.clone();
+        let focus_query = use_query_map();
+        Effect::new(move |_| {
+            let Some(cid) = resolved_channel.get().map(|c| c.id) else {
+                return;
+            };
+            let gated = zone_is_gated(&category_slug(), &load_zones());
+            let focus = focus_query.read().get("focus");
+            if let Some(root) = topic_root.get() {
+                let Some(f) = focus else {
+                    return;
+                };
+                let loaded = f.eq_ignore_ascii_case(&root.id)
+                    || replies.with(|rs| rs.iter().any(|r| r.id.eq_ignore_ascii_case(&f)));
+                let Some(key) = topic_list.get() else {
+                    return;
+                };
+                if loaded {
+                    return;
+                }
+                let cursor = store.history_cursor(&key);
+                let needles = vec![root.id.to_lowercase()];
+                if cursor.newer_from.is_some() && !cursor.loading && !topic_restarted.get_value() {
+                    topic_restarted.set_value(true);
+                    store.reload_newest(&relay, &key, needles, gated);
+                } else if cursor.next_request().is_some() {
+                    store.load_older(&relay, &key, needles, gated, Rc::new(|| {}), Rc::new(|| {}));
+                }
+                return;
+            }
+            // The root is missing. First the section's root list: one REQ,
+            // then the slug (an id prefix) matches against it client-side.
+            if !store.topic_roots_answered(&cid) {
+                if store.history_receipt(&cid).settles(gated) {
+                    store.request_topic_roots(&relay, &cid, gated);
+                }
+                return;
+            }
+            // Not a marked root: a loaded reply may name it in full.
+            let slug = topic_param();
+            let named = channel_events.with(|events| {
+                events.iter().find_map(|e| {
+                    nostr_bbs_core::sealed::reply_root_of(e)
+                        .filter(|r| matches_topic_slug(r, &slug))
+                        .map(str::to_lowercase)
+                })
+            });
+            if let Some(root_id) = named {
+                if fetched_root.get_value().as_deref() != Some(root_id.as_str()) {
+                    fetched_root.set_value(Some(root_id.clone()));
+                    store.fetch_by_id(&relay, &root_id);
+                }
+                return;
+            }
+            if !store.history_receipt(&cid).settles(gated) {
+                return;
+            }
+            store.settle_first_page(&cid, gated);
+            let cursor = store.history_cursor(&cid);
+            // The window may be detached in older history (the section view
+            // paged far back and evicted the newest topics): a topic newer
+            // than the window would never be found walking older, so start
+            // again from the newest page first, once.
+            if cursor.newer_from.is_some() && !cursor.loading && !restarted.get_value() {
+                restarted.set_value(true);
+                store.reload_newest(&relay, &cid, vec![cid.clone()], gated);
+                return;
+            }
+            if cursor.next_request().is_some() {
+                store.load_older(
+                    &relay,
+                    &cid,
+                    vec![cid.clone()],
+                    gated,
+                    Rc::new(|| {}),
+                    Rc::new(|| {}),
+                );
+            }
+        });
+    }
+
+    // The channel whose history window holds this topic, for the loaders.
+    // The loaders page the topic's own list by its root (`#e:[root]`).
+    let history_cid = Signal::derive(move || topic_list.get());
+    let history_needles = Signal::derive(move || {
+        topic_root
+            .get()
+            .map(|r| vec![r.id.to_lowercase()])
+            .unwrap_or_default()
+    });
+    let history_gated = Signal::derive(move || zone_is_gated(&category_slug(), &load_zones()));
+    // The topic's true reply count: the relay's count plus replies seen since
+    // (live posts arrive through the channel list, so note them here).
+    Effect::new(move |_| {
+        let Some(key) = topic_list.get() else {
+            return;
+        };
+        replies.with(|rs| {
+            for r in rs {
+                store.note_inserted(&key, &r.id, r.created_at);
+            }
+        });
+    });
+    let reply_total = Signal::derive(move || {
+        let shown = replies.with(Vec::len) as u32;
+        topic_list
+            .get()
+            .map_or(shown, |key| store.total_for(&key).max(shown))
+    });
 
     // -- Landing position ---------------------------------------------------
     //
@@ -1232,6 +1584,7 @@ pub fn ThreadPage() -> impl IntoView {
                     view! {
                         <RootPost
                             post=root
+                            media_target=thread_media_target
                             my_pubkey=my_pubkey
                             editing_id=editing_id
                             on_save_edit=publish_edit
@@ -1251,7 +1604,7 @@ pub fn ThreadPage() -> impl IntoView {
                 <div class="mt-6">
                     <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">
                         {move || {
-                            let n = replies.get().len();
+                            let n = reply_total.get();
                             if n == 0 {
                                 "No replies yet".to_string()
                             } else if n == 1 {
@@ -1262,10 +1615,25 @@ pub fn ThreadPage() -> impl IntoView {
                         }}
                     </h3>
                     <div class="space-y-3">
-                        {move || replies.get().into_iter().map(|r| {
-                            view! {
+                        // Keyed: a new page or post renders only its own
+                        // cards, and a card re-renders when what it shows
+                        // changes (an edit, a decrypt, a resolved quote).
+                        // Bounded history window: older replies load above
+                        // the list as the reader scrolls up, evicted newer
+                        // ones below it on the way back down.
+                        <crate::components::history_loader::HistoryLoader
+                            channel_id=history_cid
+                            gated=history_gated
+                            label="Load older replies"
+                            needles=history_needles
+                        />
+                        <For
+                            each=move || replies.get()
+                            key=|r| (r.id.clone(), view_key(r))
+                            children=move |r| view! {
                                 <ReplyCard
                                     reply=r
+                                    media_target=thread_media_target
                                     my_pubkey=my_pubkey
                                     editing_id=editing_id
                                     on_save_edit=publish_edit
@@ -1275,7 +1643,14 @@ pub fn ThreadPage() -> impl IntoView {
                                     on_delete=publish_delete
                                 />
                             }
-                        }).collect_view()}
+                        />
+                        <crate::components::history_loader::HistoryLoader
+                            channel_id=history_cid
+                            gated=history_gated
+                            label="Load newer replies"
+                            direction=crate::components::history_loader::HistoryDirection::Newer
+                            needles=history_needles
+                        />
                     </div>
                 </div>
             </Show>
@@ -1300,6 +1675,7 @@ pub fn ThreadPage() -> impl IntoView {
                         on_send=noop_send
                         on_send_with_mentions=send_callback
                         enable_image_upload=true
+                        media_target=thread_media_target
                         restore_failed=restore_failed
                     />
                 </div>
@@ -1373,7 +1749,11 @@ fn PostBody(
     view! {
         <>
             {(!text.is_empty()).then(|| view! { <MentionText content=text tags=tags /> })}
-            {media_urls.into_iter().map(|u| view! { <MediaEmbed url=u /> }).collect_view()}
+            {media_urls
+                .into_iter()
+                .enumerate()
+                .map(|(position, u)| view! { <MediaEmbed url=u position=position /> })
+                .collect_view()}
             {first_link.map(|u| view! { <LinkPreview url=u /> })}
         </>
     }
@@ -1484,6 +1864,8 @@ fn RootPost(
     can_reply: Signal<bool>,
     is_admin: Signal<bool>,
     on_delete: Callback<String>,
+    /// Pod container for an image attached while editing (the channel zone).
+    media_target: Signal<crate::utils::restricted_media::MediaTarget>,
 ) -> impl IntoView {
     let author_pk = post.pubkey.clone();
     // The name as a string, for the composer's quote line.
@@ -1589,6 +1971,7 @@ fn RootPost(
                                 initial_content=edit_initial.clone()
                                 is_editing=true
                                 enable_image_upload=true
+                                media_target=media_target
                                 on_cancel_edit=cancel_edit
                             />
                         </div>
@@ -1612,6 +1995,8 @@ fn ReplyCard(
     can_reply: Signal<bool>,
     is_admin: Signal<bool>,
     on_delete: Callback<String>,
+    /// Pod container for an image attached while editing (the channel zone).
+    media_target: Signal<crate::utils::restricted_media::MediaTarget>,
 ) -> impl IntoView {
     let author_pk = reply.pubkey.clone();
     // The name as a string, for the composer's quote line.
@@ -1651,10 +2036,26 @@ fn ReplyCard(
     let cancel_edit = Callback::new(move |()| editing_id.set(None));
     let noop = Callback::new(|_: String| {});
 
+    // The per-card controls (edit, delete, tip) mount only once the reader
+    // engages with the card (hover, keyboard focus or a tap), then stay: a
+    // thread window holds up to THREAD_WINDOW cards and most are only read.
+    // An open edit keeps them mounted.
+    let engaged = RwSignal::new(false);
+    let controls_shown = move || engaged.get() || is_editing.get();
+    let edit_post_id = post_id.clone();
+    let edit_post_pubkey = post_pubkey.clone();
+    let delete_post_id = post_id.clone();
+    let delete_post_pubkey = post_pubkey.clone();
+    let tip_post_id = post_id.clone();
+    let tip_post_pubkey = post_pubkey.clone();
     view! {
         <div
             id=post_anchor_id(&post_id)
+            data-anchor-id=post_id.clone()
             class="bg-gray-800/40 border border-gray-700/50 rounded-lg p-4 scroll-mt-20 transition-shadow"
+            on:mouseenter=move |_| engaged.set(true)
+            on:focusin=move |_| engaged.set(true)
+            on:touchstart=move |_| engaged.set(true)
         >
             <div class="flex items-start gap-3">
                 <Avatar pubkey=pk size=AvatarSize::Sm />
@@ -1666,20 +2067,22 @@ fn ReplyCard(
                         {edited.then(|| view! {
                             <span class="text-xs text-gray-600 italic">"(edited)"</span>
                         })}
-                        <EditControls
-                            post_id=post_id.clone()
-                            post_pubkey=post_pubkey.clone()
-                            my_pubkey=my_pubkey
-                            editing_id=editing_id
-                        />
-                        <DeleteControls
-                            post_id=post_id.clone()
-                            post_pubkey=post_pubkey.clone()
-                            is_root=false
-                            my_pubkey=my_pubkey
-                            is_admin=is_admin
-                            on_delete=on_delete
-                        />
+                        <Show when=controls_shown>
+                            <EditControls
+                                post_id=edit_post_id.clone()
+                                post_pubkey=edit_post_pubkey.clone()
+                                my_pubkey=my_pubkey
+                                editing_id=editing_id
+                            />
+                            <DeleteControls
+                                post_id=delete_post_id.clone()
+                                post_pubkey=delete_post_pubkey.clone()
+                                is_root=false
+                                my_pubkey=my_pubkey
+                                is_admin=is_admin
+                                on_delete=on_delete
+                            />
+                        </Show>
                         // The reply row: Reply, then tips at the far right
                         // (ADR-2021), away from the emoji reactions below.
                         <div class="ml-auto flex items-center gap-3">
@@ -1693,7 +2096,9 @@ fn ReplyCard(
                                     aria-label="Reply to this post"
                                 >"\u{21A9} Reply"</button>
                             </Show>
-                            <TipControl event_id=post_id.clone() author_pubkey=post_pubkey.clone() open_down=true />
+                            <Show when=controls_shown>
+                                <TipControl event_id=tip_post_id.clone() author_pubkey=tip_post_pubkey.clone() open_down=true />
+                            </Show>
                         </div>
                     </div>
                     {quote.map(|q| {
@@ -1724,6 +2129,7 @@ fn ReplyCard(
                                 initial_content=edit_initial.clone()
                                 is_editing=true
                                 enable_image_upload=true
+                                media_target=media_target
                                 on_cancel_edit=cancel_edit
                             />
                         </div>
@@ -1869,6 +2275,126 @@ mod tests {
             content: content.to_string(),
             sig: String::new(),
         }
+    }
+
+    /// The O(n) derivation agrees with the previous fixpoint on a topic with
+    /// every case it handles: root edits (author's and another's), direct and
+    /// nested replies, reply edits and edits of edits, quotes of siblings and
+    /// of the root, kind-1111 comments, mixed-case ids, unrelated topics.
+    #[test]
+    fn thread_replies_match_the_reference_derivation() {
+        let ch = "c".repeat(64);
+        let root = ev(
+            "ROOT",
+            "alice",
+            100,
+            "topic",
+            vec![vec!["e", &ch, "", "root"]],
+        );
+        let mut events = vec![root.clone()];
+        let id = |i: usize| format!("r{i:04}");
+        for i in 0..400usize {
+            let mut tags = vec![vec![
+                "e".to_string(),
+                ch.clone(),
+                String::new(),
+                "root".to_string(),
+            ]];
+            let parent = match i % 7 {
+                0..=2 => "root".to_string(),
+                3 if i > 10 => id(i - 5),       // reply to a reply
+                4 if i > 3 => id(i - 3),        // reply to a reply
+                5 => "OTHER-TOPIC".to_string(), // not in this topic
+                _ => "ROOT".to_string(),        // upper-case root ref
+            };
+            tags.push(vec!["e".into(), parent, String::new(), "reply".into()]);
+            if i % 11 == 0 && i > 20 {
+                tags.push(vec![
+                    "e".into(),
+                    id(i - 13),
+                    String::new(),
+                    QUOTE_MARKER.into(),
+                ]);
+            }
+            if i % 13 == 0 {
+                tags.push(vec![
+                    "e".into(),
+                    "root".into(),
+                    String::new(),
+                    QUOTE_MARKER.into(),
+                ]);
+            }
+            let author = ["alice", "bob", "carol"][i % 3];
+            let mut e = ev(
+                &id(i),
+                author,
+                200 + (i as u64 / 3),
+                &format!("line {i}\nmore"),
+                vec![],
+            );
+            e.tags = tags;
+            if i % 17 == 0 {
+                e.kind = 1111;
+            }
+            events.push(e);
+            // Edits: by the author (and an edit of that edit), and by someone else.
+            if i % 5 == 0 {
+                let ed = ev(
+                    &format!("e{i:04}"),
+                    author,
+                    900 + i as u64,
+                    &format!("edited {i}"),
+                    vec![edit_tag(&id(i))],
+                );
+                events.push(ed);
+                if i % 10 == 0 {
+                    events.push(ev(
+                        &format!("f{i:04}"),
+                        author,
+                        1900 + i as u64,
+                        &format!("edited twice {i}"),
+                        vec![edit_tag(&format!("e{i:04}"))],
+                    ));
+                }
+                events.push(ev(
+                    &format!("x{i:04}"),
+                    "mallory",
+                    950 + i as u64,
+                    "not yours",
+                    vec![edit_tag(&id(i))],
+                ));
+            }
+        }
+        events.push(ev(
+            "rootedit",
+            "alice",
+            3000,
+            "topic v2",
+            vec![edit_tag("root")],
+        ));
+        events.push(ev(
+            "rootedit2",
+            "alice",
+            3001,
+            "topic v3",
+            vec![edit_tag("rootedit")],
+        ));
+        events.push(ev(
+            "rootforge",
+            "bob",
+            3002,
+            "forged",
+            vec![edit_tag("root")],
+        ));
+        let root = events[0].clone();
+        assert_eq!(
+            thread_replies(&root, &events),
+            thread_replies_reference(&root, &events)
+        );
+        assert!(
+            thread_replies(&root, &events).len() > 200,
+            "the fixture exercises many replies"
+        );
     }
 
     fn edit_tag(target: &str) -> Vec<&str> {

@@ -1,4 +1,4 @@
-//! Native [`Relay`] implementation: one NIP-42-authenticated WebSocket plus
+//! Native [`Relay`](crate::relay::Relay) implementation: one NIP-42-authenticated WebSocket plus
 //! the relay worker's HTTP API on the same origin.
 //!
 //! Protocol facts, from `nostr-bbs-relay-worker`:
@@ -14,10 +14,10 @@
 
 use std::time::Duration;
 
+use crate::relay::{DeleteOutcome, Filter, PublishOutcome, Relay, RelayError};
 use futures_util::{SinkExt, StreamExt};
 use nostr_bbs_core::keys::SecretKey;
 use nostr_bbs_core::{sign_event, NostrEvent, UnsignedEvent};
-use nostr_bbs_zone_migrate::relay::{DeleteOutcome, Filter, PublishOutcome, Relay, RelayError};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout_at, Instant};

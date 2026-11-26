@@ -88,6 +88,50 @@ impl ReadCache {
         lookup: impl Fn(&str, u32) -> Option<ZoneKey>,
         admits: impl Fn(&NostrEvent) -> bool,
     ) -> bool {
+        self.redecrypt_with(messages, |ev| Some(read_outcome(ev, &lookup)), admits)
+    }
+
+    /// The events [`redecrypt`](Self::redecrypt) would run the read path on
+    /// for `messages`, newest first, each once: a live post's original
+    /// ciphertext (under its own id), a placeholder's envelope, and the
+    /// envelope of a restored original. A chunked pass opens these a few at a
+    /// time (see `ZoneKeyStore::redecrypt_chunked`) and applies each chunk
+    /// with [`redecrypt_with`](Self::redecrypt_with).
+    pub fn open_targets(&self, messages: &HashMap<String, Vec<NostrEvent>>) -> Vec<NostrEvent> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut out: Vec<NostrEvent> = Vec::new();
+        for ev in messages.values().flatten() {
+            if let Some(ct) = self.ciphertexts.get(&ev.id) {
+                if seen.insert(ev.id.as_str()) {
+                    let mut original = ev.clone();
+                    original.content = ct.clone();
+                    out.push(original);
+                }
+            } else if let Some(outer) = self.envelopes.get(&ev.id).or_else(|| {
+                self.restored
+                    .get(&ev.id)
+                    .and_then(|outer_id| self.envelopes.get(outer_id))
+            }) {
+                if seen.insert(outer.id.as_str()) {
+                    out.push(outer.clone());
+                }
+            }
+        }
+        out.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+        out
+    }
+
+    /// [`redecrypt`](Self::redecrypt) with the read-path outcome supplied by
+    /// `outcome_of`, called with the event to open (as
+    /// [`open_targets`](Self::open_targets) lists them). `None` leaves that
+    /// message exactly as it is, so a chunked pass applies only the outcomes
+    /// it has computed so far; the swap and dedupe rules are the same.
+    pub fn redecrypt_with(
+        &mut self,
+        messages: &mut HashMap<String, Vec<NostrEvent>>,
+        mut outcome_of: impl FnMut(&NostrEvent) -> Option<ReadOutcome>,
+        admits: impl Fn(&NostrEvent) -> bool,
+    ) -> bool {
         let mut changed = false;
         for events in messages.values_mut() {
             let mut restored_now: HashSet<String> = HashSet::new();
@@ -96,13 +140,19 @@ impl ReadCache {
                 if let Some(ct) = self.ciphertexts.get(&ev.id) {
                     let mut original = ev.clone();
                     original.content = ct.clone();
-                    let text = display_text(&read_outcome(&original, &lookup), ct);
+                    let Some(outcome) = outcome_of(&original) else {
+                        continue;
+                    };
+                    let text = display_text(&outcome, ct);
                     if ev.content != text {
                         ev.content = text;
                         changed = true;
                     }
                 } else if let Some(outer) = self.envelopes.get(&ev.id) {
-                    match read_outcome(outer, &lookup) {
+                    let Some(outcome) = outcome_of(outer) else {
+                        continue;
+                    };
+                    match outcome {
                         ReadOutcome::Sealed(inner) => {
                             self.restored
                                 .entry(inner.id.clone())
@@ -124,7 +174,9 @@ impl ReadCache {
                     .get(&ev.id)
                     .and_then(|outer_id| self.envelopes.get(outer_id))
                 {
-                    let outcome = read_outcome(outer, &lookup);
+                    let Some(outcome) = outcome_of(outer) else {
+                        continue;
+                    };
                     if !matches!(outcome, ReadOutcome::Sealed(_)) {
                         let inner_id = ev.id.clone();
                         *ev = resolve_event(outer, outcome);
@@ -153,6 +205,29 @@ impl ReadCache {
     /// sealed original this session.
     pub fn envelope_of(&self, inner_id: &str) -> Option<&str> {
         self.restored.get(inner_id).map(String::as_str)
+    }
+
+    /// Forget the messages `ids` (ids as they appear in the channel lists),
+    /// as history paging evicts them: a live post's ciphertext, a
+    /// placeholder's envelope, and for a restored sealed original both the
+    /// id mapping and the envelope it came from. The cache then holds no
+    /// trace of an evicted message, so nothing of it can be re-opened or
+    /// re-displayed until the relay delivers it again.
+    pub fn evict<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        for id in ids {
+            self.ciphertexts.remove(id);
+            self.envelopes.remove(id);
+            if let Some(outer) = self.restored.remove(id) {
+                self.envelopes.remove(&outer);
+            }
+        }
+    }
+
+    /// Entries held (ciphertexts, envelopes, restored mappings), for tests
+    /// and the `alloc-stats` diagnostics.
+    #[cfg(any(test, feature = "alloc-stats"))]
+    pub fn len(&self) -> usize {
+        self.ciphertexts.len() + self.envelopes.len() + self.restored.len()
     }
 
     /// Whether nothing has been cached yet (no zone-encrypted message seen).
@@ -305,6 +380,128 @@ mod tests {
         let json = serde_json::to_string(&orig).unwrap();
         let live = live_encrypted(BOB, 1_700_000_100, &json);
         assert_eq!(read_outcome(&live, with_key), ReadOutcome::Decrypted(json));
+    }
+
+    /// The chunked pass (open `open_targets` a few at a time, apply each
+    /// chunk with `redecrypt_with`) ends exactly where one full `redecrypt`
+    /// does, and a partial pass leaves unreached messages untouched.
+    #[test]
+    fn chunked_redecrypt_matches_a_full_pass() {
+        let build = |cache: &mut ReadCache| {
+            let mut msgs = one_channel(Vec::new());
+            let list = msgs.get_mut(&channel()).unwrap();
+            for i in 0..12u64 {
+                let ev = if i % 3 == 0 {
+                    live_encrypted(ALICE, 100 + i, &format!("live {i}"))
+                } else {
+                    seal(&original(100 + i, &format!("sealed {i}")))
+                };
+                assert!(insert_message(list, cache.prepare(&ev, no_key)));
+            }
+            msgs
+        };
+        let mut full_cache = ReadCache::default();
+        let mut full = build(&mut full_cache);
+        assert!(full_cache.redecrypt(&mut full, with_key, |_| true));
+
+        let mut cache = ReadCache::default();
+        let mut msgs = build(&mut cache);
+        let targets = cache.open_targets(&msgs);
+        assert_eq!(targets.len(), 12, "each message's source once");
+        assert!(
+            targets
+                .windows(2)
+                .all(|w| w[0].created_at >= w[1].created_at),
+            "newest first"
+        );
+        let mut first = true;
+        for chunk in targets.chunks(5) {
+            let mut outcomes: HashMap<String, ReadOutcome> = chunk
+                .iter()
+                .map(|ev| (ev.id.clone(), read_outcome(ev, with_key)))
+                .collect();
+            cache.redecrypt_with(&mut msgs, |ev| outcomes.remove(&ev.id), |_| true);
+            if first {
+                // Only the newest five are decrypted so far.
+                let shown = &msgs[&channel()];
+                let locked = shown
+                    .iter()
+                    .filter(|e| e.content == PLACEHOLDER_MISSING_KEY)
+                    .count();
+                assert_eq!(locked, 7);
+                first = false;
+            }
+        }
+        // Live posts are re-encrypted with a fresh nonce per build, so their
+        // ids differ between the two lists; compare what the reader sees, and
+        // the restored originals (deterministic) whole.
+        let seen = |m: &HashMap<String, Vec<NostrEvent>>| -> Vec<(u64, String, Option<String>)> {
+            m[&channel()]
+                .iter()
+                .map(|e| {
+                    let sealed_id = (!e.tags.iter().any(|t| t[0] == "zk")).then(|| e.id.clone());
+                    (e.created_at, e.content.clone(), sealed_id)
+                })
+                .collect()
+        };
+        assert_eq!(seen(&msgs), seen(&full));
+        assert!(!msgs[&channel()]
+            .iter()
+            .any(|e| e.content == PLACEHOLDER_MISSING_KEY));
+    }
+
+    /// One event id can sit in two channel lists (the history paths resolve
+    /// the list key differently). A chunked apply must reach every copy, as
+    /// `apply_outcomes` does by cloning each outcome instead of taking it.
+    #[test]
+    fn a_chunk_outcome_reaches_every_copy_of_an_event() {
+        let mut cache = ReadCache::default();
+        let env = seal(&original(100, "twice"));
+        let placeholder = cache.prepare(&env, no_key);
+        let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
+        msgs.insert("by-id".into(), vec![placeholder.clone()]);
+        msgs.insert("by-name".into(), vec![placeholder]);
+        let outcomes: HashMap<String, ReadOutcome> = cache
+            .open_targets(&msgs)
+            .iter()
+            .map(|ev| (ev.id.clone(), read_outcome(ev, with_key)))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "one source to open");
+        cache.redecrypt_with(&mut msgs, |ev| outcomes.get(&ev.id).cloned(), |_| true);
+        for list in msgs.values() {
+            assert_eq!(list[0].content, "twice");
+        }
+    }
+
+    /// Evicting a page leaves no cache entry behind: a restored original's
+    /// envelope is reached through the restored mapping, a live post's
+    /// ciphertext and a placeholder's envelope by their own ids.
+    #[test]
+    fn evict_drops_every_trace_of_the_evicted_messages() {
+        let mut cache = ReadCache::default();
+        let mut msgs = one_channel(Vec::new());
+        let list = msgs.get_mut(&channel()).unwrap();
+        let sealed = seal(&original(100, "sealed"));
+        let live = live_encrypted(ALICE, 101, "live");
+        let locked = seal(&original(102, "locked"));
+        assert!(insert_message(list, cache.prepare(&sealed, with_key)));
+        assert!(insert_message(list, cache.prepare(&live, with_key)));
+        assert!(insert_message(list, cache.prepare(&locked, no_key)));
+        assert!(
+            cache.len() >= 4,
+            "restored + envelope, ciphertext, envelope"
+        );
+        let ids: Vec<String> = msgs[&channel()].iter().map(|e| e.id.clone()).collect();
+        assert_ne!(
+            ids[0], sealed.id,
+            "the list holds the restored original's id"
+        );
+        cache.evict(ids.iter().map(String::as_str));
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        // The same envelopes delivered again are prepared afresh.
+        let again = cache.prepare(&sealed, with_key);
+        assert_eq!(again.content, "sealed");
     }
 
     #[test]

@@ -194,7 +194,8 @@ async fn resolve_aliased_profiles(
 
     let placeholders: Vec<String> = (1..=new_pubkeys.len()).map(|i| format!("?{i}")).collect();
     let alias_sql = format!(
-        "SELECT new_pubkey, old_pubkey FROM pubkey_aliases WHERE new_pubkey IN ({})",
+        "SELECT new_pubkey, old_pubkey FROM pubkey_aliases WHERE new_pubkey IN ({}) \
+         ORDER BY created_at DESC, rowid DESC",
         placeholders.join(", ")
     );
     let binds: Vec<JsValue> = new_pubkeys.iter().map(|p| JsValue::from_str(p)).collect();
@@ -229,9 +230,16 @@ async fn resolve_aliased_profiles(
     let old_by_pk: std::collections::HashMap<String, &ProfileRow> =
         old_rows.iter().map(|r| (r.pubkey.clone(), r)).collect();
 
+    // A successor may replace several keys: one profile per successor, the
+    // most recently linked predecessor that has one (rows are newest first).
     let mut out = Vec::new();
+    let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for pair in &pairs {
+        if done.contains(pair.new_pubkey.as_str()) {
+            continue;
+        }
         if let Some(old) = old_by_pk.get(&pair.old_pubkey) {
+            done.insert(pair.new_pubkey.as_str());
             out.push(json!({
                 "pubkey": pair.new_pubkey,
                 "name": old.name,

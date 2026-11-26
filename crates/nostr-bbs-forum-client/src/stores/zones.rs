@@ -126,6 +126,28 @@ pub struct Zone {
     /// kinds by zone tag regardless.
     #[serde(default)]
     pub kanban: bool,
+    /// Search mode (`"off" | "server" | "sealed"`), projected from
+    /// `nostr_bbs_config::schema::Zone::search`. Absent ⇒ derived by
+    /// [`Zone::effective_search`] exactly as the config does.
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+impl Zone {
+    /// The search mode in force: configured, else encrypted → `sealed`,
+    /// public → `off`, otherwise `server` (mirrors
+    /// `nostr_bbs_config::schema::Zone::effective_search`). An unknown value
+    /// reads as `off`.
+    pub fn effective_search(&self) -> &'static str {
+        match self.search.as_deref() {
+            Some("sealed") if self.encrypted => "sealed",
+            Some("server") if !self.encrypted => "server",
+            Some(_) => "off",
+            None if self.encrypted => "sealed",
+            None if self.visibility == ZoneVisibility::Public => "off",
+            None => "server",
+        }
+    }
 }
 
 impl Zone {
@@ -158,18 +180,28 @@ impl Zone {
 /// legacy fallback list when the key is absent or unparseable so navigation
 /// never regresses.
 pub fn load_zones() -> Vec<Zone> {
+    configured_zones().unwrap_or_else(fallback_zones)
+}
+
+/// The zones the deployment actually configured, or `None` when
+/// `ZONE_CONFIG` is absent, empty or unparseable (the generic kit default,
+/// where [`load_zones`] substitutes the built-in fallback list).
+///
+/// Admin tooling that must tell "this deployment declares its own zones" from
+/// "no config, using placeholders" reads this rather than [`load_zones`].
+pub fn configured_zones() -> Option<Vec<Zone>> {
     match read_zone_config_json() {
         Some(json) => match serde_json::from_str::<Vec<Zone>>(&json) {
-            Ok(zones) if !zones.is_empty() => zones,
-            Ok(_) => fallback_zones(),
+            Ok(zones) if !zones.is_empty() => Some(zones),
+            Ok(_) => None,
             Err(e) => {
                 web_sys::console::warn_1(
                     &format!("[zones] ZONE_CONFIG parse failed ({e}); using fallback").into(),
                 );
-                fallback_zones()
+                None
             }
         },
-        None => fallback_zones(),
+        None => None,
     }
 }
 
@@ -269,6 +301,37 @@ pub fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
     zones.first().map(|z| z.id.clone())
 }
 
+/// Pod container for images attached in a channel with this `section`: the
+/// strict zone ([`zone_id_for_section`]) when the deployment declares zones,
+/// `Unzoned` (upload refused) when it declares zones but the section names
+/// none, and `Public` when it declares no zones at all.
+pub fn media_target_for_section(
+    section: Option<&str>,
+) -> crate::utils::restricted_media::MediaTarget {
+    let ids: Option<Vec<String>> =
+        configured_zones().map(|zs| zs.into_iter().map(|z| z.id).collect());
+    crate::utils::restricted_media::media_target_for(section, ids.as_deref())
+}
+
+/// Strict counterpart of [`section_to_zone`]: the id of the configured zone a
+/// section id belongs to by exact match or `<zone-id>-` prefix, and `None`
+/// otherwise.
+///
+/// [`section_to_zone`] falls back to the first zone so a stray channel never
+/// vanishes from the index. That is right for display and wrong for anything
+/// that writes: binding a channel on the relay (`channel_zones`) changes who may
+/// read and write it, so only a section that names its zone may be bound.
+pub fn zone_id_for_section(section: &str, zones: &[Zone]) -> Option<String> {
+    let sec = section.to_lowercase();
+    zones
+        .iter()
+        .find(|z| {
+            let id = z.id.to_lowercase();
+            sec == id || sec.starts_with(&format!("{id}-"))
+        })
+        .map(|z| z.id.clone())
+}
+
 /// Compare two section ids for zone-tile ordering. An operator-pinned section
 /// (present in `section_order`, e.g. a zone's `[[zones]].section_order`) sorts
 /// before an unpinned one; two pinned sections keep their configured order; two
@@ -341,6 +404,7 @@ fn fallback_zones() -> Vec<Zone> {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         },
         Zone {
             id: "friends".to_string(),
@@ -355,6 +419,7 @@ fn fallback_zones() -> Vec<Zone> {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         },
         Zone {
             id: "family".to_string(),
@@ -369,6 +434,7 @@ fn fallback_zones() -> Vec<Zone> {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         },
         Zone {
             id: "business".to_string(),
@@ -383,6 +449,7 @@ fn fallback_zones() -> Vec<Zone> {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         },
     ]
 }
@@ -439,6 +506,7 @@ mod tests {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         }
     }
 
@@ -456,6 +524,27 @@ mod tests {
             zone("family"),
             zone("business"),
         ]
+    }
+
+    #[test]
+    fn zone_id_for_section_is_strict_where_section_to_zone_falls_back() {
+        let zones = sample_zones();
+        assert_eq!(
+            zone_id_for_section("family-events", &zones),
+            Some("family".to_string())
+        );
+        assert_eq!(
+            zone_id_for_section("Family", &zones),
+            Some("family".to_string())
+        );
+        // A legacy section names no configured zone: no binding.
+        assert_eq!(zone_id_for_section("home-lobby", &zones), None);
+        assert_eq!(zone_id_for_section("familyevents", &zones), None);
+        // The display resolver still catches it, by design.
+        assert_eq!(
+            section_to_zone("home-lobby", &zones),
+            Some("public".to_string())
+        );
     }
 
     #[test]

@@ -310,6 +310,27 @@ fn redirect_spinner() -> impl IntoView {
 
 #[component]
 pub fn App() -> impl IntoView {
+    // Sign-in link (sheet QR / tapped link, `utils::connect_link`): take the
+    // key FIRST, before any provider, effect or the router runs. The
+    // index.html script already scrubbed it from the address bar; this takes
+    // it from that one-shot hand-off (or scrubs `location.hash` itself), keeps
+    // it only on `<base>/` or `<base>/connect`, and parks it in a zeroising
+    // slot. The URL is then pointed at `/connect` so the router mounts the
+    // connect page rather than `HomeOrForums`, which would bounce a
+    // signed-out visitor to the login page.
+    if let Some(key) = crate::utils::connect_link::take_pending_key(&base_href("")) {
+        crate::utils::connect_link::stash(key);
+        if let Some(w) = web_sys::window() {
+            let _ = w.history().and_then(|h| {
+                h.replace_state_with_url(
+                    &wasm_bindgen::JsValue::NULL,
+                    "",
+                    Some(&base_href("/connect")),
+                )
+            });
+        }
+    }
+
     // Defensive, no-op-safe capture of any `beforeinstallprompt` that fires on
     // the forum origin (the real prompt lives on the BBS page, ADR-109). Called
     // once, as early as possible per MDN (the event can originate from an
@@ -410,7 +431,13 @@ pub fn App() -> impl IntoView {
                 };
                 rebaked.set_value(true);
                 leptos::task::spawn_local(async move {
-                    if crate::utils::bake::is_baked().await {
+                    // Re-bake when there is no bake, or when the bake belongs
+                    // to another account (an in-app account switch): the next
+                    // launch must adopt the account signed in now.
+                    let current = auth.pubkey().get_untracked();
+                    if crate::utils::bake::is_baked().await
+                        && crate::utils::bake::baked_pubkey().is_none_or(|p| Some(p) == current)
+                    {
                         return;
                     }
                     let Some(secret) = auth.get_privkey_bytes() else {
@@ -451,6 +478,12 @@ pub fn App() -> impl IntoView {
     // Zone end-to-end encryption (ADR-2016): keys load from IndexedDB now,
     // before channel sync, so held keys decrypt the first messages to arrive.
     crate::zone_crypto::store::provide_zone_key_store(use_channel_store());
+    #[cfg(feature = "alloc-stats")]
+    crate::alloc_stats::install_store_stats(
+        relay.clone(),
+        use_channel_store(),
+        crate::zone_crypto::store::try_use_zone_key_store().expect("zone-key store provided above"),
+    );
     crate::stores::reactions::provide_reaction_store();
 
     let auth = use_auth();
@@ -895,7 +928,8 @@ pub fn App() -> impl IntoView {
     // whatever had arrived. `channel_list_settled` waits for an authenticated
     // answer or the deadline, which is armed when the relay connects (not at
     // app start: sign-in can take longer than the deadline). Still gated on
-    // a non-empty list, since `start_msg_sync` bails on an empty one.
+    // a non-empty list, since `start_msg_sync` bails on an empty one (the
+    // empty case is covered by `history_known_empty` below).
     let msg_sync_deadline =
         crate::utils::lookup::deadline_for(move || relay_conn.get() == ConnectionState::Connected);
     Effect::new(move |_| {
@@ -907,8 +941,17 @@ pub fn App() -> impl IntoView {
             store.channel_receipt.get(),
             msg_sync_deadline.get(),
         );
-        let has_channels = store.channels.with(|c| !c.is_empty());
-        if !settled || !has_channels {
+        let channel_count = store.channels.with(|c| c.len());
+        // A relay with no channels never starts the message sync (nothing to
+        // scope its filters to), so its EOSE would never arrive and readiness
+        // checks waiting on it (the admin zone-key mint plan) would hang on a
+        // fresh database. An authenticated empty list is the relay's answer
+        // that there is no history to see; if channels appear later,
+        // `start_msg_sync` clears the flag and re-earns it on its own EOSE.
+        if crate::utils::lookup::history_known_empty(store.channel_receipt.get(), channel_count) {
+            store.msg_eose_received.set(true);
+        }
+        if !settled || channel_count == 0 {
             return;
         }
         let r = expect_context::<RelayConnection>();

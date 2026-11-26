@@ -247,6 +247,34 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
             }
             // ADR-2016: a public zone is readable by anonymous visitors, who can
             // never hold a zone key, so it cannot be end-to-end encrypted.
+            // Search mode (sealed-search design): a server index of an
+            // encrypted zone would hand its plaintext to the server.
+            if let Some(mode) = zone.search {
+                use crate::schema::SearchMode;
+                if zone.encrypted && mode == SearchMode::Server {
+                    return Err(format!(
+                        "zone '{}' has encrypted = true but search = \"server\" — a server-side \
+                         index would expose the zone's plaintext to the server; use \
+                         search = \"sealed\" (browser-side) or \"off\"",
+                        zone.id
+                    ));
+                }
+                if !zone.encrypted && mode == SearchMode::Sealed {
+                    return Err(format!(
+                        "zone '{}' has search = \"sealed\" but is not encrypted — sealed search \
+                         needs a zone key; use search = \"server\" or \"off\"",
+                        zone.id
+                    ));
+                }
+                if zone.visibility == crate::schema::ZoneVisibility::Public
+                    && mode != SearchMode::Off
+                {
+                    return Err(format!(
+                        "zone '{}' is public; public zones get no search (search must be \"off\")",
+                        zone.id
+                    ));
+                }
+            }
             if zone.encrypted && zone.visibility == crate::schema::ZoneVisibility::Public {
                 return Err(format!(
                     "zone '{}' has encrypted = true but visibility = \"public\" — a public \
@@ -316,6 +344,17 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
         }
     }
 
+    for pk in &cfg.search_archivists {
+        if pk.len() != 64
+            || !pk
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!(
+                "search_archivists entry '{pk}' is not 64-char lowercase hex"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -364,6 +403,7 @@ mod tests {
             },
             branding: Branding::default(),
             zones: Vec::new(),
+            search_archivists: Vec::new(),
             trust: Trust::default(),
             invites: Invites::default(),
             moderation: Moderation::default(),
@@ -771,6 +811,7 @@ operator = "tier-2"
             agent_keys: false,
             auto_approve: false,
             kanban: false,
+            search: None,
             group_pubkey: None,
         }
     }
@@ -813,6 +854,45 @@ operator = "tier-2"
     }
 
     #[test]
+    fn search_mode_rules() {
+        use crate::schema::SearchMode;
+        let mut cfg = baseline_cfg();
+        // Defaults: encrypted locked → sealed, public → off.
+        let enc = zone_for_encryption(ZoneVisibility::Locked, true);
+        assert_eq!(enc.effective_search(), SearchMode::Sealed);
+        assert_eq!(
+            zone_for_encryption(ZoneVisibility::Public, false).effective_search(),
+            SearchMode::Off
+        );
+        assert_eq!(
+            zone_for_encryption(ZoneVisibility::Locked, false).effective_search(),
+            SearchMode::Server
+        );
+        let mut bad = enc.clone();
+        bad.search = Some(SearchMode::Server);
+        cfg.zones = vec![bad];
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .contains("expose the zone's plaintext"));
+        let mut sealed_plain = zone_for_encryption(ZoneVisibility::Locked, false);
+        sealed_plain.search = Some(SearchMode::Sealed);
+        cfg.zones = vec![sealed_plain];
+        assert!(validate_config(&cfg).is_err());
+        let mut pub_server = zone_for_encryption(ZoneVisibility::Public, false);
+        pub_server.search = Some(SearchMode::Server);
+        cfg.zones = vec![pub_server];
+        assert!(validate_config(&cfg).is_err());
+        let mut ok = enc;
+        ok.search = Some(SearchMode::Off);
+        cfg.zones = vec![ok];
+        assert!(validate_config(&cfg).is_ok());
+        cfg.search_archivists = vec!["AB".into()];
+        assert!(validate_config(&cfg).is_err());
+        cfg.search_archivists = vec!["ab".repeat(32)];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
     fn encrypted_locked_or_hidden_zone_is_accepted() {
         for vis in [ZoneVisibility::Locked, ZoneVisibility::Hidden] {
             let mut cfg = baseline_cfg();
@@ -846,6 +926,7 @@ operator = "tier-2"
             agent_keys: false,
             auto_approve: false,
             kanban: false,
+            search: None,
             group_pubkey: None,
         }];
         assert!(validate_config(&cfg).is_ok());
@@ -867,6 +948,7 @@ operator = "tier-2"
             agent_keys: false,
             auto_approve: false,
             kanban: false,
+            search: None,
             group_pubkey: None,
         }];
         assert!(validate_config(&cfg).is_err());
@@ -888,6 +970,7 @@ operator = "tier-2"
             agent_keys: false,
             auto_approve: false,
             kanban: false,
+            search: None,
             group_pubkey: None,
         }
     }

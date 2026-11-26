@@ -98,8 +98,9 @@ fn full_run_seals_verifies_and_purges_preserving_every_original() {
     assert!(report.failed.is_empty());
     assert_eq!(report.counts.sealed, 5);
     assert_eq!(relay.published.len(), 5);
-    // Saved after recording the plan and after every entry.
-    assert_eq!(sink.saves.len(), 6);
+    // Saved after recording the plan, a checkpoint per entry (the CLI turns
+    // those into a save every --persist-every), and at the end of the phase.
+    assert_eq!(sink.saves.len(), 7);
 
     // Every envelope is on the relay, sealed with the newest epoch, at the
     // original's created_at, and opens to the original byte for byte.
@@ -786,4 +787,344 @@ fn ticket_epoch_key_must_match_what_the_zone_posts_use() {
     // The ticket's epoch-2 key differs from the observed epoch-2 key.
     let msg = refusal_with(vec![live_zk_post(CHANNEL, "zone3", 2, ZONE3_E2)], &keys).unwrap();
     assert!(msg.contains("differs"), "{msg}");
+}
+
+// --- --allow-unanchored-first-encryption ---
+
+/// A ring whose only zone3 key (epoch 2) came from a grant by another admin.
+fn granted_ring() -> KeyRing {
+    let mut r = KeyRing::new();
+    r.insert(zone_key(
+        "zone3",
+        2,
+        ZONE3_E2,
+        KeySource::Grant {
+            granted_by: pk([0x55; 32]),
+        },
+    ))
+    .unwrap();
+    r
+}
+
+fn expect() -> Vec<(String, u32, String)> {
+    vec![("zone3".to_string(), 2, pk(ZONE3_E2))]
+}
+
+fn seal_first(
+    relay: &mut FakeRelay,
+    keys: &KeyRing,
+    st: &mut State,
+    allow: bool,
+    expected: &[(String, u32, String)],
+    limit: Option<usize>,
+    sink: &mut Sink,
+) -> Result<engine::SealReport, EngineError> {
+    let ch = channels();
+    let opts = engine::SealOptions {
+        limit,
+        allow_unanchored_first_encryption: allow,
+        expect_zone_keys: expected,
+    };
+    sink.run(|h| {
+        block_on(engine::seal_with(
+            relay,
+            &sk(MIGRATOR),
+            &ch,
+            keys,
+            st,
+            opts,
+            h,
+        ))
+    })
+}
+
+fn refused_with(r: Result<engine::SealReport, EngineError>, needle: &str) {
+    match r {
+        Err(EngineError::Refused(m)) => assert!(m.contains(needle), "{m}"),
+        other => panic!("expected a refusal containing {needle:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_all_plaintext_zone_seals_with_the_flag_and_is_recorded_and_warned() {
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.insert(post(AUTHOR, CHANNEL, 1_600_000_000, "plain"));
+    let mut st = new_state();
+    let mut sink = Sink::default();
+    // Without the flag: refused as before.
+    assert!(matches!(
+        seal_first(
+            &mut relay,
+            &granted_ring(),
+            &mut st,
+            false,
+            &[],
+            None,
+            &mut sink
+        ),
+        Err(EngineError::Refused(_))
+    ));
+    let report = seal_first(
+        &mut relay,
+        &granted_ring(),
+        &mut st,
+        true,
+        &expect(),
+        None,
+        &mut sink,
+    )
+    .unwrap();
+    assert_eq!(report.sealed, 1);
+    assert!(sink
+        .lines
+        .iter()
+        .any(|l| l.contains("WARNING: UNANCHORED FIRST ENCRYPTION")
+            && l.contains("zone3")
+            && l.contains(&pk([0x55; 32]))));
+    assert_eq!(report.unanchored.len(), 1);
+    assert_eq!(st.unanchored_zones["zone3"].epoch, 2);
+    // Every kind naming the zone was asked for (no kind restriction).
+    assert!(relay
+        .queries
+        .iter()
+        .any(|q| q.zk_tags.as_deref() == Some(&["zone3".to_string()][..]) && q.kinds.is_none()));
+}
+
+#[test]
+fn a_resumed_first_encryption_accepts_only_its_own_envelopes_at_the_current_key() {
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.insert(post(AUTHOR, CHANNEL, 1_600_000_000, "one"));
+    relay.insert(post(AUTHOR, CHANNEL, 1_600_000_001, "two"));
+    let mut st = new_state();
+    let mut sink = Sink::default();
+    let first = seal_first(
+        &mut relay,
+        &granted_ring(),
+        &mut st,
+        true,
+        &expect(),
+        Some(1),
+        &mut sink,
+    )
+    .unwrap();
+    assert_eq!(first.sealed, 1);
+    let second = seal_first(
+        &mut relay,
+        &granted_ring(),
+        &mut st,
+        true,
+        &expect(),
+        None,
+        &mut sink,
+    )
+    .unwrap();
+    assert_eq!(second.sealed + second.adopted, 1);
+}
+
+#[test]
+fn the_flag_needs_auth_an_expected_key_and_a_clean_grant() {
+    let base = || {
+        let mut r = FakeRelay::with_admin(&pk(MIGRATOR));
+        r.insert(post(AUTHOR, CHANNEL, 1_600_000_000, "plain"));
+        r
+    };
+    let mut sink = Sink::default();
+    // Unauthenticated session.
+    let mut r = base();
+    r.unauthenticated = true;
+    refused_with(
+        seal_first(
+            &mut r,
+            &granted_ring(),
+            &mut new_state(),
+            true,
+            &expect(),
+            None,
+            &mut sink,
+        ),
+        "not NIP-42",
+    );
+    // No or wrong --expect-zone-key.
+    refused_with(
+        seal_first(
+            &mut base(),
+            &granted_ring(),
+            &mut new_state(),
+            true,
+            &[],
+            None,
+            &mut sink,
+        ),
+        "--expect-zone-key",
+    );
+    let wrong = vec![("zone3".to_string(), 1, pk(ZONE3_E1))];
+    refused_with(
+        seal_first(
+            &mut base(),
+            &granted_ring(),
+            &mut new_state(),
+            true,
+            &wrong,
+            None,
+            &mut sink,
+        ),
+        "names epoch 1",
+    );
+    // Key-file key.
+    let mut file_ring = KeyRing::new();
+    file_ring
+        .insert(zone_key("zone3", 2, ZONE3_E2, KeySource::KeyFile))
+        .unwrap();
+    refused_with(
+        seal_first(
+            &mut base(),
+            &file_ring,
+            &mut new_state(),
+            true,
+            &expect(),
+            None,
+            &mut sink,
+        ),
+        "not a grant",
+    );
+    // Self-grant.
+    let mut self_ring = KeyRing::new();
+    self_ring
+        .insert(zone_key(
+            "zone3",
+            2,
+            ZONE3_E2,
+            KeySource::Grant {
+                granted_by: pk(MIGRATOR),
+            },
+        ))
+        .unwrap();
+    refused_with(
+        seal_first(
+            &mut base(),
+            &self_ring,
+            &mut new_state(),
+            true,
+            &expect(),
+            None,
+            &mut sink,
+        ),
+        "sealer itself",
+    );
+    // An earlier epoch held too: the zone was encrypted before.
+    let mut two = granted_ring();
+    two.insert(zone_key("zone3", 1, ZONE3_E1, KeySource::KeyFile))
+        .unwrap();
+    refused_with(
+        seal_first(
+            &mut base(),
+            &two,
+            &mut new_state(),
+            true,
+            &expect(),
+            None,
+            &mut sink,
+        ),
+        "other key",
+    );
+}
+
+#[test]
+fn the_flag_never_bypasses_live_ciphertext_of_any_kind_anywhere() {
+    let mut sink = Sink::default();
+    // A live encrypted post of the zone in another channel.
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.insert(post(AUTHOR, CHANNEL, 1_600_000_000, "plain"));
+    relay.insert(live_zk_post(OTHER_CHANNEL, "zone3", 1, ZONE3_E1));
+    refused_with(
+        seal_first(
+            &mut relay,
+            &granted_ring(),
+            &mut new_state(),
+            true,
+            &expect(),
+            None,
+            &mut sink,
+        ),
+        "live encrypted",
+    );
+    assert!(relay.published.is_empty());
+    // Zone ciphertext in another kind (e.g. a kind-1 note).
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.insert(post(AUTHOR, CHANNEL, 1_600_000_000, "plain"));
+    relay.insert(sign(
+        AUTHOR2,
+        1,
+        5,
+        vec![tag(&["zk", "zone3", "1", &pk(ZONE3_E1)])],
+        "c",
+    ));
+    refused_with(
+        seal_first(
+            &mut relay,
+            &granted_ring(),
+            &mut new_state(),
+            true,
+            &expect(),
+            None,
+            &mut sink,
+        ),
+        "kind 1",
+    );
+    // A malformed zone tag still refuses (never skipped).
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.insert(post(AUTHOR, CHANNEL, 1_600_000_000, "plain"));
+    relay.insert(sign(
+        AUTHOR2,
+        42,
+        5,
+        vec![
+            tag(&["e", OTHER_CHANNEL, "", "root"]),
+            tag(&["zk", "zone3"]),
+        ],
+        "c",
+    ));
+    refused_with(
+        seal_first(
+            &mut relay,
+            &granted_ring(),
+            &mut new_state(),
+            true,
+            &expect(),
+            None,
+            &mut sink,
+        ),
+        "live encrypted",
+    );
+}
+
+#[test]
+fn purge_of_an_unanchored_zone_waits_for_a_member_post_at_the_sealed_key() {
+    use nostr_bbs_zone_migrate::engine::unanchored_purge_refusal;
+    use nostr_bbs_zone_migrate::state::UnanchoredZone;
+    let sealed = UnanchoredZone {
+        epoch: 2,
+        pubkey: pk(ZONE3_E2),
+        granted_by: pk([0x55; 32]),
+    };
+    let me = pk(MIGRATOR);
+    assert!(unanchored_purge_refusal("zone3", &sealed, &me, &[]).is_some());
+    // The sealer's own encrypted post does not prove members hold the key.
+    let mine = sign(
+        MIGRATOR,
+        42,
+        5,
+        vec![
+            tag(&["e", CHANNEL, "", "root"]),
+            tag(&["zk", "zone3", "2", &pk(ZONE3_E2)]),
+        ],
+        "c",
+    );
+    assert!(unanchored_purge_refusal("zone3", &sealed, &me, &[mine]).is_some());
+    // A member post at another epoch does not either.
+    let other_epoch = live_zk_post(CHANNEL, "zone3", 1, ZONE3_E1);
+    assert!(unanchored_purge_refusal("zone3", &sealed, &me, &[other_epoch]).is_some());
+    // A member post at the sealed key does.
+    let member = live_zk_post(CHANNEL, "zone3", 2, ZONE3_E2);
+    assert!(unanchored_purge_refusal("zone3", &sealed, &me, &[member]).is_none());
 }

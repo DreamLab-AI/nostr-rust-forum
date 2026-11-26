@@ -578,25 +578,38 @@ pub async fn check_suspension(pubkey: &str, env: &Env) -> (bool, bool) {
 // Channel zone lookup
 // ---------------------------------------------------------------------------
 
-/// Look up the zone for a channel from the `channel_zones` table.
+/// A `channel_zones` lookup that could not be answered (D1 unavailable, a
+/// bind or query failure). Callers fail CLOSED on it: reads are withheld and
+/// writes refused, because "no row" means unscoped (public) and must never
+/// be inferred from an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneLookupError;
+
+/// Look up the zone a channel is bound to in the `channel_zones` table.
 ///
-/// Returns `None` if the channel is not in the table (defaults to "home").
-pub async fn get_channel_zone(channel_id: &str, env: &Env) -> Option<String> {
-    let db = env.d1("DB").ok()?;
+/// `Ok(None)`: the query ran and the channel has no row (unscoped).
+/// `Err(ZoneLookupError)`: the answer is unknown. Previously every error was
+/// folded into `None`, so a D1 failure on a cold cache read a zone channel
+/// as public (security review F3).
+pub async fn get_channel_zone(
+    channel_id: &str,
+    env: &Env,
+) -> Result<Option<String>, ZoneLookupError> {
+    let db = env.d1("DB").map_err(|_| ZoneLookupError)?;
 
     #[derive(Deserialize)]
     struct Row {
         zone: String,
     }
 
-    let stmt = db.prepare("SELECT zone FROM channel_zones WHERE channel_id = ?1");
-    match stmt.bind(&[JsValue::from_str(channel_id)]) {
-        Ok(s) => match s.first::<Row>(None).await {
-            Ok(Some(row)) => Some(row.zone),
-            _ => None,
-        },
-        Err(_) => None,
-    }
+    let stmt = db
+        .prepare("SELECT zone FROM channel_zones WHERE channel_id = ?1")
+        .bind(&[JsValue::from_str(channel_id)])
+        .map_err(|_| ZoneLookupError)?;
+    stmt.first::<Row>(None)
+        .await
+        .map(|row| row.map(|r| r.zone))
+        .map_err(|_| ZoneLookupError)
 }
 
 /// Fetch a pubkey's cohort list and admin flag from the whitelist.

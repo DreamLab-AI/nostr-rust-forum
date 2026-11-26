@@ -261,6 +261,18 @@ pub fn channel_list_settled(receipt: SyncReceipt, deadline_passed: bool) -> bool
     receipt.authed || deadline_passed
 }
 
+/// Whether an authenticated channel-list answer proves the relay holds no
+/// channels (and so no message history) this viewer may read.
+///
+/// The broad message sync never starts on an empty list, so its EOSE, which
+/// readiness checks such as the zone-key mint plan wait for, would never
+/// arrive on a fresh database. An empty list is only evidence of an empty
+/// relay once the answer is authenticated: the deadline passing with no answer,
+/// or an anonymous answer (which omits Hidden-zone channels), proves nothing.
+pub fn history_known_empty(receipt: SyncReceipt, channel_count: usize) -> bool {
+    receipt.authed && channel_count == 0
+}
+
 /// The failure clock for whichever target (zone, section, topic) a page is
 /// currently looking up. Leptos reuses a route component when only its params
 /// change, so one clock per mount would let the previous target's expiry
@@ -447,6 +459,22 @@ mod tests {
         );
         r.record(true);
         assert!(channel_list_settled(r, false));
+    }
+
+    #[test]
+    fn empty_history_needs_an_authenticated_empty_list() {
+        let none = SyncReceipt::default();
+        assert!(!history_known_empty(none, 0), "no answer at all");
+        let mut anon = SyncReceipt::default();
+        anon.record(false);
+        assert!(
+            !history_known_empty(anon, 0),
+            "anonymous answer hides channels"
+        );
+        let mut authed = SyncReceipt::default();
+        authed.record(true);
+        assert!(history_known_empty(authed, 0));
+        assert!(!history_known_empty(authed, 3), "channels exist: sync them");
     }
 
     #[test]

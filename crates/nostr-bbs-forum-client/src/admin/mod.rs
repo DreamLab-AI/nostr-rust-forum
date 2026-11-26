@@ -13,6 +13,7 @@ pub(crate) mod membership;
 pub mod overview;
 pub mod registrations;
 pub mod reports;
+pub mod section_options;
 pub mod section_requests;
 pub mod settings;
 pub mod user_table;
@@ -151,6 +152,21 @@ pub struct AdminState {
     /// Drives the create form's pending state so it can reset on success,
     /// rejection, or timeout and let the admin retry.
     pub channel_creating: RwSignal<bool>,
+    /// Per-channel relay zone-binding status, keyed by kind-40 event id. Only
+    /// holds channels bound or attempted in this session: the relay exposes no
+    /// read endpoint for `channel_zones`.
+    pub channel_bind: RwSignal<std::collections::HashMap<String, BindStatus>>,
+}
+
+/// Outcome of a `POST /api/admin/channel-zone` for one channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BindStatus {
+    /// Request in flight.
+    Binding,
+    /// The relay accepted the binding to this zone id.
+    Bound(String),
+    /// The request failed; the message is shown with a retry action.
+    Failed(String),
 }
 
 // -- AdminStore ---------------------------------------------------------------
@@ -176,6 +192,7 @@ impl AdminStore {
                 success: RwSignal::new(None),
                 active_tab: RwSignal::new(AdminTab::Overview),
                 channel_creating: RwSignal::new(false),
+                channel_bind: RwSignal::new(Default::default()),
             },
         }
     }
@@ -618,6 +635,50 @@ impl AdminStore {
 
     // -- Channel management ---------------------------------------------------
 
+    /// Bind a channel to a configured zone on the relay
+    /// (`POST /api/admin/channel-zone`, NIP-98 admin).
+    ///
+    /// The relay zone-gates reads and writes, and enforces encryption, only for
+    /// a channel with a `channel_zones` row, and nothing else writes one, so a
+    /// channel created from the UI is unscoped until this succeeds. `zone_id`
+    /// is the config zone **id** (not its URL slug): the relay resolves it with
+    /// `ZoneConfig::get`. The upsert is idempotent, so retrying is safe. The
+    /// outcome is recorded in `state.channel_bind` for the channel's row.
+    pub async fn bind_channel_zone_signer(
+        &self,
+        channel_id: &str,
+        zone_id: &str,
+        signer: &dyn Signer,
+    ) -> Result<(), String> {
+        let status = self.state.channel_bind;
+        status.update(|m| {
+            m.insert(channel_id.to_string(), BindStatus::Binding);
+        });
+        let body = serde_json::json!({
+            "channel_id": channel_id,
+            "zone": zone_id,
+            "archived": false,
+        });
+        let url = format!("{}/api/admin/channel-zone", Self::api_base());
+        let result = match serde_json::to_string(&body) {
+            Ok(json) => fetch_with_nip98_post_signer(&url, &json, signer)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(format!("JSON serialization failed: {e}")),
+        };
+        status.update(|m| {
+            m.insert(
+                channel_id.to_string(),
+                match &result {
+                    Ok(()) => BindStatus::Bound(zone_id.to_string()),
+                    Err(e) => BindStatus::Failed(e.clone()),
+                },
+            );
+        });
+        result
+    }
+
     /// Create a kind-40 channel using the Signer trait (async, NIP-07 compatible).
     ///
     /// `relay` is passed in rather than resolved via `expect_context`: this
@@ -625,6 +686,12 @@ impl AdminStore {
     /// owner (and therefore context) is not available — resolving it here
     /// panicked the whole app on the first Create Channel click. Callers
     /// grab the connection in component scope and move a clone in.
+    ///
+    /// When the section routes to a configured zone (strictly: exact id or
+    /// `<zone-id>-` prefix) and `bind_signer` is given, the channel is bound to
+    /// that zone on the relay as soon as the kind-40 is accepted. A failed
+    /// bind leaves the channel created but unscoped; it is reported on the
+    /// channel's row with a retry (see `state.channel_bind`).
     #[allow(clippy::too_many_arguments)]
     pub async fn create_channel_with_zone_signer(
         &self,
@@ -635,6 +702,7 @@ impl AdminStore {
         zone: u8,
         cohort: Option<&str>,
         signer: &dyn Signer,
+        bind_signer: Option<Rc<dyn Signer>>,
         relay: RelayConnection,
     ) -> Result<(), String> {
         let creating = self.state.channel_creating;
@@ -697,6 +765,9 @@ impl AdminStore {
         let event_id = signed.id.clone();
         let event_created_at = signed.created_at;
         let event_pubkey = signed.pubkey.clone();
+        let store_for_bind = self.clone();
+        let bind_zone = crate::stores::zones::configured_zones()
+            .and_then(|z| crate::stores::zones::zone_id_for_section(section, &z));
 
         // Shared one-shot guard: whichever of the relay ack or the timeout fires
         // first wins; the loser is a no-op. This prevents a late relay OK from
@@ -727,6 +798,22 @@ impl AdminStore {
                     stats_sig.update(|s| {
                         s.total_channels = channels_sig.get_untracked().len() as u32;
                     });
+                    if let (Some(zone_id), Some(signer)) = (bind_zone.clone(), bind_signer.clone())
+                    {
+                        let store = store_for_bind.clone();
+                        let channel_id = event_id.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Err(e) = store
+                                .bind_channel_zone_signer(&channel_id, &zone_id, &*signer)
+                                .await
+                            {
+                                store.state.error.set(Some(format!(
+                                    "The channel was created but is not yet bound to zone \
+                                     '{zone_id}' ({e}). Use \"Bind to zone\" on the channel to retry."
+                                )));
+                            }
+                        });
+                    }
                 } else {
                     // Surface the relay's NIP-01 OK=false / NOTICE reason when present.
                     let reason = message.trim();

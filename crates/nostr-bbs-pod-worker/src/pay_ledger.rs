@@ -77,6 +77,13 @@ pub const DDL_QUOTA_USAGE: &str = "CREATE TABLE IF NOT EXISTS quota_usage (\
      used_bytes INTEGER NOT NULL DEFAULT 0, \
      updated_at INTEGER NOT NULL)";
 
+/// `quota_usage.limit_explicit`: 1 when an admin set this pod's limit
+/// (`/.quota`), 0 when the row just carries the default it was created with.
+/// Rows with 0 follow the CURRENT default (`POD_QUOTA_MB`), so raising the
+/// default raises every non-overridden pod without touching rows.
+pub const DDL_QUOTA_USAGE_LIMIT_EXPLICIT: &str =
+    "ALTER TABLE quota_usage ADD COLUMN limit_explicit INTEGER NOT NULL DEFAULT 0";
+
 /// Agent jobs with the hold/settle lifecycle. `expires_at` is ISO 8601 text;
 /// `release_ref` names the `pay_credits` row that returns the hold.
 pub const DDL_AGENT_JOBS: &str = "CREATE TABLE IF NOT EXISTS agent_jobs (\
@@ -131,6 +138,7 @@ pub const SCHEMA: &[&str] = &[
     DDL_WEBLEDGER_ACCOUNTS,
     DDL_TXO_DEPOSITS,
     DDL_QUOTA_USAGE,
+    DDL_QUOTA_USAGE_LIMIT_EXPLICIT,
     DDL_AGENT_JOBS,
     DDL_AGENT_JOBS_EXPIRES_AT,
     DDL_AGENT_JOBS_RELEASE_REF,
