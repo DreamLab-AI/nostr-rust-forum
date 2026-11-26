@@ -1088,6 +1088,91 @@ mod tests {
         assert!(plan.pending.iter().all(|(_, pubkey)| pubkey != &d));
     }
 
+    #[test]
+    fn an_empty_record_never_widens_approval() {
+        // A fresh admin browser (no ledger, no approved set, relay answered
+        // "no backup") must not adopt whatever roster the relay serves: a
+        // pubkey injected before this device's first sweep would otherwise be
+        // approved and sent the key with no admin decision.
+        let zones = [rule("zone3", "family", false)];
+        let held = held("zone3", &[1]);
+        let gate = gate_records(
+            &zones,
+            &held,
+            &members(),
+            ME,
+            HashMap::new(),
+            &HashSet::new(),
+        );
+        assert!(gate.adopt.is_empty(), "nothing is approved on no record");
+        assert!(gate
+            .known
+            .get("zone3")
+            .is_none_or(|k| !k.contains(&pk('b'))));
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held,
+            &HashMap::new(),
+            &gate.known,
+            false,
+            None,
+        );
+        assert_eq!(plan.pending, vec![("zone3".to_string(), pk('b'))]);
+        assert!(plan.grants.iter().all(|(_, r)| r == &vec![ME.to_string()]));
+    }
+
+    #[test]
+    fn an_unread_backup_approves_nothing() {
+        // The relay never answered for the backup: the device cannot tell a
+        // member granted elsewhere from an injected one, so nobody is adopted.
+        let zones = [rule("zone3", "family", false)];
+        let unread = HashSet::from(["zone3".to_string()]);
+        let gate = gate_records(
+            &zones,
+            &held("zone3", &[1]),
+            &members(),
+            ME,
+            HashMap::new(),
+            &unread,
+        );
+        assert!(gate.adopt.is_empty());
+        assert!(gate.known.get("zone3").is_none_or(HashSet::is_empty));
+    }
+
+    fn tally(handed: usize, accepted: &[String], rejected: usize, failed: usize) -> GrantTally {
+        GrantTally {
+            planned_members: 3,
+            handed,
+            failed,
+            accepted: accepted.len(),
+            rejected,
+            accepted_members: accepted.iter().cloned().collect(),
+        }
+    }
+
+    #[test]
+    fn a_refused_or_unanswered_grant_is_never_reported_as_sent() {
+        // Three grants handed over: b accepted, c refused, d never answered.
+        let r = tally(3, &[pk('b')], 1, 0).report();
+        assert_eq!(r.members, 1, "only members whose grant was accepted");
+        let s = report_summary(&r).expect("something to say");
+        assert!(s.problem, "a refusal is not a success: {}", s.text);
+        assert!(s.text.contains("refused"), "{}", s.text);
+        assert!(s.text.contains("not confirmed"), "{}", s.text);
+        // Nothing accepted at all, everything refused: still a problem.
+        let r = tally(2, &[], 2, 0).report();
+        let s = report_summary(&r).expect("something to say");
+        assert!(s.problem);
+        assert!(!s.text.starts_with("Sent"), "{}", s.text);
+        // Every grant accepted: a plain success naming the members reached.
+        let r = tally(2, &[pk('b'), pk('c')], 0, 0).report();
+        let s = report_summary(&r).expect("something to say");
+        assert!(!s.problem);
+        assert!(s.text.contains("2 member(s)"), "{}", s.text);
+    }
+
     #[derive(Default)]
     struct MemKv(std::cell::RefCell<HashMap<String, String>>);
     impl super::super::grant_ledger::GrantKv for MemKv {

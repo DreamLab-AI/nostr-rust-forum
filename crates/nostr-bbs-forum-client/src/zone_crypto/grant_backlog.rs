@@ -402,11 +402,16 @@ mod tests {
     }
 
     #[test]
-    fn failed_inbox_setup_does_not_hold_it_open() {
+    fn failed_inbox_setup_is_couldnt_check_not_settled() {
+        // The inbox key could not be set up (its backup unreadable, the relay
+        // unreachable): grants addressed to it were never fetched, so "no
+        // more keys" would be a guess. Stalled, never settled, so a page says
+        // its keys could not be checked rather than "not found".
         let mut b = GrantBacklog::new(true, 0.0);
         b.scope_delivered(GrantScope::Identity, true, 1.0);
         b.inbox_failed(1.0);
-        assert!(b.settled());
+        assert!(!b.settled());
+        assert_eq!(b.phase(2.0), KeyPhase::Stalled);
     }
 
     #[test]

@@ -913,8 +913,11 @@ mod tests {
         assert_eq!(epochs(grantable_keys(held.clone(), Some(5))), vec![5]);
         assert_eq!(epochs(grantable_keys(held.clone(), Some(2))), vec![2, 3, 5]);
         assert_eq!(epochs(grantable_keys(held.clone(), None)), vec![1, 2, 3, 5]);
-        // A floor above every held key still leaves the newest grantable.
-        assert_eq!(epochs(grantable_keys(held, Some(9))), vec![5]);
+        // A floor above every held key leaves nothing grantable: the newest
+        // held key is below the floor too, so it is an old key (a stale
+        // device, or a misconfigured floor) and must stay home.
+        assert!(grantable_keys(held.clone(), Some(9)).is_empty());
+        assert!(grantable_keys(held, Some(6)).is_empty());
         assert!(grantable_keys(Vec::new(), Some(5)).is_empty());
         // With history on, the plan then carries only the floor's keys.
         let recs = vec!["b".repeat(64)];
