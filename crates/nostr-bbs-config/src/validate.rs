@@ -344,6 +344,12 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
         }
     }
 
+    for host in &cfg.preview.allowed_hosts {
+        if let Err(why) = preview_host_problem(host) {
+            return Err(format!("preview.allowed_hosts entry '{host}' {why}"));
+        }
+    }
+
     for pk in &cfg.search_archivists {
         if pk.len() != 64
             || !pk
@@ -354,6 +360,86 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
                 "search_archivists entry '{pk}' is not 64-char lowercase hex"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Suffixes under which anyone can register or publish a host. Listing one
+/// would let any such host through, so an entry must name a site beneath it.
+/// A guard against the common mistakes, not a full public-suffix list.
+const OPEN_SUFFIXES: &[&str] = &[
+    "ac.uk",
+    "co.jp",
+    "co.nz",
+    "co.uk",
+    "com.au",
+    "com.br",
+    "github.io",
+    "gov.uk",
+    "herokuapp.com",
+    "netlify.app",
+    "org.uk",
+    "pages.dev",
+    "vercel.app",
+    "web.app",
+    "workers.dev",
+];
+
+/// Names that never resolve on the public internet.
+const PRIVATE_SUFFIXES: &[&str] = &[
+    "arpa",
+    "home",
+    "internal",
+    "lan",
+    "local",
+    "localdomain",
+    "localhost",
+    "onion",
+    "test",
+];
+
+/// Why `host` is not acceptable in `preview.allowed_hosts`, if it is not.
+///
+/// An entry is a bare public hostname: lower-case ASCII labels separated by
+/// dots, at least two of them, with no scheme, port, path, wildcard or IP
+/// address, and not a private-use or open-registration suffix.
+fn preview_host_problem(host: &str) -> Result<(), &'static str> {
+    if host.is_empty() || host.len() > 253 {
+        return Err("must be a hostname of 1 to 253 characters");
+    }
+    if host.contains("://") || host.contains('/') {
+        return Err("must be a bare hostname, without a scheme or path");
+    }
+    if host.contains(':') {
+        return Err("must not carry a port or be an IPv6 address");
+    }
+    if host.contains('*') {
+        return Err("must not use a wildcard (an entry already covers its subdomains)");
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let label_ok = |l: &&str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    if !labels.iter().all(label_ok) {
+        return Err("must be lower-case letters, digits and hyphens in dot-separated labels");
+    }
+    if labels.len() < 2 {
+        return Err("must have at least two labels (a bare top-level name covers too much)");
+    }
+    let last = labels[labels.len() - 1];
+    if last.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("must be a hostname, not an IP address");
+    }
+    if PRIVATE_SUFFIXES.contains(&last) {
+        return Err("is a private-use name the worker never fetches");
+    }
+    if OPEN_SUFFIXES.contains(&host) {
+        return Err("is an open-registration suffix; list the specific site beneath it");
     }
     Ok(())
 }
@@ -431,6 +517,7 @@ mod tests {
             payments: Payments::default(),
             calendar: Calendar::default(),
             poker: Poker::default(),
+            preview: Preview::default(),
             encryption: Encryption::default(),
             ingress: Vec::new(),
         }
@@ -439,6 +526,87 @@ mod tests {
     #[test]
     fn baseline_validates() {
         assert!(validate_config(&baseline_cfg()).is_ok());
+    }
+
+    #[test]
+    fn preview_hosts_must_be_bare_public_hostnames() {
+        let ok = |h: &str| {
+            let mut cfg = baseline_cfg();
+            cfg.preview.allowed_hosts = vec![h.into()];
+            validate_config(&cfg)
+        };
+        for good in [
+            "wikipedia.org",
+            "bbc.co.uk",
+            "youtu.be",
+            "my-forum.example.com",
+            "x.com",
+        ] {
+            assert!(ok(good).is_ok(), "{good} should be accepted");
+        }
+        for bad in [
+            "",
+            "https://github.com",
+            "github.com/owner",
+            "github.com:443",
+            "*.github.com",
+            "GitHub.com",
+            "github.com.",
+            "com",
+            "10.0.0.1",
+            "[::1]",
+            "localhost",
+            "router.lan",
+            "printer.local",
+            "co.uk",
+            "github.io",
+            "workers.dev",
+            "-bad.example.com",
+            "bad..example.com",
+            "exa mple.com",
+        ] {
+            let err = ok(bad).expect_err(&format!("{bad:?} should be refused"));
+            assert!(err.contains("preview.allowed_hosts"), "{err}");
+        }
+    }
+
+    #[test]
+    fn preview_hosts_project_in_canonical_form() {
+        let p = Preview {
+            allowed_hosts: vec![
+                "youtube.com".into(),
+                "wikipedia.org".into(),
+                "en.wikipedia.org".into(),
+                "youtube.com".into(),
+                "bbc.co.uk".into(),
+                // Not a subdomain of bbc.co.uk: kept.
+                "notbbc.co.uk".into(),
+            ],
+        };
+        assert_eq!(
+            p.canonical_hosts(),
+            vec!["bbc.co.uk", "notbbc.co.uk", "wikipedia.org", "youtube.com"]
+        );
+        assert_eq!(
+            p.allowed_hosts_var(),
+            "bbc.co.uk, notbbc.co.uk, wikipedia.org, youtube.com"
+        );
+        // No list: an empty var, which the worker treats as "refuse all".
+        assert_eq!(Preview::default().allowed_hosts_var(), "");
+    }
+
+    #[test]
+    fn preview_section_parses_from_toml_and_defaults_to_empty() {
+        let with = "[preview]\nallowed_hosts = [\"wikipedia.org\", \"github.com\"]\n";
+        let p: Preview = toml::from_str::<toml::Value>(with)
+            .unwrap()
+            .get("preview")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(p.allowed_hosts_var(), "github.com, wikipedia.org");
+        assert!(baseline_cfg().preview.allowed_hosts.is_empty());
     }
 
     #[test]
