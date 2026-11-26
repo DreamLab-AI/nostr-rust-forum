@@ -18,6 +18,19 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Preview worker egress fails closed without an allow-list (2026-11-26, breaking)
+
+Preview worker only. **Breaking for deployments that do not set `PREVIEW_ALLOWED_HOSTS`:** link previews and the BBS
+ASCII image route now answer 503 until it is set.
+
+- **Why.** The Workers runtime resolves the hostname again at `fetch` time and cannot pin an IP, so the hostname
+  denylist alone is open to DNS rebinding (an attacker domain that resolves to `127.0.0.1` or `169.254.169.254`). The
+  allow-list was documented as the real mitigation but defaulted off.
+- **What.** `ssrf::EgressPolicy` (`AllowList`, `DenylistOnly`, `Closed`) is derived from the worker's `Env` on every
+  request. A non-empty `PREVIEW_ALLOWED_HOSTS` is authoritative; unset or blank is `Closed`: every fetch, redirect hop
+  included, is refused and `/preview` and `/ascii` return 503. The denylist-only mode needs the development opt-out
+  `PREVIEW_ALLOW_ANY_HOST = "true"` (exact value). The kit `wrangler.toml` now ships an example allow-list.
+
 ### Zone-key grant backlog paged past the relay's row cap (2026-11-24, PR #95)
 
 Forum client only. Not yet exercised in a browser or on a live relay; see "Not verified" below.

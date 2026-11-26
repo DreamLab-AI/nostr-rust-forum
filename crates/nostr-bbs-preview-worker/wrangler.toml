@@ -11,3 +11,12 @@ id = "c56bfb95f0984b3a8822866b094f3a61"
 
 [vars]
 ALLOWED_ORIGIN = "https://example.com"
+# Egress allow-list: the only hosts /preview and /ascii will fetch (comma or
+# whitespace separated; an entry also matches its subdomains). Required: when
+# unset or blank the worker fails closed and both routes answer 503, because the
+# Workers runtime cannot pin resolved IPs and a denylist alone is open to DNS
+# rebinding. List the sites your members link to; unlisted hosts get no preview.
+# Twitter/X previews fetch publish.twitter.com, which `twitter.com` covers.
+PREVIEW_ALLOWED_HOSTS = "example.com, wikipedia.org, github.com, youtube.com, twitter.com, x.com"
+# Local development only: PREVIEW_ALLOW_ANY_HOST = "true" with no allow-list
+# falls back to the denylist alone. Never set it on an internet-facing worker.
