@@ -2461,9 +2461,20 @@ pub(crate) fn is_reference_kind(kind: u64) -> bool {
 
 /// Sealed envelopes wrapping the original whose id is `?1`, by their whole
 /// wire shape (kind 42, a well-formed `sealed` tag naming `?1` with a decimal
-/// version, a `zk` tag) and an admin author, as the ingest gate requires of
-/// every envelope. A bare `sealed` tag on any other event never matches
-/// (review finding 1; mirrors `SEALED_ENVELOPES_FOR_SQL`).
+/// version, a `zk` tag) and a TRUSTED sealer. A bare `sealed` tag on any other
+/// event never matches (review finding 1; mirrors `SEALED_ENVELOPES_FOR_SQL`).
+///
+/// A sealer is trusted when it is (a) a current whitelist admin, (b) an
+/// `old_pubkey` in `pubkey_aliases` whose `new_pubkey` is a current admin (one
+/// hop; only admins create aliases, and the successor must still be an admin,
+/// so an alias can never vouch for a non-admin's key), or (c) listed in
+/// `?2`, a JSON array of lowercase hex keys from the `TRUSTED_SEALERS`
+/// operator variable (retired sealers, see [`parse_trusted_sealers`]).
+///
+/// This widens READ-side target resolution only (replying to, or reacting to,
+/// an old topic). INGEST stays strict: `sealed_write_rejection` still admits
+/// envelopes from current admins alone, and moderator deletion of envelopes
+/// still requires a current admin author.
 const SEALED_TARGET_SQL: &str =
     "SELECT s.id AS id, s.pubkey AS pubkey, s.created_at AS created_at, \
      s.kind AS kind, s.tags AS tags, s.content AS content, s.sig AS sig \
@@ -2476,7 +2487,31 @@ const SEALED_TARGET_SQL: &str =
                      AND json_extract(st.value, '$[2]') <> '' \
                      AND json_extract(st.value, '$[2]') NOT GLOB '*[^0-9]*') \
        AND EXISTS (SELECT 1 FROM event_tags z WHERE z.event_id = s.id AND z.name = 'zk') \
-       AND s.pubkey IN (SELECT pubkey FROM whitelist WHERE is_admin = 1)";
+       AND (s.pubkey IN (SELECT pubkey FROM whitelist WHERE is_admin = 1) \
+            OR s.pubkey IN (SELECT a.old_pubkey FROM pubkey_aliases a \
+                            WHERE a.new_pubkey IN (SELECT pubkey FROM whitelist WHERE is_admin = 1)) \
+            OR s.pubkey IN (SELECT value FROM json_each(?2)))";
+
+/// The most keys `TRUSTED_SEALERS` may name; the rest are ignored.
+pub(crate) const MAX_TRUSTED_SEALERS: usize = 16;
+
+/// Parse the `TRUSTED_SEALERS` operator variable: comma- or whitespace-
+/// separated 64-character hex keys, lowercased, deduplicated, at most
+/// [`MAX_TRUSTED_SEALERS`]. Anything that is not a canonical key is dropped
+/// (a typo trusts nobody), and an unset variable trusts nobody.
+pub(crate) fn parse_trusted_sealers(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tok in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+        let k = tok.trim().to_ascii_lowercase();
+        if k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()) && !out.contains(&k) {
+            out.push(k);
+            if out.len() == MAX_TRUSTED_SEALERS {
+                break;
+            }
+        }
+    }
+    out
+}
 
 /// The most targets one reference-kind event may name; more is treated as
 /// unknown (gated), which bounds the lookups per event.
@@ -2851,12 +2886,20 @@ impl NostrRelayDO {
         if !found.is_empty() {
             return Ok(found);
         }
+        let trusted = serde_json::to_string(&parse_trusted_sealers(
+            &self
+                .env
+                .var("TRUSTED_SEALERS")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        ))
+        .map_err(|_| ())?;
         let sealed: Vec<super::storage::EventRow> = db
             .prepare(format!(
                 "{SEALED_TARGET_SQL} LIMIT {}",
                 MAX_REFERENCE_TARGETS + 1
             ))
-            .bind(&[JsValue::from_str(id)])
+            .bind(&[JsValue::from_str(id), JsValue::from_str(&trusted)])
             .map_err(|_| ())?
             .all()
             .await
@@ -9304,7 +9347,10 @@ mod sealed_target_sql_tests {
         }
         c.execute_batch(
             "CREATE TABLE whitelist (pubkey TEXT PRIMARY KEY, is_admin INTEGER NOT NULL DEFAULT 0);
-             INSERT INTO whitelist VALUES ('admin', 1), ('member', 0);",
+             INSERT INTO whitelist VALUES ('admin', 1), ('member', 0), ('demoted', 0);
+             CREATE TABLE pubkey_aliases (old_pubkey TEXT PRIMARY KEY, new_pubkey TEXT NOT NULL);
+             CREATE INDEX idx_pubkey_aliases_new ON pubkey_aliases(new_pubkey);
+             INSERT INTO pubkey_aliases VALUES ('old-live', 'admin'), ('old-member', 'member');",
         )
         .unwrap();
         c
@@ -9319,8 +9365,12 @@ mod sealed_target_sql_tests {
     }
 
     fn matches(c: &Connection, inner: &str) -> Vec<String> {
+        matches_with(c, inner, "[]")
+    }
+
+    fn matches_with(c: &Connection, inner: &str, trusted: &str) -> Vec<String> {
         let mut s = c.prepare(SEALED_TARGET_SQL).unwrap();
-        s.query_map([inner], |r| r.get::<_, String>(0))
+        s.query_map([inner, trusted], |r| r.get::<_, String>(0))
             .unwrap()
             .map(Result::unwrap)
             .collect()
@@ -9360,5 +9410,82 @@ mod sealed_target_sql_tests {
         );
         assert_eq!(matches(&c, &inner), vec!["real".to_string()]);
         assert!(matches(&c, &"b".repeat(64)).is_empty());
+    }
+
+    fn env_for(inner: &str) -> serde_json::Value {
+        serde_json::json!([
+            ["e", "chan", "", "root"],
+            ["zk", "zone2", "1", "pk"],
+            ["sealed", inner, "1"]
+        ])
+    }
+
+    #[test]
+    fn an_alias_of_a_current_admin_and_a_listed_sealer_resolve_but_nobody_else() {
+        let c = db();
+        let inner = "c".repeat(64);
+        put(&c, "by-alias", "old-live", 42, env_for(&inner));
+        put(&c, "by-listed", "retired-archivist", 42, env_for(&inner));
+        put(&c, "by-demoted", "demoted", 42, env_for(&inner));
+        put(&c, "by-member-alias", "old-member", 42, env_for(&inner));
+        put(&c, "by-stranger", "stranger", 42, env_for(&inner));
+        // No operator list: only the alias of a CURRENT admin joins the admin.
+        assert_eq!(matches(&c, &inner), vec!["by-alias".to_string()]);
+        // Listed in TRUSTED_SEALERS: the retired sealer resolves too.
+        let mut got = matches_with(&c, &inner, r#"["retired-archivist"]"#);
+        got.sort();
+        assert_eq!(got, vec!["by-alias".to_string(), "by-listed".to_string()]);
+        // An alias whose successor is not an admin never vouches, and a
+        // demoted or unknown key is not trusted unless listed.
+        assert!(!matches_with(&c, &inner, r#"["x"]"#).contains(&"by-member-alias".to_string()));
+        assert!(!matches_with(&c, &inner, r#"["x"]"#).contains(&"by-demoted".to_string()));
+        // The shape rules still apply to a trusted sealer.
+        put(
+            &c,
+            "alias-nozk",
+            "old-live",
+            42,
+            serde_json::json!([["e", "evil", "", "root"], ["sealed", "d".repeat(64), "1"]]),
+        );
+        assert!(matches(&c, &"d".repeat(64)).is_empty());
+        put(&c, "alias-k1", "old-live", 1, env_for(&"e".repeat(64)));
+        assert!(matches(&c, &"e".repeat(64)).is_empty());
+    }
+
+    #[test]
+    fn the_alias_lookup_uses_the_successor_index() {
+        let c = db();
+        let mut s = c
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT a.old_pubkey FROM pubkey_aliases a \
+                 WHERE a.new_pubkey IN (SELECT pubkey FROM whitelist WHERE is_admin = 1)",
+            )
+            .unwrap();
+        let plan: Vec<String> = s
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.join(" ").contains("idx_pubkey_aliases_new"),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_sealers_parse_strictly() {
+        let a = "a".repeat(64);
+        let b = "B".repeat(64);
+        let raw = format!("{a}, {b} {a} nothex, {}", "c".repeat(63));
+        assert_eq!(super::parse_trusted_sealers(&raw), vec![a, "b".repeat(64)]);
+        assert!(super::parse_trusted_sealers("").is_empty());
+        let many = (0..40)
+            .map(|i| format!("{i:064x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            super::parse_trusted_sealers(&many).len(),
+            super::MAX_TRUSTED_SEALERS
+        );
     }
 }
