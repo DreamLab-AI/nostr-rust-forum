@@ -557,20 +557,20 @@ pub fn deletion_for_wrap(pubkey: &str, wrap_id: &str, now: u64) -> UnsignedEvent
 
 // -- Live port ------------------------------------------------------------------
 
-struct Slot<T> {
+pub(super) struct Slot<T> {
     value: RefCell<Option<T>>,
     waker: RefCell<Option<Waker>>,
 }
 
 impl<T> Slot<T> {
-    fn new() -> Rc<Self> {
+    pub(super) fn new() -> Rc<Self> {
         Rc::new(Self {
             value: RefCell::new(None),
             waker: RefCell::new(None),
         })
     }
     /// First writer wins.
-    fn fill(&self, v: T) {
+    pub(super) fn fill(&self, v: T) {
         if self.value.borrow().is_none() {
             *self.value.borrow_mut() = Some(v);
             if let Some(w) = self.waker.borrow_mut().take() {
@@ -578,7 +578,7 @@ impl<T> Slot<T> {
             }
         }
     }
-    async fn wait(self: &Rc<Self>) -> T {
+    pub(super) async fn wait(self: &Rc<Self>) -> T {
         std::future::poll_fn(|cx| {
             if let Some(v) = self.value.borrow_mut().take() {
                 return Poll::Ready(v);

@@ -1515,6 +1515,20 @@ impl ZoneKeyStore {
         ledger.sent_to(&IdbGrantKv, zone, epoch, targets).await
     }
 
+    /// The ledger entries of `(zone, epoch)`, for the relay-held backup
+    /// ([`super::grant_backup`]).
+    pub async fn export_grant_backup(&self, zone: &str, epoch: u32) -> Vec<String> {
+        let ledger = self.grants.get_value();
+        ledger.export(&IdbGrantKv, zone, epoch).await
+    }
+
+    /// Merge entries restored from the relay-held backup into the ledger;
+    /// returns how many were new to this device.
+    pub async fn merge_grant_backup(&self, zone: &str, epoch: u32, entries: &[String]) -> usize {
+        let ledger = self.grants.get_value();
+        ledger.merge(&IdbGrantKv, zone, epoch, entries).await
+    }
+
     /// Record that `(zone, epoch)` was granted to each `(member, recipient
     /// key)`. Safe to call
     /// concurrently: acks for one batch arrive together (see [`GrantLedger`]).

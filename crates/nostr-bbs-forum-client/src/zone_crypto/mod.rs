@@ -75,6 +75,7 @@
 pub mod auto_grant;
 pub mod conversation_keys;
 pub mod grant_backlog;
+pub mod grant_backup;
 pub mod grant_ledger;
 pub mod inbox_key;
 pub mod key_owner;

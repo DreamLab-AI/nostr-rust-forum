@@ -2,9 +2,13 @@
 //!
 //! One card per zone whose `ZONE_CONFIG` entry has `"encrypted": true`:
 //! create the first key, grant it to members who are missing it, or rotate to
-//! a new epoch. Grants are NIP-59 gift wraps sealed by this admin; which
-//! members hold a key can only be known for grants sent from this device, so
-//! the card says exactly that. Agents (cohort `agent`) receive a key only in a
+//! a new epoch. Grants are NIP-59 gift wraps sealed by this admin. The relay
+//! cannot be asked who holds a key (wraps are readable only by their
+//! recipient and signed by throwaway keys), so "granted" is this admin's own
+//! ledger: kept on this device and backed up to the relay, encrypted to the
+//! admin ([`crate::zone_crypto::grant_backup`]), so it survives clearing site
+//! data. Grants sent by another admin, or before the backup existed, read as
+//! "missing" until re-granted; re-sending is harmless. Agents (cohort `agent`) receive a key only in a
 //! zone configured with `agent_keys`. Granting to a member who is missing the
 //! current key can also send the earlier keys this admin holds, so someone
 //! who joins after a rotation can read the zone's history.
@@ -248,14 +252,30 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
     };
 
     // Reload "granted from this device" whenever the current epoch changes.
+    let relay_for_ledger = relay.clone();
     Effect::new(move |_| {
         let Some(key) = latest() else {
             sent.set(HashSet::new());
             return;
         };
+        let relay = relay_for_ledger.clone();
+        let signer = auth.get_signer();
         spawn_local(async move {
-            let s = keys.grants_sent(&key.zone, key.epoch).await;
-            sent.set(s);
+            // Show what this device knows straight away, then fold in the
+            // relay-held record (grants sent before site data was cleared, or
+            // from another browser of this admin) and show that.
+            sent.set(keys.grants_sent(&key.zone, key.epoch).await);
+            if let Some(signer) = signer {
+                if let Ok(n) = crate::zone_crypto::grant_backup::pull(
+                    &relay, &*signer, keys, &key.zone, key.epoch,
+                )
+                .await
+                {
+                    if n > 0 {
+                        let _ = sent.try_set(keys.grants_sent(&key.zone, key.epoch).await);
+                    }
+                }
+            }
         });
     });
 
@@ -512,6 +532,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
     let grant = StoredValue::new_local(grant);
     let fresh_roster = StoredValue::new_local(fresh_roster);
 
+    let relay_btn = StoredValue::new_local(relay.clone());
     let title = zone.with_value(|z| {
         if z.display_name.is_empty() {
             z.id.clone()
@@ -555,10 +576,15 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                                     let history = include_history.get_untracked();
                                     let zone_id = zone.with_value(|z| z.id.clone());
                                     let held = keys.all_for_zone(&zone_id);
+                                    let relay_btn = relay_btn.get_value();
+                                    let signer_btn = auth.get_signer();
                                     spawn_local(async move {
                                         let mut earlier = std::collections::HashMap::new();
                                         if history {
                                             for k in &held {
+                                                if let Some(sg) = &signer_btn {
+                                                    let _ = crate::zone_crypto::grant_backup::pull(&relay_btn, &**sg, keys, &k.zone, k.epoch).await;
+                                                }
                                                 earlier.insert(k.epoch, keys.grants_sent(&k.zone, k.epoch).await);
                                             }
                                         }
@@ -655,7 +681,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 {move || {
                     let t = targets().len();
                     let s = sent.with(|s| targets().iter().filter(|pk| s.contains(*pk)).count());
-                    format!("{s} of {t} eligible members granted from this device (including you).")
+                    format!("{s} of {t} eligible members recorded as granted by you (including you). Grants sent by other admins show as missing.")
                 }}
             </p>
 
