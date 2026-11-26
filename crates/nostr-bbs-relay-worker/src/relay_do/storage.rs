@@ -470,10 +470,13 @@ impl NostrRelayDO {
             Some(old) => {
                 // Roll forward: fold in what arrived since, drop expired rows.
                 let h = snapshot_horizon(now);
-                let (groups, rows, windows) = self
+                let Some((groups, rows, windows)) = self
                     .windowed_count_n(value, Some(old.as_of.saturating_add(1)), h)
                     .await
-                    .ok_or("count read failed")?;
+                else {
+                    // A failed roll still leaves a usable (older) snapshot.
+                    return Ok(old);
+                };
                 let snap = CountSnapshot {
                     as_of: h,
                     groups: merge_groups(&old.groups, &groups),
@@ -481,6 +484,7 @@ impl NostrRelayDO {
                         base.extend(rows);
                         snapshot_exceptions(&drop_expired(base, now))
                     }),
+                    windows: old.windows,
                 };
                 console_log!(
                     "count roll {}: {} windows, {} messages, {:.0} ms",
@@ -549,8 +553,7 @@ impl NostrRelayDO {
             part.absorb(&groups, rows);
             windows += 1;
             let Some(n) = next else {
-                let _ = storage.delete(&pk).await;
-                let snap = part.finish();
+                let snap = part.finish().built_in(windows);
                 console_log!(
                     "count built {}: +{} windows, {} messages",
                     &key[..8.min(key.len())],
@@ -560,8 +563,14 @@ impl NostrRelayDO {
                 return Ok(Some(snap));
             };
             part.lo = n;
+            // Too many own channels for the fast path: finish now, unservable.
+            if part.groups.len() > filter::COUNT_MAX_GROUPS {
+                return Ok(Some(part.finish().built_in(u32::MAX)));
+            }
             if let Ok(json) = serde_json::to_string(&part) {
-                let _ = storage.put(&pk, json).await;
+                if let Err(e) = storage.put(&pk, json).await {
+                    console_error!("count partial not saved: {e:?}");
+                }
             }
             if js_sys::Date::now() - started > COUNT_BUILD_BUDGET_MS {
                 console_log!(
@@ -603,18 +612,30 @@ impl NostrRelayDO {
         snap: &super::read_cache::CountSnapshot,
         now: u64,
     ) {
+        // A one-window count (a random id, a quiet channel) is cheap to
+        // redo and is not cached, so such requests cannot flush the cache.
+        if snap.windows <= 1 && !super::read_cache::persist_snapshot(snap) {
+            return;
+        }
         if self.count_cache.len() >= super::read_cache::COUNT_CACHE_MAX {
             self.count_cache.clear();
         }
         self.count_cache.insert(key, snap.clone(), now);
-        if super::read_cache::persist_snapshot(snap) {
+        if super::read_cache::persist_snapshot(snap) || snap.windows > 1 {
             if let Ok(json) = serde_json::to_string(snap) {
                 let k = super::read_cache::snapshot_storage_key(key);
                 if let Err(e) = self.state.storage().put(&k, json).await {
                     console_error!("count snapshot not persisted: {e:?}");
+                    return;
                 }
             }
         }
+        // Stored: any part-built progress for this key is now obsolete.
+        let _ = self
+            .state
+            .storage()
+            .delete(&super::read_cache::partial_storage_key(key))
+            .await;
     }
 
     /// A count of `#e = value` from `since` to `hi`, in windows, with the

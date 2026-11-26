@@ -132,6 +132,7 @@ impl CountPartial {
             as_of: self.hi,
             groups: self.groups,
             exceptions: if self.overflow { None } else { Some(self.rows) },
+            windows: 0,
         }
     }
 }
@@ -162,9 +163,19 @@ pub(crate) struct CountSnapshot {
     pub(crate) as_of: u64,
     pub(crate) groups: Vec<(String, u64)>,
     pub(crate) exceptions: Option<Vec<NostrEvent>>,
+    /// Windows the first build took (cost to redo); 0 for rolls and older
+    /// stored snapshots.
+    #[serde(default)]
+    pub(crate) windows: u32,
 }
 
 impl CountSnapshot {
+    /// This snapshot, recording that its build took `windows` windows.
+    pub(crate) fn built_in(mut self, windows: u32) -> Self {
+        self.windows = windows;
+        self
+    }
+
     /// Total messages counted.
     pub(crate) fn total(&self) -> u64 {
         self.groups.iter().map(|(_, n)| n).sum()
@@ -425,6 +436,7 @@ mod tests {
             as_of,
             groups: vec![("ch".into(), 200_000)],
             exceptions: None,
+            windows: 0,
         }
     }
 
@@ -470,6 +482,7 @@ mod tests {
             as_of: 1,
             groups: vec![("ch".into(), COUNT_PERSIST_MIN - 1)],
             exceptions: None,
+            windows: 0,
         };
         assert!(!persist_snapshot(&small));
         // A random id: nothing counted, nothing stored.
@@ -477,6 +490,7 @@ mod tests {
             as_of: 1,
             groups: vec![],
             exceptions: None,
+            windows: 0,
         };
         assert!(!persist_snapshot(&empty));
     }
