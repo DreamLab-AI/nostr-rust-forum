@@ -250,6 +250,12 @@ pub struct Zone {
     /// the agent calls — an operator trade-off, made per zone.
     #[serde(default)]
     pub agent_keys: bool,
+    /// Oldest epoch of this zone's key that admin grants may hand out as
+    /// history. Earlier epochs an admin's browser still holds (a previous
+    /// deployment's keys, say) are never sent; the newest held key always is.
+    /// Projected into the client's `ZONE_CONFIG` as `history_from_epoch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_from_epoch: Option<u32>,
     /// NIP-171 group identity public key bound to this zone (ADR-2028): the key
     /// that signs this zone's `kind:1014` epoch tickets. 64-char lowercase hex.
     /// Projected into the relay's `ZONE_CONFIG` as `group_pubkey`; with the

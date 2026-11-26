@@ -59,6 +59,8 @@ pub struct ZoneRule {
     pub required_cohorts: Vec<String>,
     /// Whether agents receive the key.
     pub agent_keys: bool,
+    /// Oldest epoch grants may hand out (see [`super::grantable_keys`]).
+    pub history_from_epoch: Option<u32>,
 }
 
 /// The encrypted zones of this deployment (empty with the encryption gate off).
@@ -71,6 +73,7 @@ pub fn encrypted_zone_rules() -> Vec<ZoneRule> {
             id: z.id,
             required_cohorts: z.required_cohorts,
             agent_keys: z.agent_keys,
+            history_from_epoch: z.history_from_epoch,
         })
         .collect()
 }
@@ -410,7 +413,11 @@ impl AutoGrant {
         let zones = encrypted_zone_rules();
         let held: HashMap<String, Vec<ZoneKey>> = zones
             .iter()
-            .map(|z| (z.id.clone(), self.store.all_for_zone(&z.id)))
+            .map(|z| {
+                let keys =
+                    super::grantable_keys(self.store.all_for_zone(&z.id), z.history_from_epoch);
+                (z.id.clone(), keys)
+            })
             .filter(|(_, keys)| !keys.is_empty())
             .collect();
         if held.is_empty() {
@@ -735,6 +742,7 @@ mod tests {
             id: id.into(),
             required_cohorts: vec![cohort.into()],
             agent_keys,
+            history_from_epoch: None,
         }
     }
 

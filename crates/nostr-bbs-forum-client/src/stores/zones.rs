@@ -106,6 +106,12 @@ pub struct Zone {
     /// (ADR-2016). Default `false`.
     #[serde(default)]
     pub agent_keys: bool,
+    /// Oldest epoch of this zone's key that grants may still hand out as
+    /// history. Keys held for earlier epochs (for example a previous
+    /// deployment's keys still in an admin's browser) are never sent. The
+    /// newest held key is always grantable. Absent: no floor.
+    #[serde(default)]
+    pub history_from_epoch: Option<u32>,
     /// Operator-configured accent colour override (issue #34), e.g. `"#22c55e"`.
     /// Validated upstream as a CSS hex colour by `nostr_bbs_config::validate`.
     /// When absent, rendering falls back to the built-in
@@ -401,6 +407,7 @@ fn fallback_zones() -> Vec<Zone> {
             visibility: ZoneVisibility::Public,
             encrypted: false,
             agent_keys: false,
+            history_from_epoch: None,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
@@ -416,6 +423,7 @@ fn fallback_zones() -> Vec<Zone> {
             visibility: ZoneVisibility::Locked,
             encrypted: false,
             agent_keys: false,
+            history_from_epoch: None,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
@@ -431,6 +439,7 @@ fn fallback_zones() -> Vec<Zone> {
             visibility: ZoneVisibility::Locked,
             encrypted: true,
             agent_keys: false,
+            history_from_epoch: None,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
@@ -446,6 +455,7 @@ fn fallback_zones() -> Vec<Zone> {
             visibility: ZoneVisibility::Locked,
             encrypted: false,
             agent_keys: false,
+            history_from_epoch: None,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
@@ -503,6 +513,7 @@ mod tests {
             visibility: ZoneVisibility::Public,
             encrypted: false,
             agent_keys: false,
+            history_from_epoch: None,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
