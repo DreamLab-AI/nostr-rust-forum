@@ -116,18 +116,23 @@ pub(crate) enum Fallback {
     NoteView,
     /// Land on the channel's topic list (`/chat/<cid>` redirects there).
     Channel(String),
+    /// Open the topic the post names as its root, focused on the post.
+    Topic(String),
 }
 
 /// The give-up decision, `elapsed_ms` after the fetch started. Waits
 /// [`RESOLVE_TIMEOUT_MS`], or up to [`HINTED_RESOLVE_CEILING_MS`] while a
 /// hinted channel's history is still loading (`hint_loading`). Then: the
-/// note view when the relay delivered the post itself (`relay_has_it`, a
-/// plaintext post the note view can show), else the channel's topic list
-/// when the channel is known, else the note view.
+/// topic the held post names as its root, when known (`topic`, a topic URL
+/// focused on the post); else the note view when the relay delivered the
+/// post itself (`relay_has_it`, a plaintext post the note view can show);
+/// else the channel's topic list when the channel is known; else the note
+/// view. Blank values count as unknown.
 pub(crate) fn fallback(
     elapsed_ms: f64,
     hint_loading: bool,
     relay_has_it: bool,
+    topic: Option<&str>,
     channel: Option<&str>,
 ) -> Fallback {
     if elapsed_ms < f64::from(RESOLVE_TIMEOUT_MS)
@@ -135,7 +140,13 @@ pub(crate) fn fallback(
     {
         return Fallback::Wait;
     }
-    match channel {
+    fn known(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|v| !v.is_empty())
+    }
+    if let Some(t) = known(topic) {
+        return Fallback::Topic(t.to_string());
+    }
+    match known(channel) {
         Some(c) if !relay_has_it => Fallback::Channel(format!("/chat/{c}")),
         _ => Fallback::NoteView,
     }
@@ -264,6 +275,10 @@ pub fn MessageJumpPage() -> impl IntoView {
     let relay_has_it = StoredValue::new(false);
     // The post's channel once any source has named it.
     let known_channel: StoredValue<Option<String>> = StoredValue::new(None);
+    // The topic the held post names as its root (its `reply` tag), for when
+    // the reply chain cannot be walked because the root predates the loaded
+    // history: the thread page fetches a missing root itself.
+    let topic_guess: StoredValue<Option<String>> = StoredValue::new(None);
     let sub_id: StoredValue<Option<String>> = StoredValue::new(None);
     let fetch_started = StoredValue::new(false);
     let done = StoredValue::new(false);
@@ -306,22 +321,37 @@ pub fn MessageJumpPage() -> impl IntoView {
         }
         let zone_keys = store.zone_store();
         let wanted = id.to_ascii_lowercase();
-        let fallback_cid = hinted.clone().unwrap_or_default();
+        let hint_for_events = hinted.clone();
         let on_event = Rc::new(move |ev: NostrEvent| {
             let outer_is_target = ev.id.eq_ignore_ascii_case(&wanted);
             if nostr_bbs_core::sealed::parse_sealed(&ev.tags).is_none() {
                 if outer_is_target {
-                    relay_has_it.try_set_value(true);
+                    // Only a plaintext post is one the note view can show; a
+                    // live zone-encrypted post resolves through the store.
+                    if !crate::zone_crypto::is_zone_message(&ev) {
+                        relay_has_it.try_set_value(true);
+                    }
                     let _ = target.try_set(Some(ev));
                 }
                 return;
             }
             // A sealed envelope: open it through the store's usual admission
             // and decrypt path; the store lookup below then finds the
-            // original under its own id.
+            // original under its own id. Its outer root tag names the
+            // channel when the channel list has not loaded yet.
+            let fallback_cid = hint_for_events
+                .clone()
+                .or_else(|| channel_of(&ev))
+                .unwrap_or_default();
+            if fallback_cid.is_empty() {
+                return;
+            }
             let Some((cid, opened)) = store.ingest(zone_keys, ev, &fallback_cid) else {
                 return;
             };
+            if cid.is_empty() {
+                return;
+            }
             known_channel.try_set_value(Some(cid.clone()));
             if outer_is_target || opened.id.eq_ignore_ascii_case(&wanted) {
                 let _ = target.try_set(Some(opened.clone()));
@@ -365,10 +395,12 @@ pub fn MessageJumpPage() -> impl IntoView {
                     .try_get_value()
                     .flatten()
                     .or_else(|| hinted.clone());
+                let topic = topic_guess.try_get_value().flatten();
                 match fallback(
                     js_sys::Date::now() - started,
                     hint_loading,
                     relay_has_it.try_get_value().unwrap_or(false),
+                    topic.as_deref(),
                     channel.as_deref(),
                 ) {
                     Fallback::Wait => false,
@@ -376,7 +408,7 @@ pub fn MessageJumpPage() -> impl IntoView {
                         go(format!("/view/{fallback_id}"));
                         true
                     }
-                    Fallback::Channel(path) => {
+                    Fallback::Channel(path) | Fallback::Topic(path) => {
                         go(path);
                         true
                     }
@@ -405,7 +437,7 @@ pub fn MessageJumpPage() -> impl IntoView {
             .get()
             .or_else(|| store.channel_messages.with(|m| find_held(&id, m).cloned()));
         let Some(ev) = ev else { return };
-        let Some(cid) = channel_of(&ev) else {
+        let Some(cid) = channel_of(&ev).filter(|c| !c.is_empty()) else {
             go(format!("/view/{}", ev.id));
             return;
         };
@@ -421,9 +453,6 @@ pub fn MessageJumpPage() -> impl IntoView {
         if !events.iter().any(|e| e.id.eq_ignore_ascii_case(&ev.id)) {
             events.push(ev.clone());
         }
-        let Some(root) = topic_root_of(&focus, &cid, &events) else {
-            return; // ancestors still streaming in; the effect re-runs
-        };
         let zones = load_zones();
         let section = store.channels.with(|chans| {
             chans
@@ -431,18 +460,34 @@ pub fn MessageJumpPage() -> impl IntoView {
                 .find(|c| c.id == cid)
                 .map(|c| c.section.clone())
         });
-        let Some(section) = section else {
-            return; // channel metadata not loaded yet
+        let zone_id = section.as_deref().and_then(|s| section_to_zone(s, &zones));
+        let topic_url = |root: &str| {
+            zone_id.as_deref().map(|z| {
+                format!(
+                    "/forums/{}/{}/{}?focus={}",
+                    zone_path_for_id(z),
+                    section_slug(&cid),
+                    topic_slug(root),
+                    focus
+                )
+            })
         };
-        match section_to_zone(&section, &zones) {
-            Some(zone_id) => go(format!(
-                "/forums/{}/{}/{}?focus={}",
-                zone_path_for_id(&zone_id),
-                section_slug(&cid),
-                topic_slug(&root),
-                focus
-            )),
-            None => go(format!("/view/{}", ev.id)),
+        let Some(root) = topic_root_of(&focus, &cid, &events) else {
+            // Ancestors still streaming in; the effect re-runs. Meanwhile
+            // remember the topic the post names, for the give-up path.
+            let guess = nostr_bbs_core::sealed::reply_root_of(&ev).and_then(topic_url);
+            topic_guess.set_value(guess);
+            return;
+        };
+        if section.is_none() {
+            return; // channel metadata not loaded yet
+        }
+        match topic_url(&root) {
+            Some(url) => go(url),
+            // No zone for the channel: its own resolver (`/chat/<cid>`)
+            // lands on the section, never on a note view that cannot show
+            // an encrypted post.
+            None => go(format!("/chat/{cid}")),
         }
     });
 
@@ -556,26 +601,58 @@ mod tests {
     fn fallback_waits_then_prefers_the_channel_over_not_found() {
         let early = f64::from(RESOLVE_TIMEOUT_MS) - 1.0;
         let late = f64::from(RESOLVE_TIMEOUT_MS) + 1.0;
-        assert_eq!(fallback(early, false, false, Some("chan")), Fallback::Wait);
+        let chan = Some("chan");
+        assert_eq!(fallback(early, false, false, None, chan), Fallback::Wait);
         // A hinted channel still loading its history: keep waiting...
-        assert_eq!(fallback(late, true, false, Some("chan")), Fallback::Wait);
+        assert_eq!(fallback(late, true, false, None, chan), Fallback::Wait);
         // ...up to the longer ceiling.
         assert_eq!(
-            fallback(HINTED_RESOLVE_CEILING_MS + 1.0, true, false, Some("chan")),
+            fallback(HINTED_RESOLVE_CEILING_MS + 1.0, true, false, None, chan),
             Fallback::Channel("/chat/chan".into())
         );
         // Unresolved but the channel is known: its topic list, never "Not Found".
         assert_eq!(
-            fallback(late, false, false, Some("chan")),
+            fallback(late, false, false, None, chan),
             Fallback::Channel("/chat/chan".into())
         );
         // A plaintext post the relay delivered: the note view shows it.
+        assert_eq!(fallback(late, false, true, None, chan), Fallback::NoteView);
+        // Nothing known at all.
+        assert_eq!(fallback(late, false, false, None, None), Fallback::NoteView);
+    }
+
+    #[test]
+    fn fallback_opens_the_named_topic_when_the_walk_stalls() {
+        // The post is held and names its topic root, but the root is older
+        // than the loaded history: open that topic, focused on the post.
+        let late = f64::from(RESOLVE_TIMEOUT_MS) + 1.0;
+        let topic = Some("/forums/z/s/t?focus=p");
         assert_eq!(
-            fallback(late, false, true, Some("chan")),
+            fallback(late, false, false, topic, Some("chan")),
+            Fallback::Topic("/forums/z/s/t?focus=p".into())
+        );
+        assert_eq!(
+            fallback(late, false, true, topic, Some("chan")),
+            Fallback::Topic("/forums/z/s/t?focus=p".into())
+        );
+        // Still waits first.
+        assert_eq!(
+            fallback(late, true, false, topic, Some("chan")),
+            Fallback::Wait
+        );
+    }
+
+    #[test]
+    fn fallback_never_navigates_to_an_empty_channel() {
+        let late = f64::from(RESOLVE_TIMEOUT_MS) + 1.0;
+        assert_eq!(
+            fallback(late, false, false, None, Some("")),
             Fallback::NoteView
         );
-        // Nothing known at all.
-        assert_eq!(fallback(late, false, false, None), Fallback::NoteView);
+        assert_eq!(
+            fallback(late, false, false, Some(""), Some(" ")),
+            Fallback::NoteView
+        );
     }
 
     #[test]
