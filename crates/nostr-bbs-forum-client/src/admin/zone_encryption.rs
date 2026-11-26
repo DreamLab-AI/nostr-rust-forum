@@ -128,8 +128,10 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
 ///
 /// A browser with no grant record (a fresh device, or site data cleared with
 /// no relay backup) lists every member here: "Approve all" confirms them in
-/// one batch. Members of a zone whose relay-held record could not be read are
-/// listed apart as unverified (check again, or approve explicitly), and a
+/// batches of at most [`APPROVE_ALL_LISTED`], each approving exactly the
+/// members its confirmation lists, members without a recognised name first
+/// (see [`approve_all_batch`]). Members of a zone whose relay-held record
+/// could not be read are listed apart as unverified (check again, or approve explicitly), and a
 /// failed check says so rather than showing an empty list.
 #[component]
 fn PendingApprovals(held: RwSignal<Held>) -> impl IntoView {
@@ -169,27 +171,21 @@ fn PendingApprovals(held: RwSignal<Held>) -> impl IntoView {
         // Drop the row optimistically; the next check recomputes the set.
         drop_rows(&[(zone, pubkey)]);
     };
-    let admin = use_admin();
+    let users = use_admin().state.users;
+    // Approves exactly the members its confirmation lists (at most
+    // `APPROVE_ALL_LISTED`); any others stay pending for a further click.
     let approve_all = move |targets: Vec<(String, String)>| {
-        let roster: HashMap<String, (Option<String>, Vec<String>)> =
-            admin.state.users.with_untracked(|users| {
-                users
-                    .iter()
-                    .map(|u| {
-                        let name = u.display_name.clone().or_else(|| u.handle.clone());
-                        (u.pubkey.to_ascii_lowercase(), (name, u.cohorts.clone()))
-                    })
-                    .collect()
-            });
-        let ask = approve_all_summary(&targets, &roster, APPROVE_ALL_LISTED);
+        let roster = users.with_untracked(|u| name_roster(u));
+        let ApproveBatch { batch, text, .. } =
+            approve_all_batch(&targets, &roster, APPROVE_ALL_LISTED);
         let ok = web_sys::window()
-            .and_then(|w| w.confirm_with_message(&ask).ok())
+            .and_then(|w| w.confirm_with_message(&text).ok())
             .unwrap_or(false);
         if !ok {
             return;
         }
-        auto.get_value().approve_all(targets.clone());
-        drop_rows(&targets);
+        auto.get_value().approve_all(batch.clone());
+        drop_rows(&batch);
     };
 
     let row = move |zone: String, pubkey: String| {
@@ -234,6 +230,9 @@ fn PendingApprovals(held: RwSignal<Held>) -> impl IntoView {
                         }).collect_view()}
                     </div>
                 });
+                // Listed in the order "Approve all" takes them, so the
+                // members one click approves are the first rows here.
+                let pending = users.with(|u| approve_all_order(&pending, &name_roster(u)));
                 let pending_box = (!pending.is_empty()).then(|| {
                     let all = pending.clone();
                     view! {
@@ -253,7 +252,7 @@ fn PendingApprovals(held: RwSignal<Held>) -> impl IntoView {
                                     <button
                                         class="shrink-0 px-2 py-1 text-xs rounded border border-amber-500 text-amber-200 hover:bg-amber-500/10"
                                         on:click=move |_| approve_all(all.clone())
-                                    >{format!("Approve all ({})", all.len())}</button>
+                                    >{approve_all_label(all.len(), APPROVE_ALL_LISTED)}</button>
                                 })}
                             </div>
                             <ul class="space-y-2">
@@ -328,15 +327,51 @@ impl Held {
     }
 }
 
-/// How many pending members the "Approve all" confirmation lists by name.
+/// How many pending members the "Approve all" confirmation lists, and so
+/// the most one click approves.
 const APPROVE_ALL_LISTED: usize = 20;
 
-/// A roster display name made safe for one line of a plain-text dialog:
-/// control characters (a newline could forge a line of the list) become
-/// spaces, and the result is capped at 40 characters.
+/// Display names and cohorts by lowercase pubkey, as the relay last returned
+/// them.
+type Roster = HashMap<String, (Option<String>, Vec<String>)>;
+
+/// `users` as a [`Roster`]: each member's display name (or handle) and
+/// cohorts.
+fn name_roster(users: &[crate::admin::WhitelistUser]) -> Roster {
+    users
+        .iter()
+        .map(|u| {
+            let name = u.display_name.clone().or_else(|| u.handle.clone());
+            (u.pubkey.to_ascii_lowercase(), (name, u.cohorts.clone()))
+        })
+        .collect()
+}
+
+/// Unicode format characters that change how a line reads without being
+/// visible: bidi embeddings and overrides, isolates and marks, zero-width
+/// characters, the word joiner and invisible operators, the byte-order mark
+/// and the soft hyphen.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// A relay-supplied display name or cohort made safe for one line of a
+/// plain-text dialog: format characters (which could reorder or disguise the
+/// line) are removed, control characters (a newline could forge a line of
+/// the list) become spaces, and the result is capped at 40 characters.
 fn one_line_name(name: &str) -> String {
     let clean: String = name
         .chars()
+        .filter(|c| !is_format_char(*c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -347,23 +382,120 @@ fn one_line_name(name: &str) -> String {
     }
 }
 
-/// The "Approve all" confirmation: every `(zone, pubkey)` in `targets`,
-/// grouped by zone, each with its display name (where `roster` has one), the
-/// first eight hex characters of its key and its cohorts. At most `cap`
-/// members are listed; the rest are counted, so an unexpected key is
-/// noticeable without a dialog too long to read.
-fn approve_all_summary(
-    targets: &[(String, String)],
-    roster: &HashMap<String, (Option<String>, Vec<String>)>,
-    cap: usize,
-) -> String {
-    let members: HashSet<&String> = targets.iter().map(|(_, pk)| pk).collect();
+/// Whether `pk` is 64 hex characters, the only shape of a Nostr pubkey.
+fn well_formed(pk: &str) -> bool {
+    pk.len() == 64 && pk.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A pubkey as the dialog shows it: the first and last eight hex characters,
+/// so a key cannot pass for another that merely shares a prefix. Anything
+/// but 64 hex characters reads "(malformed key)", never the relay's text.
+fn key_label(pk: &str) -> String {
+    if !well_formed(pk) {
+        return "(malformed key)".into();
+    }
+    let pk = pk.to_ascii_lowercase();
+    format!("{}…{}", &pk[..8], &pk[56..])
+}
+
+/// The name the dialog shows for `pk`: its roster name made safe, or `None`
+/// when it is not on the roster or its name is empty once made safe.
+fn shown_name(roster: &Roster, pk: &str) -> Option<String> {
+    roster
+        .get(&pk.to_ascii_lowercase())
+        .and_then(|(name, _)| name.as_deref())
+        .map(one_line_name)
+        .filter(|n| !n.is_empty())
+}
+
+/// The pubkeys in `targets` whose shown name (ignoring case) another pubkey
+/// in `targets` also has.
+fn duplicate_names(targets: &[(String, String)], roster: &Roster) -> HashSet<String> {
+    let mut by_name: HashMap<String, HashSet<String>> = HashMap::new();
+    for (_, pk) in targets {
+        let pk = pk.to_ascii_lowercase();
+        if let Some(name) = shown_name(roster, &pk) {
+            by_name.entry(name.to_lowercase()).or_default().insert(pk);
+        }
+    }
+    by_name
+        .into_values()
+        .filter(|pks| pks.len() > 1)
+        .flatten()
+        .collect()
+}
+
+/// `targets` in the order the approval list shows them and "Approve all"
+/// takes them: first the members an admin is least likely to expect (not on
+/// the roster, no usable name, a name another pending member shares, or a
+/// malformed key), then everyone else; within each, by zone and then by
+/// pubkey. A relay-supplied name never decides the order within a group, so
+/// it cannot push an entry past the end of the dialog.
+fn approve_all_order(targets: &[(String, String)], roster: &Roster) -> Vec<(String, String)> {
+    let dups = duplicate_names(targets, roster);
+    let recognised = |pk: &str| {
+        let pk = pk.to_ascii_lowercase();
+        well_formed(&pk) && shown_name(roster, &pk).is_some() && !dups.contains(&pk)
+    };
+    let mut out = targets.to_vec();
+    out.sort_by(|(za, pa), (zb, pb)| {
+        (recognised(pa), za, pa.to_ascii_lowercase()).cmp(&(
+            recognised(pb),
+            zb,
+            pb.to_ascii_lowercase(),
+        ))
+    });
+    out
+}
+
+/// The "Approve all" button's label for `total` pending entries: it names
+/// how many one click approves when that is not all of them.
+fn approve_all_label(total: usize, cap: usize) -> String {
+    if total > cap {
+        format!("Approve these {cap} ({} more remain)", total - cap)
+    } else {
+        format!("Approve all ({total})")
+    }
+}
+
+/// One "Approve all" click: the members it approves, the confirmation text
+/// listing them, and how many pending entries it leaves for a further click.
+#[derive(Debug, Clone, PartialEq)]
+struct ApproveBatch {
+    /// The `(zone, pubkey)` pairs approved on OK: exactly those listed.
+    batch: Vec<(String, String)>,
+    /// The confirmation dialog's text.
+    text: String,
+    /// Pending entries left out of `batch`; they stay pending.
+    remaining: usize,
+}
+
+/// What one "Approve all" click approves and asks: the first `cap` of
+/// `targets` in [`approve_all_order`], each listed under its zone with its
+/// display name (where `roster` has one), both ends of its key, its cohorts,
+/// and a mark where another pending member has the same name. OK approves
+/// `batch` and nothing else, so no member is approved without being shown.
+fn approve_all_batch(targets: &[(String, String)], roster: &Roster, cap: usize) -> ApproveBatch {
+    let dups = duplicate_names(targets, roster);
+    let batch: Vec<(String, String)> = approve_all_order(targets, roster)
+        .into_iter()
+        .take(cap)
+        .collect();
+    let remaining = targets.len() - batch.len();
+    let members: HashSet<String> = batch
+        .iter()
+        .map(|(_, pk)| pk.to_ascii_lowercase())
+        .collect();
     let mut by_zone: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
-    for (zone, pk) in targets {
-        let prefix = pk.get(..8).unwrap_or(pk);
+    for (zone, pk) in &batch {
+        let key = key_label(pk);
+        let dup = if dups.contains(&pk.to_ascii_lowercase()) {
+            " [duplicate name]"
+        } else {
+            ""
+        };
         let line = match roster.get(&pk.to_ascii_lowercase()) {
-            Some((name, cohorts)) => {
-                let name = name.as_deref().map(one_line_name).unwrap_or_default();
+            Some((_, cohorts)) => {
                 let cohorts = if cohorts.is_empty() {
                     "no cohort".to_string()
                 } else {
@@ -373,9 +505,12 @@ fn approve_all_summary(
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
-                format!("{name} ({prefix}…) · {cohorts}")
+                match shown_name(roster, pk) {
+                    Some(name) => format!("{name} ({key}) · {cohorts}{dup}"),
+                    None => format!("({key}) · no name · {cohorts}"),
+                }
             }
-            None => format!("({prefix}…) · not in the member list"),
+            None => format!("({key}) · not in the member list"),
         };
         by_zone.entry(zone.as_str()).or_default().push(line);
     }
@@ -383,45 +518,94 @@ fn approve_all_summary(
         format!(
             "Approve and send zone keys: {} grant(s) to {} member(s)? Confirm only if you \
              recognise every one: a compromised relay could have added a pubkey.",
-            targets.len(),
+            batch.len(),
             members.len()
         ),
+        "Members without a recognised name are listed first.".to_string(),
         String::new(),
     ];
-    let mut listed = 0;
-    for (zone, mut entries) in by_zone {
-        if listed >= cap {
-            break;
-        }
-        entries.sort();
+    for (zone, entries) in by_zone {
         lines.push(format!("{zone}:"));
-        for e in entries.into_iter().take(cap - listed) {
-            lines.push(format!("  {}", e.trim_start()));
-            listed += 1;
-        }
+        lines.extend(entries.into_iter().map(|e| format!("  {e}")));
     }
-    let rest = targets.len() - listed;
-    if rest > 0 {
+    if remaining > 0 {
+        lines.push(String::new());
         lines.push(format!(
-            "…and {rest} more not listed here. Approve them one at a time below to check each."
+            "{remaining} more stay awaiting approval: this approves only the {} listed. \
+             Review the rest with a further click.",
+            batch.len()
         ));
     }
-    lines.join("\n")
+    ApproveBatch {
+        batch,
+        text: lines.join("\n"),
+        remaining,
+    }
+}
+
+/// How many members of `known` (granted or approved for a zone), other than
+/// `me`, are not among `targets`, the zone's members on the roster just read.
+fn absent_known(known: &HashSet<String>, targets: &[String], me: &str) -> usize {
+    let me = me.to_ascii_lowercase();
+    let now: HashSet<String> = targets.iter().map(|t| t.to_ascii_lowercase()).collect();
+    known
+        .iter()
+        .map(|k| k.to_ascii_lowercase())
+        .filter(|k| *k != me && !now.contains(k))
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// The confirmation shown before a new key is created (`rotate` false) or
 /// rotated in at `epoch`: how many members receive it now (`receiving`, the
-/// admin not counted), and how many are held back. Rotation always asks;
-/// creation asks only when someone is held back.
+/// admin not counted), how many are held back (`pending` awaiting approval,
+/// `unverified` because the zone's grant record could not be read), and how
+/// many members granted or approved before the roster no longer lists
+/// (`absent`). Rotation always asks; creation asks only when someone is held
+/// back.
+///
+/// `Err` refuses a rotation that would hand the new key to nobody but the
+/// admin while members are held: posting under it would leave every one of
+/// them unable to read, with nothing on screen to say so. The text says why
+/// and what to do instead. Creating a first key is never refused: on a new
+/// zone everyone is pending until approved.
 fn new_key_confirmation(
     rotate: bool,
     epoch: u32,
     receiving: usize,
     pending: usize,
     unverified: usize,
-) -> Option<String> {
+    absent: usize,
+) -> Result<Option<String>, String> {
+    let absent_note = (absent > 0).then(|| {
+        format!(
+            "{absent} member(s) granted or approved before are not in the member list the relay \
+             returned and will not receive this key. That is expected for anyone who has left; \
+             otherwise check the member list before rotating."
+        )
+    });
+    if rotate && receiving == 0 && pending + unverified > 0 {
+        let mut why = vec![format!(
+            "Key epoch {epoch} was not created: the rotation would send the new key to nobody \
+             but you, and members would be left unable to read new messages."
+        )];
+        if pending > 0 {
+            why.push(format!(
+                "{pending} member(s) are awaiting your approval: approve the members you \
+                 recognise under \"New members awaiting approval\", then rotate."
+            ));
+        }
+        if unverified > 0 {
+            why.push(format!(
+                "{unverified} member(s) could not be checked because this zone's grant record \
+                 did not load: use \"Check again\" once the relay answers, then rotate."
+            ));
+        }
+        why.extend(absent_note);
+        return Err(why.join(" "));
+    }
     if !rotate && pending + unverified == 0 {
-        return None;
+        return Ok(None);
     }
     let mut lines = vec![
         if rotate {
@@ -443,6 +627,7 @@ fn new_key_confirmation(
         ));
     }
     if rotate {
+        lines.extend(absent_note);
         lines.push(String::new());
         lines.push(
             "Anyone removed from the zone cannot read messages posted after this. Older \
@@ -450,7 +635,7 @@ fn new_key_confirmation(
                 .into(),
         );
     }
-    Some(lines.join("\n"))
+    Ok(Some(lines.join("\n")))
 }
 
 #[derive(Clone, PartialEq)]
@@ -854,17 +1039,36 @@ fn ZoneKeyCard(
                     // anyone else is held for approval.
                     let plan = plan_new_key(&rule, &members, &me, &key, &g);
                     let (pending, unverified) = plan.held();
-                    if let Some(ask) = new_key_confirmation(
+                    // Members this device granted or approved for the zone
+                    // whom the roster just read no longer places in it.
+                    let absent = g.known.get(&rule.id).map_or(0, |known| {
+                        let now =
+                            grant_targets(&members, &rule.required_cohorts, &me, rule.agent_keys);
+                        absent_known(known, &now, &me)
+                    });
+                    match new_key_confirmation(
                         rotate,
                         next_epoch,
                         plan.receiving(&me),
                         pending,
                         unverified,
+                        absent,
                     ) {
-                        let ok = web_sys::window()
-                            .and_then(|w| w.confirm_with_message(&ask).ok())
-                            .unwrap_or(false);
-                        if !ok {
+                        Ok(None) => {}
+                        Ok(Some(ask)) => {
+                            let ok = web_sys::window()
+                                .and_then(|w| w.confirm_with_message(&ask).ok())
+                                .unwrap_or(false);
+                            if !ok {
+                                return;
+                            }
+                        }
+                        Err(why) => {
+                            // Nothing is created; list the held members so
+                            // the admin can approve them (approves nobody).
+                            held_back(&plan);
+                            let _ = gate.try_set(Some(g));
+                            let _ = status.try_set(Some(why));
                             return;
                         }
                     }
@@ -1146,9 +1350,18 @@ fn ZoneKeyCard(
 mod tests {
     use super::*;
 
+    fn named(name: &str, cohorts: &[&str]) -> (Option<String>, Vec<String>) {
+        (
+            Some(name.to_string()),
+            cohorts.iter().map(|c| c.to_string()).collect(),
+        )
+    }
+
     #[test]
     fn the_rotation_confirmation_counts_who_receives_and_who_is_held() {
-        let ask = new_key_confirmation(true, 7, 3, 2, 0).expect("rotation always asks");
+        let ask = new_key_confirmation(true, 7, 3, 2, 0, 0)
+            .expect("not refused")
+            .expect("rotation always asks");
         assert!(ask.contains("Rotate to key epoch 7?"), "{ask}");
         assert!(ask.contains("3 member(s) receive the key now"), "{ask}");
         assert!(
@@ -1156,7 +1369,10 @@ mod tests {
             "{ask}"
         );
         assert!(!ask.contains("could not be checked"), "{ask}");
-        let ask = new_key_confirmation(true, 7, 3, 0, 4).expect("rotation always asks");
+        assert!(!ask.contains("not in the member list"), "{ask}");
+        let ask = new_key_confirmation(true, 7, 3, 0, 4, 0)
+            .expect("not refused")
+            .expect("rotation always asks");
         assert!(
             ask.contains("0 member(s) are held for your approval"),
             "{ask}"
@@ -1165,19 +1381,64 @@ mod tests {
     }
 
     #[test]
+    fn a_rotation_that_would_reach_only_the_admin_while_members_are_held_is_refused() {
+        let why = new_key_confirmation(true, 7, 0, 3, 0, 0).expect_err("refused");
+        assert!(why.contains("Key epoch 7 was not created"), "{why}");
+        assert!(
+            why.contains("3 member(s) are awaiting your approval"),
+            "{why}"
+        );
+        assert!(why.contains("approve the members you recognise"), "{why}");
+        let why = new_key_confirmation(true, 7, 0, 0, 2, 1).expect_err("refused");
+        assert!(why.contains("2 member(s) could not be checked"), "{why}");
+        assert!(why.contains("Check again"), "{why}");
+        assert!(
+            why.contains("1 member(s) granted or approved before"),
+            "{why}"
+        );
+        // Nobody else in the zone at all: nothing is stranded.
+        assert!(new_key_confirmation(true, 7, 0, 0, 0, 0).is_ok());
+        // Creating a first key with everyone pending is the normal start.
+        assert!(new_key_confirmation(false, 1, 0, 5, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn the_rotation_confirmation_counts_known_members_missing_from_the_roster() {
+        let ask = new_key_confirmation(true, 7, 3, 0, 0, 2)
+            .expect("not refused")
+            .expect("rotation always asks");
+        assert!(
+            ask.contains(
+                "2 member(s) granted or approved before are not in the member list the relay \
+                 returned"
+            ),
+            "{ask}"
+        );
+        let pk = |c: char| c.to_string().repeat(64);
+        let known: HashSet<String> = [pk('a'), pk('b'), pk('c'), pk('f')].into();
+        let targets = vec![pk('a'), pk('d'), pk('f')];
+        // `f` is the admin: never counted. `B` in upper case is still `b`.
+        assert_eq!(
+            absent_known(&known, &targets, &pk('F').to_ascii_uppercase()),
+            2
+        );
+        assert_eq!(
+            absent_known(&known, &[pk('B').to_ascii_uppercase(), pk('c')], &pk('f')),
+            1
+        );
+    }
+
+    #[test]
     fn approve_all_lists_each_member_by_zone_with_name_key_and_cohorts() {
         let pk = |c: char| c.to_string().repeat(64);
         let roster = HashMap::from([
-            (
-                pk('b'),
-                (Some("Alice".to_string()), vec!["family".to_string()]),
-            ),
+            (pk('b'), named("Alice", &["family"])),
             (
                 pk('c'),
                 // A name that tries to forge a line of its own.
-                (
-                    Some("Mallory\n  Bob (dddddddd…) · family".to_string()),
-                    vec!["family".to_string(), "business".to_string()],
+                named(
+                    "Mallory\n  Bob (dddddddd…) · family",
+                    &["family", "business"],
                 ),
             ),
         ]);
@@ -1187,15 +1448,18 @@ mod tests {
             ("zone3".to_string(), pk('b')),
             ("zone3".to_string(), pk('e')),
         ];
-        let text = approve_all_summary(&targets, &roster, 20);
+        let text = approve_all_batch(&targets, &roster, 20).text;
         assert!(text.contains("4 grant(s) to 3 member(s)"), "{text}");
         let zone2 = text.find("zone2:").expect("zone2 group");
         let zone3 = text.find("zone3:").expect("zone3 group");
         assert!(zone2 < zone3, "zones in order: {text}");
         assert_eq!(text.matches("zone3:").count(), 1, "one header per zone");
-        assert!(text.contains("Alice (bbbbbbbb…) · family"), "{text}");
         assert!(
-            text.contains("(eeeeeeee…) · not in the member list"),
+            text.contains("Alice (bbbbbbbb…bbbbbbbb) · family"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(eeeeeeee…eeeeeeee) · not in the member list"),
             "{text}"
         );
         assert!(text.contains("family, business"), "{text}");
@@ -1204,14 +1468,160 @@ mod tests {
     }
 
     #[test]
-    fn approve_all_caps_the_list_and_says_how_many_are_not_shown() {
-        let roster = HashMap::new();
-        let targets: Vec<(String, String)> = (0..25)
-            .map(|i| ("zone3".to_string(), format!("{i:064x}")))
-            .collect();
-        let text = approve_all_summary(&targets, &roster, 20);
-        assert_eq!(text.matches("not in the member list").count(), 20, "{text}");
-        assert!(text.contains("and 5 more not listed"), "{text}");
+    fn approve_all_approves_exactly_the_members_it_lists() {
+        let key = |n: u32| format!("{n:064x}");
+        let mut roster = Roster::new();
+        let mut targets = Vec::new();
+        // An injected key named to sort last by name, with the lowest pubkey.
+        roster.insert(key(1), named("zzz Mallory", &["family"]));
+        targets.push(("zone3".to_string(), key(1)));
+        for i in 0..20 {
+            let name = if i == 0 {
+                "aaa".to_string()
+            } else {
+                format!("Member {i:02}")
+            };
+            roster.insert(key(0x100 + i), named(&name, &["family"]));
+            targets.push(("zone3".to_string(), key(0x100 + i)));
+        }
+        for i in 0..4 {
+            targets.push(("zone3".to_string(), key(0x900 + i)));
+        }
+        let b = approve_all_batch(&targets, &roster, 20);
+        assert_eq!(b.batch.len(), 20, "{}", b.text);
+        assert_eq!(b.remaining, 5, "{}", b.text);
+        for (_, pk) in &targets {
+            assert_eq!(
+                b.text.contains(&key_label(pk)),
+                b.batch.iter().any(|(_, p)| p == pk),
+                "listed if and only if approved: {pk}\n{}",
+                b.text
+            );
+        }
+        // The name does not decide whether a key is shown.
+        assert!(
+            b.batch.contains(&("zone3".to_string(), key(1))),
+            "{}",
+            b.text
+        );
+        // Keys the relay gave no name come before any named member.
+        let unknown = b.text.find(&key_label(&key(0x900))).expect("unknown key");
+        let aaa = b.text.find("aaa").expect("aaa listed");
+        assert!(unknown < aaa, "{}", b.text);
+        assert!(
+            b.text
+                .contains("Approve and send zone keys: 20 grant(s) to 20 member(s)?"),
+            "{}",
+            b.text
+        );
+        assert!(
+            b.text.contains("5 more stay awaiting approval"),
+            "{}",
+            b.text
+        );
+    }
+
+    #[test]
+    fn the_approve_all_button_says_how_many_remain() {
+        assert_eq!(
+            approve_all_label(57, 20),
+            "Approve these 20 (37 more remain)"
+        );
+        assert_eq!(approve_all_label(20, 20), "Approve all (20)");
+        assert_eq!(approve_all_label(5, 20), "Approve all (5)");
+    }
+
+    #[test]
+    fn unrecognised_members_sort_first_by_zone_and_key_never_by_name() {
+        let pk = |c: char| c.to_string().repeat(64);
+        let roster = HashMap::from([
+            (pk('1'), named("Aaron", &["family"])),
+            (pk('2'), (None, vec!["family".to_string()])),
+            // Only format characters: as good as no name.
+            (pk('3'), named("\u{200B}\u{202E}", &["family"])),
+            (pk('4'), named("Dup", &["family"])),
+            (pk('5'), named("dup\u{200D}", &["family"])),
+            (pk('6'), named("Beth", &["family"])),
+        ]);
+        let t = |z: &str, c: char| (z.to_string(), pk(c));
+        let targets = vec![
+            t("zone3", '6'),
+            t("zone3", '1'),
+            t("zone2", '1'),
+            t("zone3", '5'),
+            t("zone3", '9'),
+            t("zone3", '4'),
+            t("zone3", '3'),
+            t("zone3", '2'),
+        ];
+        assert_eq!(
+            approve_all_order(&targets, &roster),
+            vec![
+                t("zone3", '2'),
+                t("zone3", '3'),
+                t("zone3", '4'),
+                t("zone3", '5'),
+                t("zone3", '9'),
+                t("zone2", '1'),
+                t("zone3", '1'),
+                t("zone3", '6'),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_dialog_shows_both_ends_of_each_key_and_never_a_malformed_one() {
+        let pk = format!("{}{}", "ab".repeat(4), "0".repeat(48)) + "cdcdcdcd";
+        assert_eq!(key_label(&pk), "abababab…cdcdcdcd");
+        assert_eq!(key_label(&pk.to_ascii_uppercase()), "abababab…cdcdcdcd");
+        assert_eq!(key_label("abc"), "(malformed key)");
+        assert_eq!(key_label(&"\u{202E}".repeat(32)), "(malformed key)");
+        assert_eq!(key_label(&"g".repeat(64)), "(malformed key)");
+    }
+
+    #[test]
+    fn names_and_cohorts_lose_format_characters() {
+        assert_eq!(
+            one_line_name("Ali\u{202E}ce\u{2066}\u{200B}\u{FEFF}\u{2060}\u{200F}"),
+            "Alice"
+        );
+        assert_eq!(one_line_name("a\u{202A}b\u{2069}c\u{200E}"), "abc");
+        let pk = |c: char| c.to_string().repeat(64);
+        let roster = HashMap::from([(pk('b'), named("Eve\u{202E}lyn", &["fam\u{200D}ily"]))]);
+        let text = approve_all_batch(&[("zone3".to_string(), pk('b'))], &roster, 20).text;
+        assert!(
+            text.contains("Evelyn (bbbbbbbb…bbbbbbbb) · family"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn pending_members_sharing_a_display_name_are_both_marked() {
+        let pk = |c: char| c.to_string().repeat(64);
+        let roster = HashMap::from([
+            (pk('a'), named("Alice", &["family"])),
+            (pk('b'), named("alice\u{200B}", &["family"])),
+            (pk('c'), named("Bob", &["family"])),
+            (pk('d'), named("\u{FEFF}", &["family"])),
+            (pk('e'), (Some(String::new()), vec!["family".to_string()])),
+        ]);
+        let t = |z: &str, c: char| (z.to_string(), pk(c));
+        let targets = vec![
+            t("zone3", 'a'),
+            t("zone3", 'b'),
+            // One member pending in two zones is not a duplicate.
+            t("zone2", 'c'),
+            t("zone3", 'c'),
+            t("zone3", 'd'),
+            t("zone3", 'e'),
+        ];
+        let text = approve_all_batch(&targets, &roster, 20).text;
+        assert_eq!(text.matches("[duplicate name]").count(), 2, "{text}");
+        for line in text.lines() {
+            if line.contains("aaaaaaaa…") || line.contains("bbbbbbbb…") {
+                assert!(line.contains("[duplicate name]"), "{line}");
+            }
+        }
     }
 
     #[test]
@@ -1237,8 +1647,10 @@ mod tests {
 
     #[test]
     fn creating_a_key_asks_only_when_someone_is_held() {
-        assert_eq!(new_key_confirmation(false, 1, 5, 0, 0), None);
-        let ask = new_key_confirmation(false, 1, 0, 5, 0).expect("held members");
+        assert_eq!(new_key_confirmation(false, 1, 5, 0, 0, 0), Ok(None));
+        let ask = new_key_confirmation(false, 1, 0, 5, 0, 0)
+            .expect("not refused")
+            .expect("held members");
         assert!(ask.contains("Create key epoch 1?"), "{ask}");
         assert!(ask.contains("5 member(s) are held"), "{ask}");
     }
