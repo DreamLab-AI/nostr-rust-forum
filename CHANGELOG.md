@@ -18,6 +18,19 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Inter self-hosted; BBS page gets the baseline CSP (2026-11-26)
+
+Forum client and BBS client shells only.
+
+- **Inter.** The forum loaded Inter from Google Fonts on every page view, handing each visitor's IP and Referer to a
+  third party. It now ships `assets/fonts/InterVariable.woff2` (Inter 4.1, rsms/inter release `v4.1`, one variable file
+  for weights 100 to 900; SHA-256 `693b77d4f32ee9b8bfc995589b5fad5e99adf2832738661f5402f9978429a8e3`) with its SIL OFL
+  1.1 licence, copied to `<public-url>/fonts/`, and declares it with `@font-face` in `style.css`. No font CDN request
+  remains. First load fetches about 344 KiB of font instead of Google's Latin subset; the service worker caches it.
+- **BBS CSP.** The BBS page had no CSP at all. It now carries the forum's baseline meta policy
+  (`object-src 'none'; base-uri 'none'; form-action 'self'`). A `script-src` for either page needs the host site to
+  stop injecting inline scripts after the build; that is a separate, cross-repository change.
+
 ### Forum deep-link restore stays inside the forum (2026-11-26)
 
 Forum client `index.html` only. The GitHub Pages pickup concatenated `__p` onto `/community` unchecked, so

@@ -85,10 +85,13 @@
     <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
     <link rel="icon" href="icons/icon-192.png" sizes="192x192" type="image/png" />
 
-    <!-- Inter font -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+    <!-- Inter, self-hosted: the @font-face lives in style.css. Never load it
+         from a font CDN; every such request hands the visitor's IP to a third
+         party. The OFL licence travels with the font into dist. No preload
+         link: a relative href here would resolve against the restored
+         deep-link path, whereas the stylesheet's url() resolves against the
+         stylesheet's own (public-url) location. -->
+    <link data-trunk rel="copy-dir" href="assets/fonts" data-target-path="fonts" />
 
     <!-- Tailwind utilities (tree-shaken at build time by Tailwind CLI v3.4.17,
          driven by Trunk pre_build hook in Trunk.toml). Replaces the legacy
