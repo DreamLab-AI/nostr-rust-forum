@@ -323,9 +323,10 @@ fn approve_request(
                     format!("Approved: {} added to {}", pk_display, cohort),
                     ToastVariant::Success,
                 );
-                // The approved cohort may open an encrypted zone: send its key.
+                // The approved cohort may open an encrypted zone: approve and
+                // send that zone's key, and no other.
                 if let Some(g) = &auto_grant {
-                    g.after_allocation(&pk);
+                    g.after_allocation(&pk, std::slice::from_ref(&cohort));
                 }
 
                 // Publish kind-9000 (add user to group) as confirmation

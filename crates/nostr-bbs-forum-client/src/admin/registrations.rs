@@ -120,7 +120,7 @@ pub fn RegistrationsPanel() -> impl IntoView {
             let auto_grant = auto_grant.clone();
             spawn_local(async move {
                 match admin_clone
-                    .add_to_whitelist_signer(&pubkey, &[cohort], &*signer)
+                    .add_to_whitelist_signer(&pubkey, std::slice::from_ref(&cohort), &*signer)
                     .await
                 {
                     Ok(_) => {
@@ -130,9 +130,10 @@ pub fn RegistrationsPanel() -> impl IntoView {
                                 .key(pubkey.clone(), short),
                             true,
                         )));
-                        // The default cohort may open an encrypted zone.
+                        // The default cohort may open an encrypted zone:
+                        // approve and grant that zone only.
                         if let Some(g) = &auto_grant {
-                            g.after_allocation(&pubkey);
+                            g.after_allocation(&pubkey, std::slice::from_ref(&cohort));
                         }
                     }
                     Err(e) => action_msg.set(Some((format!("Approve failed: {e}").into(), false))),

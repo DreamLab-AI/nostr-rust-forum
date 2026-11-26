@@ -89,8 +89,11 @@ pub enum Lookup {
     /// says keys are on their way rather than blaming the connection.
     KeysLoading,
     /// The relay answered but the member's zone keys stopped arriving (no
-    /// progress within the stall window, or the overall cap). Distinct from
-    /// [`Lookup::TimedOut`], which means no relay answer arrived at all.
+    /// progress within the stall window, or the overall cap) or could not be
+    /// checked (a grant whose sealer's admin check went unanswered, an inbox
+    /// key that could not be set up). "Couldn't check", never "absent": the
+    /// unsettled grants stay retryable. Distinct from [`Lookup::TimedOut`],
+    /// which means no relay answer arrived at all.
     KeysTimedOut,
 }
 
@@ -169,8 +172,9 @@ pub enum KeyState {
         /// When the stall window or cap next needs checking.
         until: f64,
     },
-    /// The grant backlog stopped moving, hit its cap, or never started
-    /// before the page deadline.
+    /// The grant backlog stopped moving, hit its cap, could not reach a
+    /// grant scope (the inbox key failed to set up), or never started before
+    /// the page deadline.
     Stalled,
 }
 
