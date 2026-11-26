@@ -1191,14 +1191,25 @@ impl NostrRelayDO {
             // pubkey verbatim (gate-off / non-device ⇒ unchanged behaviour). The
             // event's signature was already verified strictly above against the
             // device's own key; we only rebind WHO the allowlist is checked for.
-            if !self.is_whitelisted(&principal).await {
-                // NIP-42 semantics: a denial AFTER a completed AUTH is
-                // `restricted:` (authenticated but not authorised), distinct
-                // from `auth-required:`. Legacy `allowlist` mode keeps the
-                // historical `blocked:` message.
-                let reason = nip42::allowlist_denial_reason(auth_mode, session_authed);
-                Self::send_ok(ws, &event.id, false, reason);
-                return;
+            match self.whitelist_lookup(&principal).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // NIP-42 semantics: a denial AFTER a completed AUTH is
+                    // `restricted:` (authenticated but not authorised),
+                    // distinct from `auth-required:`. Legacy `allowlist` mode
+                    // keeps the historical `blocked:` message.
+                    let reason = nip42::allowlist_denial_reason(auth_mode, session_authed);
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+                Err(e) => {
+                    // Still refused (fail closed), but not as "not allowed":
+                    // members were told they were off the allowlist whenever
+                    // D1 was overloaded (2026-11-26).
+                    console_error!("EVENT {}: whitelist lookup failed: {e}", event.id);
+                    Self::send_ok(ws, &event.id, false, nip42::LOOKUP_FAILED_REASON);
+                    return;
+                }
             }
         }
 
@@ -2154,8 +2165,18 @@ impl NostrRelayDO {
         // Persist subscriptions to DO storage so they survive hibernation
         self.save_subscriptions(session_id).await;
 
-        // Query D1 for matching events
-        let events = self.query_events(&filters).await;
+        // Query D1 for matching events. A failed read gets no EOSE: an empty
+        // answer with EOSE reads as "complete", and members then concluded
+        // they had no key grants (2026-11-26, D1 overloaded). The
+        // subscription stays registered for live events, and the client's
+        // REQ watchdog re-sends an unanswered REQ with backoff.
+        let events = match self.query_events_checked(&filters).await {
+            Ok(events) => events,
+            Err(e) => {
+                console_error!("REQ {sub_id}: stored read failed, no EOSE sent: {e}");
+                return;
+            }
+        };
 
         // Resolve the viewer's effective read scope once (ADR-099 device→owner
         // rebinding, admin status, calendar cohorts), then apply the SHARED
@@ -3516,11 +3537,10 @@ impl NostrRelayDO {
         }
 
         if let Some((value, since, until)) = filter::channel_count_target(&filters) {
-            let q = filter::build_channel_count(&value, since, until);
             // More own channels than COUNT_MAX_GROUPS (one zone lookup each)
             // means crafted spread; the generic path's row cap bounds that.
             if let Some((groups, exceptions)) = self
-                .count_channel_messages(&q)
+                .count_channel_messages_cached(&value, since, until)
                 .await
                 .filter(|(g, _)| g.len() <= filter::COUNT_MAX_GROUPS)
             {

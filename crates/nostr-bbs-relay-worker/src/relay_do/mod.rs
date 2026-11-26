@@ -114,6 +114,10 @@ pub struct NostrRelayDO {
     pub(crate) ref_unknown_cache: TtlCache<()>,
     /// Short-TTL memo of channels with no channel_zones row (finding 4).
     pub(crate) channel_zone_none_cache: TtlCache<()>,
+    /// Grouped message-count snapshots per `(value, since)` (COUNT fast path):
+    /// a big channel's count reads every message, so it is taken once per
+    /// [`read_cache::COUNT_CACHE_TTL_SECS`] and topped up with newer messages.
+    pub(crate) count_cache: TtlCache<read_cache::CountSnapshot>,
     /// ADR-2018: 60s-TTL memo of pubkey → (cohorts, whitelist is_admin).
     pub(crate) cohort_cache: TtlCache<(Vec<String>, bool)>,
     /// ADR-2018: 60s-TTL memo of device pubkey → owner (None = not a device key).
@@ -150,6 +154,7 @@ impl DurableObject for NostrRelayDO {
             ref_target_cache: TtlCache::new(LOOKUP_TTL_SECS),
             ref_unknown_cache: TtlCache::new(NEGATIVE_LOOKUP_TTL_SECS),
             channel_zone_none_cache: TtlCache::new(NEGATIVE_LOOKUP_TTL_SECS),
+            count_cache: TtlCache::new(read_cache::COUNT_CACHE_TTL_SECS),
             cohort_cache: TtlCache::new(LOOKUP_TTL_SECS),
             device_owner_cache: TtlCache::new(LOOKUP_TTL_SECS),
             recipient_row_cache: TtlCache::new(LOOKUP_TTL_SECS),

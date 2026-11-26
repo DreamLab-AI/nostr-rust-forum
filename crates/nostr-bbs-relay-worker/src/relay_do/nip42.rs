@@ -327,6 +327,12 @@ pub fn protected_read_blocked(
     })
 }
 
+/// The NIP-01 `OK` reason when the allowlist could not be read (the write is
+/// refused, fail closed): a machine-readable `error:` prefix and wording that
+/// tells the member to retry, never that they are not allowed.
+pub const LOOKUP_FAILED_REASON: &str =
+    "error: the relay is busy and could not check membership; try again";
+
 /// The NIP-01 `OK` reason for an allowlist (authorisation) denial.
 ///
 /// Under NIP-42 semantics a denial AFTER a completed AUTH is `restricted:`
@@ -491,6 +497,14 @@ mod tests {
         // withholds protected content downstream).
         let anykind = [filter_kinds(None)];
         assert!(!protected_read_blocked(&anykind, false, AuthMode::Nip42));
+    }
+
+    #[test]
+    fn a_failed_membership_lookup_is_an_error_not_a_denial() {
+        assert!(LOOKUP_FAILED_REASON.starts_with("error: "));
+        assert!(!LOOKUP_FAILED_REASON.contains("allowlist"));
+        assert!(!LOOKUP_FAILED_REASON.contains("whitelist"));
+        assert!(LOOKUP_FAILED_REASON.contains("try again"));
     }
 
     #[test]

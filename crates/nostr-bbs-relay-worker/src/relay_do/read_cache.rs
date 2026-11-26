@@ -51,6 +51,71 @@ pub(crate) const ACTIVITY_FLUSH_SECS: u64 = 300;
 /// Pending delivered-read count that forces an early flush.
 pub(crate) const PENDING_READS_FLUSH_AT: i32 = 50;
 
+/// How long a channel/topic message-count snapshot is reused. A hit adds the
+/// messages created after the snapshot with a cheap time-range query, so the
+/// answer stays exact for new posts; only a post backdated into the counted
+/// range, or a deletion, waits for the snapshot to expire.
+pub(crate) const COUNT_CACHE_TTL_SECS: u64 = 300;
+
+/// Most snapshots kept before the cache is emptied (one per channel or topic
+/// counted; each holds at most a few `(channel, n)` pairs).
+pub(crate) const COUNT_CACHE_MAX: usize = 4096;
+
+/// A grouped message count (see `filter::build_channel_count`), valid for
+/// every message created at or before `as_of`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CountSnapshot {
+    pub(crate) as_of: u64,
+    pub(crate) groups: Vec<(String, u64)>,
+}
+
+/// How to answer a grouped count for a request ending at `until` (`None`:
+/// no upper bound), given the snapshot held for its `(value, since)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CountPlan {
+    /// Add the messages created after the snapshot (`from` onward, up to the
+    /// request's `until`) to it.
+    Delta { from: u64 },
+    /// Count up to `horizon` from scratch and keep that as the snapshot, then
+    /// add anything after `horizon` the request still covers.
+    Full { horizon: u64 },
+}
+
+/// The plan for a count ending at `until`, at time `now`. A snapshot serves
+/// any request whose range reaches at least to its `as_of`; an older `until`
+/// is counted from scratch, exactly.
+pub(crate) fn plan_count(snap: Option<&CountSnapshot>, until: Option<u64>, now: u64) -> CountPlan {
+    let reach = until.unwrap_or(u64::MAX);
+    match snap {
+        Some(s) if s.as_of <= reach => CountPlan::Delta {
+            from: s.as_of.saturating_add(1),
+        },
+        _ => CountPlan::Full {
+            horizon: reach.min(now),
+        },
+    }
+}
+
+/// Sum two grouped counts channel by channel, in first-seen order.
+pub(crate) fn merge_groups(a: &[(String, u64)], b: &[(String, u64)]) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = a.to_vec();
+    for (ch, n) in b {
+        match out.iter_mut().find(|(c, _)| c == ch) {
+            Some((_, m)) => *m += n,
+            None => out.push((ch.clone(), *n)),
+        }
+    }
+    out
+}
+
+/// The snapshot key of a count of `value` from `since`.
+pub(crate) fn count_key(value: &str, since: Option<u64>) -> String {
+    match since {
+        Some(s) => format!("{value}|{s}"),
+        None => value.to_string(),
+    }
+}
+
 struct Entry<V> {
     value: V,
     fetched_at: u64,
@@ -89,6 +154,16 @@ impl<V: Clone> TtlCache<V> {
                 fetched_at: now,
             },
         );
+    }
+
+    /// Number of entries held, expired ones included.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    /// Forget everything.
+    pub(crate) fn clear(&self) {
+        self.entries.borrow_mut().clear();
     }
 
     /// Forget `key` so the next lookup goes back to D1.
@@ -171,6 +246,83 @@ impl ActivityLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snap(as_of: u64) -> CountSnapshot {
+        CountSnapshot {
+            as_of,
+            groups: vec![("ch".into(), 200_000)],
+        }
+    }
+
+    #[test]
+    fn a_count_snapshot_serves_any_request_reaching_its_horizon() {
+        // The client asks "up to now": served from the snapshot plus newer.
+        assert_eq!(
+            plan_count(Some(&snap(1_000)), Some(1_030), 1_030),
+            CountPlan::Delta { from: 1_001 }
+        );
+        assert_eq!(
+            plan_count(Some(&snap(1_000)), None, 1_030),
+            CountPlan::Delta { from: 1_001 }
+        );
+        // Exactly at the horizon: nothing newer to add, still a hit.
+        assert_eq!(
+            plan_count(Some(&snap(1_000)), Some(1_000), 1_030),
+            CountPlan::Delta { from: 1_001 }
+        );
+        // An older `until` is counted from scratch (the snapshot would overcount).
+        assert_eq!(
+            plan_count(Some(&snap(1_000)), Some(900), 1_030),
+            CountPlan::Full { horizon: 900 }
+        );
+        // No snapshot: count to now (never past it), keep that as the snapshot.
+        assert_eq!(
+            plan_count(None, None, 1_030),
+            CountPlan::Full { horizon: 1_030 }
+        );
+        assert_eq!(
+            plan_count(None, Some(5_000), 1_030),
+            CountPlan::Full { horizon: 1_030 }
+        );
+        assert_eq!(
+            plan_count(None, Some(700), 1_030),
+            CountPlan::Full { horizon: 700 }
+        );
+    }
+
+    #[test]
+    fn grouped_counts_merge_per_channel() {
+        let a = vec![("x".to_string(), 10), ("y".to_string(), 1)];
+        let b = vec![("y".to_string(), 2), ("z".to_string(), 3)];
+        assert_eq!(
+            merge_groups(&a, &b),
+            vec![
+                ("x".to_string(), 10),
+                ("y".to_string(), 3),
+                ("z".to_string(), 3)
+            ]
+        );
+        assert_eq!(merge_groups(&a, &[]), a);
+        assert_eq!(merge_groups(&[], &b), b);
+    }
+
+    #[test]
+    fn count_keys_separate_since_values() {
+        assert_eq!(count_key("ch", None), "ch");
+        assert_eq!(count_key("ch", Some(5)), "ch|5");
+        assert_ne!(count_key("ch", Some(5)), count_key("ch", Some(6)));
+    }
+
+    #[test]
+    fn ttl_cache_len_and_clear() {
+        let c: TtlCache<u8> = TtlCache::new(60);
+        c.insert("a", 1, 0);
+        c.insert("b", 2, 0);
+        assert_eq!(c.len(), 2);
+        c.clear();
+        assert_eq!(c.len(), 0);
+        assert_eq!(c.get("a", 0), None);
+    }
 
     #[test]
     fn ttl_cache_serves_fresh_entries_and_expires_stale_ones() {
