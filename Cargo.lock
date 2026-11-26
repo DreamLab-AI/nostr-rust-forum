@@ -3267,6 +3267,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostr-bbs-bulk-import"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "k256",
+ "libc",
+ "nostr-bbs-core",
+ "nostr-bbs-zone-migrate",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "nostr-bbs-config"
 version = "1.0.0-beta.20"
 dependencies = [
@@ -6693,6 +6712,7 @@ version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 
