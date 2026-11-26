@@ -192,7 +192,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # Pure-Rust QR *decoder* for the in-app "Scan your sheet" flow (iOS Safari
 # has no BarcodeDetector). MIT OR Apache-2.0, a port of quirc with no unsafe
 # code; `img` (the image crate) is off: frames arrive as canvas RGBA.
-rqrr = { version = "0.10", default-features = false }
+rqrr = { version = "0.11", default-features = false }
 async-trait = { workspace = true }
 uuid = { version = "1", features = ["js"] }
 # Member wallets on sidestr:dreamlab (testnet4) and DREAM tips (ADR-2015).
