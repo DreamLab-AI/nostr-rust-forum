@@ -302,6 +302,27 @@ pub fn TopicList(
     }
 }
 
+/// The row under a topic title: "last by", name, agent pill, dot, replies.
+/// One non-wrapping flex row: on a phone a wrapping row put each of those
+/// on its own line, so a badged row was several lines taller. Literal class
+/// strings, so the Tailwind scan sees them.
+const BYLINE_ROW_CLASS: &str =
+    "flex flex-nowrap items-center gap-2 mt-1 text-xs text-gray-500 min-w-0";
+/// "last by", name and pill: the part of the byline that gives way.
+const LAST_BY_CLASS: &str = "flex items-center gap-1 min-w-0 overflow-hidden whitespace-nowrap";
+/// The "last by" words never shrink.
+const LAST_BY_LABEL_CLASS: &str = "flex-shrink-0";
+/// The last poster's name truncates before the row wraps.
+const LAST_BY_NAME_CLASS: &str = "text-gray-400 min-w-0 truncate";
+/// Wrapper of the agent pill (`AgentBadge` renders `<span title><Badge/></span>`
+/// plus a copy glyph). The pill's text sits in an `inline-flex` span, where
+/// `text-overflow` does nothing, so its span becomes a truncating block; the
+/// copy glyph keeps its size.
+const LAST_BY_PILL_CLASS: &str = "flex items-center gap-1 min-w-0 overflow-hidden \
+     [&>span]:min-w-0 [&>span>span]:block [&>span>span]:truncate [&>button]:flex-shrink-0";
+/// The reply count keeps its width.
+const REPLIES_CLASS: &str = "flex items-center gap-1 flex-shrink-0 whitespace-nowrap";
+
 /// A single topic row: title line, latest participant, reply count,
 /// last-activity.
 ///
@@ -347,12 +368,14 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
                             {title}
                         </A>
                     </h3>
-                    <div class="flex items-center gap-2 mt-1 text-xs text-gray-500 flex-wrap">
-                        <span>"last by "</span>
-                        <span class="text-gray-400"><KeyName pubkey=last_pk key_class="relative z-10 font-mono" /></span>
-                        <AgentBadge pubkey=last_badge_pubkey compact=true />
-                        <span class="text-gray-700">"\u{2022}"</span>
-                        <span class="flex items-center gap-1">
+                    <div class=BYLINE_ROW_CLASS>
+                        <span class=LAST_BY_CLASS>
+                            <span class=LAST_BY_LABEL_CLASS>"last by"</span>
+                            <span class=LAST_BY_NAME_CLASS><KeyName pubkey=last_pk key_class="relative z-10 font-mono" /></span>
+                            <span class=LAST_BY_PILL_CLASS><AgentBadge pubkey=last_badge_pubkey compact=true /></span>
+                        </span>
+                        <span class="text-gray-700 flex-shrink-0">"\u{2022}"</span>
+                        <span class=REPLIES_CLASS>
                             <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
@@ -406,6 +429,31 @@ fn topic_title(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn classes(c: &str) -> Vec<&str> {
+        c.split_whitespace().collect()
+    }
+
+    #[test]
+    fn byline_is_one_row_that_never_wraps() {
+        // At 390 px a wrapping byline put "last by", the name, the agent pill,
+        // its glyph and the dot on separate lines. One non-wrapping row whose
+        // children may shrink keeps a badged row as tall as an unbadged one.
+        let row = classes(BYLINE_ROW_CLASS);
+        assert!(row.contains(&"flex") && row.contains(&"flex-nowrap"));
+        assert!(!row.contains(&"flex-wrap"));
+        assert!(row.contains(&"min-w-0"));
+        let who = classes(LAST_BY_CLASS);
+        assert!(who.contains(&"min-w-0") && who.contains(&"overflow-hidden"));
+        assert!(classes(LAST_BY_LABEL_CLASS).contains(&"flex-shrink-0"));
+        assert!(classes(LAST_BY_NAME_CLASS).contains(&"truncate"));
+        let pill = classes(LAST_BY_PILL_CLASS);
+        assert!(pill.contains(&"min-w-0") && pill.contains(&"overflow-hidden"));
+        // The pill's text sits in an inline-flex span, where `text-overflow`
+        // does nothing: the wrapper turns that span into a truncating block.
+        assert!(pill.contains(&"[&>span>span]:truncate"));
+        assert!(classes(REPLIES_CLASS).contains(&"flex-shrink-0"));
+    }
 
     fn ev(
         id: &str,
