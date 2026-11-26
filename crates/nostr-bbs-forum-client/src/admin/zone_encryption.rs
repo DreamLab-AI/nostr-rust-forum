@@ -521,7 +521,7 @@ fn approve_all_batch(targets: &[(String, String)], roster: &Roster, cap: usize) 
             batch.len(),
             members.len()
         ),
-        "Members without a recognised name are listed first.".to_string(),
+        "Within each zone, members without a recognised name are listed first.".to_string(),
         String::new(),
     ];
     for (zone, entries) in by_zone {
@@ -579,8 +579,8 @@ fn new_key_confirmation(
 ) -> Result<Option<String>, String> {
     let absent_note = (absent > 0).then(|| {
         format!(
-            "{absent} member(s) granted or approved before are not in the member list the relay \
-             returned and will not receive this key. That is expected for anyone who has left; \
+            "{absent} member(s) granted or approved before are no longer in this zone's cohorts \
+             on the member list the relay returned and will not receive this key. That is expected for anyone who has left; \
              otherwise check the member list before rotating."
         )
     });
@@ -1409,8 +1409,8 @@ mod tests {
             .expect("rotation always asks");
         assert!(
             ask.contains(
-                "2 member(s) granted or approved before are not in the member list the relay \
-                 returned"
+                "2 member(s) granted or approved before are no longer in this zone's cohorts on \
+                 the member list the relay returned"
             ),
             "{ask}"
         );
@@ -1463,6 +1463,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("family, business"), "{text}");
+        assert!(
+            text.contains("Within each zone, members without a recognised name are listed first."),
+            "{text}"
+        );
         // A display name cannot add a line to the list.
         assert!(!text.contains("\n  Bob"), "{text}");
     }
