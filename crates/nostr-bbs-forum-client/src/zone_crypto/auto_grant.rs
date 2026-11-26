@@ -182,6 +182,40 @@ pub fn plan_missing(
     out
 }
 
+/// What this device's own records allow the first-grant gate to treat as
+/// known, per zone, before [`plan_missing`] splits the owed grants.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GateRecords {
+    /// Zone id to the pubkeys that may be auto-granted.
+    pub known: HashMap<String, HashSet<String>>,
+    /// `(zone, pubkey)` approvals to persist.
+    pub adopt: Vec<(String, String)>,
+}
+
+/// Decide what the gate may treat as known, from this device's ledger and
+/// approved set (`known`), the roster, and the zones whose relay-held backup
+/// could not be read (`unread`).
+pub fn gate_records(
+    zones: &[ZoneRule],
+    held: &HashMap<String, Vec<ZoneKey>>,
+    members: &[(String, Vec<String>)],
+    me: &str,
+    mut known: HashMap<String, HashSet<String>>,
+    _unread: &HashSet<String>,
+) -> GateRecords {
+    let mut adopt = Vec::new();
+    for zone in zones {
+        if known.get(&zone.id).is_none_or(HashSet::is_empty) && held.contains_key(&zone.id) {
+            let base = grant_targets(members, &zone.required_cohorts, me, zone.agent_keys);
+            for pk in &base {
+                adopt.push((zone.id.clone(), pk.clone()));
+            }
+            known.insert(zone.id.clone(), base.into_iter().collect());
+        }
+    }
+    GateRecords { known, adopt }
+}
+
 /// What one run of grants did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GrantReport {
@@ -191,6 +225,65 @@ pub struct GrantReport {
     pub failed: usize,
     /// Distinct members granted at least one key.
     pub members: usize,
+}
+
+/// Running count of one batch's grants as they are built, handed to the
+/// relay and answered.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GrantTally {
+    /// Members the batch plans to grant.
+    pub planned_members: usize,
+    /// Grants handed to the relay.
+    pub handed: usize,
+    /// Grants that could not be built or handed over.
+    pub failed: usize,
+    /// Grants the relay accepted (`OK true`) and the ledger recorded.
+    pub accepted: usize,
+    /// Grants the relay refused (`OK false`).
+    pub rejected: usize,
+    /// Members with at least one accepted grant.
+    pub accepted_members: HashSet<String>,
+}
+
+impl GrantTally {
+    /// The batch's report.
+    pub fn report(&self) -> GrantReport {
+        GrantReport {
+            sent: self.handed,
+            failed: self.failed,
+            members: self.planned_members,
+        }
+    }
+}
+
+/// A report put into words for a toast or status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportSummary {
+    /// What to tell the admin.
+    pub text: String,
+    /// Whether something went wrong (shown as an error, with a retry hint).
+    pub problem: bool,
+}
+
+/// Put `r` into words; `None` when the run sent nothing at all.
+pub fn report_summary(r: &GrantReport) -> Option<ReportSummary> {
+    if r.sent == 0 && r.failed == 0 {
+        return None;
+    }
+    Some(if r.failed > 0 {
+        ReportSummary {
+            text: format!(
+                "Sent {} zone key grant(s); {} failed. Retry from Admin → Encryption.",
+                r.sent, r.failed
+            ),
+            problem: true,
+        }
+    } else {
+        ReportSummary {
+            text: format!("Sent zone keys to {} member(s).", r.members),
+            problem: false,
+        }
+    })
 }
 
 /// Called with each grant once the relay has accepted it and it is recorded.
@@ -242,10 +335,10 @@ pub async fn send_grants(
     on_recorded: OnRecorded,
 ) -> GrantReport {
     let members: HashSet<String> = plan.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
-    let mut report = GrantReport {
-        members: members.len(),
-        ..GrantReport::default()
-    };
+    let tally = Rc::new(std::cell::RefCell::new(GrantTally {
+        planned_members: members.len(),
+        ..GrantTally::default()
+    }));
     let targets = resolve_targets(signer, &members).await;
     // Tickets need the relay's zone-group bindings. A failed load falls back
     // to the 21453 grant for every recipient.
@@ -277,7 +370,7 @@ pub async fn send_grants(
                 Some(Ok(t)) => t.clone(),
                 Some(Err(e)) => {
                     web_sys::console::warn_1(&format!("[zone-key] inbox lookup: {e}").into());
-                    report.failed += 1;
+                    tally.borrow_mut().failed += 1;
                     continue;
                 }
                 None => pk.clone(),
@@ -303,17 +396,20 @@ pub async fn send_grants(
                 None => build_grant_wrap(signer, &target, &key, now_secs()).await,
             };
             let Ok(wrap) = built else {
-                report.failed += 1;
+                tally.borrow_mut().failed += 1;
                 continue;
             };
             let key_for_ack = key.clone();
             let on_recorded = on_recorded.clone();
             let acks_for_ack = acks.clone();
+            let tally_for_ack = tally.clone();
             let on_ok = Rc::new(move |ok: bool, _msg: String| {
                 if !ok {
+                    tally_for_ack.borrow_mut().rejected += 1;
                     return;
                 }
                 let acks = acks_for_ack.clone();
+                let tally = tally_for_ack.clone();
                 let key = key_for_ack.clone();
                 let pk = pk.clone();
                 let target = target.clone();
@@ -322,21 +418,27 @@ pub async fn send_grants(
                     store
                         .record_grants(&key.zone, key.epoch, &[(pk.clone(), target)])
                         .await;
+                    {
+                        let mut t = tally.borrow_mut();
+                        t.accepted += 1;
+                        t.accepted_members.insert(pk.clone());
+                    }
                     on_recorded(&key, &pk);
                     acks.ack();
                 });
             });
             if relay.publish_with_ack(&wrap, Some(on_ok)).is_err() {
-                report.failed += 1;
+                tally.borrow_mut().failed += 1;
             } else {
-                report.sent += 1;
+                tally.borrow_mut().handed += 1;
             }
         }
     }
     // Keep the ledger on the relay too, so "granted" survives clearing site
     // data. Best effort: the local ledger stays authoritative on failure.
-    acks.expect(report.sent);
-    if !touched.is_empty() && report.sent > 0 {
+    let handed = tally.borrow().handed;
+    acks.expect(handed);
+    if !touched.is_empty() && handed > 0 {
         // The wraps are paced out of the send queue (one frame each), so the
         // ack window starts once they have all left, not when they were queued.
         relay
@@ -345,7 +447,8 @@ pub async fn send_grants(
         acks.wait(BACKUP_ACK_WAIT_MS).await;
         push_backups(relay, signer, store, &touched).await;
     }
-    report
+    let done = tally.borrow();
+    done.report()
 }
 
 /// Publish this admin's backup of each `(zone, epoch)` in `which`, retrying
@@ -485,15 +588,11 @@ impl AutoGrant {
         // has a baseline and a genuinely new pubkey is held pending. A relay
         // compromised before a device's first sweep is adopted — documented in
         // ADR-2016; the robust fix is a durable admin-signed grant ledger.
-        for zone in &zones {
-            if known.get(&zone.id).is_none_or(HashSet::is_empty) && held.contains_key(&zone.id) {
-                let base = grant_targets(&members, &zone.required_cohorts, &me, zone.agent_keys);
-                for pk in &base {
-                    self.store.approve_target(&zone.id, pk).await;
-                }
-                known.insert(zone.id.clone(), base.into_iter().collect());
-            }
+        let gate = gate_records(&zones, &held, &members, &me, known, &HashSet::new());
+        for (zone, pk) in &gate.adopt {
+            self.store.approve_target(zone, pk).await;
         }
+        let known = gate.known;
         let mut plan = plan_missing(
             &zones,
             &members,
@@ -654,22 +753,13 @@ impl AutoGrant {
                 Rc::new(|_, _| ()),
             )
             .await;
-            if r.failed > 0 {
-                this.toast(
-                    format!(
-                        "Sent {} zone key grant(s); {} failed. Retry from Admin → Encryption.",
-                        r.sent, r.failed
-                    ),
-                    ToastVariant::Error,
-                );
-            } else {
-                this.toast(
-                    format!(
-                        "Sent zone keys to {} member(s) who were missing them.",
-                        r.members
-                    ),
-                    ToastVariant::Success,
-                );
+            if let Some(s) = report_summary(&r) {
+                let variant = if s.problem {
+                    ToastVariant::Error
+                } else {
+                    ToastVariant::Success
+                };
+                this.toast(s.text, variant);
             }
         });
     }
