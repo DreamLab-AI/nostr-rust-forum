@@ -29,6 +29,18 @@ use crate::poker::{LogEntry, SeatView};
 
 // -- JS interop with the scene -------------------------------------------------
 
+// `js/table3d.js` statically imports `./librepoker/poker.js` from its own
+// snippet directory (`snippets/nostr-bbs-forum-client-<hash>/js/`). wasm-bindgen
+// writes a local snippet only under the crate that declares it, and the engine's
+// declarations now live in `nostr-bbs-client-core`, so this crate declares the
+// file as well; without it the import 404s and the whole module graph (and so
+// the app) fails to load.
+#[wasm_bindgen(module = "/js/librepoker/poker.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = cardName)]
+    fn librepoker_card_name(card: u32) -> String;
+}
+
 #[wasm_bindgen(module = "/js/table3d.js")]
 extern "C" {
     #[wasm_bindgen(js_name = table3dInit, catch)]
