@@ -10,6 +10,27 @@
 //!   `(epoch, zone_pk)` appears in the `zone_pk` tags;
 //! - `index_version` is strictly greater than the stored high-water mark, or
 //!   equal with the same event id, and jumps by at most 2^20 (M2).
+//!
+//! # Content versions
+//!
+//! - **v1**: every object was built at `index_version` and lives in the
+//!   signer's pod. Browsers built before v2 accept only this.
+//! - **v2** (incremental updates): an object may carry the `version` its
+//!   header was built at (an unchanged object from an earlier version) and the
+//!   `owner` whose pod holds it (another trusted publisher, such as the
+//!   archivist that built the base), and the content may list `excluded` row
+//!   ids (deleted or superseded posts) that a searcher must not return. A v2
+//!   manifest is refused by older browsers as unsupported, so they keep using
+//!   the newest v1 manifest they can find. Every field v2 adds is optional
+//!   with a default that reads exactly as v1, so a v1 manifest is a valid v2
+//!   manifest without them.
+//!
+//! v2 adds these acceptance rules: an `owner` is one of the trusted
+//! publishers; an object's `version` is at most `index_version` and equals the
+//! `v<N>` in its name; no two objects share a name or an
+//! `(epoch, zone_pk, shard, kind)`; every excluded id is 64 lowercase hex, and
+//! there are at most [`MAX_EXCLUDED`] of them. A v1 manifest carrying any v2
+//! field is refused, so an older browser can never misread one.
 
 use nostr_bbs_core::event::{verify_event_strict, NostrEvent};
 use serde::{Deserialize, Serialize};
@@ -32,6 +53,12 @@ pub fn parse_publishers(list: &str) -> Vec<String> {
 
 /// Event kind (NIP-78 application-specific data).
 pub const KIND: u64 = 30078;
+/// Content version of a manifest every browser understands.
+pub const V1: u32 = 1;
+/// Content version with per-object `owner` and `version`, and `excluded`.
+pub const V2: u32 = 2;
+/// Most excluded ids one manifest may list.
+pub const MAX_EXCLUDED: usize = 1 << 17;
 /// Largest accepted version jump (M2).
 pub const MAX_VERSION_JUMP: u64 = 1 << 20;
 
@@ -59,6 +86,26 @@ pub struct ObjectRef {
     pub size: u64,
     /// Hex SHA-256 of the sealed bytes.
     pub sha256: String,
+    /// v2: the publisher whose pod holds the object (hex pubkey), when it is
+    /// not the manifest's signer. Must be a trusted publisher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// v2: the index version the object's header was built at, when it is
+    /// not the manifest's `index_version` (an object carried over unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+}
+
+impl ObjectRef {
+    /// The index version this object's authenticated header must carry.
+    pub fn effective_version(&self, content: &Content) -> u64 {
+        self.version.unwrap_or(content.index_version)
+    }
+
+    /// The pubkey of the pod holding this object (`signer` when no `owner`).
+    pub fn owner_or<'a>(&'a self, signer: &'a str) -> &'a str {
+        self.owner.as_deref().unwrap_or(signer)
+    }
 }
 
 /// Manifest content.
@@ -80,6 +127,21 @@ pub struct Content {
     pub vocab_sha256: String,
     /// Objects.
     pub objects: Vec<ObjectRef>,
+    /// v2: hex ids of rows a searcher must skip (deleted or superseded posts
+    /// still present in an unchanged object). Sorted, no duplicates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<String>,
+}
+
+impl Content {
+    /// The excluded ids as raw bytes (malformed entries, which
+    /// [`Manifest::verify`] refuses, are skipped).
+    pub fn excluded_ids(&self) -> std::collections::HashSet<[u8; 32]> {
+        self.excluded
+            .iter()
+            .filter_map(|h| <[u8; 32]>::try_from(hex::decode(h).ok()?.as_slice()).ok())
+            .collect()
+    }
 }
 
 /// A verified manifest.
@@ -159,9 +221,10 @@ impl Manifest {
         }
         let content: Content =
             serde_json::from_str(&ev.content).map_err(|e| format!("bad content: {e}"))?;
-        if content.v != 1 || content.zone != zone || content.dim != 384 {
+        if !(content.v == V1 || content.v == V2) || content.zone != zone || content.dim != 384 {
             return Err("unsupported manifest content".into());
         }
+        check_version_rules(&content, publishers)?;
         let pks: Vec<(u32, String)> = tag(&ev, "zone_pk")
             .filter_map(|t| Some((t.get(1)?.parse().ok()?, t.get(2)?.to_lowercase())))
             .collect();
@@ -186,6 +249,11 @@ impl Manifest {
         Ok(Self { event: ev, content })
     }
 
+    /// The pubkey of the pod holding `o` (its `owner`, else the signer).
+    pub fn owner_of<'a>(&'a self, o: &'a ObjectRef) -> &'a str {
+        o.owner_or(&self.event.pubkey)
+    }
+
     /// The new high-water mark after accepting this manifest.
     pub fn high_water(&self) -> HighWater {
         HighWater {
@@ -193,6 +261,57 @@ impl Manifest {
             event_id: self.event.id.clone(),
         }
     }
+}
+
+fn is_hex64_lower(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The v1/v2 content rules (see the module documentation).
+fn check_version_rules(c: &Content, publishers: &[String]) -> Result<(), String> {
+    if c.v == V1 {
+        if c.objects
+            .iter()
+            .any(|o| o.owner.is_some() || o.version.is_some())
+            || !c.excluded.is_empty()
+        {
+            return Err("v1 manifest carries v2 fields".into());
+        }
+        return Ok(());
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut slots = std::collections::HashSet::new();
+    for o in &c.objects {
+        if let Some(owner) = &o.owner {
+            if !is_hex64_lower(owner) || !publishers.iter().any(|p| p.eq_ignore_ascii_case(owner)) {
+                return Err(format!("object {} is held by an untrusted pod", o.name));
+            }
+        }
+        let v = o.effective_version(c);
+        if v > c.index_version || object_name_version(&o.name) != Some(v) {
+            return Err(format!("object {} has an inconsistent version", o.name));
+        }
+        if !names.insert(o.name.as_str())
+            || !slots.insert((o.epoch, o.zone_pk.to_lowercase(), o.shard, o.kind as u8))
+        {
+            return Err(format!("object {} is listed twice", o.name));
+        }
+    }
+    if c.excluded.len() > MAX_EXCLUDED || !c.excluded.iter().all(|h| is_hex64_lower(h)) {
+        return Err("bad excluded list".into());
+    }
+    Ok(())
+}
+
+/// The `v<N>` index version in an object name (`None` for `m.json` or a
+/// malformed name).
+pub fn object_name_version(name: &str) -> Option<u64> {
+    if !valid_object_name(name) || name == "m.json" {
+        return None;
+    }
+    name.strip_suffix(".age")?.rsplit_once("-v")?.1.parse().ok()
 }
 
 fn digits(s: &str, max: u64) -> bool {
@@ -272,7 +391,10 @@ mod tests {
                 count: 10,
                 size: 999,
                 sha256: "cc".into(),
+                owner: None,
+                version: None,
             }],
+            excluded: Vec::new(),
         }
     }
 
@@ -396,5 +518,121 @@ mod tests {
         ] {
             assert!(!valid_object_name(bad), "{bad}");
         }
+    }
+
+    fn pk(b: u8) -> String {
+        hex::encode(sk(b).verifying_key().to_bytes())
+    }
+
+    /// A v2 update over a v1 base by key 1, signed by key 2.
+    fn update_content(version: u64) -> Content {
+        let mut c = content(1);
+        c.v = V2;
+        c.index_version = version;
+        c.objects[0].owner = Some(pk(1));
+        c.objects[0].version = Some(1);
+        c.objects.push(ObjectRef {
+            name: object_name(Kind::Bin, 1, 1, version),
+            shard: 1,
+            owner: None,
+            version: None,
+            ..c.objects[0].clone()
+        });
+        c.excluded = vec!["ab".repeat(32)];
+        c
+    }
+
+    #[test]
+    fn a_v1_manifest_reads_as_before_under_v2_rules() {
+        let pubs = vec![pk(1)];
+        let c = content(5);
+        let json = serde_json::to_string(&c).unwrap();
+        for absent in ["owner", "\"version\"", "excluded"] {
+            assert!(!json.contains(absent), "v1 JSON stays v1: {json}");
+        }
+        let m = Manifest::verify(signed(1, &c, "ws://r"), "zone2", "ws://r", &pubs, None).unwrap();
+        let o = &m.content.objects[0];
+        assert_eq!(
+            m.owner_of(o),
+            pk(1),
+            "an object without owner is in the signer's pod"
+        );
+        assert_eq!(o.effective_version(&m.content), 5);
+        assert!(m.content.excluded_ids().is_empty());
+        // The JSON an older builder wrote (no v2 keys at all) parses the same.
+        let old = json.replace(",\"excluded\":[]", "");
+        assert_eq!(serde_json::from_str::<Content>(&old).unwrap(), c);
+    }
+
+    #[test]
+    fn a_v1_manifest_with_v2_fields_is_refused() {
+        let pubs = vec![pk(1)];
+        let mut c = content(5);
+        c.excluded = vec!["ab".repeat(32)];
+        assert!(Manifest::verify(signed(1, &c, "ws://r"), "zone2", "ws://r", &pubs, None).is_err());
+        let mut c = content(5);
+        c.objects[0].owner = Some(pk(1));
+        assert!(Manifest::verify(signed(1, &c, "ws://r"), "zone2", "ws://r", &pubs, None).is_err());
+    }
+
+    #[test]
+    fn a_v2_update_may_reference_another_trusted_publishers_objects() {
+        let pubs = vec![pk(1), pk(2)];
+        let c = update_content(7);
+        let m = Manifest::verify(signed(2, &c, "ws://r"), "zone2", "ws://r", &pubs, None).unwrap();
+        assert_eq!(m.owner_of(&m.content.objects[0]), pk(1));
+        assert_eq!(m.owner_of(&m.content.objects[1]), pk(2));
+        assert_eq!(m.content.objects[0].effective_version(&m.content), 1);
+        assert_eq!(m.content.objects[1].effective_version(&m.content), 7);
+        assert_eq!(m.content.excluded_ids().len(), 1);
+        // The same manifest with the base's publisher untrusted is refused.
+        assert!(
+            Manifest::verify(signed(2, &c, "ws://r"), "zone2", "ws://r", &[pk(2)], None).is_err()
+        );
+    }
+
+    #[test]
+    fn v2_rules_refuse_inconsistent_objects() {
+        let pubs = vec![pk(1), pk(2)];
+        let refuse = |c: Content, why: &str| {
+            assert!(
+                Manifest::verify(signed(2, &c, "ws://r"), "zone2", "ws://r", &pubs, None).is_err(),
+                "{why}"
+            );
+        };
+        let mut c = update_content(7);
+        c.objects[0].owner = Some(pk(3));
+        refuse(c, "owner outside the publisher list");
+        let mut c = update_content(7);
+        c.objects[0].owner = Some(pk(1).to_uppercase());
+        refuse(c, "owner not canonical hex");
+        let mut c = update_content(7);
+        c.objects[0].version = Some(8);
+        c.objects[0].name = object_name(Kind::Bin, 1, 0, 8);
+        refuse(c, "object newer than the manifest");
+        let mut c = update_content(7);
+        c.objects[0].version = Some(2);
+        refuse(c, "header version differs from the name");
+        let mut c = update_content(7);
+        c.objects[1].shard = 0;
+        refuse(c, "two objects in one slot");
+        let mut c = update_content(7);
+        c.objects[1].name = c.objects[0].name.clone();
+        c.objects[1].version = Some(1);
+        refuse(c, "two objects with one name");
+        let mut c = update_content(7);
+        c.excluded = vec!["AB".repeat(32)];
+        refuse(c, "excluded id not lowercase hex");
+        let mut c = update_content(7);
+        c.v = 3;
+        refuse(c, "unknown content version");
+    }
+
+    #[test]
+    fn object_name_versions_parse() {
+        assert_eq!(object_name_version("b-1-0-v7.age"), Some(7));
+        assert_eq!(object_name_version("q-4-12-v0.age"), Some(0));
+        assert_eq!(object_name_version("m.json"), None);
+        assert_eq!(object_name_version("b-1-0-v07.age"), None);
     }
 }

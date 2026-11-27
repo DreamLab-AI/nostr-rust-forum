@@ -9,9 +9,14 @@
 //!    publisher, zone, this deployment's relay URL, the `zone_pk` bindings,
 //!    and the per-zone high-water mark kept in `localStorage`).
 //! 2. Fetch the sealed objects for the epochs this member holds (NIP-98 GET),
+//!    each from the pod of the publisher that holds it (the manifest's signer,
+//!    or for a v2 manifest the object's `owner`, itself a listed publisher:
+//!    an update by the indexer lists the archivist's base objects unchanged),
 //!    check each against the manifest's size and SHA-256 (computed here, on
 //!    the downloaded bytes), and cache them in IndexedDB as `Blob`s keyed by
-//!    that hash (responses are `no-store`). The cache holds only what the pod
+//!    that hash (responses are `no-store`). An object a newer manifest lists
+//!    unchanged has the same hash, so it is never fetched again: a nightly
+//!    update costs only its new objects. The cache holds only what the pod
 //!    serves (sealed objects, public model files) and survives page loads for
 //!    the same identity and relay; see [`cache`] for its rules.
 //! 3. Derive the per-epoch search key (`okm`) from the held key whose pubkey
@@ -24,8 +29,10 @@
 //! and does not say "no results" while it is loading. The worker lives as long
 //! as the page: in-app navigation keeps it and its index.
 //!
-//! The worker embeds the query on the device; it never fetches anything.
-//! Hits are resolved by one relay REQ that hides them among decoy ids drawn
+//! The worker embeds the query on the device; it never fetches anything. It
+//! never returns a row whose id the manifest excludes (v2: a deleted or
+//! edited post still inside an unchanged shard). Hits are resolved by one
+//! relay REQ that hides them among decoy ids drawn
 //! from the index (review H1), then opened with the existing zone crypto; a
 //! hit counts only if it decrypts or opens and its `zk` tag names the zone,
 //! epoch and key of the shard it came from (review M4).
@@ -707,6 +714,25 @@ async fn ensure_model(
     r
 }
 
+/// Where `o` is fetched from: the pod of the publisher holding it (the
+/// manifest's signer, or the object's v2 `owner`, which
+/// [`Manifest::verify`] has checked is a listed publisher). The manifest's
+/// hash pins the bytes wherever they come from.
+fn object_url(pod: &str, zone: &str, manifest: &Manifest, o: &ObjectRef) -> String {
+    format!(
+        "{pod}/pods/{}/media/zones/{zone}/search/{}",
+        manifest.owner_of(o).to_lowercase(),
+        o.name
+    )
+}
+
+/// Drop hits whose id a zone's loaded manifest excludes (the worker already
+/// skips them; this keeps the rule even if a worker answers from an index
+/// built before the manifest it was loaded with).
+fn drop_excluded(want: &mut HashMap<String, HitSource>, kept: &HashMap<String, Content>) {
+    want.retain(|id, (zone, ..)| kept.get(zone).is_none_or(|c| !c.excluded.contains(id)));
+}
+
 /// A manifest event from one publisher: `Ok(None)` when it answered that it
 /// has none for this member (404, or refused), `Err` when it did not answer.
 async fn fetch_manifest(
@@ -816,7 +842,7 @@ async fn load_zone(
     }))
     .await;
     alive(gen, None)?;
-    let mut best: Option<(Manifest, String)> = None;
+    let mut best: Option<Manifest> = None;
     let mut unreachable: Option<String> = None;
     for (p, answer) in answers {
         let ev = match answer {
@@ -831,9 +857,9 @@ async fn load_zone(
             Ok(m)
                 if best
                     .as_ref()
-                    .is_none_or(|(b, _)| m.content.index_version > b.content.index_version) =>
+                    .is_none_or(|b| m.content.index_version > b.content.index_version) =>
             {
-                best = Some((m, p.clone()));
+                best = Some(m);
             }
             Ok(_) => {}
             Err(e) => web_sys::console::warn_1(
@@ -842,7 +868,7 @@ async fn load_zone(
         }
     }
     debug(&format!("{zone}: manifest read in {:.0} ms", now_ms() - t0));
-    let Some((manifest, publisher)) = best else {
+    let Some(manifest) = best else {
         if was_ready {
             // Keep answering from what is loaded; try again next time.
             return Ok(SVC.with(|s| {
@@ -916,7 +942,7 @@ async fn load_zone(
     let db = open_db().await?;
     alive(gen, Some(&svc))?;
     let result = load_shards(
-        &svc, &db, zone, &manifest, &publisher, pod, &okms, signer, gen, was_ready,
+        &svc, &db, zone, &manifest, pod, &okms, signer, gen, was_ready,
     )
     .await;
     db.close();
@@ -957,7 +983,6 @@ async fn load_shards(
     db: &web_sys::IdbDatabase,
     zone: &str,
     manifest: &Manifest,
-    publisher: &str,
     pod: &str,
     okms: &[(u32, String, [u8; 32])],
     signer: &dyn nostr_bbs_core::signer::Signer,
@@ -994,12 +1019,7 @@ async fn load_shards(
     if !was_ready {
         set_zone(gen, zone, ZoneLoad::Loading { loaded: 0, total });
     }
-    let url = |o: &ObjectRef| {
-        format!(
-            "{pod}/pods/{publisher}/media/zones/{zone}/search/{}",
-            o.name
-        )
-    };
+    let url = |o: &ObjectRef| object_url(pod, zone, manifest, o);
     let (url, content_json, loaded, rows) = (&url, &content_json, &loaded, &rows);
     let units = pairs.into_iter().map(|(b, q)| {
         async move {
@@ -1264,6 +1284,8 @@ pub async fn search(
         );
         ids.push(id);
     }
+    drop_excluded(&mut want, &svc.kept.borrow());
+    ids.retain(|id| want.contains_key(id));
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1575,6 +1597,75 @@ mod tests {
         assert_eq!(hits.len(), 1, "one hit per id; decoy and wrong key dropped");
         assert_eq!(hits[0].event.id, original.id);
         assert_ne!(hits[0].event.id, decoy_original.id);
+    }
+
+    fn manifest_with(objects: Vec<ObjectRef>, excluded: Vec<String>, signer: &str) -> Manifest {
+        Manifest {
+            event: NostrEvent {
+                id: "e".repeat(64),
+                pubkey: signer.into(),
+                created_at: 0,
+                kind: 30078,
+                tags: vec![],
+                content: String::new(),
+                sig: String::new(),
+            },
+            content: Content {
+                v: 2,
+                zone: "zone2".into(),
+                index_version: 2,
+                dim: 384,
+                model: "bge".into(),
+                model_sha256: "m".into(),
+                vocab_sha256: "v".into(),
+                objects,
+                excluded,
+            },
+        }
+    }
+
+    fn object(name: &str, owner: Option<&str>) -> ObjectRef {
+        ObjectRef {
+            name: name.into(),
+            kind: Kind::Bin,
+            epoch: 5,
+            zone_pk: "ab".repeat(32),
+            shard: 0,
+            count: 1,
+            size: 1,
+            sha256: "00".repeat(32),
+            owner: owner.map(String::from),
+            version: owner.map(|_| 1),
+        }
+    }
+
+    #[test]
+    fn objects_are_fetched_from_the_pod_that_holds_them() {
+        let indexer = "1".repeat(64);
+        let archivist = "2".repeat(64);
+        let m = manifest_with(vec![], vec![], &indexer);
+        let base = object("b-5-0-v1.age", Some(&archivist));
+        let fresh = object("b-5-1-v2.age", None);
+        assert_eq!(
+            object_url("https://pods.example", "zone2", &m, &base),
+            format!("https://pods.example/pods/{archivist}/media/zones/zone2/search/b-5-0-v1.age")
+        );
+        assert_eq!(
+            object_url("https://pods.example", "zone2", &m, &fresh),
+            format!("https://pods.example/pods/{indexer}/media/zones/zone2/search/b-5-1-v2.age")
+        );
+    }
+
+    #[test]
+    fn excluded_hits_are_dropped_before_resolving() {
+        let gone = "a".repeat(64);
+        let kept_id = "b".repeat(64);
+        let m = manifest_with(vec![], vec![gone.clone()], &"1".repeat(64));
+        let kept = HashMap::from([("zone2".to_string(), m.content)]);
+        let mut want = HashMap::from([(gone.clone(), source(0.9)), (kept_id.clone(), source(0.8))]);
+        drop_excluded(&mut want, &kept);
+        assert!(!want.contains_key(&gone));
+        assert!(want.contains_key(&kept_id));
     }
 
     #[test]

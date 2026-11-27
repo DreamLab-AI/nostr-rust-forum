@@ -23,7 +23,13 @@
 //!   `total` and `complete` describe the version being filled).
 //! - `{op:"query", id, zones:[zone], text, k, r, decoys}` → `{op:"hits", id,
 //!   hits:[{zone,id,score,epoch,zone_pk}], decoys:[{zone,id}], embed_ms, first_ms, rescore_ms, mem}`
-//!   (top `k` merged across the zones by score)
+//!   (top `k` merged across the zones by score; rows whose id the manifest's v2 `excluded` list
+//!   names are never returned and never used as decoys)
+//!
+//! A v2 manifest may list objects built at an earlier index version (each carries its own
+//! `version`, which its authenticated header must match) and held in another trusted
+//! publisher's pod; the main thread fetches them, so nothing changes here but the checks the
+//! shared `Index` makes.
 //! - failures → `{op:"error", id, message}`
 
 #[cfg(not(target_arch = "wasm32"))]
