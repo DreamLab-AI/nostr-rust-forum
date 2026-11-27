@@ -270,11 +270,11 @@ async fn handle_preview(req: &Request, env: &Env) -> Result<Response> {
         );
     }
 
-    // SSRF check
-    if ssrf::is_private_url(&target_url) {
+    // SSRF check: say which rule refused (allow-list or internal address).
+    if let Some(refusal) = ssrf::refusal(&target_url) {
         return json_response(
             &ErrorResponse {
-                error: "URL not allowed (private or internal address)".to_string(),
+                error: refusal.message().to_string(),
             },
             400,
             env,
@@ -390,11 +390,11 @@ async fn handle_ascii(req: &Request, env: &Env) -> Result<Response> {
         );
     }
 
-    // SSRF check
-    if ssrf::is_private_url(&target_url) {
+    // SSRF check: say which rule refused (allow-list or internal address).
+    if let Some(refusal) = ssrf::refusal(&target_url) {
         return json_response(
             &ErrorResponse {
-                error: "URL not allowed (private or internal address)".to_string(),
+                error: refusal.message().to_string(),
             },
             400,
             env,

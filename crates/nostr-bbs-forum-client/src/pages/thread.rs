@@ -1272,6 +1272,19 @@ fn PostBody(
     }
 }
 
+/// Whether the signed-in member (`my_pubkey`, hex; empty while signed out)
+/// wrote the post signed by `post_pubkey`.
+fn is_own_post(my_pubkey: &str, post_pubkey: &str) -> bool {
+    !my_pubkey.is_empty() && my_pubkey.eq_ignore_ascii_case(post_pubkey)
+}
+
+/// Whether a reply card mounts its per-card controls (edit, delete, tip).
+/// Others' posts wait for the reader to engage with the card; the reader's
+/// own posts never do, so a just-sent post shows Edit and Delete at once.
+fn reply_controls_shown(engaged: bool, editing: bool, own: bool) -> bool {
+    engaged || editing || own
+}
+
 /// Author-only edit affordance: an inline pencil button that opens the composer
 /// in-place for `post_id`. Returns nothing when the viewer is not the author.
 #[component]
@@ -1282,10 +1295,7 @@ fn EditControls(
     editing_id: RwSignal<Option<String>>,
 ) -> impl IntoView {
     let pid = post_id.clone();
-    let is_author = Signal::derive(move || {
-        let mine = my_pubkey.get();
-        !mine.is_empty() && mine.eq_ignore_ascii_case(&post_pubkey)
-    });
+    let is_author = Signal::derive(move || is_own_post(&my_pubkey.get(), &post_pubkey));
     let pid_click = pid.clone();
     move || {
         if !is_author.get() {
@@ -1322,10 +1332,8 @@ fn DeleteControls(
     is_admin: Signal<bool>,
     on_delete: Callback<String>,
 ) -> impl IntoView {
-    let can_delete = Signal::derive(move || {
-        let mine = my_pubkey.get();
-        is_admin.get() || (!mine.is_empty() && mine.eq_ignore_ascii_case(&post_pubkey))
-    });
+    let can_delete =
+        Signal::derive(move || is_admin.get() || is_own_post(&my_pubkey.get(), &post_pubkey));
     let show_confirm = RwSignal::new(false);
     let pid = StoredValue::new(post_id);
     let on_confirm = Callback::new(move |()| on_delete.run(pid.get_value()));
@@ -1552,9 +1560,14 @@ fn ReplyCard(
     // The per-card controls (edit, delete, tip) mount only once the reader
     // engages with the card (hover, keyboard focus or a tap), then stay: a
     // thread window holds up to THREAD_WINDOW cards and most are only read.
-    // An open edit keeps them mounted.
+    // An open edit keeps them mounted, and so does authorship: the reader's
+    // own post may appear (or remount on a decrypt) under a resting pointer
+    // that never fires `mouseenter`.
     let engaged = RwSignal::new(false);
-    let controls_shown = move || engaged.get() || is_editing.get();
+    let own_pubkey = post_pubkey.clone();
+    let is_own = Signal::derive(move || is_own_post(&my_pubkey.get(), &own_pubkey));
+    let controls_shown =
+        move || reply_controls_shown(engaged.get(), is_editing.get(), is_own.get());
     let edit_post_id = post_id.clone();
     let edit_post_pubkey = post_pubkey.clone();
     let delete_post_id = post_id.clone();
@@ -1667,5 +1680,32 @@ mod tests {
         assert!(is_media_url("https://pod.example.com/a/clip.mp4?v=2"));
         assert!(is_media_url("https://youtu.be/abc123"));
         assert!(!is_media_url("https://example.com/article"));
+    }
+
+    // ── Own-post controls (Edit/Delete on a just-sent post) ─────────────────
+
+    #[test]
+    fn own_post_is_judged_by_pubkey_case_insensitively() {
+        let me = "ab".repeat(32);
+        assert!(is_own_post(&me, &me));
+        assert!(is_own_post(&me.to_uppercase(), &me));
+        assert!(!is_own_post(&me, &"cd".repeat(32)));
+        assert!(!is_own_post("", ""), "signed out owns nothing");
+        assert!(!is_own_post("", &me));
+    }
+
+    #[test]
+    fn own_posts_show_their_controls_without_engagement() {
+        // A just-sent post can mount (or remount, when a decrypt or resolved
+        // quote changes its list key) under a resting pointer, so no
+        // `mouseenter` ever arrives: the author's own controls must not wait
+        // for one.
+        assert!(reply_controls_shown(false, false, true));
+        assert!(reply_controls_shown(true, false, false));
+        assert!(reply_controls_shown(false, true, false));
+        assert!(
+            !reply_controls_shown(false, false, false),
+            "others' posts stay lazy"
+        );
     }
 }

@@ -213,7 +213,7 @@ pub fn ForumsPage() -> impl IntoView {
                         {crate::utils::relay_url::forum_name()}
                     </h1>
                     <p class="text-gray-400 text-lg max-w-xl mx-auto">
-                        "Explore zones, dive into categories, and join the conversation"
+                        "Explore zones, dive into sections, and join the conversation"
                     </p>
                 </div>
             </div>
@@ -261,7 +261,7 @@ pub fn ForumsPage() -> impl IntoView {
                         </h2>
                         <p class="text-gray-300 text-sm mb-3">
                             "This is your community hub. Forums are organized into zones \u{2014} "
-                            "each zone has categories and topics for different discussions."
+                            "each zone has sections, and each section holds topics."
                         </p>
                         <p class="text-gray-400 text-xs">
                             "Start by exploring the "
@@ -488,7 +488,7 @@ fn zone_tile(
         let cta_style = format!("color: {}", accent_hex);
         view! {
             <A href=zone_href.clone() attr:class="block glass-card-interactive p-4 text-center no-underline text-inherit">
-                <p class="text-gray-400 text-sm mb-2">"No topics yet"</p>
+                <p class="text-gray-400 text-sm mb-2">"No sections yet"</p>
                 <span class="font-medium text-sm hover:opacity-80 transition-opacity" style=cta_style>
                     "Enter & start a conversation →"
                 </span>
@@ -528,7 +528,7 @@ fn zone_tile(
                     }>
                         <h2 class="text-xl sm:text-2xl font-bold" style=heading_style>{label}</h2>
                         <span class="text-sm text-gray-300 group-hover:text-white transition-colors">
-                            "View channels →"
+                            "View sections →"
                         </span>
                     </div>
                 </div>

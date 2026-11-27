@@ -87,7 +87,7 @@ pub const BADGE_DEFINITIONS: &[BadgeDefinition] = &[
     BadgeDefinition {
         id: "explorer",
         name: "Explorer",
-        description: "Posted in 5 or more channels",
+        description: "Posted in 5 or more sections",
         color_class: "text-cyan-400",
         icon: BadgeIcon::Explorer,
         manual: false,

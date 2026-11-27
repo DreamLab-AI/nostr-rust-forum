@@ -80,7 +80,7 @@ pub fn ExportModal(
         <Modal is_open=is_open title="Export Messages".to_string() max_width="480px".to_string() on_close=on_modal_close>
             <div class="space-y-4">
                 <p class="text-sm text-gray-400">
-                    {format!("Export {} message{} from this channel.", msg_count, if msg_count == 1 { "" } else { "s" })}
+                    {format!("Export {} message{} from this section.", msg_count, if msg_count == 1 { "" } else { "s" })}
                 </p>
 
                 // Format selector

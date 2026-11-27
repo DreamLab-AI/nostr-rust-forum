@@ -1908,7 +1908,7 @@ pub fn parse_channel_content(content: &str) -> (String, String, String) {
             let name = val
                 .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("Unnamed Channel")
+                .unwrap_or("Unnamed section")
                 .to_string();
             let description = val
                 .get("about")
@@ -1922,7 +1922,7 @@ pub fn parse_channel_content(content: &str) -> (String, String, String) {
                 .to_string();
             (name, description, picture)
         }
-        Err(_) => ("Unnamed Channel".to_string(), String::new(), String::new()),
+        Err(_) => ("Unnamed section".to_string(), String::new(), String::new()),
     }
 }
 

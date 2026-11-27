@@ -109,20 +109,20 @@ impl BootstrapPhase {
     pub fn message(&self) -> &'static str {
         match self {
             BootstrapPhase::Connecting => "Connecting to the relay\u{2026}",
-            BootstrapPhase::ResolvingChannel => "Finding this channel\u{2026}",
+            BootstrapPhase::ResolvingChannel => "Finding this section\u{2026}",
             BootstrapPhase::LoadingMessages => "Loading messages\u{2026}",
             BootstrapPhase::Ready => "Up to date",
             BootstrapPhase::Failed(BootstrapFailure::Disconnected) => {
-                "Could not reach the relay, so this channel could not be loaded."
+                "Could not reach the relay, so this section could not be loaded."
             }
             BootstrapPhase::Failed(BootstrapFailure::ChannelNotFound) => {
-                "This channel is not on the relay. It may have been removed, or the link may be wrong."
+                "This section is not on the relay. It may have been removed, or the link may be wrong."
             }
             BootstrapPhase::Failed(BootstrapFailure::ChannelUnresolved) => {
-                "This channel's details did not arrive in time, so its messages could not be loaded."
+                "This section's details did not arrive in time, so its messages could not be loaded."
             }
             BootstrapPhase::Failed(BootstrapFailure::ReplayTimedOut) => {
-                "The relay did not finish sending this channel's messages, so the list below may be incomplete."
+                "The relay did not finish sending this section's messages, so the list below may be incomplete."
             }
         }
     }
