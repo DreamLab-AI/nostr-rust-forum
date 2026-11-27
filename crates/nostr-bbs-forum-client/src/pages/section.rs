@@ -225,6 +225,31 @@ pub fn SectionPage() -> impl IntoView {
         resolve_section(&chans, &category_slug(), &section_slug(), &zones)
     });
 
+    // "Continue where you left off" (utils::resume): remember this section
+    // (route plus zone and section names, no content) once it resolves.
+    Effect::new(move |_| {
+        if !has_zone_access.get() {
+            return;
+        }
+        let (Some(pk), Some(ch)) = (auth.pubkey().get(), resolved_channel.get()) else {
+            return;
+        };
+        let slug = crate::utils::slug_hash::section_slug(&ch.id);
+        let name = if ch.name.trim().is_empty() {
+            humanize_section_slug(&section_slug())
+        } else {
+            ch.name.clone()
+        };
+        if let Some(point) = crate::utils::resume::point_for(
+            &load_zones(),
+            &category_slug(),
+            Some((&slug, &name)),
+            None,
+        ) {
+            crate::utils::resume::remember(&pk, &point);
+        }
+    });
+
     // Pod container for images attached to a new topic: this channel's zone.
     let topic_media_target = Signal::derive(move || {
         crate::stores::zones::media_target_for_section(

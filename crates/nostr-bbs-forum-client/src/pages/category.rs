@@ -119,6 +119,22 @@ pub fn CategoryPage() -> impl IntoView {
         }
     });
 
+    // "Continue where you left off" (utils::resume): remember this zone once
+    // the member is known to be allowed in.
+    Effect::new(move |_| {
+        if !has_zone_access.get() {
+            return;
+        }
+        let Some(pk) = auth.pubkey().get() else {
+            return;
+        };
+        if let Some(point) =
+            crate::utils::resume::point_for(&load_zones(), &category_slug(), None, None)
+        {
+            crate::utils::resume::remember(&pk, &point);
+        }
+    });
+
     // Gate with a one-shot self-heal refresh so a just-granted member (e.g. a
     // fresh invite redeem, whose cohort read is momentarily stale) doesn't flash
     // "Access Restricted" — it auto-retries once and shows a neutral "checking"

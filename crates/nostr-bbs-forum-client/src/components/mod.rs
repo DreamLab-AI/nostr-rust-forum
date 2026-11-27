@@ -52,7 +52,9 @@ pub mod profile_popover;
 pub mod user_display;
 
 // -- Navigation + Mobile (Stream 4) ------------------------------------------
+pub mod back_button;
 pub mod breadcrumb;
+pub mod continue_link;
 pub mod mobile_bottom_nav;
 pub mod notification_bell;
 
