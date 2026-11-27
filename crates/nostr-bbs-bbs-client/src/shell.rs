@@ -231,7 +231,7 @@ fn TopBar() -> impl IntoView {
                     None => view! {
                         <button
                             type="button"
-                            class="bbs-btn bbs-btn-sm bbs-btn-primary"
+                            class="bbs-btn bbs-btn-sm bbs-btn-primary tui-signin-btn"
                             on:click=move |_| router.go(Route::Settings)
                         >"Sign in"</button>
                     }.into_any(),

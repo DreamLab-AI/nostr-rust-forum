@@ -1613,6 +1613,15 @@ html.bbs-reduced-motion .sentry-radar::before {
     min-width: 44px;
     padding: 0 0.2rem;
   }
+  .bbs-btn.tui-signin-btn {
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+  input[type="checkbox"],
+  input[type="radio"] {
+    width: 1.4rem;
+    height: 1.4rem;
+  }
   .bbs-btn.tui-profile-btn {
     white-space: nowrap;
     max-width: 4.5em;
