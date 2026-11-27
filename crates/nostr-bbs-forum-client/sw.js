@@ -273,7 +273,7 @@ function composePushNotifications(drained) {
   if (drained.topic > 0) {
     out.push({
       tag: 'nbbs-topic',
-      body: plural(drained.topic, 'New topic', 'new topics'),
+      body: plural(drained.topic, 'New section', 'new sections'),
       url: (drained.link_topic || '').replace(/^\//, '') || '',
     });
   }

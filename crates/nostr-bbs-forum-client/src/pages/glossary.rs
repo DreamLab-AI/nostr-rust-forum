@@ -225,8 +225,7 @@ pub fn GlossaryPage() -> impl IntoView {
                         <em>"zone"</em>
                         " is a large area; it holds "
                         <em>"sections"</em>
-                        " (the Forums page sometimes calls these categories or channels); a \
-                         section holds "
+                        "; a section holds "
                         <em>"topics"</em>
                         "."
                     </p>

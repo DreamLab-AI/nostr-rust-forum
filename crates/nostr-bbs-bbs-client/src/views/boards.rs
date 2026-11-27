@@ -259,7 +259,7 @@ pub fn ZoneView(slug: String) -> impl IntoView {
                     return view! {
                         <EmptyCard
                             title="No boards in this zone yet"
-                            body="Boards (kind-40 channels) stream from the relay. If this zone is cohort-gated, sign in to unlock reads."
+                            body="Boards stream from the relay. If this zone is cohort-gated, sign in to unlock reads."
                         />
                     }.into_any();
                 }

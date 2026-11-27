@@ -14,12 +14,14 @@
 //! It already implements backdrop-close, Escape-to-close, and auto-focus
 //! itself.
 
-use crate::app::base_href;
 use crate::components::copy_key::KeyGlyph;
 use crate::relay::{Filter, RelayConnection};
+use crate::utils::sealed_search::IndexState;
 use gloo::events::EventListener;
 use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
+use leptos_router::hooks::use_navigate;
+use leptos_router::NavigateOptions;
 use serde::{Deserialize, Serialize};
 
 /// A raw message search hit before relay hydration: `(event_id, score, content, label)`.
@@ -85,7 +87,7 @@ impl Tab {
     fn label(&self) -> &'static str {
         match self {
             Self::All => "All",
-            Self::Channels => "Channels",
+            Self::Channels => "Sections",
             Self::Messages => "Messages",
             Self::Users => "Users",
         }
@@ -96,10 +98,20 @@ const TABS: &[Tab] = &[Tab::All, Tab::Channels, Tab::Messages, Tab::Users];
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 enum Hit {
-    Channel {
-        id: String,
+    /// A section (kind-40 channel) the member can reach.
+    Section {
         name: String,
         desc: String,
+        /// Canonical section path (router-relative).
+        path: String,
+    },
+    /// A topic (kind-42 root) in a section the member can reach.
+    Topic {
+        title: String,
+        /// The section's name, as the row's subtitle.
+        section: String,
+        /// Canonical topic path (router-relative).
+        path: String,
     },
     Message {
         /// The matching event itself — the link target.
@@ -138,7 +150,8 @@ impl Hit {
     }
     fn title(&self) -> String {
         match self {
-            Self::Channel { name, .. } => name.clone(),
+            Self::Section { name, .. } => name.clone(),
+            Self::Topic { title, .. } => ellipsise(title, 80),
             Self::Message { content, .. } | Self::SemanticMessage { content, .. } => {
                 ellipsise(content, 80)
             }
@@ -151,7 +164,8 @@ impl Hit {
     }
     fn subtitle(&self) -> String {
         match self {
-            Self::Channel { desc, .. } => desc.clone(),
+            Self::Section { desc, .. } => desc.clone(),
+            Self::Topic { section, .. } => format!("Topic in {section}"),
             Self::Message { author, .. } => format!(
                 "by {}",
                 crate::components::user_display::use_display_name_tracked(author)
@@ -163,22 +177,26 @@ impl Hit {
                 )
             }
             Self::SemanticMessage { .. } => "semantic match".to_string(),
+            // The abbreviated key tells apart two members with one name.
             Self::User { pubkey, .. } => {
-                crate::components::user_display::use_display_name_tracked(pubkey)
+                format!("Member \u{00b7} {}", crate::utils::shorten_pubkey(pubkey))
             }
         }
     }
     fn icon(&self) -> (&'static str, &'static str) {
         match self {
-            Self::Channel { .. } => ("#", "bg-blue-500/10 text-blue-400"),
+            Self::Section { .. } => ("#", "bg-blue-500/10 text-blue-400"),
+            Self::Topic { .. } => ("T", "bg-blue-500/10 text-blue-400"),
             Self::Message { .. } => ("M", "bg-amber-500/10 text-amber-400"),
             Self::SemanticMessage { .. } => ("S", "bg-amber-500/10 text-amber-400"),
             Self::User { .. } => ("@", "bg-purple-500/10 text-purple-400"),
         }
     }
-    fn href(&self) -> String {
+    /// Router path of the hit, relative to the router base (`FORUM_BASE`),
+    /// for `use_navigate`: a result opens in the app, not by a document load.
+    fn path(&self) -> String {
         match self {
-            Self::Channel { id, .. } => base_href(&format!("/chat/{}", id)),
+            Self::Section { path, .. } | Self::Topic { path, .. } => path.clone(),
             // Messages open AT the message: `/go/:id` resolves the topic it
             // lives in and lands on it (pages/message_jump.rs), rather than
             // dropping the reader one level up in the channel. The channel
@@ -188,14 +206,11 @@ impl Hit {
                 event_id,
                 channel_id,
                 ..
-            } => base_href(&crate::utils::post_link::jump_link(
-                event_id,
-                Some(channel_id),
-            )),
+            } => crate::utils::post_link::jump_link(event_id, Some(channel_id)),
             Self::SemanticMessage { event_id, id, .. } => {
-                base_href(&crate::utils::post_link::jump_link(event_id, Some(id)))
+                crate::utils::post_link::jump_link(event_id, Some(id))
             }
-            Self::User { pubkey, .. } => base_href(&format!("/profile/{}", pubkey)),
+            Self::User { pubkey, .. } => format!("/profile/{pubkey}"),
         }
     }
     fn score(&self) -> Option<f64> {
@@ -204,6 +219,198 @@ impl Hit {
             _ => None,
         }
     }
+}
+
+/// Whether `tab` searches message bodies (and so encrypted zones).
+fn searches_messages(tab: &Tab) -> bool {
+    matches!(tab, Tab::All | Tab::Messages)
+}
+
+/// Whether to tell the member that encrypted zones were not searched yet.
+fn sealed_notice(state: IndexState, tab: &Tab, query: &str) -> bool {
+    state == IndexState::Loading && searches_messages(tab) && !query.trim().is_empty()
+}
+
+/// Whether the index load that moved `prev` to `next` should re-run the
+/// query in the open panel, so results appear without retyping.
+fn rerun_on_ready(prev: IndexState, next: IndexState, open: bool, query: &str, tab: &Tab) -> bool {
+    prev == IndexState::Loading
+        && next == IndexState::Ready
+        && open
+        && searches_messages(tab)
+        && !query.trim().is_empty()
+}
+
+/// Whether to say "No results found": not while searching, and not while
+/// encrypted zones are still to come (the notice says so instead).
+fn shows_no_results(loading: bool, empty: bool, query: &str, sealed_pending: bool) -> bool {
+    !loading && empty && !query.trim().is_empty() && !sealed_pending
+}
+
+/// At most this many rows per local source (sections, topics, members).
+const LOCAL_HITS_PER_SOURCE: usize = 8;
+
+/// Lowest semantic score (0..1) an encrypted-zone row needs to be shown. The
+/// worker always returns its nearest `SEMANTIC_K`; on the live index genuine
+/// matches scored 0.82-1.0 and nonsense queries 0.68-0.70, so 0.75 sits in
+/// the gap and drops the filler without touching real matches.
+const SEMANTIC_MIN_SCORE: f64 = 0.75;
+
+/// Whether a semantic row scores high enough to be a result.
+fn relevant(score: f64) -> bool {
+    score >= SEMANTIC_MIN_SCORE
+}
+
+/// Case-insensitive substring match; `needle` must already be lowercased.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(needle)
+}
+
+/// Ids of the zones the member can open, by the Forums page's rule: public
+/// zones, zones whose cohort the member holds, and every zone for an admin.
+fn reachable_zone_ids(
+    zones: &[crate::stores::zones::Zone],
+    cohorts: &[String],
+    is_admin: bool,
+) -> Vec<String> {
+    zones
+        .iter()
+        .filter(|z| {
+            is_admin
+                || z.visibility == crate::stores::zones::ZoneVisibility::Public
+                || z.is_member(cohorts)
+        })
+        .map(|z| z.id.clone())
+        .collect()
+}
+
+/// The zone id `channel` belongs to, when that zone is in `reachable`.
+fn reachable_zone_of(
+    channel: &crate::stores::channels::ChannelMeta,
+    zones: &[crate::stores::zones::Zone],
+    reachable: &[String],
+) -> Option<String> {
+    let tag = crate::utils::section_url::effective_section_tag(channel, zones);
+    crate::stores::zones::section_to_zone(tag, zones).filter(|z| reachable.contains(z))
+}
+
+/// Sections whose name contains `query` (case-insensitive), in reachable
+/// zones, linking to their canonical URL; alphabetical.
+fn section_hits(
+    channels: &[crate::stores::channels::ChannelMeta],
+    zones: &[crate::stores::zones::Zone],
+    reachable: &[String],
+    query: &str,
+) -> Vec<Hit> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut found: Vec<&crate::stores::channels::ChannelMeta> = channels
+        .iter()
+        .filter(|c| contains_ci(&c.name, &q) && reachable_zone_of(c, zones, reachable).is_some())
+        .collect();
+    found.sort_by_key(|c| (c.name.to_lowercase(), c.id.clone()));
+    found.dedup_by(|a, b| a.id.eq_ignore_ascii_case(&b.id));
+    found
+        .into_iter()
+        .filter_map(|c| {
+            Some(Hit::Section {
+                name: c.name.clone(),
+                desc: ellipsise(&c.description, 100),
+                path: crate::utils::section_url::canonical_section_path(c, zones)?,
+            })
+        })
+        .take(LOCAL_HITS_PER_SOURCE)
+        .collect()
+}
+
+/// Topics (kind-42 roots the store holds, with their channel) whose title
+/// contains `query`, in reachable zones, linking to their canonical URL;
+/// newest first. A post still locked behind a missing key has no title.
+fn topic_hits(
+    posts: &[(Option<String>, nostr_bbs_core::NostrEvent)],
+    channels: &[crate::stores::channels::ChannelMeta],
+    zones: &[crate::stores::zones::Zone],
+    reachable: &[String],
+    query: &str,
+) -> Vec<Hit> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut found: Vec<(u64, Hit)> = posts
+        .iter()
+        .filter(|(_, ev)| {
+            ev.kind == 42
+                && nostr_bbs_core::sealed::is_topic_root(ev)
+                && ev.content != crate::zone_crypto::PLACEHOLDER_MISSING_KEY
+                && ev.content != crate::zone_crypto::PLACEHOLDER_UNDECRYPTABLE
+        })
+        .filter_map(|(cid, ev)| {
+            let title = crate::topics::board::topic_title(&ev.content);
+            if !contains_ci(&title, &q) {
+                return None;
+            }
+            let ch = channels.iter().find(|c| Some(&c.id) == cid.as_ref())?;
+            reachable_zone_of(ch, zones, reachable)?;
+            let slug = crate::utils::section_url::channel_zone_slug(ch, zones)?;
+            Some((
+                ev.created_at,
+                Hit::Topic {
+                    title,
+                    section: ch.name.clone(),
+                    path: crate::utils::section_url::topic_path(&slug, &ch.id, &ev.id),
+                },
+            ))
+        })
+        .collect();
+    found.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    found
+        .into_iter()
+        .map(|(_, h)| h)
+        .take(LOCAL_HITS_PER_SOURCE)
+        .collect()
+}
+
+/// Members whose display name or name contains `query` (case-insensitive),
+/// from the profile cache; alphabetical by their shown name. A key replaced
+/// by a successor (`successors`, the relay's alias map) is left out, as the
+/// mention picker does, so one member is not listed twice.
+fn user_hits<'a>(
+    entries: impl IntoIterator<Item = &'a crate::stores::profile_cache::ProfileEntry>,
+    successors: &std::collections::HashMap<String, String>,
+    query: &str,
+) -> Vec<Hit> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut found: Vec<(String, String)> = entries
+        .into_iter()
+        .filter(|e| !successors.contains_key(&e.pubkey))
+        .filter(|e| {
+            [&e.display_name, &e.name]
+                .into_iter()
+                .flatten()
+                .any(|n| contains_ci(n, &q))
+        })
+        .map(|e| {
+            (
+                e.best_label().unwrap_or_else(|| e.pubkey.clone()),
+                e.pubkey.clone(),
+            )
+        })
+        .collect();
+    found.sort_by_key(|(label, pk)| (label.to_lowercase(), pk.clone()));
+    found
+        .into_iter()
+        .take(LOCAL_HITS_PER_SOURCE)
+        .map(|(label, pubkey)| Hit::User {
+            pubkey,
+            nickname: Some(label),
+        })
+        .collect()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -227,6 +434,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     // used to be swallowed silently while the list rendered nothing).
     let search_error: RwSignal<Option<String>> = RwSignal::new(None);
     let sel = RwSignal::new(0usize);
+    let search_gen = StoredValue::new(0u64);
     let input_ref = NodeRef::<leptos::html::Input>::new();
     let recents = RwSignal::new(load_recents());
 
@@ -242,28 +450,13 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     // Sealed per-zone search (encrypted zones): on open, load each sealed
     // zone's verified index into the search worker. Nothing is sent to a
     // search server; the query is embedded in the worker, on this device.
+    // The load runs once at a time; the panel shows its progress (`sealed`)
+    // and re-runs the query when it completes (effect below `do_search`).
     let zone_store = crate::zone_crypto::store::try_use_zone_key_store();
     let auth = crate::auth::use_auth();
-    Effect::new(move |_| {
-        if is_open.get() {
-            let (Some(store), Some(signer)) = (zone_store, auth.get_signer()) else {
-                return;
-            };
-            wasm_bindgen_futures::spawn_local(async move {
-                let mut any = crate::utils::sealed_search::ready();
-                for zone in crate::utils::sealed_search::sealed_zones() {
-                    match crate::utils::sealed_search::ensure_zone(&zone, &store, &*signer).await {
-                        Ok(n) if n > 0 => any = true,
-                        Ok(_) => {}
-                        Err(e) => {
-                            web_sys::console::warn_1(&format!("[sealed-search] {zone}: {e}").into())
-                        }
-                    }
-                }
-                api_online.set(any);
-            });
-        }
-    });
+    let sealed = RwSignal::new(IndexState::Idle);
+    let sealed_in_flight = StoredValue::new(false);
+    let navigate = StoredValue::new(use_navigate());
 
     // Cmd/Ctrl+K global listener
     let listener = EventListener::new(&gloo::utils::document(), "keydown", move |e| {
@@ -290,6 +483,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 50,
             );
         } else {
+            search_gen.update_value(|g| *g += 1);
             query.set(String::new());
             results.set(Vec::new());
             sel.set(0);
@@ -304,22 +498,66 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     // left the timer running and its closure leaked, firing `do_search`
     // (and the `results`/`loading`/`search_error` signal writes inside it)
     // against a disposed component scope.
+    let channel_store = crate::stores::channels::use_channel_store();
+    let profile_cache = crate::stores::profile_cache::try_use_profile_cache();
+    let zone_access = crate::stores::zone_access::use_zone_access();
+    let local_hits = move |t: &Tab, q: &str| -> Vec<Hit> {
+        let mut out = Vec::new();
+        if matches!(t, Tab::All | Tab::Channels) {
+            let zones = crate::stores::zones::load_zones();
+            let reachable = reachable_zone_ids(
+                &zones,
+                &zone_access.cohorts.get_untracked(),
+                zone_access.is_admin.get_untracked(),
+            );
+            channel_store.channels.with_untracked(|chans| {
+                out.extend(section_hits(chans, &zones, &reachable, q));
+                let posts = channel_store
+                    .channel_messages
+                    .with_untracked(crate::stores::channels::distinct_posts);
+                out.extend(topic_hits(&posts, chans, &zones, &reachable, q));
+            });
+        }
+        if matches!(t, Tab::All | Tab::Users) {
+            if let Some(cache) = profile_cache {
+                cache.entries.with_untracked(|e| {
+                    cache
+                        .successors
+                        .with_untracked(|succ| out.extend(user_hits(e.values(), succ, q)))
+                });
+            }
+        }
+        out
+    };
     let dh = RwSignal::new(0i32);
     let do_search = move || {
         let q = query.get_untracked();
         let t = tab.get_untracked();
+        // Only the newest search writes the panel: a slower earlier one (say,
+        // from before the encrypted index was ready) must not overwrite it.
+        search_gen.update_value(|g| *g += 1);
+        let generation = search_gen.get_value();
         if q.trim().is_empty() {
             results.set(Vec::new());
             loading.set(false);
             search_error.set(None);
             return;
         }
-        loading.set(true);
         sel.set(0);
         search_error.set(None);
+        // Sections, topics and members come from what this device already
+        // holds (channel store, profile cache), so they are instant and list
+        // above the message hits under "All".
+        let local = local_hits(&t, &q);
+        if !searches_messages(&t) {
+            results.set(local);
+            loading.set(false);
+            return;
+        }
+        loading.set(true);
         let relay = relay_handle.with_value(|r| r.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            let mut out = Vec::new();
+            let mut out = local;
             let mut errors: Vec<String> = Vec::new();
 
             if t == Tab::All || t == Tab::Messages {
@@ -356,7 +594,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                     match crate::utils::sealed_search::search(&relay, &store, &q, SEMANTIC_K).await
                     {
                         Ok(hits) => {
-                            for h in hits {
+                            for h in hits.into_iter().filter(|h| relevant(h.score)) {
                                 if !seen.insert(h.event.id.clone()) {
                                     continue;
                                 }
@@ -375,53 +613,8 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 }
             }
 
-            if t == Tab::All || t == Tab::Channels {
-                let ql = q.to_lowercase();
-                let relay = relay.clone();
-                let found: RwSignal<Vec<Hit>> = RwSignal::new(Vec::new());
-                let qs = ql.clone();
-                let cb = Rc::new(move |ev: nostr_bbs_core::NostrEvent| {
-                    let nm = ev
-                        .tags
-                        .iter()
-                        .find(|t| t.first().map(|v| v == "d").unwrap_or(false))
-                        .and_then(|t| t.get(1))
-                        .cloned()
-                        .unwrap_or_default();
-                    if nm.to_lowercase().contains(&qs) {
-                        let d = ellipsise(&ev.content, 100);
-                        found.update(|v| {
-                            v.push(Hit::Channel {
-                                id: nm.clone(),
-                                name: nm,
-                                desc: d,
-                            })
-                        });
-                    }
-                });
-                let sid = relay.subscribe(
-                    vec![Filter {
-                        kinds: Some(vec![40]),
-                        limit: Some(50),
-                        ..Default::default()
-                    }],
-                    cb,
-                    None,
-                );
-                crate::utils::set_timeout_once(
-                    move || {
-                        relay.unsubscribe(&sid);
-                    },
-                    800,
-                );
-                // Wait for relay results to arrive
-                let delay = js_sys::Promise::new(&mut |resolve, _| {
-                    let _ = web_sys::window()
-                        .unwrap()
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 900);
-                });
-                let _ = JsFuture::from(delay).await;
-                out.extend(found.get_untracked());
+            if search_gen.try_get_value() != Some(generation) {
+                return;
             }
             if !errors.is_empty() {
                 let msg = errors.join(" \u{2014} ");
@@ -478,16 +671,73 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
         query.set(i.value());
         trigger();
     };
+
+    // Sealed per-zone search (encrypted zones): on open, load each sealed
+    // zone's verified index into the search worker. Nothing is sent to a
+    // search server; the query is embedded in the worker, on this device.
+    // Tracks the key store's readiness too, so a panel opened before the
+    // member's keys are read starts the load once they are.
+    Effect::new(move |_| {
+        if !is_open.get() {
+            return;
+        }
+        let (Some(store), Some(signer)) = (zone_store, auth.get_signer()) else {
+            sealed.set(IndexState::Idle);
+            return;
+        };
+        let zones = crate::utils::sealed_search::sealed_zones();
+        let searchable = !zones.is_empty() && !crate::utils::sealed_search::publishers().is_empty();
+        let keys_ready = store.ready_for(auth.pubkey().get().as_deref());
+        let holds_key = keys_ready && zones.iter().any(|z| !store.all_for_zone(z).is_empty());
+        let ready_now = crate::utils::sealed_search::ready();
+        sealed.set(crate::utils::sealed_search::state_on_open(
+            searchable, keys_ready, holds_key, ready_now,
+        ));
+        if !searchable || !holds_key || sealed_in_flight.get_value() {
+            return;
+        }
+        sealed_in_flight.set_value(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            for zone in zones {
+                if let Err(e) =
+                    crate::utils::sealed_search::ensure_zone(&zone, &store, &*signer).await
+                {
+                    web_sys::console::warn_1(&format!("[sealed-search] {zone}: {e}").into());
+                }
+            }
+            let _ = sealed_in_flight.try_set_value(false);
+            let next = if crate::utils::sealed_search::ready() {
+                IndexState::Ready
+            } else {
+                IndexState::Idle
+            };
+            let Some(prev) = sealed.try_get_untracked() else {
+                return;
+            };
+            sealed.set(next);
+            api_online.set(next == IndexState::Ready);
+            if rerun_on_ready(
+                prev,
+                next,
+                is_open.get_untracked(),
+                &query.get_untracked(),
+                &tab.get_untracked(),
+            ) {
+                do_search();
+            }
+        });
+    });
+
+    // Results open in the app (router), as notification rows do, never by a
+    // full document load; Enter takes the same path as a click.
     let nav_result = move |idx: usize| {
         let r = results.get_untracked();
         if let Some(hit) = r.get(idx) {
             save_recent(&query.get_untracked());
             recents.set(load_recents());
-            let href = hit.href();
+            let path = hit.path();
             is_open.set(false);
-            if let Some(w) = web_sys::window() {
-                let _ = w.location().set_href(&href);
-            }
+            navigate.with_value(|nav| nav(&path, NavigateOptions::default()));
         }
     };
     let on_keydown = move |ev: leptos::ev::KeyboardEvent| {
@@ -518,6 +768,13 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     };
     let tab_click = move |t: Tab| {
         tab.set(t);
+        // Drop the previous filter's rows at once (and any search still in
+        // flight for it) rather than showing them until the new one lands.
+        search_gen.update_value(|g| *g += 1);
+        results.set(Vec::new());
+        if !query.get_untracked().trim().is_empty() {
+            loading.set(true);
+        }
         trigger();
     };
     let toggle_semantic = move |_| {
@@ -534,7 +791,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 <div class="search-panel" on:click=|e| e.stop_propagation() on:keydown=on_keydown role="search" aria-label="Global search">
                     <div class="flex items-center gap-3 p-4 border-b border-gray-700/50">
                         <svg class="w-5 h-5 text-gray-400 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                        <input node_ref=input_ref type="text" class="flex-1 bg-transparent text-white placeholder-gray-500 focus:outline-none text-sm" placeholder="Search channels, messages, users..." prop:value=move || query.get() on:input=on_input aria-label="Search query" autocomplete="off" />
+                        <input node_ref=input_ref type="text" class="flex-1 bg-transparent text-white placeholder-gray-500 focus:outline-none text-sm" placeholder="Search sections, messages, users..." prop:value=move || query.get() on:input=on_input aria-label="Search query" autocomplete="off" />
                         // Semantic toggle pill
                         <button
                             on:click=toggle_semantic
@@ -558,6 +815,12 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                         <Show when=move || search_error.get().is_some()>
                             <div class="mx-1 mt-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-xs text-red-300" role="alert">
                                 {move || search_error.get().unwrap_or_default()}
+                            </div>
+                        </Show>
+                        <Show when=move || sealed_notice(sealed.get(), &tab.get(), &query.get())>
+                            <div class="mx-1 mt-2 flex items-center gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2 text-xs text-amber-300" role="status" aria-live="polite">
+                                <span class="animate-pulse w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"></span>
+                                "Encrypted zones are still loading; results will appear here"
                             </div>
                         </Show>
                         <Show when=move || loading.get()>
@@ -588,7 +851,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                                 </div> }
                             }).collect_view() }}</div>
                         </Show>
-                        <Show when=move || !loading.get() && results.get().is_empty() && !query.get().trim().is_empty()>
+                        <Show when=move || shows_no_results(loading.get(), results.get().is_empty(), &query.get(), sealed_notice(sealed.get(), &tab.get(), &query.get()))>
                             <p class="text-center text-gray-500 text-sm py-8">{move || format!("No results found for '{}'", query.get())}</p>
                         </Show>
                         <Show when=move || !loading.get() && query.get().trim().is_empty()>
@@ -755,6 +1018,7 @@ mod tests {
         assert_eq!(out.chars().count(), 80);
     }
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn message_hits_link_with_their_channel_hint() {
@@ -766,7 +1030,7 @@ mod tests {
             author: String::new(),
             channel_id: "chan".into(),
         };
-        assert_eq!(m.href(), base_href("/go/e1?c=chan"));
+        assert_eq!(m.path(), "/go/e1?c=chan");
         let sm = Hit::SemanticMessage {
             event_id: "e2".into(),
             id: "chan".into(),
@@ -774,14 +1038,87 @@ mod tests {
             label: String::new(),
             score: 0.5,
         };
-        assert_eq!(sm.href(), base_href("/go/e2?c=chan"));
+        assert_eq!(sm.path(), "/go/e2?c=chan");
         let unknown = Hit::Message {
             event_id: "e3".into(),
             content: String::new(),
             author: String::new(),
             channel_id: String::new(),
         };
-        assert_eq!(unknown.href(), base_href("/go/e3"));
+        assert_eq!(unknown.path(), "/go/e3");
+    }
+
+    #[test]
+    fn every_hit_path_is_app_relative_for_the_router() {
+        // The router is mounted at `FORUM_BASE`, so a path handed to
+        // `use_navigate` must not carry the base itself (or it doubles up).
+        let hits = [
+            Hit::Section {
+                name: String::new(),
+                desc: String::new(),
+                path: "/welcome/s0123456789ab".into(),
+            },
+            Hit::User {
+                pubkey: "ab".into(),
+                nickname: None,
+            },
+        ];
+        assert_eq!(hits[0].path(), "/welcome/s0123456789ab");
+        assert_eq!(hits[1].path(), "/profile/ab");
+        for h in &hits {
+            assert!(h.path().starts_with('/'), "{}", h.path());
+            assert!(!h.path().starts_with("/community/"), "{}", h.path());
+        }
+    }
+
+    // ── Encrypted-zone index readiness ──────────────────────────────────────
+
+    #[test]
+    fn the_notice_shows_only_for_a_pending_message_search() {
+        let l = IndexState::Loading;
+        assert!(sealed_notice(l, &Tab::All, "Glastonbury"));
+        assert!(sealed_notice(l, &Tab::Messages, "Glastonbury"));
+        assert!(
+            !sealed_notice(l, &Tab::Channels, "Glastonbury"),
+            "no messages searched"
+        );
+        assert!(!sealed_notice(l, &Tab::Users, "Glastonbury"));
+        assert!(!sealed_notice(l, &Tab::All, "  "), "no query yet");
+        assert!(!sealed_notice(IndexState::Idle, &Tab::All, "Glastonbury"));
+        assert!(!sealed_notice(IndexState::Ready, &Tab::All, "Glastonbury"));
+    }
+
+    #[test]
+    fn the_query_reruns_once_the_index_becomes_ready() {
+        let (l, r, i) = (IndexState::Loading, IndexState::Ready, IndexState::Idle);
+        assert!(rerun_on_ready(l, r, true, "Glastonbury", &Tab::All));
+        assert!(rerun_on_ready(l, r, true, "Glastonbury", &Tab::Messages));
+        assert!(
+            !rerun_on_ready(l, i, true, "Glastonbury", &Tab::All),
+            "nothing loaded"
+        );
+        assert!(
+            !rerun_on_ready(r, r, true, "Glastonbury", &Tab::All),
+            "a refresh, not a load"
+        );
+        assert!(
+            !rerun_on_ready(l, r, false, "Glastonbury", &Tab::All),
+            "panel closed"
+        );
+        assert!(!rerun_on_ready(l, r, true, "", &Tab::All), "no query");
+        assert!(!rerun_on_ready(l, r, true, "Glastonbury", &Tab::Users));
+    }
+
+    #[test]
+    fn no_results_waits_for_encrypted_zones() {
+        assert!(shows_no_results(false, true, "x", false));
+        assert!(
+            !shows_no_results(false, true, "x", true),
+            "notice says more"
+        );
+        assert!(!shows_no_results(true, true, "x", false), "still searching");
+        assert!(!shows_no_results(false, false, "x", false));
+        assert!(!shows_no_results(false, true, " ", false));
     }
 
     // Pure tests only: the overlay itself is Leptos/wasm, but the wire contract
@@ -805,5 +1142,194 @@ mod tests {
         // Absent by default, so existing filters are byte-identical.
         let plain = serde_json::to_string(&Filter::default()).unwrap();
         assert!(!plain.contains("search"), "was {plain}");
+    }
+
+    // ── Section, topic and member matching ──────────────────────────────────
+
+    fn zones() -> Vec<crate::stores::zones::Zone> {
+        serde_json::from_str(
+            r#"[
+                {"id":"zone1","slug":"welcome","display_name":"Welcome","visibility":"public"},
+                {"id":"zone3","slug":"family","display_name":"Family",
+                 "visibility":"locked","required_cohorts":["family"]}
+            ]"#,
+        )
+        .expect("zone config parses")
+    }
+
+    fn channel(id: &str, name: &str, section: &str) -> crate::stores::channels::ChannelMeta {
+        crate::stores::channels::ChannelMeta {
+            id: id.into(),
+            name: name.into(),
+            description: format!("about {name}"),
+            section: section.into(),
+            picture: String::new(),
+            created_at: 0,
+        }
+    }
+
+    fn root(id: &str, channel: &str, content: &str, at: u64) -> nostr_bbs_core::NostrEvent {
+        nostr_bbs_core::NostrEvent {
+            id: id.into(),
+            pubkey: "f".repeat(64),
+            created_at: at,
+            kind: 42,
+            tags: vec![vec![
+                "e".into(),
+                channel.into(),
+                String::new(),
+                "root".into(),
+            ]],
+            content: content.into(),
+            sig: String::new(),
+        }
+    }
+
+    #[test]
+    fn reachable_zones_follow_the_forums_page_rule() {
+        let z = zones();
+        assert_eq!(reachable_zone_ids(&z, &[], false), ["zone1"]);
+        assert_eq!(
+            reachable_zone_ids(&z, &["family".into()], false),
+            ["zone1", "zone3"]
+        );
+        assert_eq!(reachable_zone_ids(&z, &[], true), ["zone1", "zone3"]);
+    }
+
+    #[test]
+    fn sections_match_by_name_case_insensitively_within_reach() {
+        let z = zones();
+        let a = "a".repeat(64);
+        let chans = vec![
+            channel(&a, "Rants", "zone1-rants"),
+            channel(&"b".repeat(64), "General", "zone1"),
+            channel(&"c".repeat(64), "Family rants", "zone3"),
+        ];
+        let reach = reachable_zone_ids(&z, &[], false);
+        let hits = section_hits(&chans, &z, &reach, "rant");
+        assert_eq!(hits.len(), 1, "the locked zone's section is out of reach");
+        match &hits[0] {
+            Hit::Section { name, path, .. } => {
+                assert_eq!(name, "Rants");
+                assert_eq!(
+                    path,
+                    &crate::utils::section_url::section_path("welcome", &a)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(section_hits(&chans, &z, &reach, "GENERAL").len(), 1);
+        assert!(section_hits(&chans, &z, &reach, "photos").is_empty());
+        let all = reachable_zone_ids(&z, &[], true);
+        assert_eq!(section_hits(&chans, &z, &all, "rants").len(), 2);
+    }
+
+    #[test]
+    fn topics_match_by_title_and_open_their_canonical_url() {
+        let z = zones();
+        let a = "a".repeat(64);
+        let chans = vec![channel(&a, "Rants", "zone1-rants")];
+        let reach = reachable_zone_ids(&z, &[], false);
+        let r1 = "1".repeat(64);
+        let mut reply = root(&"2".repeat(64), &a, "Support this, Glastonbury too", 3);
+        reply
+            .tags
+            .push(vec!["e".into(), r1.clone(), String::new(), "reply".into()]);
+        let posts = vec![
+            (
+                Some(a.clone()),
+                root(&r1, &a, "Glastonbury tickets\nbody", 2),
+            ),
+            (Some(a.clone()), reply),
+            (
+                Some(a.clone()),
+                root(
+                    &"3".repeat(64),
+                    &a,
+                    crate::zone_crypto::PLACEHOLDER_MISSING_KEY,
+                    4,
+                ),
+            ),
+        ];
+        let hits = topic_hits(&posts, &chans, &z, &reach, "glastonbury");
+        assert_eq!(hits.len(), 1, "replies are not topics: {hits:?}");
+        match &hits[0] {
+            Hit::Topic {
+                title,
+                section,
+                path,
+            } => {
+                assert_eq!(title, "Glastonbury tickets");
+                assert_eq!(section, "Rants");
+                assert_eq!(
+                    path,
+                    &crate::utils::section_url::topic_path("welcome", &a, &r1)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            topic_hits(&posts, &chans, &z, &reach, "encrypted").is_empty(),
+            "a locked placeholder is not a title"
+        );
+    }
+
+    #[test]
+    fn members_match_display_name_or_name() {
+        use crate::stores::profile_cache::ProfileEntry;
+        let entry = |pk: &str, display: Option<&str>, name: Option<&str>| ProfileEntry {
+            pubkey: pk.into(),
+            display_name: display.map(Into::into),
+            name: name.map(Into::into),
+            ..Default::default()
+        };
+        let people = [
+            entry("p1", Some("RedDread"), None),
+            entry("p2", None, Some("technologikal")),
+            entry("p3", Some("Beema"), Some("beema")),
+            entry("p4", None, None),
+        ];
+        let none = HashMap::new();
+        let pk = |hits: Vec<Hit>| -> Vec<String> {
+            hits.into_iter()
+                .filter_map(|h| match h {
+                    Hit::User { pubkey, .. } => Some(pubkey),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(pk(user_hits(people.iter(), &none, "red")), ["p1"]);
+        assert_eq!(pk(user_hits(people.iter(), &none, "TECHNO")), ["p2"]);
+        assert_eq!(
+            pk(user_hits(people.iter(), &none, "beema")),
+            ["p3"],
+            "matched once"
+        );
+        assert!(user_hits(people.iter(), &none, "nobody").is_empty());
+        assert!(user_hits(people.iter(), &none, " ").is_empty());
+    }
+
+    #[test]
+    fn a_replaced_key_is_not_listed_beside_its_successor() {
+        use crate::stores::profile_cache::ProfileEntry;
+        let named = |pk: &str| ProfileEntry {
+            pubkey: pk.into(),
+            display_name: Some("RedDread".into()),
+            ..Default::default()
+        };
+        let people = [named("old"), named("new")];
+        let successors = HashMap::from([("old".to_string(), "new".to_string())]);
+        let hits = user_hits(people.iter(), &successors, "red");
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(&hits[0], Hit::User { pubkey, .. } if pubkey == "new"));
+    }
+
+    #[test]
+    fn low_scoring_semantic_rows_are_dropped() {
+        // Seen on the live index: real matches 82-100 %, nonsense 68-70 %.
+        assert!(relevant(0.82));
+        assert!(relevant(1.0));
+        assert!(!relevant(0.70));
+        assert!(!relevant(0.68));
     }
 }

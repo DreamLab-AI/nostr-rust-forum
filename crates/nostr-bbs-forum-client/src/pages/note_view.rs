@@ -314,7 +314,7 @@ pub fn NoteViewPage() -> impl IntoView {
                                             attr:class="text-xs text-gray-400 hover:text-amber-400 border border-gray-700 hover:border-amber-500/30 rounded-lg px-3 py-1.5 transition-colors flex items-center gap-1.5"
                                         >
                                             {channel_icon()}
-                                            "View in Channel"
+                                            "View in section"
                                         </A>
                                     }
                                 })}

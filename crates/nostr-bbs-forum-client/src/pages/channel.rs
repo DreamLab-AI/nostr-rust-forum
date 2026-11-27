@@ -1106,7 +1106,7 @@ pub fn ChannelPage() -> impl IntoView {
                             <line x1="10" y1="12" x2="14" y2="12" stroke-linecap="round"/>
                         </svg>
                         <span class="text-sm text-gray-400">
-                            "This channel is archived. No new messages can be posted."
+                            "This section is archived. No new messages can be posted."
                         </span>
                     </div>
                 </div>
@@ -1148,7 +1148,7 @@ pub fn ChannelPage() -> impl IntoView {
                                     </svg>
                                     <div class="flex-1">
                                         <h3 class="text-amber-200 text-sm font-semibold mb-1">
-                                            "Channel could not be loaded"
+                                            "Section could not be loaded"
                                         </h3>
                                         <p class="text-amber-100/80 text-sm">{message}</p>
                                     </div>
@@ -1212,7 +1212,7 @@ pub fn ChannelPage() -> impl IntoView {
                                             let label = if h.loading {
                                                 "Loading older messages…"
                                             } else if h.exhausted {
-                                                "Start of channel history"
+                                                "Start of section history"
                                             } else {
                                                 ""
                                             };
@@ -1428,7 +1428,7 @@ fn parse_channel_metadata(content: &str) -> ChannelHeader {
             name: val
                 .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("Unnamed Channel")
+                .unwrap_or("Unnamed section")
                 .to_string(),
             description: val
                 .get("about")
@@ -1441,7 +1441,7 @@ fn parse_channel_metadata(content: &str) -> ChannelHeader {
                 .unwrap_or(false),
         },
         Err(_) => ChannelHeader {
-            name: "Unnamed Channel".to_string(),
+            name: "Unnamed section".to_string(),
             description: String::new(),
             archived: false,
         },

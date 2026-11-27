@@ -1316,6 +1316,39 @@ pub async fn search(
     Ok(verified_hits(&events, &want, |z, e| store.lookup(z, e)))
 }
 
+/// Where the on-device index for encrypted zones stands, as a search UI
+/// shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexState {
+    /// Nothing to wait for: no encrypted zone this member can search, or its
+    /// load finished without anything to search.
+    Idle,
+    /// The member's zone keys or the index are still on their way.
+    Loading,
+    /// At least one encrypted zone is searchable in the worker.
+    Ready,
+}
+
+/// The index state when a search UI opens. `searchable` is "an encrypted zone
+/// ([`sealed_zones`]) and an index publisher ([`publishers`]) are
+/// configured"; `keys_ready` is "this member's stored zone keys are read";
+/// `holds_key` is "a key for one of those zones is held"; `ready_now` is
+/// [`ready`].
+pub fn state_on_open(
+    searchable: bool,
+    keys_ready: bool,
+    holds_key: bool,
+    ready_now: bool,
+) -> IndexState {
+    if ready_now {
+        IndexState::Ready
+    } else if !searchable || (keys_ready && !holds_key) {
+        IndexState::Idle
+    } else {
+        IndexState::Loading
+    }
+}
+
 /// Whether any sealed zone is loaded in the worker.
 pub fn ready() -> bool {
     SVC.with(|s| {
@@ -1369,6 +1402,46 @@ pub fn wipe() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_to_load_means_no_loading_state() {
+        // No sealed zone or no publisher: there is nothing to wait for.
+        assert_eq!(
+            crate::utils::sealed_search::state_on_open(false, true, true, false),
+            IndexState::Idle
+        );
+        // Keys loaded, none held for a sealed zone: never "still loading".
+        assert_eq!(
+            crate::utils::sealed_search::state_on_open(true, true, false, false),
+            IndexState::Idle
+        );
+    }
+
+    #[test]
+    fn loading_while_keys_or_index_are_on_their_way() {
+        // Stored keys not yet read: the zones cannot be searched yet.
+        assert_eq!(
+            crate::utils::sealed_search::state_on_open(true, false, false, false),
+            IndexState::Loading
+        );
+        assert_eq!(
+            crate::utils::sealed_search::state_on_open(true, true, true, false),
+            IndexState::Loading
+        );
+    }
+
+    #[test]
+    fn an_index_already_in_the_worker_is_ready() {
+        assert_eq!(
+            crate::utils::sealed_search::state_on_open(true, true, true, true),
+            IndexState::Ready
+        );
+        assert_eq!(
+            crate::utils::sealed_search::state_on_open(false, false, false, true),
+            IndexState::Ready
+        );
+    }
+
     use crate::zone_crypto::zk_tag;
     use k256::schnorr::SigningKey;
     use nostr_bbs_core::keys::SecretKey;

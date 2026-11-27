@@ -339,9 +339,62 @@ pub(crate) fn is_private_url(raw_url: &str) -> bool {
 /// Policy-explicit core of [`is_private_url`]. Kept pure (no global reads) so
 /// it can be unit-tested deterministically without mutating process state.
 pub(crate) fn is_private_url_with(raw_url: &str, policy: &EgressPolicy) -> bool {
-    if policy.is_closed() {
-        return true;
+    refusal_with(raw_url, policy).is_some()
+}
+
+/// Why a URL is refused, so the answer can say which rule refused it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// A private, loopback, link-local, metadata or otherwise internal
+    /// address, a non-http(s) scheme, userinfo, a non-standard port, or the
+    /// egress policy is closed.
+    Private,
+    /// A public host that is not on the egress allowlist.
+    NotOnAllowList,
+}
+
+impl Refusal {
+    /// The `error` text of the 400 answer for this refusal.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Refusal::Private => "URL not allowed (private or internal address)",
+            Refusal::NotOnAllowList => {
+                "URL not allowed (this site is not on the forum's preview allow-list)"
+            }
+        }
     }
+}
+
+/// Why [`is_private_url`] refuses `raw_url` under the current policy, or
+/// `None` when it may be fetched.
+pub(crate) fn refusal(raw_url: &str) -> Option<Refusal> {
+    refusal_with(raw_url, &current_policy())
+}
+
+/// Policy-explicit core of [`refusal`]. The denylist is judged first so an
+/// internal address outside the allowlist is still reported as private; both
+/// are checks on the URL text before any fetch, so the order changes only the
+/// message, never what is blocked.
+pub(crate) fn refusal_with(raw_url: &str, policy: &EgressPolicy) -> Option<Refusal> {
+    if policy.is_closed() || denylisted(raw_url) {
+        return Some(Refusal::Private);
+    }
+    // Egress allowlist (authoritative when configured): the robust
+    // DNS-rebinding mitigation available in the CF Workers runtime.
+    if let EgressPolicy::AllowList(allowlist) = policy {
+        let host = Url::parse(raw_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_lowercase));
+        if !host.is_some_and(|h| allowlist.allows(&h)) {
+            return Some(Refusal::NotOnAllowList);
+        }
+    }
+    None
+}
+
+/// The policy-independent denylist: scheme, userinfo, port and the
+/// private/internal hostname checks.
+fn denylisted(raw_url: &str) -> bool {
     let parsed = match Url::parse(raw_url) {
         Ok(u) => u,
         Err(_) => return true, // unparseable -> block
@@ -371,15 +424,6 @@ pub(crate) fn is_private_url_with(raw_url: &str, policy: &EgressPolicy) -> bool 
         Some(h) => h.to_lowercase(),
         None => return true,
     };
-
-    // Egress allowlist (authoritative when configured). A host outside the
-    // allowlist is blocked before any denylist heuristic runs; this is the
-    // robust DNS-rebinding mitigation available in the CF Workers runtime.
-    if let EgressPolicy::AllowList(allowlist) = policy {
-        if !allowlist.allows(&hostname) {
-            return true;
-        }
-    }
 
     // Reject mDNS / internal `.local` TLD (RFC 6762) — never publicly routable.
     if hostname == "local" || hostname.ends_with(".local") {
@@ -831,6 +875,65 @@ mod tests {
         let list = EgressPolicy::from_vars(Some("127.0.0.1, printer.local"), None);
         assert!(is_private_url_with("http://127.0.0.1/", &list));
         assert!(is_private_url_with("http://printer.local/", &list));
+    }
+
+    #[test]
+    fn a_public_host_off_the_allowlist_gets_its_own_refusal() {
+        let list = EgressPolicy::from_vars(Some("example.com"), None);
+        for url in ["https://other.com/", "https://news.bbc.co.uk/article"] {
+            assert_eq!(
+                refusal_with(url, &list),
+                Some(Refusal::NotOnAllowList),
+                "{url}"
+            );
+        }
+        assert_eq!(refusal_with("https://www.example.com/", &list), None);
+        assert!(Refusal::NotOnAllowList
+            .message()
+            .contains("this site is not on the forum's preview allow-list"));
+        assert!(!Refusal::NotOnAllowList.message().contains("private"));
+    }
+
+    #[test]
+    fn a_private_host_keeps_the_private_refusal_on_or_off_the_allowlist() {
+        let list = EgressPolicy::from_vars(Some("example.com, 127.0.0.1"), None);
+        for url in [
+            "http://127.0.0.1/",              // listed by mistake
+            "http://169.254.169.254/latest/", // not listed
+            "http://192.168.1.1/secret",
+            "http://localhost/",
+            "http://printer.local/",
+        ] {
+            assert_eq!(refusal_with(url, &list), Some(Refusal::Private), "{url}");
+        }
+        assert_eq!(
+            refusal_with("http://10.0.0.1/", &EgressPolicy::DenylistOnly),
+            Some(Refusal::Private)
+        );
+        assert!(Refusal::Private
+            .message()
+            .contains("private or internal address"));
+    }
+
+    #[test]
+    fn refusal_agrees_with_is_private_url() {
+        let list = EgressPolicy::from_vars(Some("example.com"), None);
+        for policy in [&list, &EgressPolicy::DenylistOnly, &EgressPolicy::Closed] {
+            for url in [
+                "https://example.com/",
+                "https://other.com/",
+                "http://127.0.0.1/",
+                "ftp://example.com/",
+                "https://example.com:8443/",
+                "not a url",
+            ] {
+                assert_eq!(
+                    refusal_with(url, policy).is_some(),
+                    is_private_url_with(url, policy),
+                    "{url} under {policy:?}"
+                );
+            }
+        }
     }
 
     #[test]
