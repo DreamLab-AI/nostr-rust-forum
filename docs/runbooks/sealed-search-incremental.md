@@ -45,6 +45,7 @@ logs one JSON report per step: counts only, never text or keys.
 | 4 | The relay session is not NIP-42 authenticated. Nothing was read. |
 | 5 | Retired. Compaction no longer refuses or drops on rows the relay does not serve. |
 | 6 | The pods show an older index than this job published. Rollback or withholding; refused. |
+| 9 | The zone has an index but the author book was never seeded. Refused; run `seed-book` once (see "Switching it on"). |
 | 8 | The exclusion list would pass its cap (16,384). Refused; run `compact --all`. The default full-compaction threshold keeps this from happening. |
 | 7 | The relay serves none of the zone's already-indexed posts to the indexer. Refused. The relay's zone read gate answers an authenticated non-member with nothing rather than an error, so without this check a missing cohort would look like "nothing new" every night. |
 | 10 | Another run holds the lock. |
@@ -104,6 +105,14 @@ mac = HMAC-SHA256(key, the event's content string, exactly as signed)
   nightly runs) and at most 16,384 excluded ids, applied as a set lookup.
 - **Tie-break.** Equal versions resolve to the first publisher in
   `SEARCH_PUBLISHERS`, in both the client and the builder.
+- **Epoch floor.** Each device records the newest epoch of the last manifest it
+  accepted. A later v2 manifest must be MAC'd with at least that epoch, so a
+  former member holding old epoch keys and a publisher key cannot MAC a
+  manifest that lists only old-epoch objects.
+- **Fallback.** A browser tries the verified manifests newest first. If one
+  fails to load (a higher v1 signed with a publisher key alone, whose objects
+  do not verify), it loads the next. Only a manifest that loaded moves its
+  high-water mark.
 
 Updates and compactions always sign `v: 2`. A browser built before this change
 refuses a v2 manifest as unsupported. It then keeps using the newest v1 manifest
@@ -113,8 +122,13 @@ never raises its rollback mark to a version it could not load later.
 The high-water mark of the relay read moves only on verified events of this
 zone, never past the job's clock. That is stricter than the relay's own bound
 of now + `MAX_CREATED_AT_DRIFT_SECS`: a post dated ahead is read again each run
-until the clock passes it. A second the relay cannot page completely (more than
-1,000 events) holds the mark below it.
+until the clock passes it.
+
+A second the relay cannot page completely (more than 1,000 events) holds the
+mark below it only if that query returned a verified event that matters at
+that second: a post of this zone, or a kind-5 naming one. Junk or unrelated
+deletions hold nothing. Even a relevant second is released after 3 days, with a
+warning in the report, because events at it may never be readable.
 
 A full build (`--manifest-format auto`, the default) signs v1 while no trusted
 publisher holds a v2 manifest for the zone, and v2 once one does. The import
@@ -173,12 +187,19 @@ removes a row.
 
 - **Deletions.** A verified kind-5 deletes a row only when its signer is the
   post's author, or a key in `NBSS_MODERATORS` (admins and moderators,
-  supplied in config). For an imported post, the author is the original's
-  author. The target may be a live post id, an envelope id or an original id.
+  supplied in config; a malformed entry is an error, never silently dropped).
+  For an imported post, the author is the original's author. The target may be
+  a live post id, an envelope id or an original id.
+  - **Moderator deletions need no author.** They count as soon as the target
+    names a row of the index, directly or through a known envelope. The relay
+    removes the post at once, often before any run saw its author.
   - The author comes from the post itself if it was read this run, else from
     the job's **author book**, else from the relay. The book records every row
-    id's author and every envelope's original id when the job first opens the
-    post; the first run reads the whole zone, so it covers the base too.
+    id's author and every envelope's original id when the job opens the post.
+    It is **seeded** once, before the first update, from the zone's events
+    (`seed-book`). The first update refuses to run (exit 9) without it. The
+    book is pruned to the rows of the index on every run, so it stays the
+    index's size.
   - The book matters because the relay removes a post at once on its author's
     kind-5. Without it, an ordinary author deletion could never be verified
     afterwards.
@@ -195,10 +216,35 @@ removes a row.
   folds. A row the relay merely does not serve, such as one deleted through the
   admin HTTP API with no kind-5, is kept and counted (`missing_rows`).
   Withholding must never become a signed, permanent exclusion.
+- **Takedown.** A post moderated without a kind-5 (the admin HTTP API), or one
+  that must go for any other reason, is taken down explicitly. See "Takedown
+  procedure" below.
 - **Base shards.** The archivist's full base shards are re-packed only by
   `compact --all`. By default it runs once 4,096 ids are excluded. Until then,
   the embeddings of excluded posts in those shards are hidden from members but
   still sit in the sealed bytes they download.
+
+### Takedown procedure
+
+1. **Exclude the post now.** Put its id in a file: the id members see, which is
+   the original's id for an imported post. Then run:
+
+   ```
+   nostr-bbs-search-build takedown --ids ids.txt --reason "<why>" <the job's usual flags>
+   ```
+
+   The next manifest, signed by the indexer, lists the id as excluded.
+   Browsers stop returning it once they load that manifest (minutes, at their
+   next manifest check). The report records the ids and the reason; keep it
+   with the moderation record. An id not in the index is reported and skipped.
+2. **Remove its embedding.** The row stays in the sealed shard until a
+   compaction folds it. That happens at the next `compact`, when the row is in
+   an update shard or the base's last shard, and at the next `compact --all`
+   (or a full rebuild) when it is in a full base shard. Run `compact --all` at
+   once when the embedding must not stay in the sealed bytes.
+3. **Full rebuild, if needed.** A full build from the relay (no subcommand,
+   `--from-relay`) re-embeds the zone as it now stands. It is the last resort,
+   for example when many posts must go or the base itself is in doubt.
 
 ### Disclosure
 
@@ -227,7 +273,7 @@ reaches Cloudflare or non-members.
 | Update and compacted objects, the indexer's `m.json` (v2) | `pods/<indexer>/media/zones/zone2/search/` | Zone members |
 | Indexer key | `NBSS_KEY_FILE` (0600) on the job machine | The job user |
 | State file (`<zone>.state.json`): high-water mark, last version, retired names with times | `NBSS_STATE_DIR` (0600) | The job user |
-| Author book (`<zone>.state.authors.json`): row id → author, envelope id → original id; no text | `NBSS_STATE_DIR` (0600) | The job user |
+| Author book (`<zone>.state.authors.json`): row id → author, envelope id → original id, seeded flag; no text; pruned to the index's rows. Written before the state, so the mark never moves past an unsaved book | `NBSS_STATE_DIR` (0600) | The job user |
 | Zone-key file, if used instead of grants (`NBSS_KEYS_FILE`) | 0600, checked by the job and the builder | The job user |
 | Object cache (`<zone>.cache/<sha256>`): sealed bytes only | `NBSS_STATE_DIR` | The job user |
 | Log (`<zone>.log`): JSON counts | `NBSS_STATE_DIR` | The job user |
@@ -266,15 +312,36 @@ Plaintext and embeddings exist only in the job's memory, while it runs.
 7. **Write the config file.** Copy the variables in the script header into a
    0600 file owned by the job user. Run once by hand. Then schedule it nightly
    (systemd timer or cron) with the config path as the only argument.
-8. **Check the first run.** The first update has no high-water mark, so it reads
+8. **Seed the author book.** Run once, before the first update:
+
+   ```
+   nostr-bbs-search-build seed-book --from-events <export> | --from-relay <url> <the job's flags>
+   ```
+
+   It records every zone post's author, so later deletions can be verified.
+   Prefer a NIP-01 export of the zone's events taken at import (`--from-events`).
+   A post deleted between the import and seeding is gone from the relay, so
+   seeding from the relay cannot record it; only a moderator's kind-5 or a
+   takedown can then remove it from the index. A full build from the relay
+   seeds the book too.
+9. **Check the first run.** The first update has no high-water mark, so it reads
    the whole zone (241,929 envelopes, paged). It finds them all indexed and
    publishes nothing unless something is new. Later runs read about 8 days.
-9. **Retire the archivist (later).** Run `compact --all` once, then remove the
+10. **Retire the archivist (later).** Run `compact --all` once, then remove the
    archivist from `SEARCH_PUBLISHERS`.
 
 After a new import or zone-migrate run, the new envelopes carry their original,
 older `created_at`, below the high-water mark. Run `update --since 0` once. It
 reads the whole zone and indexes only what is missing.
+
+The state file is format 2 (retired objects carry the time they were retired).
+A state file of format 1 from an earlier build is refused with a message, not
+migrated. No such file exists outside test runs; delete it and let the next run
+start a fresh state.
+
+The state directory must be owned by the job user and be mode 0700. The
+config file's directory must be owned by the job user or root, and not be
+writable by group or others.
 
 A `--dry-run` writes the new objects and `m.json` to `--out` and changes no pod
 and no state (its report says `"dry_run": true`). Without `--pod` it builds as

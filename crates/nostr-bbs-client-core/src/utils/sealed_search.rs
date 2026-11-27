@@ -744,12 +744,17 @@ fn choose_manifests(
             Err(e) => refused.push((p, e)),
         }
     }
-    let best = Manifest::newest(accepted);
-    (best.into_iter().collect(), refused)
+    // Newest first; the sort is stable, so equal versions keep
+    // trusted-publisher order (the rule `Manifest::newest` applies).
+    accepted.sort_by_key(|m| std::cmp::Reverse(m.content.index_version));
+    (accepted, refused)
 }
 
 /// Try `load` on each candidate in order until one succeeds; `stop` says
-/// whether to give up between attempts (the session ended).
+/// whether to give up between attempts (the session ended). A manifest that
+/// verifies but whose objects do not (a higher v1 signed with a publisher key
+/// alone, say) therefore cannot deny the index: the next valid one loads. Only
+/// a loaded manifest moves the high-water mark.
 async fn first_loadable<T, F, Fut>(
     candidates: Vec<Manifest>,
     mut load: F,
@@ -759,12 +764,17 @@ where
     F: FnMut(Manifest) -> Fut,
     Fut: std::future::Future<Output = Result<T, String>>,
 {
-    let _ = &stop;
-    let mut it = candidates.into_iter();
-    match it.next() {
-        Some(m) => load(m).await,
-        None => Err("no manifest to load".into()),
+    let mut last = Err("no manifest to load".to_string());
+    for (i, m) in candidates.into_iter().enumerate() {
+        if i > 0 && stop() {
+            break;
+        }
+        last = load(m).await;
+        if last.is_ok() {
+            break;
+        }
     }
+    last
 }
 
 /// Where `o` is fetched from: the pod of the publisher holding it (the
@@ -950,7 +960,16 @@ async fn load_zone(
     }
     first_loadable(
         candidates,
-        |manifest| load_candidate(zone, store, signer, gen, was_ready, pod, t0, manifest),
+        |manifest| async move {
+            let version = manifest.content.index_version;
+            let r = load_candidate(zone, store, signer, gen, was_ready, pod, t0, manifest).await;
+            if let Err(e) = &r {
+                web_sys::console::warn_1(
+                    &format!("[sealed-search] {zone}: index version {version} did not load ({e}); trying the next").into(),
+                );
+            }
+            r
+        },
         || generation() != gen,
     )
     .await

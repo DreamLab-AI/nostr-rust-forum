@@ -267,6 +267,10 @@ pub struct Report {
     pub embed_rows_per_s: f64,
     /// Seconds spent sealing.
     pub seal_s: f64,
+    /// Takedown: the ids excluded at the operator's request.
+    pub taken_down: Vec<String>,
+    /// Takedown: the operator's reason.
+    pub reason: Option<String>,
     /// Non-fatal findings.
     pub warnings: Vec<String>,
 }
@@ -833,6 +837,11 @@ pub async fn run_update<P: Pod, R: Relay, E: Embedder>(
     check_rollback(state, Some(&cur))?;
     report.previous_version = Some(cur.content.index_version);
     report.index_version = Some(cur.content.index_version);
+    if !book.seeded {
+        return Err(JobError::BookNotSeeded {
+            zone: job.zone.to_string(),
+        });
+    }
     let pins = local_pins(job)?;
     check_same_model(pins, &cur)?;
     let indexed = indexed_ids(job, &cur).await?;
@@ -844,6 +853,14 @@ pub async fn run_update<P: Pod, R: Relay, E: Embedder>(
     };
     let h = harvest(relay, job.zone, job.ring, since, &indexed, &rules, book).await?;
     report.harvested(&h);
+    job.warnings.extend(h.warnings.iter().cloned());
+    // The book keeps only rows of the index as it stands after this run.
+    let keep: HashSet<String> = indexed
+        .iter()
+        .cloned()
+        .chain(h.rows.iter().map(|r| r.id.clone()))
+        .collect();
+    book.retain_rows(&keep);
     let exclude: Vec<String> = h
         .exclude
         .iter()
@@ -913,7 +930,6 @@ pub async fn run_compact<P: Pod, R: Relay>(
     book: &mut AuthorBook,
     fold: Fold,
 ) -> Result<Report, JobError> {
-    let _ = &book;
     let mut report = Report::new("compact", job.zone);
     if !relay.session_authenticated() {
         return Err(HarvestError::Unauthenticated.into());
@@ -1027,6 +1043,7 @@ pub async fn run_compact<P: Pod, R: Relay>(
     report.rows_added = opened.iter().map(|p| p.ids.len()).sum::<usize>() - dropped.len();
     report.objects_carried = built.content.objects.len() - built.objects.len();
     publish(job, Some(state), Some(&cur), built, &mut report).await?;
+    book.forget(&dropped);
     report.high_water = state.high_water;
     report.warnings = std::mem::take(&mut job.warnings);
     Ok(report)
@@ -1046,11 +1063,68 @@ pub async fn run_takedown<P: Pod>(
     ids: &[String],
     reason: &str,
 ) -> Result<Report, JobError> {
-    let _ = (state, ids, reason);
-    Ok(Report::new("takedown", job.zone))
+    let mut report = Report::new("takedown", job.zone);
+    let cur = newest_manifest(job)
+        .await?
+        .ok_or_else(|| format!("no index for {} on the pods yet", job.zone))?;
+    check_rollback(state, Some(&cur))?;
+    report.previous_version = Some(cur.content.index_version);
+    report.index_version = Some(cur.content.index_version);
+    let indexed = indexed_ids(job, &cur).await?;
+    let already: HashSet<&str> = cur.content.excluded.iter().map(String::as_str).collect();
+    let mut take: Vec<String> = Vec::new();
+    for id in ids.iter().map(|i| i.trim().to_lowercase()) {
+        if !indexed.contains(&id) {
+            job.warnings
+                .push(format!("{id} is not in the index: nothing to take down"));
+        } else if already.contains(id.as_str()) || take.contains(&id) {
+            job.warnings.push(format!("{id} is already excluded"));
+        } else {
+            take.push(id);
+        }
+    }
+    report.reason = Some(reason.to_string());
+    if take.is_empty() {
+        report.warnings = std::mem::take(&mut job.warnings);
+        return Ok(report);
+    }
+    let total = cur.content.excluded.len() + take.len();
+    if total > job.max_excluded {
+        return Err(JobError::ExclusionListFull {
+            total,
+            cap: job.max_excluded,
+        });
+    }
+    let pins = Pins {
+        model: cur.content.model.clone(),
+        model_sha256: cur.content.model_sha256.clone(),
+        vocab_sha256: cur.content.vocab_sha256.clone(),
+    };
+    let me = me_hex(job);
+    let built = update(
+        &spec(job, &pins, cur.content.index_version + 1),
+        Previous {
+            content: &cur.content,
+            signer: &cur.event.pubkey,
+        },
+        &me,
+        &[],
+        &take,
+        &KeyMap::new(),
+    )?;
+    report.objects_carried = cur.content.objects.len();
+    report.excluded_added = take.len();
+    publish(job, Some(state), Some(&cur), built, &mut report).await?;
+    report.taken_down = take;
+    report.high_water = state.high_water;
+    report.warnings = std::mem::take(&mut job.warnings);
+    Ok(report)
 }
 
-/// Write the state and the author book after a run.
+/// Write the author book, then the state, after a run. In that order: if
+/// the book cannot be written, the high-water mark has not moved either, and
+/// the next run reads the same posts again (a book ahead of the state is
+/// harmless; a state ahead of the book would lose authors for good).
 ///
 /// # Errors
 ///
@@ -1059,11 +1133,11 @@ pub fn persist(
     state: Option<(&State, &std::path::Path)>,
     book: Option<(&AuthorBook, &std::path::Path)>,
 ) -> Result<(), String> {
-    if let Some((s, p)) = state {
-        s.save(p)?;
-    }
     if let Some((b, p)) = book {
         b.save(p)?;
+    }
+    if let Some((s, p)) = state {
+        s.save(p)?;
     }
     Ok(())
 }

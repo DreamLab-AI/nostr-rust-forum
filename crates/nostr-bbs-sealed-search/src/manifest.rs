@@ -76,7 +76,21 @@ pub fn parse_publishers(list: &str) -> Vec<String> {
 /// On any entry that is not 64 hex characters (one typo must not silently
 /// drop a key).
 pub fn parse_pubkey_list(list: &str) -> Result<Vec<String>, String> {
-    Ok(parse_publishers(list))
+    let mut out: Vec<String> = Vec::new();
+    for (i, p) in list
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .enumerate()
+        .filter(|(_, p)| !p.is_empty())
+    {
+        if p.len() != 64 || !p.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("entry {} is not a 64-hex pubkey", i + 1));
+        }
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    Ok(out)
 }
 
 /// Event kind (NIP-78 application-specific data).
@@ -309,6 +323,15 @@ impl Manifest {
         let m = Self::verify(ev, zone, relay_url, publishers, high_water)?;
         if m.content.v == V2 {
             let (epoch, pk, mac) = mac_tag(&m.event, &m.content)?;
+            // Never MAC'd with an older epoch than this device last accepted:
+            // a former member keeps old epoch keys, not the current one.
+            if let Some(floor) = high_water.and_then(|h| h.mac_epoch) {
+                if epoch < floor {
+                    return Err(format!(
+                        "manifest MAC uses epoch {epoch}, older than epoch {floor} already accepted"
+                    ));
+                }
+            }
             let secret = secret_for(epoch, &pk).ok_or_else(|| {
                 format!("no zone key for epoch {epoch} to check the manifest MAC")
             })?;
@@ -390,12 +413,14 @@ impl Manifest {
         o.owner_or(&self.event.pubkey)
     }
 
-    /// The new high-water mark after accepting this manifest.
+    /// The new high-water mark after accepting this manifest, recording the
+    /// newest epoch it lists: a later v2 manifest must be MAC'd with at least
+    /// that epoch on this device.
     pub fn high_water(&self) -> HighWater {
         HighWater {
             version: self.content.index_version,
             event_id: self.event.id.clone(),
-            mac_epoch: None,
+            mac_epoch: mac_slot(&self.content).map(|(e, _)| e),
         }
     }
 }

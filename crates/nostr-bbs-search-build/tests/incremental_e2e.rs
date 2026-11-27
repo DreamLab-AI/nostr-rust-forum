@@ -823,12 +823,13 @@ fn a_zone_the_relay_withholds_is_refused_not_read_as_empty() {
     // Authenticated, but outside the zone's cohorts: the relay answers every
     // zone REQ with nothing (exit 7), on the first run and on later ones.
     let mut gated = MemRelay::new(Vec::new());
+    let mut seeded = f.book.clone();
     let e = indexer(&mut f, &mut state, |j, _, s| {
         block_on(run_update(
             j,
             &mut gated,
             s,
-            &mut Default::default(),
+            &mut seeded,
             &mut HashEmbedder { calls: 0 },
             None,
             0,

@@ -56,6 +56,16 @@ steps: [`docs/runbooks/sealed-search-incremental.md`](docs/runbooks/sealed-searc
   - `--keys-file` and `NBSS_KEYS_FILE` must be 0600, and the nightly config's directory must not be writable by
     others. `--dump-vectors` works only with `--input` and writes 0600.
   - Equal-version manifests resolve to the first listed publisher everywhere.
+- **Second security review of #126.**
+  - Moderator deletions count without a known author.
+  - The author book is seeded once (`seed-book`). The first update refuses an unseeded book (exit 9). The book is
+    written before the state and pruned to the index's rows.
+  - Operator takedown: `takedown --ids FILE --reason …` excludes indexed posts in the next manifest.
+  - Unpaged seconds hold the mark only with a relevant verified event of the same query, and for at most 3 days.
+  - `--moderators` and `--publishers` refuse malformed entries.
+  - Browsers fall back to the next verified manifest when one fails to load, and record the newest epoch accepted;
+    a later v2 MAC must use at least that epoch.
+  - The nightly script checks the state directory (owner, 0700) and the config directory's owner.
 - **Job.** `scripts/sealed-search-nightly.sh`: update, then compact when enough partial shard pairs exist; lock,
   time budget, distinct exit codes, no secrets in argv.
 

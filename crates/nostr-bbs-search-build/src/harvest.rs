@@ -51,7 +51,7 @@ use nostr_bbs_core::sealed::{open_sealed_with_conversation_key, parse_sealed};
 use nostr_bbs_core::NostrEvent;
 use nostr_bbs_zone_migrate::keys::{KeyRing, ZoneKey};
 use nostr_bbs_zone_migrate::relay::{
-    fetch_all, fetch_by_ids, Filter, Relay, RelayError, MAX_IDS_PER_REQ,
+    fetch_all, fetch_by_ids, Filter, Relay, RelayError, MAX_IDS_PER_REQ, MAX_REQ_LIMIT,
 };
 use zeroize::Zeroizing;
 
@@ -106,6 +106,10 @@ pub struct Rules<'a> {
     pub moderators: &'a [String],
 }
 
+/// How long a second the relay cannot page completely may hold the
+/// high-water mark (3 days); after that it is released with a warning.
+pub const AMBIGUOUS_HOLD_SECS: u64 = 3 * 86_400;
+
 /// What the job has seen of posts it opened: each row id's author and each
 /// envelope id's original id. It holds no text: the relay already serves the
 /// same facts (the event's `pubkey`, the envelope's `sealed` tag). It lets a
@@ -147,6 +151,19 @@ impl AuthorBook {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(format!("author book {}: {e}", path.display())),
         }
+    }
+
+    /// Keep only entries for rows in `keep` (the index's row ids): the book
+    /// stays the size of the index.
+    pub fn retain_rows(&mut self, keep: &HashSet<String>) {
+        self.authors.retain(|id, _| keep.contains(id));
+        self.envelopes.retain(|_, row| keep.contains(row));
+    }
+
+    /// Forget `rows` (dropped from the index by a compaction).
+    pub fn forget(&mut self, rows: &HashSet<String>) {
+        self.authors.retain(|id, _| !rows.contains(id));
+        self.envelopes.retain(|_, row| !rows.contains(row));
     }
 
     /// Write the book to `path` (mode 0600, through a fresh temporary file).
@@ -197,8 +214,12 @@ pub struct Harvest {
     /// Newest `created_at` read.
     pub newest: Option<u64>,
     /// `created_at` seconds holding more events than one relay page, which
-    /// the relay's `until` paging cannot read completely.
+    /// the relay's `until` paging cannot read completely, and which hold a
+    /// verified event that matters here and are younger than
+    /// [`AMBIGUOUS_HOLD_SECS`]: the mark stays below them.
     pub ambiguous_seconds: Vec<u64>,
+    /// Findings for the report (no text, no keys).
+    pub warnings: Vec<String>,
 }
 
 impl Harvest {
@@ -384,8 +405,47 @@ pub async fn seed_book<R: Relay>(
     ring: &KeyRing,
     book: &mut AuthorBook,
 ) -> Result<SeedReport, HarvestError> {
-    let _ = (relay, zone, ring, book);
-    Ok(SeedReport::default())
+    if !relay.session_authenticated() {
+        return Err(HarvestError::Unauthenticated);
+    }
+    let posts = fetch_all(
+        relay,
+        &Filter {
+            kinds: Some(vec![42]),
+            zk_tags: Some(vec![zone.to_string()]),
+            ..Filter::default()
+        },
+    )
+    .await?
+    .events;
+    let mut opener = Opener {
+        zone,
+        ring,
+        conv: HashMap::new(),
+    };
+    let mut r = SeedReport {
+        events: posts.len(),
+        ..SeedReport::default()
+    };
+    for ev in &posts {
+        if verify_event_strict(ev).is_err() {
+            r.skipped += 1;
+            continue;
+        }
+        match opener.open(ev) {
+            Opened::Post(id, author, _, _) => {
+                if id != ev.id.to_ascii_lowercase() {
+                    book.envelopes
+                        .insert(ev.id.to_ascii_lowercase(), id.clone());
+                }
+                book.authors.insert(id, author);
+                r.recorded += 1;
+            }
+            _ => r.skipped += 1,
+        }
+    }
+    book.seeded = true;
+    Ok(r)
 }
 
 /// Which of `ids` (row ids: live post ids or original ids) the relay still
@@ -468,19 +528,19 @@ pub async fn harvest<R: Relay>(
         },
     )
     .await?;
-    let mut ambiguous: Vec<u64> = posts
-        .ambiguous_seconds
-        .iter()
-        .chain(dels.ambiguous_seconds.iter())
-        .copied()
-        .collect();
-    ambiguous.sort_unstable();
-    ambiguous.dedup();
+    // Seconds the relay could not page; only those holding a verified event
+    // that matters here (a post of this zone, or a kind-5 naming one) will
+    // hold the mark, so nobody can pin it with junk or unrelated deletions.
+    // Each query's own unpaged seconds count only with a relevant event of
+    // that query at that second.
+    let post_ambiguous = posts.ambiguous_seconds.clone();
+    let del_ambiguous = dels.ambiguous_seconds.clone();
+    let mut relevant_secs: HashSet<u64> = HashSet::new();
+    let mut relevant_del_secs: HashSet<u64> = HashSet::new();
     let (posts, dels) = (posts.events, dels.events);
     let mut h = Harvest {
         events: posts.len(),
         deletions: dels.len(),
-        ambiguous_seconds: ambiguous,
         ..Harvest::default()
     };
     let mut opener = Opener {
@@ -503,6 +563,7 @@ pub async fn harvest<R: Relay>(
         match opener.open(ev) {
             Opened::Post(id, author, text, edit_of) => {
                 seen(&mut h, ev.created_at);
+                relevant_secs.insert(ev.created_at);
                 if id != ev.id.to_ascii_lowercase() {
                     env_to_inner.insert(ev.id.to_ascii_lowercase(), id.clone());
                 }
@@ -523,6 +584,7 @@ pub async fn harvest<R: Relay>(
             }
             Opened::MissingKey => {
                 seen(&mut h, ev.created_at);
+                relevant_secs.insert(ev.created_at);
                 h.missing_key += 1;
                 if let Some((_, e, _)) = zk(ev) {
                     h.missing_epochs.insert(e);
@@ -532,6 +594,7 @@ pub async fn harvest<R: Relay>(
             Opened::Foreign => h.foreign += 1,
             Opened::Undecryptable => {
                 seen(&mut h, ev.created_at);
+                relevant_secs.insert(ev.created_at);
                 h.undecryptable += 1;
             }
         }
@@ -593,6 +656,28 @@ pub async fn harvest<R: Relay>(
             .filter(|t| t.len() >= 2 && t[0] == "e" && is_hex64(&t[1]))
         {
             let t = t[1].to_ascii_lowercase();
+            // A moderator's deletion needs no author: only the row it names
+            // (the relay removes the post at once, often before any run saw
+            // its author).
+            if moderator {
+                let row = env_to_inner
+                    .get(&t)
+                    .cloned()
+                    .or_else(|| recs.contains_key(&t).then(|| t.clone()))
+                    .or_else(|| {
+                        book.envelopes
+                            .get(&t)
+                            .filter(|r| indexed.contains(*r))
+                            .cloned()
+                    })
+                    .or_else(|| indexed.contains(&t).then(|| t.clone()))
+                    .or_else(|| authors.get(&t).cloned().flatten().map(|(r, _)| r));
+                if let Some(row) = row {
+                    relevant_del_secs.insert(d.created_at);
+                    deleted.insert(row);
+                }
+                continue;
+            }
             // (row id, author) the target stands for.
             let target = if let Some(inner) = env_to_inner.get(&t) {
                 recs.get(inner).map(|r| (inner.clone(), r.author.clone()))
@@ -613,7 +698,8 @@ pub async fn harvest<R: Relay>(
                 authors.get(&t).cloned().flatten()
             };
             if let Some((row, author)) = target {
-                if moderator || author == signer {
+                relevant_del_secs.insert(d.created_at);
+                if author == signer {
                     deleted.insert(row);
                 }
             }
@@ -668,6 +754,30 @@ pub async fn harvest<R: Relay>(
     }
     rows.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
     h.rows = rows;
+    // Ambiguous seconds that matter hold the mark, but not for ever: past
+    // the hold period they are released with a warning (events at that
+    // second may never be read: the relay pages only by whole seconds).
+    let mut relevant_ambiguous: Vec<u64> = post_ambiguous
+        .into_iter()
+        .filter(|s| relevant_secs.contains(s))
+        .chain(
+            del_ambiguous
+                .into_iter()
+                .filter(|s| relevant_del_secs.contains(s)),
+        )
+        .collect();
+    relevant_ambiguous.sort_unstable();
+    relevant_ambiguous.dedup();
+    for sec in relevant_ambiguous {
+        if sec.saturating_add(AMBIGUOUS_HOLD_SECS) < rules.now {
+            h.warnings.push(format!(
+                "events at created_at {sec} could not be read completely (more than {MAX_REQ_LIMIT} at one second); released after {} days, some may never be indexed",
+                AMBIGUOUS_HOLD_SECS / 86_400
+            ));
+        } else {
+            h.ambiguous_seconds.push(sec);
+        }
+    }
     h.exclude = deleted
         .union(&superseded)
         .filter(|id| indexed.contains(*id))

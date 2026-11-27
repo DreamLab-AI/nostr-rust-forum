@@ -444,7 +444,8 @@ mod native {
         let me = load_identity(cli.key_file.as_deref()).map_err(|e| Fail(e.to_string(), 2))?;
         let publisher = me.public_key().to_hex();
         let publishers = match &cli.publishers {
-            Some(l) => nostr_bbs_sealed_search::manifest::parse_publishers(l),
+            Some(l) => nostr_bbs_sealed_search::manifest::parse_pubkey_list(l)
+                .map_err(|e| Fail(format!("--publishers: {e}"), 2))?,
             None => vec![publisher.clone()],
         };
         if !publishers.contains(&publisher) {
@@ -511,11 +512,11 @@ mod native {
         } else {
             KeyRing::new()
         };
-        let moderators = cli
-            .moderators
-            .as_deref()
-            .map(nostr_bbs_sealed_search::manifest::parse_publishers)
-            .unwrap_or_default();
+        let moderators = match cli.moderators.as_deref() {
+            Some(l) => nostr_bbs_sealed_search::manifest::parse_pubkey_list(l)
+                .map_err(|e| Fail(format!("--moderators: {e}"), 2))?,
+            None => Vec::new(),
+        };
         let mut job = Job {
             zone,
             relay_url,
@@ -678,6 +679,8 @@ mod native {
                     .await
                     .map_err(JobError::from)?;
                     let rows = std::mem::take(&mut h.rows);
+                    // A full read of the zone: the book now covers this base.
+                    book.seeded = true;
                     run_full(
                         &mut job,
                         state.as_mut(),

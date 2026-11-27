@@ -12,7 +12,8 @@
 # directory (no pod worker): the archivist's base, the indexer's first update
 # (nothing new), a night of new posts with an edit and two deletions, and a
 # compaction. The relay serves the deleted posts still (they were seeded, not
-# deleted through it), so their exclusion comes from the kind-5s alone.
+# deleted through it), so their exclusion comes from the kind-5s alone. The
+# indexer seeds its author book before its first update, as the runbook says.
 #
 # Never point this at a deployed relay: it only ever starts its own on
 # 127.0.0.1.
@@ -126,6 +127,10 @@ log "archivist: full build from the relay"
 "$bin" "${common[@]}" --key-file "$zone/archivist.key" >"$work/full.json"
 expect "$work/full.json" rows_added 2500
 expect "$work/full.json" index_version 1
+
+log "indexer: seed the author book from the zone"
+"$bin" seed-book "${common[@]}" "${indexer_args[@]}" >"$work/seed.json"
+expect "$work/seed.json" recorded 2500
 
 log "indexer: first update reads the whole zone, finds nothing new"
 "$bin" update "${common[@]}" "${indexer_args[@]}" >"$work/u1.json"

@@ -38,6 +38,8 @@
 #   0  done (published, or nothing new)
 #   3  published, but posts under an epoch the indexer holds no key for were
 #      held back (grant the epoch; the next run picks them up)
+#   9  the author book is not seeded: run `nostr-bbs-search-build seed-book`
+#      once (see the runbook) before the first update
 #   1, 4, 6, 7, 8  the builder's: error; relay not NIP-42 authenticated; the
 #      pods show an older index than the state recorded (rollback or
 #      withholding); the relay serves none of the zone's indexed posts to the
@@ -67,6 +69,9 @@ case "$mode" in
 esac
 # Nor may anyone else replace it: its directory must not be group/other writable.
 config_dir="$(dirname "$config")"
+dir_owner="$(stat -c %u "$config_dir")"
+[ "$dir_owner" = "$(id -u)" ] || [ "$dir_owner" = 0 ] ||
+  die_config "$config_dir is owned by neither the job user nor root"
 dir_mode="$(stat -c %a "$config_dir")"
 case "$dir_mode" in
   *[2367]? | *[2367]) die_config "$config_dir is writable by group or others (mode $dir_mode)" ;;
@@ -101,6 +106,13 @@ for n in "$compact_at" "$full_at" "$budget"; do
 done
 
 mkdir -p "$NBSS_STATE_DIR"
+# State, author book, object cache and log: the job user's alone.
+[ "$(stat -c %u "$NBSS_STATE_DIR")" = "$(id -u)" ] ||
+  die_config "$NBSS_STATE_DIR is not owned by the user running the job"
+case "$(stat -c %a "$NBSS_STATE_DIR")" in
+  ?00) ;;
+  *) die_config "$NBSS_STATE_DIR must be mode 0700" ;;
+esac
 zone="$NBSS_ZONE"
 log="$NBSS_STATE_DIR/$zone.log"
 lock="$NBSS_STATE_DIR/$zone.lock"
