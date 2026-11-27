@@ -11,7 +11,7 @@ use leptos::prelude::*;
 use std::rc::Rc;
 
 use super::session::{save_privkey_session, StoredSession};
-use crate::auth::{AccountStatus, AuthPhase, AuthState, AuthStore};
+use crate::auth::{AccountStatus, AuthPhase, AuthState, AuthStore, KeyPersistence};
 use crate::dm::DMMessage;
 use nostr_bbs_core::keys::{Keypair, SecretKey};
 use nostr_bbs_core::signer::{PrfSigner, Signer};
@@ -121,7 +121,7 @@ pub fn dev_login(store: &AuthStore, identity_index: usize) {
     store
         .privkey
         .set_value(Some(keypair.secret.as_bytes().to_vec()));
-    save_privkey_session(&privkey_hex);
+    save_privkey_session(&privkey_hex, &pubkey, KeyPersistence::RememberFlag);
 
     // Build and store signer
     let signer: Rc<dyn Signer> = Rc::new(PrfSigner::new(keypair));

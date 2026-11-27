@@ -98,6 +98,24 @@ impl Default for AuthState {
 
 // -- AuthStore ----------------------------------------------------------------
 
+/// How a local-key sign-in stores the raw private key.
+///
+/// Passkey and NIP-07 sign-ins never store a raw key, whatever this says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyPersistence {
+    /// Follow the site-wide "stay signed in on this device" flag (see
+    /// [`AuthStore::set_remember_me`]): durable localStorage when it is set,
+    /// otherwise sessionStorage, cleared when the tab closes. The forum's
+    /// behaviour.
+    RememberFlag,
+    /// Hold the key in memory only: a reload signs the member out. A stored
+    /// copy of a *different* key is removed, since session restore would
+    /// otherwise install it under this session's pubkey; a stored copy of the
+    /// same key (the member's own earlier choice) is kept. The BBS uses this
+    /// unless the member ticked "Stay signed in" (ADR-2008).
+    MemoryOnly,
+}
+
 /// Reactive auth store providing the auth context for the entire app.
 ///
 /// Holds an `RwSignal<AuthState>` for the reactive UI state and a
@@ -105,12 +123,13 @@ impl Default for AuthState {
 /// Also holds reactive signals for pod_url and web_id from passkey auth.
 #[derive(Clone, Copy)]
 pub struct AuthStore {
-    pub state: RwSignal<AuthState>,
+    /// Reactive auth state; read it from other crates through [`Self::state`].
+    pub(crate) state: RwSignal<AuthState>,
     /// Private key bytes held in a StoredValue so they stay on the WASM thread.
-    /// Never serialized or persisted.
-    pub privkey: StoredValue<Option<Vec<u8>>>,
+    /// Never serialized; persisted only as [`KeyPersistence`] allows.
+    pub(crate) privkey: StoredValue<Option<Vec<u8>>>,
     /// Signer trait object — additive alongside privkey for trait-based signing.
-    pub signer: StoredValue<Option<SignerHandle>>,
+    pub(crate) signer: StoredValue<Option<SignerHandle>>,
     /// Pod URL from passkey auth server response (Solid pod endpoint).
     pub pod_url: RwSignal<Option<String>>,
     /// Web ID from passkey auth server response (Solid WebID URI).
@@ -129,6 +148,11 @@ impl AuthStore {
     }
 
     // -- Getters --------------------------------------------------------------
+
+    /// The reactive auth state, read-only. Only this crate changes it.
+    pub fn state(&self) -> ReadSignal<AuthState> {
+        self.state.read_only()
+    }
 
     /// Read the current auth state (reactive).
     #[allow(dead_code)]
@@ -346,11 +370,21 @@ impl AuthStore {
     /// Generate a new random keypair and register as a local-key user.
     ///
     /// Returns the hex-encoded private key so the signup UI can show it for
-    /// backup. The privkey is held in memory and persisted via
-    /// `save_privkey_session`, which defaults to sessionStorage scope
-    /// (cleared on tab close) unless the user has opted into "remember me"
-    /// (localStorage). It is never written to durable storage by default.
+    /// backup. The privkey is held in memory and stored under
+    /// [`KeyPersistence::RememberFlag`]: sessionStorage (cleared on tab close)
+    /// unless the user has opted into "remember me" (localStorage). It is
+    /// never written to durable storage by default.
     pub fn register_with_generated_key(&self, display_name: &str) -> Result<String, String> {
+        self.register_with_generated_key_scoped(display_name, KeyPersistence::RememberFlag)
+    }
+
+    /// [`Self::register_with_generated_key`], storing the new key as
+    /// `persistence` says.
+    pub fn register_with_generated_key_scoped(
+        &self,
+        display_name: &str,
+        persistence: KeyPersistence,
+    ) -> Result<String, String> {
         let keypair = nostr_bbs_core::generate_keypair()
             .map_err(|e| format!("Key generation failed: {e}"))?;
 
@@ -358,7 +392,7 @@ impl AuthStore {
         let privkey_hex = hex::encode(keypair.secret.as_bytes());
         self.privkey
             .set_value(Some(keypair.secret.as_bytes().to_vec()));
-        save_privkey_session(&privkey_hex);
+        save_privkey_session(&privkey_hex, &pubkey, persistence);
 
         // Mirror login_with_local_key's signer registration so downstream
         // NIP-98 features (pod browser, search, relay AUTH) work the moment
@@ -429,8 +463,19 @@ impl AuthStore {
     /// [`Self::login_with_local_key`] persists the key.
     pub fn set_remember_me(&self, enabled: bool) {
         session::set_remember_me(enabled);
-        if let Some(bytes) = self.privkey.get_value() {
-            save_privkey_session(&hex::encode(&bytes));
+        if let Some(bytes) = self.privkey.get_value().map(zeroize::Zeroizing::new) {
+            // Only a local-key session's key may be stored: a passkey key is
+            // re-derived on every sign-in and must never reach web storage.
+            let local_key_owner = self
+                .state
+                .with_untracked(|s| s.pubkey.clone().filter(|_| s.is_local_key));
+            if let Some(pubkey) = local_key_owner {
+                save_privkey_session(
+                    &hex::encode(bytes.as_slice()),
+                    &pubkey,
+                    KeyPersistence::RememberFlag,
+                );
+            }
         }
     }
 
@@ -473,7 +518,17 @@ impl AuthStore {
     /// Login with a local nsec/hex private key.
     ///
     /// Accepts either a 64-character hex string or an nsec1... bech32 key.
+    /// The key is stored under [`KeyPersistence::RememberFlag`].
     pub fn login_with_local_key(&self, key_input: &str) -> Result<(), String> {
+        self.login_with_local_key_scoped(key_input, KeyPersistence::RememberFlag)
+    }
+
+    /// [`Self::login_with_local_key`], storing the key as `persistence` says.
+    pub fn login_with_local_key_scoped(
+        &self,
+        key_input: &str,
+        persistence: KeyPersistence,
+    ) -> Result<(), String> {
         // Tolerate a key typed from a sheet in groups ("nsec1 abcd efgh …"):
         // no valid key contains whitespace.
         let compact = zeroize::Zeroizing::new(key_input.split_whitespace().collect::<String>());
@@ -496,7 +551,7 @@ impl AuthStore {
             .map_err(|e| format!("Invalid secp256k1 key: {e}"))?;
         let pubkey = sk.public_key().to_hex();
         self.privkey.set_value(Some(key_bytes.to_vec()));
-        save_privkey_session(privkey_hex);
+        save_privkey_session(privkey_hex, &pubkey, persistence);
 
         // Register a Signer so anything that calls `auth.get_signer()` works
         // (pod browser, search, anything that needs NIP-98). Without this, the

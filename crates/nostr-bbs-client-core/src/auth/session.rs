@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use send_wrapper::SendWrapper;
 
-use super::{AccountStatus, AuthPhase, AuthState, AuthStore, STORAGE_KEY};
+use super::{AccountStatus, AuthPhase, AuthState, AuthStore, KeyPersistence, STORAGE_KEY};
 use nostr_bbs_core::signer::Signer;
 
 /// Storage key for the local-key privkey.
@@ -144,27 +144,97 @@ pub(super) fn set_remember_me(enabled: bool) {
     }
 }
 
-/// Store privkey hex so an explicit login survives page reloads.
+/// What [`save_privkey_session`] does to one storage area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SlotAction {
+    /// Store the key here.
+    Write,
+    /// Remove any key stored here.
+    Remove,
+    /// Remove a key stored here unless it is the key being signed in.
+    RemoveIfOtherKey,
+}
+
+/// What [`save_privkey_session`] does to localStorage and sessionStorage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PrivkeyPlan {
+    /// The action on localStorage.
+    pub(super) local: SlotAction,
+    /// The action on sessionStorage.
+    pub(super) session: SlotAction,
+}
+
+/// The storage plan for a key saved under `persistence`, given the
+/// remember-me flag.
 ///
-/// Writes to localStorage by default ("remember me" on), or sessionStorage
-/// when the user opted out. The other storage area is cleared so a stale
-/// copy can never linger. See `SESSION_PRIVKEY_KEY` for the audit note —
-/// passkey-derived keys MUST NOT be persisted via this path; they
-/// re-derive from PRF on every login.
-pub(super) fn save_privkey_session(hex: &str) {
-    if remember_me() {
-        if let Some(storage) = local_storage() {
-            let _ = storage.set_item(SESSION_PRIVKEY_KEY, hex);
-        }
-        if let Some(storage) = session_storage() {
-            let _ = storage.remove_item(SESSION_PRIVKEY_KEY);
-        }
-    } else {
-        if let Some(storage) = session_storage() {
-            let _ = storage.set_item(SESSION_PRIVKEY_KEY, hex);
-        }
-        if let Some(storage) = local_storage() {
-            let _ = storage.remove_item(SESSION_PRIVKEY_KEY);
+/// [`KeyPersistence::RememberFlag`] writes one area and empties the other, so
+/// a stale copy never lingers. [`KeyPersistence::MemoryOnly`] writes nothing
+/// whatever the flag, and removes only stored copies of a *different* key:
+/// session restore installs whatever key is stored under the stored
+/// session's pubkey, so a leftover copy of another account would sign as
+/// that account. A copy of the same key is the member's own earlier choice
+/// and is kept.
+pub(super) fn privkey_plan(persistence: KeyPersistence, remember: bool) -> PrivkeyPlan {
+    use SlotAction::{Remove, RemoveIfOtherKey, Write};
+    match (persistence, remember) {
+        (KeyPersistence::RememberFlag, true) => PrivkeyPlan {
+            local: Write,
+            session: Remove,
+        },
+        (KeyPersistence::RememberFlag, false) => PrivkeyPlan {
+            local: Remove,
+            session: Write,
+        },
+        (KeyPersistence::MemoryOnly, _) => PrivkeyPlan {
+            local: RemoveIfOtherKey,
+            session: RemoveIfOtherKey,
+        },
+    }
+}
+
+/// Whether the stored key hex `stored_hex` is anything other than the
+/// secret key of `pubkey` (case-insensitive). Undecodable or invalid input
+/// counts as another key.
+pub(super) fn is_other_key(stored_hex: &str, pubkey: &str) -> bool {
+    let Ok(bytes) = hex::decode(stored_hex).map(zeroize::Zeroizing::new) else {
+        return true;
+    };
+    let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()).map(zeroize::Zeroizing::new) else {
+        return true;
+    };
+    nostr_bbs_core::keys::pubkey_hex(&arr).map_or(true, |pk| !pk.eq_ignore_ascii_case(pubkey))
+}
+
+/// Store (or deliberately not store) the private key `hex` of `pubkey`
+/// according to `persistence` and the remember-me flag; see [`privkey_plan`].
+///
+/// See `SESSION_PRIVKEY_KEY` for the audit note: passkey-derived keys MUST
+/// NOT be persisted via this path; they re-derive from PRF on every login.
+pub(super) fn save_privkey_session(hex: &str, pubkey: &str, persistence: KeyPersistence) {
+    let plan = privkey_plan(persistence, remember_me());
+    for (storage, action) in [
+        (local_storage(), plan.local),
+        (session_storage(), plan.session),
+    ] {
+        let Some(storage) = storage else { continue };
+        match action {
+            SlotAction::Write => {
+                let _ = storage.set_item(SESSION_PRIVKEY_KEY, hex);
+            }
+            SlotAction::Remove => {
+                let _ = storage.remove_item(SESSION_PRIVKEY_KEY);
+            }
+            SlotAction::RemoveIfOtherKey => {
+                let stale = storage
+                    .get_item(SESSION_PRIVKEY_KEY)
+                    .ok()
+                    .flatten()
+                    .map(zeroize::Zeroizing::new)
+                    .is_some_and(|stored| is_other_key(&stored, pubkey));
+                if stale {
+                    let _ = storage.remove_item(SESSION_PRIVKEY_KEY);
+                }
+            }
         }
     }
 }
@@ -584,4 +654,55 @@ fn schedule_nip07_provider_repoll(
         },
         std::time::Duration::from_millis(150),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::KeyPersistence;
+
+    #[test]
+    fn remember_flag_writes_one_area_and_empties_the_other() {
+        assert_eq!(
+            privkey_plan(KeyPersistence::RememberFlag, true),
+            PrivkeyPlan {
+                local: SlotAction::Write,
+                session: SlotAction::Remove,
+            }
+        );
+        assert_eq!(
+            privkey_plan(KeyPersistence::RememberFlag, false),
+            PrivkeyPlan {
+                local: SlotAction::Remove,
+                session: SlotAction::Write,
+            }
+        );
+    }
+
+    #[test]
+    fn memory_only_never_writes_whatever_the_flag() {
+        let plan = PrivkeyPlan {
+            local: SlotAction::RemoveIfOtherKey,
+            session: SlotAction::RemoveIfOtherKey,
+        };
+        assert_eq!(privkey_plan(KeyPersistence::MemoryOnly, true), plan);
+        assert_eq!(privkey_plan(KeyPersistence::MemoryOnly, false), plan);
+    }
+
+    #[test]
+    fn a_stored_copy_is_stale_unless_it_is_the_same_key() {
+        let mut sk = [0u8; 32];
+        sk[31] = 1;
+        let pk = nostr_bbs_core::keys::pubkey_hex(&sk).expect("valid key");
+        let mut other = [0u8; 32];
+        other[31] = 2;
+        // The member's own earlier "stay signed in" copy is kept.
+        assert!(!is_other_key(&hex::encode(sk), &pk));
+        assert!(!is_other_key(&hex::encode(sk), &pk.to_uppercase()));
+        // Restore would install any other copy under this session's pubkey.
+        assert!(is_other_key(&hex::encode(other), &pk));
+        assert!(is_other_key("not hex", &pk));
+        assert!(is_other_key(&hex::encode([0u8; 31]), &pk));
+        assert!(is_other_key(&hex::encode([0u8; 32]), &pk));
+    }
 }

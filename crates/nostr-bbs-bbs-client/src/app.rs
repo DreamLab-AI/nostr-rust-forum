@@ -173,7 +173,7 @@ pub fn App() -> impl IntoView {
         Effect::new(move |_| {
             let r = expect_context::<RelayConnection>();
             if is_authed.get() {
-                if auth.state.get_untracked().is_nip07 {
+                if auth.state().get_untracked().is_nip07 {
                     let a2 = auth;
                     let async_signer: nostr_bbs_client_core::relay::AuthSignAsyncCallback =
                         std::rc::Rc::new(move |event| {
@@ -285,7 +285,7 @@ pub fn App() -> impl IntoView {
             if !store.ready_for(Some(&me)) {
                 return;
             }
-            let can_refuse = auth.state.with_untracked(|s| s.is_nip07);
+            let can_refuse = auth.state().with_untracked(|s| s.is_nip07);
             store.start_grant_sync(&relay_for_keys, signer, me, can_refuse);
         });
     }

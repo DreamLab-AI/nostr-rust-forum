@@ -356,7 +356,7 @@ fn RestrictedImage(
     };
 
     // A NIP-07 extension may prompt for every signature: never sign unasked.
-    let manual = !auto_load || auth.state.with_untracked(|st| st.is_nip07);
+    let manual = !auto_load || auth.state().with_untracked(|st| st.is_nip07);
 
     // Already cached for this viewer: show at once, no observer, no request.
     let cached_now = auth

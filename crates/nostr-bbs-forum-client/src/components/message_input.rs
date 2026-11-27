@@ -272,7 +272,7 @@ pub(crate) fn MessageInput(
     // and a draft is written only while the identity that typed it is still
     // the one signed in.
     let draft_owner = move || {
-        auth.state.with_untracked(|s| {
+        auth.state().with_untracked(|s| {
             crate::zone_crypto::key_owner::owner_from_auth(s.is_authenticated, s.pubkey.as_deref())
         })
     };
