@@ -35,6 +35,7 @@ use crate::components::access_denied::AccessDenied;
 use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
+use crate::components::canonical_address::keep_address_canonical;
 use crate::components::confirm_dialog::ConfirmDialog;
 use crate::components::copy_key::KeyName;
 use crate::components::link_preview::LinkPreview;
@@ -49,12 +50,13 @@ use crate::relay::RelayConnection;
 use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
-use crate::stores::zones::{load_zones, section_routes_to_zone, Zone, ZoneVisibility};
+use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
 use crate::utils::format_relative_time;
 use crate::utils::lookup::{
     deadline_for, key_state_memo, zone_is_encrypted, zone_is_gated, Lookup,
 };
-use crate::utils::slug_hash::{matches_section_slug, matches_topic_slug, section_slug};
+use crate::utils::section_url::{canonical_topic_path, find_by_section_slug, section_path};
+use crate::utils::slug_hash::matches_topic_slug;
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
 use crate::topics::{
@@ -121,14 +123,9 @@ fn resolve_section_channel(
     section_slug_param: &str,
     zones: &[Zone],
 ) -> Option<ChannelMeta> {
-    // Hashed form first (#9): match the channel-id hash OR the section-tag hash
-    // (CategoryCard links group by section tag), scoped to the zone.
-    if let Some(found) = channels.iter().find(|c| {
-        let routes = section_routes_to_zone(&c.section, category_slug, zones);
-        routes
-            && (matches_section_slug(&c.id, section_slug_param)
-                || (!c.section.is_empty() && matches_section_slug(&c.section, section_slug_param)))
-    }) {
+    // Hashed form first (#9): the channel-id hash (canonical), or the
+    // section-tag hash old Forums index links carry, scoped to the zone.
+    if let Some(found) = find_by_section_slug(channels, category_slug, section_slug_param, zones) {
         return Some(found.clone());
     }
     // Legacy plaintext fallback (shared with SectionPage).
@@ -284,6 +281,58 @@ pub fn ThreadPage() -> impl IntoView {
             None => pinned_root
                 .get_value()
                 .filter(|r| matches_topic_slug(&r.id, &slug)),
+        }
+    });
+
+    // One URL per topic: an old form (section-tag hash, `/forums/…`, zone id,
+    // full root id) is replaced in place by the canonical one.
+    keep_address_canonical(move || {
+        let ch = resolved_channel.get()?;
+        let root = topic_root.get().map(|r| r.id);
+        canonical_topic_path(&ch, &topic_param(), root.as_deref(), &load_zones())
+    });
+
+    // "Continue where you left off" (utils::resume): remember this topic.
+    // Route plus zone and section names; the topic title only for an
+    // unencrypted zone (`point_for` drops it otherwise), never content.
+    Effect::new(move |_| {
+        if !has_zone_access.get() {
+            return;
+        }
+        let (Some(pk), Some(ch)) = (auth.pubkey().get(), resolved_channel.get()) else {
+            return;
+        };
+        let root = topic_root.get();
+        // Always the canonical ids (see `utils::section_url`), whichever form
+        // the address had: an old form is about to be replaced. A full-id
+        // topic link waits for its root.
+        let section = crate::utils::slug_hash::section_slug(&ch.id);
+        let param = topic_param();
+        let topic = match root.as_ref() {
+            Some(r) => crate::utils::slug_hash::topic_slug(&r.id),
+            None if crate::utils::slug_hash::is_topic_slug(&param) => param.to_lowercase(),
+            None => return,
+        };
+        let title = root.as_ref().map(|r| first_line(&r.content));
+        let name = if ch.name.trim().is_empty() {
+            "Section".to_string()
+        } else {
+            ch.name.clone()
+        };
+        let visit = crate::utils::resume::TopicVisit {
+            slug: &topic,
+            title: title.as_deref(),
+            is_zone_message: root
+                .as_ref()
+                .is_some_and(crate::zone_crypto::is_zone_message),
+        };
+        if let Some(point) = crate::utils::resume::point_for(
+            &load_zones(),
+            &category_slug(),
+            Some((&section, &name)),
+            Some(visit),
+        ) {
+            crate::utils::resume::remember(&pk, &point);
         }
     });
 
@@ -630,7 +679,7 @@ pub fn ThreadPage() -> impl IntoView {
     // Section href (hashed) for breadcrumb back-link — REAL section name shown.
     let section_href = move || {
         match resolved_channel.get() {
-            Some(ch) => format!("/{}/{}", category_url_slug(), section_slug(&ch.id)),
+            Some(ch) => section_path(&category_url_slug(), &ch.id),
             // Preserve whatever section param brought us here.
             None => format!("/{}/{}", category_url_slug(), section_param()),
         }
@@ -961,7 +1010,11 @@ pub fn ThreadPage() -> impl IntoView {
             // the global "Forums" crumb but keep the zone as the landing link;
             // everyone else keeps Home › Forums › {Zone} › {Section} › {Topic}.
             {move || {
-                let slug = category_slug();
+                // `try_with`: this closure can re-run after the route has
+                // disposed the page (see `history_loader::read_cursor`).
+                let Some(slug) = params.try_with(|p| p.get("category").unwrap_or_default()) else {
+                    return ().into_any();
+                };
                 let zone_label = category_display_name(&slug);
                 let zone_href = format!("/{}", category_url_slug());
                 let sec_name = section_name();
@@ -991,12 +1044,18 @@ pub fn ThreadPage() -> impl IntoView {
                 }
             }}
 
+            // `try_*` in the nested closures below: Leptos 0.7 drops them a
+            // task hop after the route disposed this page, and a store write
+            // in between re-runs them (see `history_loader::read_cursor`).
             {move || {
-                if loading.get() {
+                let Some(loading) = loading.try_get() else {
+                    return ().into_any();
+                };
+                if loading {
                     view! {
                         <div class="flex flex-col items-center justify-center py-20 gap-3">
                             <div class="animate-spin w-6 h-6 border-2 border-[color:var(--zone-accent)] border-t-transparent rounded-full"></div>
-                            <span class="text-gray-400 text-sm">{move || if lookup.get() == Lookup::KeysLoading {
+                            <span class="text-gray-400 text-sm">{move || if lookup.try_get() == Some(Lookup::KeysLoading) {
                                 "Fetching your keys for this zone\u{2026}"
                             } else {
                                 "Loading topic..."
@@ -1048,11 +1107,13 @@ pub fn ThreadPage() -> impl IntoView {
             }}
 
             // Replies
-            <Show when=move || topic_root.get().is_some() && !loading.get()>
+            <Show when=move || {
+                topic_root.try_with(Option::is_some).unwrap_or(false) && loading.try_get() == Some(false)
+            }>
                 <div class="mt-6">
                     <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">
                         {move || {
-                            let n = reply_total.get();
+                            let n = reply_total.try_get().unwrap_or_default();
                             if n == 0 {
                                 "No replies yet".to_string()
                             } else if n == 1 {
@@ -1076,7 +1137,7 @@ pub fn ThreadPage() -> impl IntoView {
                             needles=history_needles
                         />
                         <For
-                            each=move || replies.get()
+                            each=move || replies.try_get().unwrap_or_default()
                             key=|r| (r.id.clone(), view_key(r))
                             children=move |r| view! {
                                 <ReplyCard
@@ -1105,7 +1166,11 @@ pub fn ThreadPage() -> impl IntoView {
 
             // Reply composer (always appends at the bottom; shows a quote chip
             // when the reader tapped "Reply" on a specific post).
-            <Show when=move || is_authed.get() && topic_root.get().is_some() && !loading.get()>
+            <Show when=move || {
+                is_authed.try_get().unwrap_or(false)
+                    && topic_root.try_with(Option::is_some).unwrap_or(false)
+                    && loading.try_get() == Some(false)
+            }>
                 <div id="thread-reply-composer" class="mt-6 bg-gray-800 border border-gray-700 rounded-lg p-3">
                     {move || reply_target.get().map(|t| view! {
                         <div class="flex items-center gap-2 mb-2 px-2 py-1.5 rounded bg-gray-900/60 border-l-2 border-[color:var(--zone-accent)] text-xs">

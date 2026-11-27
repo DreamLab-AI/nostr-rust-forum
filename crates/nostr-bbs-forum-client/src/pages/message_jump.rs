@@ -40,8 +40,8 @@ use crate::topics::jump::{
     channel_events_across, fallback, find_held, topic_root_of, Fallback, RESOLVE_TIMEOUT_MS,
 };
 use crate::topics::thread::edit_target_of;
+use crate::utils::section_url::topic_path;
 use crate::utils::set_timeout_once;
-use crate::utils::slug_hash::{section_slug, topic_slug};
 
 /// How often the give-up check re-runs after [`RESOLVE_TIMEOUT_MS`].
 const GIVE_UP_POLL_MS: i32 = 1_000;
@@ -295,10 +295,8 @@ pub fn MessageJumpPage() -> impl IntoView {
         let topic_url = |root: &str| {
             zone_id.as_deref().map(|z| {
                 format!(
-                    "/forums/{}/{}/{}?focus={}",
-                    zone_path_for_id(z),
-                    section_slug(&cid),
-                    topic_slug(root),
+                    "{}?focus={}",
+                    topic_path(&zone_path_for_id(z), &cid, root),
                     focus
                 )
             })

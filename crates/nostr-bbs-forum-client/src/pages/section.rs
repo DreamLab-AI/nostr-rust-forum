@@ -43,6 +43,7 @@ use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::access_denied::AccessDenied;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
+use crate::components::canonical_address::keep_address_canonical;
 use crate::components::message_input::MessageInput;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::topic_list::{classify_topics, with_topic_stats, TopicList, TopicSummary};
@@ -56,7 +57,7 @@ use crate::utils::capitalize;
 use crate::utils::lookup::{
     deadline_for, key_state_memo, zone_is_encrypted, zone_is_gated, Lookup,
 };
-use crate::utils::slug_hash::matches_section_slug;
+use crate::utils::section_url::{canonical_section_path, find_by_section_slug};
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
 /// Map a zone slug to its display name. Config-driven: resolves against the
@@ -151,23 +152,9 @@ fn resolve_section(
     section_slug_param: &str,
     zones: &[Zone],
 ) -> Option<ChannelMeta> {
-    // The URL param may be the zone's slug (short URLs, issue #45) or its
-    // legacy id — canonicalise to the zone ID, which is what
-    // `section_to_zone` yields for channel routing.
-    let cat = crate::stores::zones::resolve_zone_param(category_slug, zones)
-        .map(|z| z.id.to_lowercase())
-        .unwrap_or_else(|| category_slug.to_lowercase());
-    // Hashed form (#9): match the channel-id hash (SectionCard links) OR the
-    // section-tag hash (CategoryCard links group channels by section tag).
-    if let Some(found) = channels.iter().find(|c| {
-        let routes_to_category = cat.is_empty()
-            || section_to_zone(&c.section, zones)
-                .map(|z| z.to_lowercase() == cat)
-                .unwrap_or(false);
-        routes_to_category
-            && (matches_section_slug(&c.id, section_slug_param)
-                || (!c.section.is_empty() && matches_section_slug(&c.section, section_slug_param)))
-    }) {
+    // Hashed form (#9): the channel-id hash (canonical), or the section-tag
+    // hash old Forums index links carry.
+    if let Some(found) = find_by_section_slug(channels, category_slug, section_slug_param, zones) {
         return Some(found.clone());
     }
     // Legacy plaintext fallback (old seeded / bookmarked links).
@@ -223,6 +210,41 @@ pub fn SectionPage() -> impl IntoView {
         let chans = store.channels.get();
         let zones = load_zones();
         resolve_section(&chans, &category_slug(), &section_slug(), &zones)
+    });
+
+    // One URL per section: an old form (section-tag hash, `/forums/…`, zone
+    // id) is replaced in place by the canonical one once the channel resolves.
+    keep_address_canonical(move || {
+        resolved_channel
+            .get()
+            .and_then(|ch| canonical_section_path(&ch, &load_zones()))
+    });
+
+    // "Continue where you left off" (utils::resume): remember this section
+    // (route plus zone and section names, no content) once it resolves.
+    Effect::new(move |_| {
+        if !has_zone_access.get() {
+            return;
+        }
+        let (Some(pk), Some(ch)) = (auth.pubkey().get(), resolved_channel.get()) else {
+            return;
+        };
+        // Always the canonical section id (the channel-id hash), whichever
+        // form the address had: an old form is about to be replaced.
+        let slug = crate::utils::slug_hash::section_slug(&ch.id);
+        let name = if ch.name.trim().is_empty() {
+            humanize_section_slug(&slug)
+        } else {
+            ch.name.clone()
+        };
+        if let Some(point) = crate::utils::resume::point_for(
+            &load_zones(),
+            &category_slug(),
+            Some((&slug, &name)),
+            None,
+        ) {
+            crate::utils::resume::remember(&pk, &point);
+        }
     });
 
     // Pod container for images attached to a new topic: this channel's zone.
@@ -485,7 +507,11 @@ pub fn SectionPage() -> impl IntoView {
             // the global "Forums" crumb but keep the zone as the landing link;
             // everyone else keeps Home › Forums › {Zone} › {Section}.
             {move || {
-                let slug = category_slug();
+                // `try_with`: this closure can re-run after the route has
+                // disposed the page (see `history_loader::read_cursor`).
+                let Some(slug) = params.try_with(|p| p.get("category").unwrap_or_default()) else {
+                    return ().into_any();
+                };
                 let zone_label = category_display_name(&slug);
                 let zone_href = format!("/{}", category_url_slug());
                 let section_label = header_name();
@@ -520,14 +546,20 @@ pub fn SectionPage() -> impl IntoView {
                         }
                     })}
                     <span class="inline-block mt-2 text-xs text-gray-500 border border-gray-600 rounded px-1.5 py-0.5">
+                        // `try_*` in this page's nested closures: Leptos 0.7
+                        // drops them a task hop after the route disposed the
+                        // page, and a store write in between re-runs them
+                        // (see `history_loader::read_cursor`).
                         {move || {
-                            let n = topics.get().len();
+                            let n = topics.try_with(Vec::len).unwrap_or_default();
                             if n == 1 { "1 topic".to_string() } else { format!("{n} topics") }
                         }}
                     </span>
                 </div>
 
-                <Show when=move || is_authed.get() && !section_loading.get()>
+                <Show when=move || {
+                    is_authed.try_get().unwrap_or(false) && section_loading.try_get() == Some(false)
+                }>
                     <button
                         type="button"
                         on:click=move |_| {
@@ -614,7 +646,9 @@ pub fn SectionPage() -> impl IntoView {
             </Show>
 
             {move || {
-                let state = topics_lookup.get();
+                let Some(state) = topics_lookup.try_get() else {
+                    return ().into_any();
+                };
                 if state.is_loading() {
                     view! {
                         <div class="flex flex-col items-center justify-center py-20 gap-3">

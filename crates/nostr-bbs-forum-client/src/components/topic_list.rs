@@ -20,7 +20,7 @@ use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::copy_key::KeyName;
 use crate::utils::format_relative_time;
-use crate::utils::slug_hash::{section_slug, topic_slug};
+use crate::utils::section_url::topic_path;
 
 // The topic model is shared with the BBS client (client-core `topics`).
 pub use crate::topics::{classify_topics, topic_title, with_topic_stats, TopicSummary};
@@ -37,9 +37,8 @@ pub fn TopicList(
     /// Reactive topic summaries, newest-activity first.
     topics: Signal<Vec<TopicSummary>>,
 ) -> impl IntoView {
-    let section_hash = section_slug(&channel_id);
     let category = StoredValue::new(category);
-    let section_hash = StoredValue::new(section_hash);
+    let channel_id = StoredValue::new(channel_id);
 
     // The outer view tracks only EMPTINESS, so it re-renders when the list
     // becomes empty or non-empty, never per change: re-running it per change
@@ -69,11 +68,10 @@ pub fn TopicList(
                             each=move || topics.get()
                             key=|t| (t.id.clone(), t.reply_count, t.last_activity, t.content.len(), t.last_pubkey.clone())
                             children=move |t| {
-                                let href = base_href(&format!(
-                                    "/forums/{}/{}/{}",
-                                    category.get_value(),
-                                    section_hash.get_value(),
-                                    topic_slug(&t.id),
+                                let href = base_href(&topic_path(
+                                    &category.get_value(),
+                                    &channel_id.get_value(),
+                                    &t.id,
                                 ));
                                 view! { <TopicRow topic=t href=href /> }
                             }

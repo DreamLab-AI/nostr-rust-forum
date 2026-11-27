@@ -782,6 +782,8 @@ impl AuthStore {
         crate::stores::notifications::clear_persisted_for_logout(
             self.state.get_untracked().pubkey.as_deref(),
         );
+        // "Continue where you left off" is per identity too.
+        crate::utils::resume::clear_for_logout(self.state.get_untracked().pubkey.as_deref());
         self.privkey.update_value(|opt| {
             if let Some(ref mut v) = opt {
                 v.iter_mut().for_each(|b| *b = 0);

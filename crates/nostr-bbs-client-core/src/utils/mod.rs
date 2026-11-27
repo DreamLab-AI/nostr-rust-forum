@@ -1,5 +1,6 @@
 //! Shared utility functions used across forum-client components.
 
+pub mod back_nav;
 pub mod bake;
 pub mod bootstrap;
 pub mod clipboard;
@@ -18,9 +19,11 @@ pub mod qr_scan;
 pub mod reconcile;
 pub mod relay_url;
 pub mod restricted_media;
+pub mod resume;
 pub mod sanitize;
 pub mod scroll_anchor;
 pub mod sealed_search;
+pub mod section_url;
 pub mod slug_hash;
 // zone_theme.rs is owned elsewhere (do-not-touch) and contains one genuinely
 // unused fn (`zone_accent_style`, superseded by `zone_accent_style_cfg`).

@@ -55,7 +55,7 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zones::{load_zones, section_to_zone};
 use crate::utils::bootstrap::{derive_phase, BootstrapSignals};
 use crate::utils::reconcile::{absent_from, id_set, Reconciliation};
-use crate::utils::slug_hash::section_slug;
+use crate::utils::section_url::canonical_section_path;
 use crate::utils::zone_theme::zone_accent_style_cfg;
 use crate::utils::{arrow_left_svg, set_timeout_once};
 
@@ -112,20 +112,7 @@ pub fn ChannelPage() -> impl IntoView {
                             || c.name.to_lowercase() == needle_lower
                             || c.section.to_lowercase() == needle_lower
                     })
-                    .and_then(|c| {
-                        let section = if c.section.is_empty() {
-                            zones.first().map(|z| z.id.clone()).unwrap_or_default()
-                        } else {
-                            c.section.clone()
-                        };
-                        section_to_zone(&section, &zones).map(|zone| {
-                            format!(
-                                "/{}/{}",
-                                crate::stores::zones::zone_path_for_id(&zone),
-                                section_slug(&c.id)
-                            )
-                        })
-                    })
+                    .and_then(|c| canonical_section_path(c, &zones))
             })
         })
     };
