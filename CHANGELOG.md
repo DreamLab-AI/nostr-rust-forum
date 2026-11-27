@@ -18,6 +18,30 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Sealed search: incremental nightly updates (2026-11-27)
+
+Sealed-search crate, builder, client core and search worker. Nothing is deployed or scheduled by this change; operator
+steps: [`docs/runbooks/sealed-search-incremental.md`](docs/runbooks/sealed-search-incremental.md).
+
+- **Manifest content v2** (versioned, backward compatible). Objects may carry the `version` their header was built at
+  and the trusted publisher (`owner`) whose pod holds them; the content may list `excluded` row ids. Defaults read as
+  v1, so a v1 manifest verifies and opens unchanged; a v1 manifest carrying v2 fields is refused. Browsers built before
+  this refuse v2 manifests as unsupported and keep using the newest v1 one (the archivist's base).
+- **Builder.** `nostr-bbs-search-build` is now a library plus binary. `--from-relay` (or `--from-events`, a NIP-01
+  export) reads and opens a zone's posts in memory: live posts by their own id, sealed originals by the original id;
+  deleted (kind-5) and superseded (edited) posts left out. New `update` (seal only new rows, list earlier objects
+  unchanged, exclude deleted or edited indexed posts), `compact [--all]` (re-pack shards verbatim, drop excluded rows and
+  rows the relay no longer serves, refuse when more than 5% are missing), and `status`. State file with the high-water
+  mark, rollback check against the last version published, and a one-run grace period before superseded objects are
+  deleted. Publisher key from `NOSTR_BBS_MIGRATE_KEY` or `--key-file` (0600). The explicit `--version` flag is gone:
+  a run always publishes the newest verified version + 1.
+- **Client.** Each object is fetched from the pod of the publisher that holds it; hits whose id the manifest excludes
+  are dropped (the worker's `Index` already skips them). The IndexedDB cache was already keyed by SHA-256, so objects a
+  new manifest lists unchanged are not fetched again.
+- **zone-migrate.** `Filter` gains `since` and `#sealed`.
+- **Job.** `scripts/sealed-search-nightly.sh`: update, then compact when enough partial shard pairs exist; lock,
+  time budget, distinct exit codes, no secrets in argv.
+
 ### Inter self-hosted; BBS page gets the baseline CSP (2026-11-26)
 
 Forum client and BBS client shells only.
