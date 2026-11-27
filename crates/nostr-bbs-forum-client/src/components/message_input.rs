@@ -649,7 +649,7 @@ pub(crate) fn MessageInput(
                     .unwrap_or_else(|| crate::stores::zones::media_target_for_section(None));
                 if target.container_path().is_none() {
                     upload_error.set(Some(
-                        "This channel is not in a zone, so images cannot be attached here".into(),
+                        "This section is not in a zone, so images cannot be attached here".into(),
                     ));
                     return;
                 }

@@ -578,13 +578,13 @@ impl NotificationStoreV2 {
                     continue;
                 }
                 let name = if c.name.is_empty() {
-                    "a new channel".to_string()
+                    "a new section".to_string()
                 } else {
                     c.name.clone()
                 };
                 store.add_at(
                     NotificationKind::Message,
-                    "New topic",
+                    "New section",
                     &format!("{} was created", name),
                     Some(&format!("/chat/{}", c.id)),
                     Origin {
@@ -626,7 +626,7 @@ impl NotificationStoreV2 {
                     .get(cid)
                     .filter(|n| !n.is_empty())
                     .cloned()
-                    .unwrap_or_else(|| "a channel".to_string());
+                    .unwrap_or_else(|| "a section".to_string());
 
                 for event in events.iter() {
                     if store

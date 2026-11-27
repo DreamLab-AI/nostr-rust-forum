@@ -285,7 +285,7 @@ pub fn PushSettings() -> impl IntoView {
                                 on:change=toggle(|p| &mut p.dms) />
                         </label>
                         <label class="flex items-center justify-between cursor-pointer">
-                            <span class="text-sm text-gray-300">"New topics"</span>
+                            <span class="text-sm text-gray-300">"New sections"</span>
                             <input type="checkbox"
                                 class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
                                 prop:checked=move || prefs.get().is_some_and(|p| p.new_topics)

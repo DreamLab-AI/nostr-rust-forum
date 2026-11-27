@@ -215,7 +215,7 @@ pub async fn upload_image_with_thumbnail_signer(
     target: &MediaTarget,
 ) -> Result<(String, String), String> {
     let container = target.container_path().ok_or_else(|| {
-        "This channel is not in a zone, so images cannot be attached here".to_string()
+        "This section is not in a zone, so images cannot be attached here".to_string()
     })?;
     // Millisecond stamp plus a nonce: a multi-file pick or a double paste can
     // land in the same millisecond.

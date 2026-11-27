@@ -14,12 +14,13 @@
 //! It already implements backdrop-close, Escape-to-close, and auto-focus
 //! itself.
 
-use crate::app::base_href;
 use crate::components::copy_key::KeyGlyph;
 use crate::relay::{Filter, RelayConnection};
 use gloo::events::EventListener;
 use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
+use leptos_router::hooks::use_navigate;
+use leptos_router::NavigateOptions;
 use serde::{Deserialize, Serialize};
 
 /// A raw message search hit before relay hydration: `(event_id, score, content, label)`.
@@ -85,7 +86,7 @@ impl Tab {
     fn label(&self) -> &'static str {
         match self {
             Self::All => "All",
-            Self::Channels => "Channels",
+            Self::Channels => "Sections",
             Self::Messages => "Messages",
             Self::Users => "Users",
         }
@@ -176,9 +177,11 @@ impl Hit {
             Self::User { .. } => ("@", "bg-purple-500/10 text-purple-400"),
         }
     }
-    fn href(&self) -> String {
+    /// Router path of the hit, relative to the router base (`FORUM_BASE`),
+    /// for `use_navigate`: a result opens in the app, not by a document load.
+    fn path(&self) -> String {
         match self {
-            Self::Channel { id, .. } => base_href(&format!("/chat/{}", id)),
+            Self::Channel { id, .. } => format!("/chat/{id}"),
             // Messages open AT the message: `/go/:id` resolves the topic it
             // lives in and lands on it (pages/message_jump.rs), rather than
             // dropping the reader one level up in the channel. The channel
@@ -188,11 +191,11 @@ impl Hit {
                 event_id,
                 channel_id,
                 ..
-            } => base_href(&crate::pages::jump_link(event_id, Some(channel_id))),
+            } => crate::pages::jump_link(event_id, Some(channel_id)),
             Self::SemanticMessage { event_id, id, .. } => {
-                base_href(&crate::pages::jump_link(event_id, Some(id)))
+                crate::pages::jump_link(event_id, Some(id))
             }
-            Self::User { pubkey, .. } => base_href(&format!("/profile/{}", pubkey)),
+            Self::User { pubkey, .. } => format!("/profile/{pubkey}"),
         }
     }
     fn score(&self) -> Option<f64> {
@@ -201,6 +204,69 @@ impl Hit {
             _ => None,
         }
     }
+}
+
+/// Where the on-device index for encrypted zones stands, as the panel sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SealedIndex {
+    /// Nothing to wait for: no encrypted zone this member can search, or its
+    /// load finished without anything to search.
+    Idle,
+    /// The member's zone keys or the index are still on their way.
+    Loading,
+    /// At least one encrypted zone is searchable in the worker.
+    Ready,
+}
+
+/// The index state when the panel opens. `searchable` is "an encrypted zone
+/// and an index publisher are configured"; `keys_ready` is "this member's
+/// stored zone keys are read"; `holds_key` is "a key for one of those zones is
+/// held"; `ready_now` is [`sealed_search::ready`](crate::utils::sealed_search::ready).
+fn sealed_state_on_open(
+    searchable: bool,
+    keys_ready: bool,
+    holds_key: bool,
+    ready_now: bool,
+) -> SealedIndex {
+    if ready_now {
+        SealedIndex::Ready
+    } else if !searchable || (keys_ready && !holds_key) {
+        SealedIndex::Idle
+    } else {
+        SealedIndex::Loading
+    }
+}
+
+/// Whether `tab` searches message bodies (and so encrypted zones).
+fn searches_messages(tab: &Tab) -> bool {
+    matches!(tab, Tab::All | Tab::Messages)
+}
+
+/// Whether to tell the member that encrypted zones were not searched yet.
+fn sealed_notice(state: SealedIndex, tab: &Tab, query: &str) -> bool {
+    state == SealedIndex::Loading && searches_messages(tab) && !query.trim().is_empty()
+}
+
+/// Whether the index load that moved `prev` to `next` should re-run the
+/// query in the open panel, so results appear without retyping.
+fn rerun_on_ready(
+    prev: SealedIndex,
+    next: SealedIndex,
+    open: bool,
+    query: &str,
+    tab: &Tab,
+) -> bool {
+    prev == SealedIndex::Loading
+        && next == SealedIndex::Ready
+        && open
+        && searches_messages(tab)
+        && !query.trim().is_empty()
+}
+
+/// Whether to say "No results found": not while searching, and not while
+/// encrypted zones are still to come (the notice says so instead).
+fn shows_no_results(loading: bool, empty: bool, query: &str, sealed_pending: bool) -> bool {
+    !loading && empty && !query.trim().is_empty() && !sealed_pending
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -224,6 +290,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     // used to be swallowed silently while the list rendered nothing).
     let search_error: RwSignal<Option<String>> = RwSignal::new(None);
     let sel = RwSignal::new(0usize);
+    let search_gen = StoredValue::new(0u64);
     let input_ref = NodeRef::<leptos::html::Input>::new();
     let recents = RwSignal::new(load_recents());
 
@@ -239,28 +306,13 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     // Sealed per-zone search (encrypted zones): on open, load each sealed
     // zone's verified index into the search worker. Nothing is sent to a
     // search server; the query is embedded in the worker, on this device.
+    // The load runs once at a time; the panel shows its progress (`sealed`)
+    // and re-runs the query when it completes (effect below `do_search`).
     let zone_store = crate::zone_crypto::store::try_use_zone_key_store();
     let auth = crate::auth::use_auth();
-    Effect::new(move |_| {
-        if is_open.get() {
-            let (Some(store), Some(signer)) = (zone_store, auth.get_signer()) else {
-                return;
-            };
-            wasm_bindgen_futures::spawn_local(async move {
-                let mut any = crate::utils::sealed_search::ready();
-                for zone in crate::utils::sealed_search::sealed_zones() {
-                    match crate::utils::sealed_search::ensure_zone(&zone, &store, &*signer).await {
-                        Ok(n) if n > 0 => any = true,
-                        Ok(_) => {}
-                        Err(e) => {
-                            web_sys::console::warn_1(&format!("[sealed-search] {zone}: {e}").into())
-                        }
-                    }
-                }
-                api_online.set(any);
-            });
-        }
-    });
+    let sealed = RwSignal::new(SealedIndex::Idle);
+    let sealed_in_flight = StoredValue::new(false);
+    let navigate = StoredValue::new(use_navigate());
 
     // Cmd/Ctrl+K global listener
     let listener = EventListener::new(&gloo::utils::document(), "keydown", move |e| {
@@ -287,6 +339,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 50,
             );
         } else {
+            search_gen.update_value(|g| *g += 1);
             query.set(String::new());
             results.set(Vec::new());
             sel.set(0);
@@ -305,6 +358,10 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     let do_search = move || {
         let q = query.get_untracked();
         let t = tab.get_untracked();
+        // Only the newest search writes the panel: a slower earlier one (say,
+        // from before the encrypted index was ready) must not overwrite it.
+        search_gen.update_value(|g| *g += 1);
+        let generation = search_gen.get_value();
         if q.trim().is_empty() {
             results.set(Vec::new());
             loading.set(false);
@@ -420,6 +477,9 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 let _ = JsFuture::from(delay).await;
                 out.extend(found.get_untracked());
             }
+            if search_gen.try_get_value() != Some(generation) {
+                return;
+            }
             if !errors.is_empty() {
                 let msg = errors.join(" \u{2014} ");
                 web_sys::console::warn_1(&format!("[search] {msg}").into());
@@ -475,16 +535,73 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
         query.set(i.value());
         trigger();
     };
+
+    // Sealed per-zone search (encrypted zones): on open, load each sealed
+    // zone's verified index into the search worker. Nothing is sent to a
+    // search server; the query is embedded in the worker, on this device.
+    // Tracks the key store's readiness too, so a panel opened before the
+    // member's keys are read starts the load once they are.
+    Effect::new(move |_| {
+        if !is_open.get() {
+            return;
+        }
+        let (Some(store), Some(signer)) = (zone_store, auth.get_signer()) else {
+            sealed.set(SealedIndex::Idle);
+            return;
+        };
+        let zones = crate::utils::sealed_search::sealed_zones();
+        let searchable = !zones.is_empty() && !crate::utils::sealed_search::publishers().is_empty();
+        let keys_ready = store.ready_for(auth.pubkey().get().as_deref());
+        let holds_key = keys_ready && zones.iter().any(|z| !store.all_for_zone(z).is_empty());
+        let ready_now = crate::utils::sealed_search::ready();
+        sealed.set(sealed_state_on_open(
+            searchable, keys_ready, holds_key, ready_now,
+        ));
+        if !searchable || !holds_key || sealed_in_flight.get_value() {
+            return;
+        }
+        sealed_in_flight.set_value(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            for zone in zones {
+                if let Err(e) =
+                    crate::utils::sealed_search::ensure_zone(&zone, &store, &*signer).await
+                {
+                    web_sys::console::warn_1(&format!("[sealed-search] {zone}: {e}").into());
+                }
+            }
+            let _ = sealed_in_flight.try_set_value(false);
+            let next = if crate::utils::sealed_search::ready() {
+                SealedIndex::Ready
+            } else {
+                SealedIndex::Idle
+            };
+            let Some(prev) = sealed.try_get_untracked() else {
+                return;
+            };
+            sealed.set(next);
+            api_online.set(next == SealedIndex::Ready);
+            if rerun_on_ready(
+                prev,
+                next,
+                is_open.get_untracked(),
+                &query.get_untracked(),
+                &tab.get_untracked(),
+            ) {
+                do_search();
+            }
+        });
+    });
+
+    // Results open in the app (router), as notification rows do, never by a
+    // full document load; Enter takes the same path as a click.
     let nav_result = move |idx: usize| {
         let r = results.get_untracked();
         if let Some(hit) = r.get(idx) {
             save_recent(&query.get_untracked());
             recents.set(load_recents());
-            let href = hit.href();
+            let path = hit.path();
             is_open.set(false);
-            if let Some(w) = web_sys::window() {
-                let _ = w.location().set_href(&href);
-            }
+            navigate.with_value(|nav| nav(&path, NavigateOptions::default()));
         }
     };
     let on_keydown = move |ev: leptos::ev::KeyboardEvent| {
@@ -531,7 +648,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 <div class="search-panel" on:click=|e| e.stop_propagation() on:keydown=on_keydown role="search" aria-label="Global search">
                     <div class="flex items-center gap-3 p-4 border-b border-gray-700/50">
                         <svg class="w-5 h-5 text-gray-400 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                        <input node_ref=input_ref type="text" class="flex-1 bg-transparent text-white placeholder-gray-500 focus:outline-none text-sm" placeholder="Search channels, messages, users..." prop:value=move || query.get() on:input=on_input aria-label="Search query" autocomplete="off" />
+                        <input node_ref=input_ref type="text" class="flex-1 bg-transparent text-white placeholder-gray-500 focus:outline-none text-sm" placeholder="Search sections, messages, users..." prop:value=move || query.get() on:input=on_input aria-label="Search query" autocomplete="off" />
                         // Semantic toggle pill
                         <button
                             on:click=toggle_semantic
@@ -555,6 +672,12 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                         <Show when=move || search_error.get().is_some()>
                             <div class="mx-1 mt-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-xs text-red-300" role="alert">
                                 {move || search_error.get().unwrap_or_default()}
+                            </div>
+                        </Show>
+                        <Show when=move || sealed_notice(sealed.get(), &tab.get(), &query.get())>
+                            <div class="mx-1 mt-2 flex items-center gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2 text-xs text-amber-300" role="status" aria-live="polite">
+                                <span class="animate-pulse w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"></span>
+                                "Encrypted zones are still loading; results will appear here"
                             </div>
                         </Show>
                         <Show when=move || loading.get()>
@@ -585,7 +708,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                                 </div> }
                             }).collect_view() }}</div>
                         </Show>
-                        <Show when=move || !loading.get() && results.get().is_empty() && !query.get().trim().is_empty()>
+                        <Show when=move || shows_no_results(loading.get(), results.get().is_empty(), &query.get(), sealed_notice(sealed.get(), &tab.get(), &query.get()))>
                             <p class="text-center text-gray-500 text-sm py-8">{move || format!("No results found for '{}'", query.get())}</p>
                         </Show>
                         <Show when=move || !loading.get() && query.get().trim().is_empty()>
@@ -763,7 +886,7 @@ mod tests {
             author: String::new(),
             channel_id: "chan".into(),
         };
-        assert_eq!(m.href(), base_href("/go/e1?c=chan"));
+        assert_eq!(m.path(), "/go/e1?c=chan");
         let sm = Hit::SemanticMessage {
             event_id: "e2".into(),
             id: "chan".into(),
@@ -771,14 +894,126 @@ mod tests {
             label: String::new(),
             score: 0.5,
         };
-        assert_eq!(sm.href(), base_href("/go/e2?c=chan"));
+        assert_eq!(sm.path(), "/go/e2?c=chan");
         let unknown = Hit::Message {
             event_id: "e3".into(),
             content: String::new(),
             author: String::new(),
             channel_id: String::new(),
         };
-        assert_eq!(unknown.href(), base_href("/go/e3"));
+        assert_eq!(unknown.path(), "/go/e3");
+    }
+
+    #[test]
+    fn every_hit_path_is_app_relative_for_the_router() {
+        // The router is mounted at `FORUM_BASE`, so a path handed to
+        // `use_navigate` must not carry the base itself (or it doubles up).
+        let hits = [
+            Hit::Channel {
+                id: "chan".into(),
+                name: String::new(),
+                desc: String::new(),
+            },
+            Hit::User {
+                pubkey: "ab".into(),
+                nickname: None,
+            },
+        ];
+        assert_eq!(hits[0].path(), "/chat/chan");
+        assert_eq!(hits[1].path(), "/profile/ab");
+        for h in &hits {
+            assert!(h.path().starts_with('/'), "{}", h.path());
+            assert!(!h.path().starts_with("/community/"), "{}", h.path());
+        }
+    }
+
+    // ── Encrypted-zone index readiness ──────────────────────────────────────
+
+    #[test]
+    fn nothing_to_load_means_no_loading_state() {
+        // No sealed zone or no publisher: there is nothing to wait for.
+        assert_eq!(
+            sealed_state_on_open(false, true, true, false),
+            SealedIndex::Idle
+        );
+        // Keys loaded, none held for a sealed zone: never "still loading".
+        assert_eq!(
+            sealed_state_on_open(true, true, false, false),
+            SealedIndex::Idle
+        );
+    }
+
+    #[test]
+    fn loading_while_keys_or_index_are_on_their_way() {
+        // Stored keys not yet read: the zones cannot be searched yet.
+        assert_eq!(
+            sealed_state_on_open(true, false, false, false),
+            SealedIndex::Loading
+        );
+        assert_eq!(
+            sealed_state_on_open(true, true, true, false),
+            SealedIndex::Loading
+        );
+    }
+
+    #[test]
+    fn an_index_already_in_the_worker_is_ready() {
+        assert_eq!(
+            sealed_state_on_open(true, true, true, true),
+            SealedIndex::Ready
+        );
+        assert_eq!(
+            sealed_state_on_open(false, false, false, true),
+            SealedIndex::Ready
+        );
+    }
+
+    #[test]
+    fn the_notice_shows_only_for_a_pending_message_search() {
+        let l = SealedIndex::Loading;
+        assert!(sealed_notice(l, &Tab::All, "Glastonbury"));
+        assert!(sealed_notice(l, &Tab::Messages, "Glastonbury"));
+        assert!(
+            !sealed_notice(l, &Tab::Channels, "Glastonbury"),
+            "no messages searched"
+        );
+        assert!(!sealed_notice(l, &Tab::Users, "Glastonbury"));
+        assert!(!sealed_notice(l, &Tab::All, "  "), "no query yet");
+        assert!(!sealed_notice(SealedIndex::Idle, &Tab::All, "Glastonbury"));
+        assert!(!sealed_notice(SealedIndex::Ready, &Tab::All, "Glastonbury"));
+    }
+
+    #[test]
+    fn the_query_reruns_once_the_index_becomes_ready() {
+        let (l, r, i) = (SealedIndex::Loading, SealedIndex::Ready, SealedIndex::Idle);
+        assert!(rerun_on_ready(l, r, true, "Glastonbury", &Tab::All));
+        assert!(rerun_on_ready(l, r, true, "Glastonbury", &Tab::Messages));
+        assert!(
+            !rerun_on_ready(l, i, true, "Glastonbury", &Tab::All),
+            "nothing loaded"
+        );
+        assert!(
+            !rerun_on_ready(r, r, true, "Glastonbury", &Tab::All),
+            "a refresh, not a load"
+        );
+        assert!(
+            !rerun_on_ready(l, r, false, "Glastonbury", &Tab::All),
+            "panel closed"
+        );
+        assert!(!rerun_on_ready(l, r, true, "", &Tab::All), "no query");
+        assert!(!rerun_on_ready(l, r, true, "Glastonbury", &Tab::Users));
+    }
+
+    #[test]
+    fn no_results_waits_for_encrypted_zones() {
+        assert!(shows_no_results(false, true, "x", false));
+        assert!(
+            !shows_no_results(false, true, "x", true),
+            "notice says more"
+        );
+        assert!(!shows_no_results(true, true, "x", false), "still searching");
+        assert!(!shows_no_results(false, false, "x", false));
+        assert!(!shows_no_results(false, true, " ", false));
     }
 
     // Pure tests only: the overlay itself is Leptos/wasm, but the wire contract
