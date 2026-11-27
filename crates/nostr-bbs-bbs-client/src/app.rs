@@ -152,17 +152,8 @@ pub fn App() -> impl IntoView {
         if auth.is_authenticated().get_untracked() {
             router.enter_pwa(resolved_slug);
         } else {
-            let auth_pwa = auth;
-            let router_pwa = router;
             wasm_bindgen_futures::spawn_local(async move {
-                if let Some(secret) = pwa::unwrap_baked_secret().await {
-                    let hex_sk = hex::encode(&secret[..]);
-                    if auth_pwa.login_with_local_key(&hex_sk).is_ok() {
-                        router_pwa.enter_pwa(resolved_slug);
-                        return;
-                    }
-                }
-                router_pwa.go(Route::Rebind);
+                pwa::adopt_baked_or_rebind(&auth, router, resolved_slug).await;
             });
         }
     }

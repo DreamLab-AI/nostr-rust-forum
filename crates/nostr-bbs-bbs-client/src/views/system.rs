@@ -3,7 +3,7 @@
 //! Interactive Help (`#/help`).
 
 use leptos::prelude::*;
-use nostr_bbs_client_core::auth::{nip07, use_auth};
+use nostr_bbs_client_core::auth::{nip07, use_auth, AuthStore, KeyPersistence};
 use nostr_bbs_client_core::relay::RelayConnection;
 use nostr_bbs_client_core::stores::custom_emoji::use_custom_emoji_store;
 use nostr_bbs_client_core::stores::mute::use_mute_store;
@@ -203,7 +203,10 @@ pub fn SettingsView() -> impl IntoView {
 
     // Auth forms
     let key_input: RwSignal<String> = RwSignal::new(String::new());
-    let remember_me: RwSignal<bool> = RwSignal::new(true);
+    // Off by default, as on the forum's login page (audit C2/B8): the flag
+    // behind it is the site-wide `nostr_bbs_remember`, so ticking it also
+    // decides where the forum stores its next local key.
+    let remember_me: RwSignal<bool> = RwSignal::new(false);
     let passkey_busy: RwSignal<bool> = RwSignal::new(false);
     let auth_err: RwSignal<Option<String>> = RwSignal::new(None);
     let generated_secret: RwSignal<Option<String>> = RwSignal::new(None);
@@ -485,9 +488,8 @@ pub fn SettingsView() -> impl IntoView {
                                         class="bbs-btn bbs-btn-primary"
                                         on:click=move |_| {
                                             auth_err.set(None);
-                                            auth.set_remember_me(remember_me.get_untracked());
                                             let raw = key_input.get_untracked();
-                                            match auth.login_with_local_key(&raw) {
+                                            match sign_in_with_key(auth, &raw, remember_me.get_untracked()) {
                                                 Ok(()) => {
                                                     key_input.set(String::new());
                                                     toasts.show("Signed in with key.", ToastVariant::Success);
@@ -517,7 +519,7 @@ pub fn SettingsView() -> impl IntoView {
                                             auth_err.set(None);
                                             let name = gen_name.get_untracked();
                                             let label = if name.trim().is_empty() { "Anon" } else { name.trim() };
-                                            match auth.register_with_generated_key(label) {
+                                            match generate_key(auth, label, remember_me.get_untracked()) {
                                                 Ok(hex_sk) => {
                                                     let nsec = nostr_bbs_core::encode_nsec(&hex_sk).unwrap_or(hex_sk);
                                                     generated_secret.set(Some(nsec));
@@ -866,7 +868,9 @@ pub fn RebindView() -> impl IntoView {
                         err_msg.set(None);
                         busy.set(true);
                         wasm_bindgen_futures::spawn_local(async move {
-                            match auth.login_with_local_key(&raw) {
+                            // The bake below is this app's durable copy; the
+                            // raw key itself stays in memory (ADR-2008).
+                            match auth.login_with_local_key_scoped(&raw, KeyPersistence::MemoryOnly) {
                                 Ok(()) => {
                                     if let Some(sk) = auth.get_privkey_bytes() {
                                         let _ = bake::bake(&sk, &zb).await;
@@ -888,6 +892,28 @@ pub fn RebindView() -> impl IntoView {
             </section>
         </div>
     }
+}
+
+/// Sign in with a pasted key. The BBS stores a raw key only when the member
+/// ticked "Stay signed in" (ADR-2008); otherwise it stays in memory and a
+/// reload signs out. The key moves to durable storage only once the sign-in
+/// succeeded, so a mistyped key never re-saves the previous session's key.
+fn sign_in_with_key(auth: AuthStore, key: &str, stay_signed_in: bool) -> Result<(), String> {
+    auth.login_with_local_key_scoped(key, KeyPersistence::MemoryOnly)?;
+    if stay_signed_in {
+        auth.set_remember_me(true);
+    }
+    Ok(())
+}
+
+/// Generate a throwaway keypair named `label`, stored as for
+/// [`sign_in_with_key`]. Returns the secret key hex for the one-time backup.
+fn generate_key(auth: AuthStore, label: &str, stay_signed_in: bool) -> Result<String, String> {
+    let hex_sk = auth.register_with_generated_key_scoped(label, KeyPersistence::MemoryOnly)?;
+    if stay_signed_in {
+        auth.set_remember_me(true);
+    }
+    Ok(hex_sk)
 }
 
 /// Interactive Help, Slash Commands, and Keybindings reference (`#/help`).

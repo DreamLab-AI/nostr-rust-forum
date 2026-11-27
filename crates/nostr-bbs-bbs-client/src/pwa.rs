@@ -38,9 +38,6 @@ use zeroize::Zeroize;
 #[cfg(target_arch = "wasm32")]
 use nostr_bbs_client_core::auth::AuthStore;
 
-#[cfg(target_arch = "wasm32")]
-use crate::config::BbsConfig;
-
 // ── Pure helpers (unit-tested on the native target) ─────────────────────────
 
 /// Which one-time rebind flow the isolated iOS first launch offers.
@@ -221,17 +218,28 @@ pub async fn bake_local(secret: &[u8; 32], zone_id: &str) -> Result<(), JsValue>
     Ok(())
 }
 
-/// One-shot adoption: unwrap the baked key and sign into [`AuthStore`], or
-/// route to [`crate::router::Route::Rebind`] when nothing is baked.
+/// One-shot adoption: unwrap the baked key, sign into [`AuthStore`] and enter
+/// PWA mode on `zone_slug`, or route to [`crate::router::Route::Rebind`] when
+/// nothing is baked.
+///
+/// The key is held in memory only (ADR-2008): the bake is the installed app's
+/// durable copy, so it is never copied into web storage as plain hex.
 #[cfg(target_arch = "wasm32")]
 pub async fn adopt_baked_or_rebind(
     auth: &AuthStore,
-    _cfg: &BbsConfig,
     router: crate::router::Router,
+    zone_slug: String,
 ) {
     if let Some(secret) = unwrap_baked_secret().await {
-        let hex_sk = hex::encode(&secret[..]);
-        if auth.login_with_local_key(&hex_sk).is_ok() {
+        let hex_sk = zeroize::Zeroizing::new(hex::encode(&secret[..]));
+        if auth
+            .login_with_local_key_scoped(
+                &hex_sk,
+                nostr_bbs_client_core::auth::KeyPersistence::MemoryOnly,
+            )
+            .is_ok()
+        {
+            router.enter_pwa(zone_slug);
             return;
         }
     }
