@@ -263,8 +263,13 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     let loading_older = Memo::new(move |_| channels.history_cursor(&cid.get_value()).loading);
 
     let show_new_topic = RwSignal::new(false);
+    // Render closures here read page-owned values with `try_*`: Leptos 0.7
+    // drops a page's nested render effects a task hop after the router has
+    // disposed the page, and a store write in between (the next page's
+    // first effects, for the same channel) re-runs them; `get` then panics
+    // (the forum's `history_loader::read_cursor` has the details).
     let channel_name = move || {
-        let id = cid.get_value();
+        let id = cid.try_get_value().unwrap_or_default();
         channels
             .channels
             .with(|cs| cs.iter().find(|c| c.id == id).map(|c| c.name.clone()))
@@ -309,12 +314,12 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                         class="bbs-btn bbs-btn-primary"
                         on:click=move |_| show_new_topic.update(|v| *v = !*v)
                     >
-                        {move || if show_new_topic.get() { "× Close Composer" } else { "+ New Topic" }}
+                        {move || if show_new_topic.try_get().unwrap_or(false) { "× Close Composer" } else { "+ New Topic" }}
                     </button>
                 </div>
             </div>
 
-            <Show when=move || show_new_topic.get() fallback=|| ()>
+            <Show when=move || show_new_topic.try_get().unwrap_or(false) fallback=|| ()>
                 <PostComposer
                     channel_id=cid.get_value()
                     zone_id=zone_id.clone()
@@ -326,10 +331,10 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             </Show>
 
             {move || {
-                if !topics.with(Vec::is_empty) {
+                if !topics.try_with(Vec::is_empty).unwrap_or(false) {
                     return ().into_any();
                 }
-                let (title, body) = if !settled.get() {
+                let (title, body) = if !settled.try_get().unwrap_or(false) {
                     ("Loading topics…", "Fetching this board's topics (and zone keys if encrypted) from the relay.")
                 } else if auth.is_authenticated().get() {
                     ("Board is empty", "No topics in this board yet. Tap '+ New Topic' to start the conversation.")
@@ -341,15 +346,15 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
 
             <div class="tui-stack">
                 <For
-                    each=move || topics.get()
+                    each=move || topics.try_get().unwrap_or_default()
                     key=|t| (t.id.clone(), t.reply_count, t.last_activity, t.content.len(), t.last_pubkey.clone())
                     children=move |t: TopicSummary| {
                         let is_unread = t.last_activity > last_read_at_open;
                         view! {
                             <TopicRow
                                 topic=t
-                                zone=zone_rows.get_value()
-                                channel_id=cid.get_value()
+                                zone=zone_rows.try_get_value().unwrap_or_default()
+                                channel_id=cid.try_get_value().unwrap_or_default()
                                 is_unread=is_unread
                                 encrypted=is_enc
                             />
@@ -358,20 +363,22 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                 />
             </div>
 
-            <Show when=move || can_load_older.get() fallback=|| ()>
+            <Show when=move || can_load_older.try_get().unwrap_or(false) fallback=|| ()>
                 {
                     let relay = relay_older.clone();
                     view! {
                         <button
                             type="button"
                             class="bbs-btn bbs-btn-sm"
-                            disabled=move || loading_older.get()
+                            disabled=move || loading_older.try_get().unwrap_or(true)
                             on:click=move |_| {
-                                let cid = cid.get_value();
+                                let Some(cid) = cid.try_get_value() else {
+                                    return;
+                                };
                                 page_keeping_place(channels, &relay, &cid, vec![cid.clone()], gated, true);
                             }
                         >
-                            {move || if loading_older.get() { "… Loading" } else { "▼ Load older topics" }}
+                            {move || if loading_older.try_get().unwrap_or(false) { "… Loading" } else { "▼ Load older topics" }}
                         </button>
                     }
                 }
@@ -751,12 +758,13 @@ pub fn ThreadView(
     let z_back = zone.clone();
     let cid_back = channel_id.clone();
     let zone_cards = StoredValue::new(zone.clone());
+    // Render closures below read page-owned values with `try_*`; see
+    // `BoardView` for why.
     let topic_heading = move || {
-        root_view.with(|r| {
-            r.as_ref()
-                .map(|r| snippet(&r.content, 90))
-                .unwrap_or_else(|| "Thread".to_string())
-        })
+        root_view
+            .try_with(|r| r.as_ref().map(|r| snippet(&r.content, 90)))
+            .flatten()
+            .unwrap_or_else(|| "Thread".to_string())
     };
 
     view! {
@@ -773,13 +781,13 @@ pub fn ThreadView(
                 <span>"/"</span>
                 <strong>{topic_heading}</strong>
                 {is_enc.then(|| view! { <span class="bbs-badge bbs-badge-ok">"🔒 E2E"</span> })}
-                {move || topic_root.with(Option::is_some).then(|| view! {
-                    <span class="bbs-badge">{move || replies_label(reply_total.get())}</span>
+                {move || topic_root.try_with(Option::is_some).unwrap_or(false).then(|| view! {
+                    <span class="bbs-badge">{move || replies_label(reply_total.try_get().unwrap_or_default())}</span>
                 })}
             </div>
 
             <div class="tui-stack" node_ref=thread_ref>
-                {move || (topic_root.with(Option::is_none)).then(|| view! {
+                {move || topic_root.try_with(Option::is_none).unwrap_or(false).then(|| view! {
                     <EmptyCard
                         title="Loading thread…"
                         body="Fetching messages (and zone keys if encrypted) from the relay."
@@ -788,25 +796,25 @@ pub fn ThreadView(
 
                 {move || {
                     let older = page_older.clone();
-                    can_load_older.get().then(move || view! {
+                    can_load_older.try_get().unwrap_or(false).then(move || view! {
                         <button
                             type="button"
                             class="bbs-btn bbs-btn-sm"
-                            disabled=move || paging.get()
+                            disabled=move || paging.try_get().unwrap_or(true)
                             on:click=move |_| older(true)
                         >
-                            {move || if paging.get() { "… Loading" } else { "▲ Load older posts" }}
+                            {move || if paging.try_get().unwrap_or(false) { "… Loading" } else { "▲ Load older posts" }}
                         </button>
                     })
                 }}
 
-                {move || root_view.get().map(|r| view! {
+                {move || root_view.try_get().flatten().map(|r| view! {
                     <ThreadPost
                         post=r
                         is_root=true
                         is_encrypted_zone=is_enc
-                        zone=zone_cards.get_value()
-                        channel_id=cid.get_value()
+                        zone=zone_cards.try_get_value().unwrap_or_default()
+                        channel_id=cid.try_get_value().unwrap_or_default()
                         topic=topic_sig
                         reply_to=reply_to
                         muted_check=mute
@@ -814,15 +822,15 @@ pub fn ThreadView(
                 })}
 
                 <For
-                    each=move || replies.get()
+                    each=move || replies.try_get().unwrap_or_default()
                     key=|r| (r.id.clone(), nostr_bbs_client_core::topics::view_key(r))
                     children=move |r: ReplyView| view! {
                         <ThreadPost
                             post=r
                             is_root=false
                             is_encrypted_zone=is_enc
-                            zone=zone_cards.get_value()
-                            channel_id=cid.get_value()
+                            zone=zone_cards.try_get_value().unwrap_or_default()
+                            channel_id=cid.try_get_value().unwrap_or_default()
                             topic=topic_sig
                             reply_to=reply_to
                             muted_check=mute
@@ -832,14 +840,14 @@ pub fn ThreadView(
 
                 {move || {
                     let newer = page_newer.clone();
-                    detached.get().then(move || view! {
+                    detached.try_get().unwrap_or(false).then(move || view! {
                         <button
                             type="button"
                             class="bbs-btn bbs-btn-sm"
-                            disabled=move || paging.get()
+                            disabled=move || paging.try_get().unwrap_or(true)
                             on:click=move |_| newer(false)
                         >
-                            {move || if paging.get() { "… Loading" } else { "▼ Load newer posts" }}
+                            {move || if paging.try_get().unwrap_or(false) { "… Loading" } else { "▼ Load newer posts" }}
                         </button>
                     })
                 }}
