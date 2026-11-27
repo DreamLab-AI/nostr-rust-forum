@@ -10,7 +10,7 @@
 //!   pages older replies on request
 //! - NIP-28 kind-42 topics/replies + NIP-22 kind-1111 comments
 //! - End-to-end encrypted zones (ADR-2016/2017) via shared `ZoneKeyStore` / `ZoneWriter`
-//! - Markdown rendering + on-theme phosphor `AsciiImg` with ASCII/Raw toggle
+//! - Markdown rendering + on-theme phosphor `AsciiImg`, tap for the original picture
 //! - NIP-25 kind-7 reactions (+ custom emoji + kind-5 undo)
 //! - Author edits (`edit` marker), NIP-09 deletions, NIP-56 reports (kind-1984)
 //! - Per-identity auto-saved drafts (`draft:v2:`), bookmarks, mute, read positions
@@ -43,9 +43,7 @@ use nostr_bbs_client_core::zone_crypto::store::{try_use_zone_key_store, ZoneWrit
 use nostr_bbs_client_core::zone_crypto::{encryption_enabled, has_zk_tag};
 use nostr_bbs_core::event::{NostrEvent, UnsignedEvent};
 
-use crate::ascii_img::{
-    extract_image_urls, is_protected_media, media_file_name, AsciiImg, MediaPlaceholder,
-};
+use crate::ascii_img::{extract_image_urls, is_protected_media, AsciiImg};
 use crate::components::{AuthorChip, EmptyCard, MarkdownBody};
 use crate::config::BbsConfig;
 use crate::router::{use_router, Route};
@@ -1341,31 +1339,16 @@ fn PostCard(
     }
 }
 
-/// On-theme phosphor ASCII image card with instant `[ASCII / Raw]` toggle + `[open ↗]`.
+/// On-theme phosphor ASCII image card: tap the art for the original picture
+/// (see [`AsciiImg`]).
 ///
-/// Protected media (a zone image: see [`is_protected_media`]) gets only a
-/// placeholder naming the file and linking to the post in the forum
-/// (`forum_href`): the raw image and its own URL would both be refused
-/// without the member's credentials, and the ASCII service must never see it.
+/// Protected media (a zone image: see [`is_protected_media`]) is never sent
+/// for rendering: its card shows a placeholder naming the file and linking to
+/// the post in the forum (`forum_href`), and the placeholder's toggle fetches
+/// the picture with the member's own credentials.
 #[component]
 fn PostImage(src: String, forum_href: String) -> impl IntoView {
-    if is_protected_media(&src) {
-        return view! {
-            <div class="bbs-ascii-card">
-                <div class="bbs-ascii-card-head">
-                    <span>"▞ IMG ▚"</span>
-                    <span>"🔒"</span>
-                </div>
-                <MediaPlaceholder
-                    name=media_file_name(&src)
-                    reason="protected zone media"
-                    forum_href=Some(forum_href)
-                />
-            </div>
-        }
-        .into_any();
-    }
-    let raw_mode = RwSignal::new(false);
+    let protected = is_protected_media(&src);
     let cols = {
         #[cfg(target_arch = "wasm32")]
         {
@@ -1378,29 +1361,15 @@ fn PostImage(src: String, forum_href: String) -> impl IntoView {
         #[cfg(not(target_arch = "wasm32"))]
         68
     };
-    let src_open = src.clone();
-    let src_raw = src.clone();
     view! {
         <div class="bbs-ascii-card">
             <div class="bbs-ascii-card-head">
                 <span>"▞ IMG ▚"</span>
-                <div class="tui-row">
-                    <button
-                        type="button"
-                        class="bbs-btn bbs-btn-ghost bbs-btn-sm"
-                        on:click=move |_| raw_mode.update(|v| *v = !*v)
-                    >{move || if raw_mode.get() { "ASCII view" } else { "Raw image" }}</button>
-                    <a href=src_open target="_blank" rel="noopener">"open ↗"</a>
-                </div>
+                {protected.then(|| view! { <span title="Protected zone media">"🔒"</span> })}
             </div>
-            {move || if raw_mode.get() {
-                view! { <img class="bbs-raw-img" src=src_raw.clone() alt="Attached image" loading="lazy" /> }.into_any()
-            } else {
-                view! { <AsciiImg src=src.clone() cols=cols forum_href=forum_href.clone() /> }.into_any()
-            }}
+            <AsciiImg src=src cols=cols forum_href=forum_href />
         </div>
     }
-    .into_any()
 }
 
 /// Rich Markdown + Image + Encrypted-Zone Composer shared by BoardView and ThreadView.

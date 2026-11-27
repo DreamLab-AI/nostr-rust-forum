@@ -207,7 +207,7 @@ fn TopBar() -> impl IntoView {
 
                 <button
                     type="button"
-                    class="bbs-icon-btn"
+                    class="bbs-icon-btn tui-theme-btn"
                     aria-label="Cycle phosphor theme"
                     title="Cycle phosphor theme (T)"
                     on:click=move |_| prefs.cycle_theme()
@@ -220,7 +220,7 @@ fn TopBar() -> impl IntoView {
                         view! {
                             <button
                                 type="button"
-                                class="bbs-btn bbs-btn-sm"
+                                class="bbs-btn bbs-btn-sm tui-profile-btn"
                                 title="View your profile"
                                 on:click=move |_| router.go(Route::Profile { pubkey: pk_nav.clone() })
                             >
@@ -465,12 +465,35 @@ fn Sidebar() -> impl IntoView {
                 <button
                     type="button"
                     class="tui-side-item"
-                    class:active=move || matches!(router.route.get(), Route::Members | Route::Profile { .. })
+                    class:active=move || {
+                        let me = auth.pubkey().get();
+                        match router.route.get() {
+                            Route::Members => true,
+                            Route::Profile { pubkey } => me.as_deref() != Some(pubkey.as_str()),
+                            _ => false,
+                        }
+                    }
                     on:click=move |_| nav(Route::Members)
                 >
                     <span class="tui-side-glyph">"●"</span>
                     <span class="tui-side-label">"Members"</span>
                 </button>
+                // Your own profile, where "Edit Profile" lives: the top bar's
+                // name button is too narrow to read on a phone.
+                {move || auth.pubkey().get().map(|me| {
+                    let me_active = me.clone();
+                    view! {
+                        <button
+                            type="button"
+                            class="tui-side-item"
+                            class:active=move || matches!(router.route.get(), Route::Profile { pubkey } if pubkey == me_active)
+                            on:click=move |_| nav(Route::Profile { pubkey: me.clone() })
+                        >
+                            <span class="tui-side-glyph">"☺"</span>
+                            <span class="tui-side-label">"My Profile"</span>
+                        </button>
+                    }
+                })}
                 <button
                     type="button"
                     class="tui-side-item"

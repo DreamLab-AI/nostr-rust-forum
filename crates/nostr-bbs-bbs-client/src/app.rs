@@ -321,14 +321,12 @@ pub fn App() -> impl IntoView {
         });
     }
 
-    // Reactive root theme / CRT / text / motion classes
+    // Reactive root theme / CRT / motion classes (text size is the
+    // `bbs-text-large` class `BbsPrefs::install_sync` puts on `<html>`)
     let root_class = move || {
         let mut cls = format!("bbs-root {}", prefs.theme.get().css_class());
         if !prefs.crt_effects.get() {
             cls.push_str(" bbs-crt-off");
-        }
-        if prefs.text_large.get() {
-            cls.push_str(" bbs-text-lg");
         }
         if prefs.reduced_motion.get() {
             cls.push_str(" bbs-reduced-motion");
