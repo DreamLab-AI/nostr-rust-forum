@@ -33,8 +33,11 @@ steps: [`docs/runbooks/sealed-search-incremental.md`](docs/runbooks/sealed-searc
   unchanged, exclude deleted or edited indexed posts), `compact [--all]` (re-pack shards verbatim, drop excluded rows and
   rows the relay no longer serves, refuse when more than 5% are missing), and `status`. State file with the high-water
   mark, rollback check against the last version published, and a one-run grace period before superseded objects are
-  deleted. Publisher key from `NOSTR_BBS_MIGRATE_KEY` or `--key-file` (0600). The explicit `--version` flag is gone:
-  a run always publishes the newest verified version + 1.
+  deleted. An update refuses (exit 7) when the relay serves none of the zone's indexed posts to the indexer (the zone
+  read gate withholds silently). Full builds sign v1 while no trusted publisher holds a v2 manifest for the zone, v2
+  once one does (`--manifest-format auto|v1|v2`); the import hand-off (`--input … --dry-run --out DIR`, no pod) still
+  yields a v1 base at version 1. Publisher key from `NOSTR_BBS_MIGRATE_KEY` or `--key-file` (0600). The explicit
+  `--version` flag is gone: a run always publishes the newest verified version + 1.
 - **Client.** Each object is fetched from the pod of the publisher that holds it; hits whose id the manifest excludes
   are dropped (the worker's `Index` already skips them). The IndexedDB cache was already keyed by SHA-256, so objects a
   new manifest lists unchanged are not fetched again.

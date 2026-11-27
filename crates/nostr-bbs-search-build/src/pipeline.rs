@@ -17,10 +17,17 @@
 //!   rows that are excluded or that the relay no longer serves.
 //! - [`run_full`]: build a whole new base from rows.
 //!
-//! Manifests are always content v2 (unless a full build asks for v1): a
-//! browser built before v2 refuses them as unsupported and keeps using the
-//! newest v1 manifest it can find (the archivist's), never a higher version
-//! it would then hold as its rollback mark.
+//! Updates and compactions sign content v2. A browser built before v2
+//! refuses it as unsupported and keeps using the newest v1 manifest it can
+//! find (the archivist's base), never a higher version it would then hold as
+//! its rollback mark. A full build signs v1 while no trusted publisher holds a
+//! v2 manifest for the zone (a new zone's base stays readable by every
+//! browser), v2 once one does ([`Format::Auto`]).
+//!
+//! Before reading the zone, an update checks that the relay serves some of
+//! the posts already indexed: an identity outside the zone's cohorts is
+//! answered with nothing at all, which would otherwise read as "nothing new"
+//! every night ([`JobError::Withheld`]).
 //!
 //! Objects a manifest stops listing are deleted from this publisher's pod
 //! one run later (the state's `retired` list), so a browser that read the
@@ -58,6 +65,27 @@ pub const DEFAULT_OVERLAP_SECS: u64 = nostr_bbs_core::event::MAX_CREATED_AT_DRIF
 /// the relay before it refuses (a relay answering incompletely would
 /// otherwise empty the index).
 pub const DEFAULT_MAX_MISSING: f64 = 0.05;
+
+/// Missing rows a compaction always tolerates, whatever the share (so one
+/// post deleted through the admin API cannot block a small fold for good).
+pub const MIN_MISSING_ALLOWED: usize = 10;
+
+/// Indexed ids an update asks the relay for before reading the zone: if it
+/// serves none of them, the zone is withheld from this identity.
+const PROBE_IDS: usize = 32;
+
+/// How a full build's manifest is signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// v1 while no trusted publisher holds a v2 manifest for the zone (every
+    /// browser can read it), v2 once one does (a v1 manifest above a v2 one
+    /// would strand browsers built before v2).
+    Auto,
+    /// Content v1, whatever the pods hold.
+    V1,
+    /// Content v2.
+    V2,
+}
 
 /// The model files a manifest pins (review L5).
 #[derive(Debug, Clone)]
@@ -113,6 +141,13 @@ pub enum JobError {
         /// Most allowed.
         limit: usize,
     },
+    /// The relay serves none of the zone's indexed posts to this identity:
+    /// the zone's read gate withholds them (the indexer lacks the cohort).
+    #[error("the relay serves none of {asked} indexed posts to this identity: is it admitted to the zone (cohort)? refusing to run")]
+    Withheld {
+        /// Ids asked for.
+        asked: usize,
+    },
     /// The pods show an older index than this job published.
     #[error("the newest manifest on the pods ({found}) is older than version {published} this job published: refusing to build on a rolled-back or withheld index")]
     RolledBack {
@@ -128,12 +163,13 @@ pub enum JobError {
 
 impl JobError {
     /// Process exit code: 4 unauthenticated relay, 5 too many rows missing,
-    /// 6 rollback, 1 otherwise.
+    /// 6 rollback, 7 zone withheld by the relay, 1 otherwise.
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Unauthenticated(_) => 4,
             Self::TooManyMissing { .. } => 5,
             Self::RolledBack { .. } => 6,
+            Self::Withheld { .. } => 7,
             Self::Other(_) => 1,
         }
     }
@@ -161,8 +197,12 @@ pub struct Report {
     pub mode: &'static str,
     /// Zone id.
     pub zone: String,
-    /// Whether a new manifest was published.
+    /// Whether a new manifest was published (to the dry-run folder, when
+    /// `dry_run`).
     pub published: bool,
+    /// Whether this was a dry run (nothing reached a pod; the state is
+    /// unchanged).
+    pub dry_run: bool,
     /// The version published (or current, when nothing was).
     pub index_version: Option<u64>,
     /// The version it was built on.
@@ -373,7 +413,15 @@ fn key_map<'r>(
 ///
 /// When a pod request fails.
 pub async fn newest_manifest<P: Pod>(job: &mut Job<'_, P>) -> Result<Option<Manifest>, JobError> {
-    let mut best: Option<Manifest> = None;
+    Ok(verified_manifests(job)
+        .await?
+        .into_iter()
+        .max_by_key(|m| m.content.index_version))
+}
+
+/// Every trusted publisher's manifest that verifies (see [`newest_manifest`]).
+async fn verified_manifests<P: Pod>(job: &mut Job<'_, P>) -> Result<Vec<Manifest>, JobError> {
+    let mut all: Vec<Manifest> = Vec::new();
     for p in job.publishers {
         let Some(bytes) = job.pod.get(p, "m.json").await? else {
             continue;
@@ -387,20 +435,32 @@ pub async fn newest_manifest<P: Pod>(job: &mut Job<'_, P>) -> Result<Option<Mani
             }
         };
         match Manifest::verify(ev, job.zone, job.relay_url, job.publishers, None) {
-            Ok(m)
-                if best
-                    .as_ref()
-                    .is_none_or(|b| m.content.index_version > b.content.index_version) =>
-            {
-                best = Some(m)
-            }
-            Ok(_) => {}
+            Ok(m) => all.push(m),
             Err(e) => job
                 .warnings
                 .push(format!("m.json of {} refused: {e}", &p[..8])),
         }
     }
-    Ok(best)
+    Ok(all)
+}
+
+/// Refuse when the relay serves none of a sample of indexed ids: the zone's
+/// read gate is withholding its posts from this identity, and every read
+/// would look like a zone with nothing new.
+async fn probe_served<R: Relay>(relay: &mut R, indexed: &HashSet<String>) -> Result<(), JobError> {
+    if indexed.is_empty() {
+        return Ok(());
+    }
+    let mut sample: Vec<String> = indexed.iter().cloned().collect();
+    sample.sort();
+    let step = (sample.len() / PROBE_IDS).max(1);
+    let sample: Vec<String> = sample.into_iter().step_by(step).take(PROBE_IDS).collect();
+    if present(relay, &sample).await?.is_empty() {
+        return Err(JobError::Withheld {
+            asked: sample.len(),
+        });
+    }
+    Ok(())
 }
 
 fn check_rollback(state: &State, cur: Option<&Manifest>) -> Result<(), JobError> {
@@ -629,13 +689,15 @@ pub async fn run_full<P: Pod, E: Embedder>(
     exclude: &HashSet<String>,
     harvested: Option<&Harvest>,
     embedder: &mut E,
-    manifest_v1: bool,
+    format: Format,
 ) -> Result<Report, JobError> {
     let mut report = Report::new("full", job.zone);
     if let Some(h) = harvested {
         report.harvested(h);
     }
-    let prev = newest_manifest(job).await?;
+    let all = verified_manifests(job).await?;
+    let any_v2 = all.iter().any(|m| m.content.v == V2);
+    let prev = all.into_iter().max_by_key(|m| m.content.index_version);
     if let Some(s) = state.as_deref() {
         check_rollback(s, prev.as_ref())?;
     }
@@ -645,6 +707,12 @@ pub async fn run_full<P: Pod, E: Embedder>(
         .into_iter()
         .filter(|r| !exclude.contains(&r.id.to_lowercase()))
         .collect();
+    if rows.is_empty() {
+        return Err(JobError::Other(
+            "no rows to index: refusing to publish an empty index (is the zone withheld from this identity?)"
+                .into(),
+        ));
+    }
     let keys = key_map(
         job.ring,
         job.zone,
@@ -657,7 +725,12 @@ pub async fn run_full<P: Pod, E: Embedder>(
     let mut built = build(&spec(job, pins, version), &docs, &keys)?;
     report.seal_s = t.elapsed().as_secs_f64();
     report.rows_added = docs.len();
-    if !manifest_v1 {
+    let v2 = match format {
+        Format::Auto => any_v2,
+        Format::V1 => false,
+        Format::V2 => true,
+    };
+    if v2 {
         built.content.v = V2;
     }
     publish(job, state.as_deref_mut(), prev.as_ref(), built, &mut report).await?;
@@ -702,6 +775,7 @@ pub async fn run_update<P: Pod, R: Relay, E: Embedder>(
     let pins = local_pins(job)?;
     check_same_model(pins, &cur)?;
     let indexed = indexed_ids(job, &cur).await?;
+    probe_served(relay, &indexed).await?;
     let since = since.or(state.high_water.map(|h| h.saturating_sub(overlap)));
     let h = harvest(relay, job.zone, job.ring, since, &indexed).await?;
     report.harvested(&h);
@@ -833,7 +907,13 @@ pub async fn run_compact<P: Pod, R: Relay>(
         .filter(|id| !served.contains(*id))
         .cloned()
         .collect();
-    let limit = (to_check.len() as f64 * max_missing.clamp(0.0, 1.0)).floor() as usize;
+    if !to_check.is_empty() && missing.len() == to_check.len() {
+        return Err(JobError::Withheld {
+            asked: to_check.len(),
+        });
+    }
+    let limit = ((to_check.len() as f64 * max_missing.clamp(0.0, 1.0)).floor() as usize)
+        .max(MIN_MISSING_ALLOWED);
     if missing.len() > limit {
         return Err(JobError::TooManyMissing {
             missing: missing.len(),

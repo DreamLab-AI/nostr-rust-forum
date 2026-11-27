@@ -38,11 +38,12 @@ logs one JSON report per step: counts only, never text or keys.
 | Code | Meaning |
 |---|---|
 | 0 | Done: published, or nothing new. |
-| 3 | Published, but posts under an epoch the indexer holds no key for were held back. The high-water mark stays below them; grant the epoch. |
+| 3 | Published, but posts under an epoch the indexer holds no key for were held back. The high-water mark is set just below the oldest of them, so every later run reads them again (more each night, the older they are) until the epoch is granted. |
 | 1 | Error. |
 | 4 | The relay session is not NIP-42 authenticated. Nothing was read. |
-| 5 | A compaction found more than 5% of the rows it would fold missing from the relay. Refused. |
+| 5 | A compaction found more of the rows it would fold missing from the relay than allowed (5% of them, but always at least 10). Refused. |
 | 6 | The pods show an older index than this job published. Rollback or withholding; refused. |
+| 7 | The relay serves none of the zone's already-indexed posts to the indexer. Refused. The relay's zone read gate answers an authenticated non-member with nothing rather than an error, so without this check a missing cohort would look like "nothing new" every night. |
 | 10 | Another run holds the lock. |
 | 11 | Timed out. |
 | 12 | Configuration error. |
@@ -72,19 +73,24 @@ So a current v1 manifest is a valid v2 manifest.
 
 A v1 manifest that carries any v2 field is refused.
 
-The job always signs `v: 2`. A browser built before this change refuses a v2
-manifest as unsupported. It then keeps using the newest v1 manifest it can find,
-the archivist's base, so it still works with stale results. It never raises its
-rollback mark to a version it could not load later.
+Updates and compactions always sign `v: 2`. A browser built before this change
+refuses a v2 manifest as unsupported. It then keeps using the newest v1 manifest
+it can find, the archivist's base, so it still works with stale results. It
+never raises its rollback mark to a version it could not load later.
 
-Signing v1 whenever possible would strand such a browser:
+A full build (`--manifest-format auto`, the default) signs v1 while no trusted
+publisher holds a v2 manifest for the zone, and v2 once one does. The import
+hand-off (§9 of `docs/bulk-import/DESIGN.md`: `--input … --dry-run --out DIR`,
+no pod) therefore still produces a v1 base at version 1 that every browser
+reads.
+
+Signing v1 above a v2 manifest would strand such a browser:
 
 1. It accepts a v1 manifest at version M.
 2. It refuses the v2 manifest at M+1.
 3. It refuses the archivist's version as a rollback below M.
 
-`--manifest-v1` exists only for a full build by a publisher that has never
-signed a v2 manifest for the zone.
+`--manifest-format v1` or `v2` forces the format; `auto` is the safe default.
 
 ### Publisher continuity: reference, don't re-upload
 
@@ -115,6 +121,9 @@ a time the operator chooses.
 
 - The archivist must stay in `SEARCH_PUBLISHERS` until `compact --all` has
   re-homed every object. Otherwise browsers refuse the manifest.
+- The pod's read rule depends only on the reader (an active member whose
+  cohorts satisfy the zone), not on the owner. The archivist's objects stay
+  readable even if it leaves `SEARCH_ARCHIVISTS` or the whitelist.
 - Superseded objects in the archivist's pod cannot be deleted by anyone, since
   the key is gone. After `compact --all` they are unreferenced. Removing them
   needs direct R2 access.
@@ -136,6 +145,13 @@ a time the operator chooses.
 - **Physically removed.** A compaction drops excluded rows, and rows the relay
   no longer serves, from the shards it folds. `compact --all` does this for
   every shard.
+
+  With `NBSS_FULL_COMPACT_EXCLUDED_AT=0` (the default), the embeddings of
+  deleted or edited posts that sit in the archivist's full base shards stay in
+  those shards indefinitely. Members cannot see them as hits, but they are in
+  the sealed bytes every member downloads, until an operator runs
+  `compact --all`, which re-uploads the whole index once. Set the threshold to
+  make that automatic.
 
 The builder honours every kind-5 the relay stored. The relay refuses a kind-5
 below trust level 3 unless every target is the signer's own, so a stored kind-5
@@ -214,6 +230,10 @@ Plaintext and embeddings exist only in the job's memory, while it runs.
 After a new import or zone-migrate run, the new envelopes carry their original,
 older `created_at`, below the high-water mark. Run `update --since 0` once. It
 reads the whole zone and indexes only what is missing.
+
+A `--dry-run` writes the new objects and `m.json` to `--out` and changes no pod
+and no state (its report says `"dry_run": true`). Without `--pod` it builds as
+if no index existed yet.
 
 ## Cost (measured on synthetic text, candle FP32, CPU)
 

@@ -21,7 +21,7 @@ use nostr_bbs_search_build::embed::Embedder;
 use nostr_bbs_search_build::harvest::harvest;
 use nostr_bbs_search_build::memrelay::MemRelay;
 use nostr_bbs_search_build::pipeline::{
-    run_compact, run_full, run_update, status, Fold, Job, JobError, Pins, Report,
+    run_compact, run_full, run_update, status, Fold, Format, Job, JobError, Pins, Report,
     DEFAULT_MAX_MISSING, DEFAULT_OVERLAP_SECS,
 };
 use nostr_bbs_search_build::pod::DirPod;
@@ -231,11 +231,13 @@ fn fixture(name: &str) -> Fixture {
         &HashSet::new(),
         Some(&h),
         &mut HashEmbedder { calls: 0 },
-        false,
+        Format::Auto,
     ))
     .unwrap();
     assert_eq!(r.index_version, Some(1));
     assert_eq!(r.rows_added, 115);
+    // A first base, with no v2 manifest anywhere, is v1: every browser reads it.
+    assert_eq!(browser_manifest(&f, None).content.v, 1);
     f
 }
 
@@ -721,6 +723,98 @@ fn refusals_keep_the_index_and_the_high_water_mark() {
     // Nothing on the pods changed version through any refusal.
     let cur = indexer(&mut f, &mut state, |j, _, _| block_on(status(j)).unwrap());
     assert_eq!(Some(cur.index_version), state.index_version);
+}
+
+#[test]
+fn a_zone_the_relay_withholds_is_refused_not_read_as_empty() {
+    let mut f = fixture("withheld");
+    let mut state = new_state();
+    // Authenticated, but outside the zone's cohorts: the relay answers every
+    // zone REQ with nothing (exit 7), on the first run and on later ones.
+    let mut gated = MemRelay::new(Vec::new());
+    let e = indexer(&mut f, &mut state, |j, _, s| {
+        block_on(run_update(
+            j,
+            &mut gated,
+            s,
+            &mut HashEmbedder { calls: 0 },
+            None,
+            0,
+        ))
+    })
+    .unwrap_err();
+    assert_eq!(e.exit_code(), 7, "{e}");
+    assert_eq!(state.high_water, None);
+    let e = indexer(&mut f, &mut state, |j, _, s| {
+        block_on(run_compact(
+            j,
+            &mut gated,
+            s,
+            Fold::All,
+            DEFAULT_MAX_MISSING,
+        ))
+    })
+    .unwrap_err();
+    assert_eq!(e.exit_code(), 7, "{e}");
+    // A full build reading nothing refuses to publish an empty index.
+    let e = indexer(&mut f, &mut state, |j, _, s| {
+        block_on(run_full(
+            j,
+            Some(s),
+            Vec::new(),
+            &HashSet::new(),
+            None,
+            &mut HashEmbedder { calls: 0 },
+            Format::Auto,
+        ))
+    })
+    .unwrap_err();
+    assert!(e.to_string().contains("empty"), "{e}");
+}
+
+#[test]
+fn a_full_build_after_a_v2_manifest_is_v2_and_small_folds_tolerate_a_few_gone_rows() {
+    let mut f = fixture("format");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    f.relay
+        .insert(native(BOB, T0 + 9_000, "one more post", vec![]));
+    assert!(update(&mut f, &mut state).unwrap().published);
+    assert_eq!(browser_manifest(&f, None).content.v, 2);
+    // Two posts of the base's partial shard go through the admin API: below
+    // the 5% share of a small fold, but within the absolute floor.
+    for i in [101, 102] {
+        let id = f.natives[&base_text(i)].id.clone();
+        f.relay.remove(&id);
+    }
+    let r = compact_partial(&mut f, &mut state).unwrap();
+    assert_eq!(r.missing_rows, 2);
+    // A full rebuild by the indexer now signs v2 (Auto), never v1 above a v2.
+    let mut h = block_on(harvest(
+        &mut f.relay,
+        ZONE,
+        &ring(&[(1, ZONE_E1)]),
+        None,
+        &HashSet::new(),
+    ))
+    .unwrap();
+    let rows = std::mem::take(&mut h.rows);
+    let r = indexer(&mut f, &mut state, |j, _, s| {
+        block_on(run_full(
+            j,
+            Some(s),
+            rows,
+            &HashSet::new(),
+            Some(&h),
+            &mut HashEmbedder { calls: 0 },
+            Format::Auto,
+        ))
+    })
+    .unwrap();
+    assert!(r.published);
+    let m = browser_manifest(&f, None);
+    assert_eq!(m.content.v, 2);
+    assert_eq!(m.event.pubkey, pk(INDEXER));
 }
 
 #[test]

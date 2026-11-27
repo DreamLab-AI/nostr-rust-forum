@@ -35,9 +35,11 @@
 #   0  done (published, or nothing new)
 #   3  published, but posts under an epoch the indexer holds no key for were
 #      held back (grant the epoch; the next run picks them up)
-#   1, 4, 5, 6  the builder's: error; relay not NIP-42 authenticated;
+#   1, 4, 5, 6, 7  the builder's: error; relay not NIP-42 authenticated;
 #      compaction found too many rows missing from the relay; the pods show an
-#      older index than the state recorded (rollback or withholding)
+#      older index than the state recorded (rollback or withholding); the relay
+#      serves none of the zone's indexed posts to the indexer (not admitted to
+#      the zone's cohorts)
 #   10 another run holds the lock
 #   11 timed out
 #   12 configuration error

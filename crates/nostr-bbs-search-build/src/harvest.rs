@@ -122,15 +122,15 @@ pub struct Harvest {
 }
 
 impl Harvest {
-    /// The high-water mark this harvest supports: the newest event read, but
-    /// below any event held back for want of a key, and never below `prior`.
+    /// The high-water mark this harvest supports: the newest event read (and
+    /// never below `prior`), unless an event was held back for want of a key:
+    /// then just below it, even if that is below `prior`, so the next run reads
+    /// it again however old it is (a reconcile can find old ones).
     pub fn high_water(&self, prior: Option<u64>) -> Option<u64> {
-        let hw = match (self.newest, self.hold_back) {
-            (Some(n), Some(h)) => Some(n.min(h.saturating_sub(1))),
-            (n, None) => n,
-            (None, Some(_)) => None,
-        };
-        match (hw, prior) {
+        if let Some(h) = self.hold_back {
+            return Some(h.saturating_sub(1));
+        }
+        match (self.newest, prior) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         }
@@ -498,4 +498,35 @@ pub async fn harvest<R: Relay>(
         .cloned()
         .collect();
     Ok(h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_high_water_mark_stays_below_held_back_posts() {
+        let h = Harvest {
+            newest: Some(500),
+            ..Harvest::default()
+        };
+        assert_eq!(h.high_water(None), Some(500));
+        assert_eq!(
+            h.high_water(Some(700)),
+            Some(700),
+            "never moves back otherwise"
+        );
+        let held = Harvest {
+            newest: Some(500),
+            hold_back: Some(300),
+            ..Harvest::default()
+        };
+        assert_eq!(held.high_water(None), Some(299));
+        assert_eq!(
+            held.high_water(Some(700)),
+            Some(299),
+            "an old held post is read again"
+        );
+        assert_eq!(Harvest::default().high_water(Some(9)), Some(9));
+    }
 }

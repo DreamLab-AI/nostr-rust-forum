@@ -32,7 +32,11 @@
 //! published, but posts under an epoch whose key is not held were held back;
 //! 4 the relay session is not NIP-42 authenticated; 5 a compaction found too
 //! many rows missing from the relay; 6 the pods show an older index than the
-//! state recorded (rollback or withholding).
+//! state recorded (rollback or withholding); 7 the relay serves none of the
+//! zone's indexed posts to this identity (not admitted to the zone).
+//!
+//! A `--dry-run` needs no pod: without `--pod` or `--pod-dir` it builds as if
+//! no index existed yet (version 1), as the import hand-off does.
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
@@ -57,8 +61,8 @@ mod native {
     use nostr_bbs_search_build::harvest::{harvest, ZoneRow};
     use nostr_bbs_search_build::memrelay::MemRelay;
     use nostr_bbs_search_build::pipeline::{
-        run_compact, run_full, run_update, status, Fold, Job, JobError, Pins, DEFAULT_MAX_MISSING,
-        DEFAULT_OVERLAP_SECS,
+        run_compact, run_full, run_update, status, Fold, Format, Job, JobError, Pins,
+        DEFAULT_MAX_MISSING, DEFAULT_OVERLAP_SECS,
     };
     use nostr_bbs_search_build::pod::{DirPod, DryRun, HttpPod, ObjectCache, Pod};
     use nostr_bbs_search_build::secrets::load_identity;
@@ -138,10 +142,10 @@ mod native {
         /// Compact: largest share of folded rows that may be missing from the relay.
         #[arg(long, global = true, default_value_t = DEFAULT_MAX_MISSING)]
         max_missing: f64,
-        /// Full build: publish a v1 manifest (only for a publisher no v2
-        /// manifest of this zone has ever come from).
-        #[arg(long, global = true)]
-        manifest_v1: bool,
+        /// Full build: manifest content version. `auto` signs v1 while no
+        /// trusted publisher holds a v2 manifest for the zone, v2 once one does.
+        #[arg(long, global = true, value_enum, default_value_t = ManifestFormat::Auto)]
+        manifest_format: ManifestFormat,
         /// Rows per shard.
         #[arg(long, global = true, default_value_t = 32768)]
         shard_rows: usize,
@@ -161,6 +165,23 @@ mod native {
         /// embeddings (row order) here. Embeddings are plaintext-equivalent.
         #[arg(long, global = true)]
         dump_vectors: Option<PathBuf>,
+    }
+
+    #[derive(Clone, Copy, clap::ValueEnum)]
+    enum ManifestFormat {
+        Auto,
+        V1,
+        V2,
+    }
+
+    impl From<ManifestFormat> for Format {
+        fn from(f: ManifestFormat) -> Self {
+            match f {
+                ManifestFormat::Auto => Format::Auto,
+                ManifestFormat::V1 => Format::V1,
+                ManifestFormat::V2 => Format::V2,
+            }
+        }
     }
 
     #[derive(Subcommand)]
@@ -227,6 +248,8 @@ mod native {
     enum AnyPod {
         Http(HttpPod),
         Dir(DirPod),
+        /// No pod at all (a dry run without one): holds nothing.
+        None,
     }
 
     impl Pod for AnyPod {
@@ -234,18 +257,21 @@ mod native {
             match self {
                 Self::Http(p) => p.get(owner, name).await,
                 Self::Dir(p) => p.get(owner, name).await,
+                Self::None => Ok(None),
             }
         }
         async fn put(&mut self, name: &str, bytes: &[u8], ct: &str) -> Result<(), String> {
             match self {
                 Self::Http(p) => p.put(name, bytes, ct).await,
                 Self::Dir(p) => p.put(name, bytes, ct).await,
+                Self::None => Err("no pod to write to".into()),
             }
         }
         async fn delete(&mut self, name: &str) -> Result<(), String> {
             match self {
                 Self::Http(p) => p.delete(name).await,
                 Self::Dir(p) => p.delete(name).await,
+                Self::None => Err("no pod to delete from".into()),
             }
         }
     }
@@ -414,6 +440,7 @@ mod native {
         let inner = match (&cli.pod_dir, &cli.pod) {
             (Some(dir), _) => AnyPod::Dir(DirPod::new(dir, &zone, &publisher)),
             (None, Some(url)) => AnyPod::Http(HttpPod::new(url, &zone, &me)?),
+            (None, None) if cli.dry_run => AnyPod::None,
             (None, None) => return Err(Fail("--pod or --pod-dir is required".into(), 2)),
         };
         if cli.dry_run {
@@ -471,7 +498,7 @@ mod native {
         });
         let model_dir = || req(&cli.model_dir, "model-dir");
 
-        let report = match &cli.cmd {
+        let mut report = match &cli.cmd {
             Some(Cmd::Status { field }) => {
                 let s = status(&mut job).await?;
                 match field {
@@ -552,7 +579,7 @@ mod native {
                         &exclude,
                         None,
                         &mut emb,
-                        cli.manifest_v1,
+                        cli.manifest_format.into(),
                     )
                     .await?
                 } else {
@@ -573,7 +600,7 @@ mod native {
                         &HashSet::new(),
                         Some(&h),
                         &mut emb,
-                        cli.manifest_v1,
+                        cli.manifest_format.into(),
                     )
                     .await?
                 };
@@ -588,6 +615,7 @@ mod native {
                 report
             }
         };
+        report.dry_run = cli.dry_run;
         if !cli.dry_run {
             if let (Some(p), Some(s)) = (state_path, state.as_mut()) {
                 s.updated_at = now;
