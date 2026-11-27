@@ -82,6 +82,12 @@ fn build_hash() -> String {
     window_env("BUILD_HASH").unwrap_or_else(|| "local".to_string())
 }
 
+/// The build string shown in Settings and copied by its copy button, e.g.
+/// `Build 2026.11.26 (c25b301)`.
+fn build_label(version: &str, hash: &str) -> String {
+    format!("Build {version} ({hash})")
+}
+
 /// Key used to persist muted pubkeys in localStorage.
 const MUTED_STORAGE_KEY: &str = "nostr_bbs_muted";
 
@@ -1713,11 +1719,20 @@ pub fn SettingsPage() -> impl IntoView {
 
                     <div>
                         <span class="text-xs text-gray-500 uppercase tracking-wide">"Build"</span>
-                        <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1">
-                            <code class="text-xs text-amber-300 font-mono break-all" data-testid="build-version">
-                                {move || format!("Build {} ({})", build_version(), build_hash())}
-                            </code>
-                        </div>
+                        {
+                            // One string for what is shown and what is copied.
+                            let build = build_label(&build_version(), &build_hash());
+                            view! {
+                                <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1 flex items-center gap-2">
+                                    <code class="flex-1 min-w-0 text-xs text-amber-300 font-mono break-all" data-testid="build-version">
+                                        {build.clone()}
+                                    </code>
+                                    <span class="flex-shrink-0 text-gray-400 hover:text-amber-300" data-testid="build-version-copy">
+                                        <CopyKey full=build.clone() display=build icon=true what="build version" />
+                                    </span>
+                                </div>
+                            }
+                        }
                         <p class="text-xs text-gray-500 mt-1">
                             "Use this to confirm whether a deployed build includes a given fix."
                         </p>
@@ -2327,6 +2342,15 @@ fn info_icon() -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_label_is_the_full_string_shown_and_copied() {
+        assert_eq!(
+            build_label("2026.11.26", "c25b301"),
+            "Build 2026.11.26 (c25b301)"
+        );
+        assert_eq!(build_label("dev", "local"), "Build dev (local)");
+    }
 
     #[test]
     fn avatar_types_exclude_svg_and_unknowns() {
