@@ -123,7 +123,7 @@ pub struct MissingPlan {
     pub unverified: Vec<(String, String)>,
     /// Zones this device holds keys for but may grant none of, because every
     /// held key is below the zone's `history_from_epoch` floor. Filled by
-    /// [`AutoGrant::plan`], never by [`plan_missing`].
+    /// `AutoGrant::plan`, never by [`plan_missing`].
     pub floor_blocked: Vec<super::FloorBlock>,
     /// `(zone, epoch)` ledgers this device holds entries for but the relay
     /// holds no backup of (see [`super::grant_backup::needs_repair`]). Filled

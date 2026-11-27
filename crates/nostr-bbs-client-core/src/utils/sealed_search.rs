@@ -26,8 +26,8 @@
 //! original (ADR-2017; every imported or migrated post) that is the ORIGINAL's
 //! id, which the relay does not store: it holds only the envelope, under its
 //! own id, naming the original in its `["sealed", <id>, "1"]` tag. The REQ
-//! therefore asks for the ids both ways ([`resolve_filters`]) and maps each
-//! envelope back by that tag ([`verified_hits`]).
+//! therefore asks for the ids both ways (`resolve_filters`) and maps each
+//! envelope back by that tag (`verified_hits`).
 //!
 //! [`wipe`] (sign-out, owner switch) terminates the worker first, then deletes
 //! the cache database.
