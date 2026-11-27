@@ -16,6 +16,7 @@ use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use crate::components::category_card::CategoryCard;
+use crate::components::continue_link::ContinueLink;
 use crate::components::empty_state::EmptyState;
 use crate::stores::channels::use_channel_store;
 use crate::stores::read_position::use_read_positions;
@@ -176,6 +177,11 @@ pub fn ForumsPage() -> impl IntoView {
         // Onboarding modal mounted globally in app.rs Layout — see N3e.
 
         <div class="max-w-6xl mx-auto p-4 sm:p-6">
+            // "Continue: Zone › Section": back to where the member left off
+            // (multi-zone members land here rather than in a zone). A link,
+            // never a redirect.
+            <ContinueLink />
+
             // Hero header
             <div class="relative mb-10 py-10 rounded-2xl overflow-hidden mesh-bg aurora-shimmer">
                 <div class="ambient-orb ambient-orb-1" aria-hidden="true"></div>

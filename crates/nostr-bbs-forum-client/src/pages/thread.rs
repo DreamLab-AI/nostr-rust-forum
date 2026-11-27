@@ -839,6 +839,50 @@ pub fn ThreadPage() -> impl IntoView {
         }
     });
 
+    // "Continue where you left off" (utils::resume): remember this topic.
+    // Route plus zone and section names; the topic title only for an
+    // unencrypted zone (`point_for` drops it otherwise), never content.
+    Effect::new(move |_| {
+        if !has_zone_access.get() {
+            return;
+        }
+        let (Some(pk), Some(ch)) = (auth.pubkey().get(), resolved_channel.get()) else {
+            return;
+        };
+        let root = topic_root.get();
+        let param = section_param();
+        let section = if crate::utils::slug_hash::is_section_slug(&param) {
+            param
+        } else {
+            crate::utils::slug_hash::section_slug(&ch.id)
+        };
+        let topic = root
+            .as_ref()
+            .map(|r| crate::utils::slug_hash::topic_slug(&r.id))
+            .unwrap_or_else(topic_param);
+        let title = root.as_ref().map(|r| first_line(&r.content));
+        let name = if ch.name.trim().is_empty() {
+            "Section".to_string()
+        } else {
+            ch.name.clone()
+        };
+        let visit = crate::utils::resume::TopicVisit {
+            slug: &topic,
+            title: title.as_deref(),
+            is_zone_message: root
+                .as_ref()
+                .is_some_and(crate::zone_crypto::is_zone_message),
+        };
+        if let Some(point) = crate::utils::resume::point_for(
+            &load_zones(),
+            &category_slug(),
+            Some((&section, &name)),
+            Some(visit),
+        ) {
+            crate::utils::resume::remember(&pk, &point);
+        }
+    });
+
     // Replies: kind-42 / kind-1111 events that reference the topic root id.
     //
     // Edit events are folded into the post they replace rather than shown as

@@ -7,6 +7,7 @@ use leptos_router::path;
 use leptos_router::NavigateOptions;
 
 use crate::auth::{provide_auth, use_auth};
+use crate::components::back_button::BackButton;
 use crate::components::bookmarks_modal::provide_bookmarks;
 use crate::components::bookmarks_modal::BookmarksModal;
 use crate::components::fx::provide_render_tier;
@@ -1118,6 +1119,9 @@ fn Layout(children: Children) -> impl IntoView {
     });
 
     let location = use_location();
+    // Per-session scroll positions, put back when the member returns to a
+    // list page (Back, the system back gesture, or going up).
+    crate::components::back_button::provide_scroll_memory();
     // Strip FORUM_BASE prefix so nav comparisons work regardless of sub-directory.
     // Router-aware (ADR-090): a sibling route that merely shares the base's
     // leading characters is left alone rather than mangled.
@@ -1227,13 +1231,18 @@ fn Layout(children: Children) -> impl IntoView {
             // Header
             <header class="border-b border-gray-800/50 bg-gray-900/80 backdrop-blur-md sticky top-0 z-50">
                 <nav class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-                    // Brand — links to the forum's own home, not the host
-                    // site root (issue #21: the wordmark must stay inside the
-                    // SPA when the forum is mounted under a base path).
-                    <a href=base_href("/") class="flex items-center gap-2 text-xl sm:text-2xl font-bold text-amber-400 hover:text-amber-300 transition-colors">
-                        {brand_icon()}
-                        {crate::utils::relay_url::brand_label()}
-                    </a>
+                    <div class="flex items-center gap-1 min-w-0">
+                        // Back (members' request: the installed app has no
+                        // browser back button). Hidden on the front page.
+                        <BackButton />
+                        // Brand — links to the forum's own home, not the host
+                        // site root (issue #21: the wordmark must stay inside the
+                        // SPA when the forum is mounted under a base path).
+                        <a href=base_href("/") class="flex items-center gap-2 min-w-0 text-xl sm:text-2xl font-bold text-amber-400 hover:text-amber-300 transition-colors">
+                            {brand_icon()}
+                            <span class="truncate">{crate::utils::relay_url::brand_label()}</span>
+                        </a>
+                    </div>
 
                     // Desktop nav
                     <div class="hidden sm:flex items-center gap-4">
