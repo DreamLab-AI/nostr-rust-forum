@@ -18,10 +18,11 @@ use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use crate::components::category_card::CategoryCard;
 use crate::components::continue_link::ContinueLink;
 use crate::components::empty_state::EmptyState;
-use crate::stores::channels::use_channel_store;
+use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
+use crate::utils::section_url::{effective_section_tag, representative_channel};
 use crate::utils::zone_theme::{resolved_accent_hex, zone_tile_style};
 
 /// Per-section post tallies projected into each category card.
@@ -173,6 +174,25 @@ pub fn ForumsPage() -> impl IntoView {
         meta
     });
 
+    // The channel each section card opens: a card groups the channels that
+    // share a section tag, and links to one of them by its channel-id hash,
+    // the canonical section id (see `utils::section_url`).
+    let section_targets = Memo::new(move |_| {
+        let chans = store.channels.get();
+        let zs = zones.get_value();
+        let mut by_tag = HashMap::<String, Vec<&ChannelMeta>>::new();
+        for ch in &chans {
+            by_tag
+                .entry(effective_section_tag(ch, &zs).to_string())
+                .or_default()
+                .push(ch);
+        }
+        by_tag
+            .into_iter()
+            .filter_map(|(tag, group)| representative_channel(group).map(|c| (tag, c.id.clone())))
+            .collect::<HashMap<String, String>>()
+    });
+
     view! {
         // Onboarding modal mounted globally in app.rs Layout — see N3e.
 
@@ -294,6 +314,7 @@ pub fn ForumsPage() -> impl IntoView {
                 {move || {
                     let zc = zone_categories.get();
                     let sec_meta = section_meta.get();
+                    let targets = section_targets.get();
                     let all_zones = zones.get_value();
                     let cohorts = za_cohorts.get();
                     let is_admin = za_admin.get();
@@ -311,7 +332,7 @@ pub fn ForumsPage() -> impl IntoView {
                             // normal tile.
                             (ZoneVisibility::Public, _) | (_, true) => {
                                 let cats = zc.get(&zone.id).cloned().unwrap_or_default();
-                                rendered.push(zone_tile(zone, cats, &sec_meta));
+                                rendered.push(zone_tile(zone, cats, &sec_meta, &targets));
                             }
                             // Locked zone, non-member: greyed locked tile.
                             (ZoneVisibility::Locked, false) => {
@@ -387,6 +408,7 @@ fn zone_tile(
     zone: &Zone,
     cats: HashMap<String, SectionCounts>,
     sec_meta: &HashMap<String, (String, String)>,
+    targets: &HashMap<String, String>,
 ) -> AnyView {
     let zone_id = zone.id.clone();
     // URL slug (never the raw immutable zone id) fed to each CategoryCard's
@@ -425,7 +447,8 @@ fn zone_tile(
         entries.sort_by(|a, b| crate::stores::zones::section_cmp(&a.0, &b.0, &zone.section_order));
         let cards: Vec<_> = entries
             .into_iter()
-            .map(|(section_id, counts)| {
+            .filter_map(|(section_id, counts)| {
+                let channel_id = targets.get(&section_id)?.clone();
                 // Prefer the live channel name/description (kind-40/41, folds
                 // admin renames — issue #44) when the section maps to exactly
                 // one channel; otherwise humanize the section id and fall back
@@ -438,11 +461,11 @@ fn zone_tile(
                         section_description(&section_id).to_string(),
                     ),
                 };
-                view! {
+                Some(view! {
                     <CategoryCard
                         name=display_name
                         description=description
-                        section_id=section_id
+                        channel_id=channel_id
                         icon="sparkle"
                         post_count=counts.total
                         unread_count=counts.unread
@@ -450,7 +473,7 @@ fn zone_tile(
                         zone_slug=zone_slug.clone()
                         zone_label=label.clone()
                     />
-                }
+                })
             })
             .collect();
         view! {

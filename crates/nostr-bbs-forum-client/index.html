@@ -82,8 +82,8 @@
          the previous build used an inline amber-diamond data-URI for the tab
          but pointed the manifest at the retro BBS client's black terminal
          icon, so the installed app was unidentifiable on a home screen. -->
-    <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
-    <link rel="icon" href="icons/icon-192.png" sizes="192x192" type="image/png" />
+    <link rel="icon" href="icons/icon.svg" type="image/svg+xml" data-public-url />
+    <link rel="icon" href="icons/icon-192.png" sizes="192x192" type="image/png" data-public-url />
 
     <!-- Inter, self-hosted: the @font-face lives in style.css. Never load it
          from a font CDN; every such request hands the visitor's IP to a third
@@ -136,9 +136,13 @@
          (scope /community/, one-shot boot via ?pwa=1). Copied verbatim so the
          relative href resolves at the served base; the deploy re-brands
          name/short_name. The retro BBS keeps its own nested-scope manifest at
-         /community/bbs/ for those who prefer that interface. -->
+         /community/bbs/ for those who prefer that interface.
+         This link, the icon links and the touch icon carry a marker
+         attribute: the post_build hook tools/public-url-links.sh prefixes
+         their plain hrefs with the public URL, so a deep-linked page asks for
+         /community/manifest.webmanifest, not a path under itself. -->
     <link data-trunk rel="copy-file" href="manifest.webmanifest" />
-    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="manifest" href="manifest.webmanifest" data-public-url />
 
     <!-- The forum's own icon set. Previously the manifest borrowed
          /community/bbs/icons/* — the RETRO BBS client's icons — which made the
@@ -161,7 +165,7 @@
     <meta name="apple-mobile-web-app-title" content="Forum" />
     <!-- iOS ignores the manifest's icons entirely and ignores SVG touch icons;
          without this link it screenshots the page for the home-screen tile. -->
-    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" data-public-url />
     <!-- Dark chrome behind the notch, matching theme_color and the app's own
          dark-first surface (rather than iOS's default opaque white bar). -->
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />

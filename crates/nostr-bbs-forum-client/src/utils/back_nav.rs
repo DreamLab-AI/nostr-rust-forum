@@ -257,6 +257,13 @@ pub fn restores_scroll(app_path: &str) -> bool {
     !matches!(ForumRoute::parse(app_path), ForumRoute::Topic { .. })
 }
 
+/// Whether a link from `current` to `target` (both base-relative paths) goes
+/// one level up, to [`ForumRoute::up_target`]: following it returns to that
+/// page, so its saved scroll position applies, as for Back.
+pub fn is_up_link(current: &str, target: &str) -> bool {
+    ForumRoute::parse(current).up_target().as_deref() == Some(path_only(target))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +294,31 @@ mod tests {
             up("/forums/zone1/s0123456789ab/t0123456789abcdef"),
             Some("/forums/zone1/s0123456789ab".into())
         );
+    }
+
+    #[test]
+    fn a_breadcrumb_to_the_parent_is_an_up_link() {
+        let topic = "/minimoonoir/s00405652f2bf/teddb1228c6efe63d";
+        assert!(is_up_link(topic, "/minimoonoir/s00405652f2bf"));
+        assert!(is_up_link("/minimoonoir/s00405652f2bf", "/minimoonoir"));
+        // The section-tag hash names the same section but is not its URL.
+        assert!(!is_up_link(topic, "/minimoonoir/s6d38b5f106d8"));
+        // Neither a sibling nor a page two levels up.
+        assert!(!is_up_link(topic, "/minimoonoir/s2e0e14f07842"));
+        assert!(!is_up_link(topic, "/minimoonoir"));
+    }
+
+    #[test]
+    fn up_from_a_canonical_topic_is_the_canonical_section() {
+        use crate::utils::section_url::{section_path, topic_path};
+        // Rants in Minimoonoir: the canonical topic URL (channel-id hash)
+        // goes up to the canonical section URL, never to the section-tag
+        // hash (`s6d38b5f106d8`) the Forums index used to link.
+        let cid = "62e1c0f409f0e35bacefb701e49ba85a8b6168ee48cc4a55eb70df8b8638e1bd";
+        let root = "eddb1228c6efe63d00112233445566778899aabbccddeeff0011223344556677";
+        let section = section_path("minimoonoir", cid);
+        assert_eq!(section, "/minimoonoir/s00405652f2bf");
+        assert_eq!(up(&topic_path("minimoonoir", cid, root)), Some(section));
     }
 
     #[test]

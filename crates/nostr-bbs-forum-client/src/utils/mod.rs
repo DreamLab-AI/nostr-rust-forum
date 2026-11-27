@@ -22,6 +22,7 @@ pub mod resume;
 pub mod sanitize;
 pub mod scroll_anchor;
 pub mod sealed_search;
+pub mod section_url;
 pub mod slug_hash;
 // zone_theme.rs is owned elsewhere (do-not-touch) and contains one genuinely
 // unused fn (`zone_accent_style`, superseded by `zone_accent_style_cfg`).
