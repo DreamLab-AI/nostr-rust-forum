@@ -165,6 +165,14 @@ mod native {
         /// embeddings (row order) here. Embeddings are plaintext-equivalent.
         #[arg(long, global = true)]
         dump_vectors: Option<PathBuf>,
+        /// Comma-separated hex pubkeys whose kind-5 deletes any post (admins
+        /// and moderators); anyone else deletes only their own posts.
+        #[arg(long, global = true)]
+        moderators: Option<String>,
+        /// Seconds an object a manifest stopped listing stays in the pod
+        /// before deletion (browsers may still be loading it).
+        #[arg(long, global = true, default_value_t = nostr_bbs_search_build::pipeline::DEFAULT_RETIRE_AFTER_SECS)]
+        retire_after_secs: u64,
     }
 
     #[derive(Clone, Copy, clap::ValueEnum)]
@@ -480,6 +488,11 @@ mod native {
         } else {
             KeyRing::new()
         };
+        let moderators = cli
+            .moderators
+            .as_deref()
+            .map(nostr_bbs_sealed_search::manifest::parse_publishers)
+            .unwrap_or_default();
         let mut job = Job {
             zone,
             relay_url,
@@ -492,6 +505,9 @@ mod native {
             shard_rows: cli.shard_rows,
             now,
             warnings: Vec::new(),
+            moderators: &moderators,
+            max_excluded: nostr_bbs_sealed_search::manifest::MAX_EXCLUDED,
+            retire_after_secs: cli.retire_after_secs,
         };
         let workers = cli.workers.unwrap_or_else(|| {
             std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1))
@@ -589,7 +605,11 @@ mod native {
                             2,
                         )
                     })?;
-                    let mut h = harvest(&mut relay, zone, &ring, None, &HashSet::new())
+                    let rules = nostr_bbs_search_build::harvest::Rules {
+                        now,
+                        moderators: &moderators,
+                    };
+                    let mut h = harvest(&mut relay, zone, &ring, None, &HashSet::new(), &rules)
                         .await
                         .map_err(JobError::from)?;
                     let rows = std::mem::take(&mut h.rows);

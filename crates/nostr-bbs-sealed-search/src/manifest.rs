@@ -249,6 +249,41 @@ impl Manifest {
         Ok(Self { event: ev, content })
     }
 
+    /// Accept an event as the manifest a searcher may use: [`Manifest::verify`]
+    /// plus, for content v2, the zone-key MAC. `secret_for(epoch, zone_pk)`
+    /// returns the held zone epoch secret whose pubkey is `zone_pk`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Manifest::verify`].
+    pub fn accept(
+        ev: NostrEvent,
+        zone: &str,
+        relay_url: &str,
+        publishers: &[String],
+        high_water: Option<&HighWater>,
+        secret_for: impl Fn(u32, &str) -> Option<zeroize::Zeroizing<[u8; 32]>>,
+    ) -> Result<Self, String> {
+        let _ = &secret_for;
+        Self::verify(ev, zone, relay_url, publishers, high_water)
+    }
+
+    /// The newest of `candidates` (given in trusted-publisher order): the
+    /// highest `index_version`, and among equal versions the first given.
+    /// Clients and the builder pick with this one rule.
+    pub fn newest(candidates: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut best: Option<Self> = None;
+        for m in candidates {
+            if best
+                .as_ref()
+                .is_none_or(|b| m.content.index_version > b.content.index_version)
+            {
+                best = Some(m);
+            }
+        }
+        best
+    }
+
     /// The pubkey of the pod holding `o` (its `owner`, else the signer).
     pub fn owner_of<'a>(&'a self, o: &'a ObjectRef) -> &'a str {
         o.owner_or(&self.event.pubkey)

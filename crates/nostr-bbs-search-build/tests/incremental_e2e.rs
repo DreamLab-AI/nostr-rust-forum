@@ -161,6 +161,13 @@ fn ring(epochs: &[(u32, [u8; 32])]) -> KeyRing {
     r
 }
 
+fn rules() -> nostr_bbs_search_build::harvest::Rules<'static> {
+    nostr_bbs_search_build::harvest::Rules {
+        now: 1_900_000_000,
+        moderators: &[],
+    }
+}
+
 fn pins() -> Pins {
     Pins {
         model: "bge-small-en-v1.5".into(),
@@ -221,7 +228,7 @@ fn fixture(name: &str) -> Fixture {
     let mut pod = DirPod::new(&f.root, ZONE, &pk(ARCHIVIST));
     let p = pins();
     let mut job = job(&me, &keys, &mut pod, &f.publishers, &p);
-    let mut h = block_on(harvest(&mut f.relay, ZONE, &keys, None, &HashSet::new())).unwrap();
+    let mut h = block_on(harvest(&mut f.relay, ZONE, &keys, None, &HashSet::new(), &rules())).unwrap();
     assert_eq!(h.rows.len(), 115);
     let rows = std::mem::take(&mut h.rows);
     let r = block_on(run_full(
@@ -260,6 +267,9 @@ fn job<'a>(
         shard_rows: SHARD_ROWS,
         now: 1_900_000_000,
         warnings: Vec::new(),
+        moderators: &[],
+        max_excluded: nostr_bbs_sealed_search::manifest::MAX_EXCLUDED,
+        retire_after_secs: 0,
     }
 }
 
@@ -796,6 +806,7 @@ fn a_full_build_after_a_v2_manifest_is_v2_and_small_folds_tolerate_a_few_gone_ro
         &ring(&[(1, ZONE_E1)]),
         None,
         &HashSet::new(),
+        &rules(),
     ))
     .unwrap();
     let rows = std::mem::take(&mut h.rows);

@@ -52,7 +52,7 @@ use nostr_bbs_zone_migrate::relay::Relay;
 use serde::Serialize;
 
 use crate::embed::Embedder;
-use crate::harvest::{harvest, present, Harvest, HarvestError, ZoneRow};
+use crate::harvest::{harvest, present, Harvest, HarvestError, Rules, ZoneRow};
 use crate::pod::{ObjectCache, Pod, JSON, OCTET};
 use crate::state::State;
 
@@ -65,6 +65,11 @@ pub const DEFAULT_OVERLAP_SECS: u64 = nostr_bbs_core::event::MAX_CREATED_AT_DRIF
 /// the relay before it refuses (a relay answering incompletely would
 /// otherwise empty the index).
 pub const DEFAULT_MAX_MISSING: f64 = 0.05;
+
+/// Default seconds an object a manifest stopped listing is kept before it is
+/// deleted (48 hours): a browser that read the previous manifest may still be
+/// loading it, and a manual rerun must not cut that short.
+pub const DEFAULT_RETIRE_AFTER_SECS: u64 = 48 * 3600;
 
 /// Missing rows a compaction always tolerates, whatever the share (so one
 /// post deleted through the admin API cannot block a small fold for good).
@@ -121,6 +126,12 @@ pub struct Job<'a, P> {
     pub shard_rows: usize,
     /// Current Unix time (manifest `created_at`).
     pub now: u64,
+    /// Hex pubkeys whose kind-5 deletes any post (admins and moderators).
+    pub moderators: &'a [String],
+    /// Most excluded ids a manifest this job publishes may list.
+    pub max_excluded: usize,
+    /// Seconds an object a manifest stopped listing is kept before deletion.
+    pub retire_after_secs: u64,
     /// Non-fatal findings (no secrets, no text).
     pub warnings: Vec<String>,
 }
@@ -777,7 +788,11 @@ pub async fn run_update<P: Pod, R: Relay, E: Embedder>(
     let indexed = indexed_ids(job, &cur).await?;
     probe_served(relay, &indexed).await?;
     let since = since.or(state.high_water.map(|h| h.saturating_sub(overlap)));
-    let h = harvest(relay, job.zone, job.ring, since, &indexed).await?;
+    let rules = Rules {
+        now: job.now,
+        moderators: job.moderators,
+    };
+    let h = harvest(relay, job.zone, job.ring, since, &indexed, &rules).await?;
     report.harvested(&h);
     let exclude: Vec<String> = h
         .exclude

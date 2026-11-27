@@ -85,6 +85,17 @@ impl std::fmt::Debug for ZoneRow {
     }
 }
 
+/// What a harvest may trust beyond the events themselves.
+#[derive(Debug, Clone, Copy)]
+pub struct Rules<'a> {
+    /// Current Unix time: no high-water mark is set beyond
+    /// `now + MAX_CREATED_AT_DRIFT_SECS`.
+    pub now: u64,
+    /// Hex pubkeys whose kind-5 deletes any post (admins and moderators, from
+    /// the job's configuration). Anyone else deletes only their own posts.
+    pub moderators: &'a [String],
+}
+
 /// What a harvest found. Counts only: no text.
 #[derive(Debug, Default)]
 pub struct Harvest {
@@ -119,6 +130,9 @@ pub struct Harvest {
     pub hold_back: Option<u64>,
     /// Newest `created_at` read.
     pub newest: Option<u64>,
+    /// `created_at` seconds holding more events than one relay page, which
+    /// the relay's `until` paging cannot read completely.
+    pub ambiguous_seconds: Vec<u64>,
 }
 
 impl Harvest {
@@ -340,7 +354,9 @@ pub async fn harvest<R: Relay>(
     ring: &KeyRing,
     since: Option<u64>,
     indexed: &HashSet<String>,
+    rules: &Rules<'_>,
 ) -> Result<Harvest, HarvestError> {
+    let _ = rules;
     if !relay.session_authenticated() {
         return Err(HarvestError::Unauthenticated);
     }
