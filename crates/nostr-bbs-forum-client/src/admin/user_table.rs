@@ -26,11 +26,15 @@ use crate::utils::{shorten_pubkey, Abbrev};
 /// zones are declared so the editor is stable. Each cohort is labelled by the
 /// zone it gates (falling back to a humanised cohort id).
 fn available_cohorts() -> Vec<(String, String)> {
+    available_cohorts_in(&crate::stores::zones::load_zones())
+}
+
+/// [`available_cohorts`] over `zones`.
+fn available_cohorts_in(zones: &[crate::stores::zones::Zone]) -> Vec<(String, String)> {
     use std::collections::BTreeSet;
-    let zones = crate::stores::zones::load_zones();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out: Vec<(String, String)> = Vec::new();
-    for zone in &zones {
+    for zone in zones {
         let mut cohorts: Vec<String> = zone.required_cohorts.clone();
         if let Some(write) = &zone.write_cohorts {
             cohorts.extend(write.iter().cloned());
@@ -57,7 +61,8 @@ fn available_cohorts() -> Vec<(String, String)> {
                 continue;
             }
             if seen.insert(c.clone()) {
-                out.push((c.clone(), zone.label()));
+                let label = cohort_label(&c, zones);
+                out.push((c, label));
             }
         }
     }
@@ -760,18 +765,13 @@ fn UserRow(
                                         // zone's generic id and its slug (dual-accept, e.g.
                                         // "zone4" + "dreamlab") would otherwise show the
                                         // same zone badge twice.
-                                        let mut seen_labels = std::collections::BTreeSet::new();
-                                        cohorts_disp.iter().filter_map(|c| {
-                                            let label = cohort_label(c, &zones);
-                                            if !seen_labels.insert(label.clone()) {
-                                                return None;
-                                            }
+                                        badges(&cohorts_disp, &zones).into_iter().map(|(c, label)| {
                                             let badge_class = cohort_badge_class(c);
-                                            Some(view! {
+                                            view! {
                                                 <span class=badge_class>
                                                     {label}
                                                 </span>
-                                            })
+                                            }
                                         }).collect_view()
                                     }
                                 </div>
@@ -982,17 +982,48 @@ fn CohortEditor(editing_cohorts: RwSignal<Vec<String>>) -> impl IntoView {
 /// `"zone2"` shows as "Minimoonoir" instead of the raw generic id. Falls back
 /// to a humanised cohort id for cohorts with no matching zone (`"members"`,
 /// `"agent"`, and other non-zone-gated cohorts).
+///
+/// A cohort is named by the zone it grants ACCESS to: a zone that requires
+/// it, searched across every zone first. Only a cohort no zone requires falls
+/// back to a zone that lists it in `write_cohorts`. Matching either list in
+/// zone order named "minimoonoir" after Welcome once Welcome's write list
+/// grew to include it, and every badge collapsed to "Welcome".
 fn cohort_label(cohort: &str, zones: &[crate::stores::zones::Zone]) -> String {
-    zones
-        .iter()
-        .find(|z| {
-            z.required_cohorts.iter().any(|c| c == cohort)
-                || z.write_cohorts
-                    .as_ref()
-                    .is_some_and(|w| w.iter().any(|c| c == cohort))
-        })
+    cohort_zone(cohort, zones)
         .map(|z| z.label())
         .unwrap_or_else(|| capitalize(cohort))
+}
+
+/// The zone a cohort is named after (see [`cohort_label`]).
+fn cohort_zone<'a>(
+    cohort: &str,
+    zones: &'a [crate::stores::zones::Zone],
+) -> Option<&'a crate::stores::zones::Zone> {
+    zones
+        .iter()
+        .find(|z| z.required_cohorts.iter().any(|c| c == cohort))
+        .or_else(|| {
+            zones.iter().find(|z| {
+                z.write_cohorts
+                    .as_ref()
+                    .is_some_and(|w| w.iter().any(|c| c == cohort))
+            })
+        })
+}
+
+/// The badges for a member holding `cohorts`, in order, each zone once
+/// (a member holding both a zone's generic id and its slug gets one badge).
+/// Returns `(cohort, label)`: the first cohort held for each label.
+fn badges<'a>(
+    cohorts: &'a [String],
+    zones: &[crate::stores::zones::Zone],
+) -> Vec<(&'a str, String)> {
+    let mut seen = std::collections::BTreeSet::new();
+    cohorts
+        .iter()
+        .map(|c| (c.as_str(), cohort_label(c, zones)))
+        .filter(|(_, label)| seen.insert(label.clone()))
+        .collect()
 }
 
 /// Capitalise a cohort id for display (`"friends"` -> `"Friends"`).
@@ -1078,5 +1109,65 @@ fn trash_icon() -> impl IntoView {
             <line x1="10" y1="11" x2="10" y2="17"/>
             <line x1="14" y1="11" x2="14" y2="17"/>
         </svg>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live shape: Welcome widened its `write_cohorts` so migrated members
+    /// can post in Support; Minimoonoir is gated by its dual-accept cohorts.
+    fn live_zones() -> Vec<crate::stores::zones::Zone> {
+        serde_json::from_str(
+            r#"[
+                {"id":"zone1","slug":"welcome","display_name":"Welcome",
+                 "required_cohorts":[],
+                 "write_cohorts":["members","agent","minimoonoir","family","dreamlab"]},
+                {"id":"zone2","slug":"minimoonoir","display_name":"Minimoonoir",
+                 "required_cohorts":["zone2","minimoonoir"]}
+            ]"#,
+        )
+        .expect("zone config parses")
+    }
+
+    fn held(c: &[&str]) -> Vec<String> {
+        c.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_cohort_is_named_by_the_zone_it_grants_access_to() {
+        let z = live_zones();
+        assert_eq!(cohort_label("minimoonoir", &z), "Minimoonoir");
+        assert_eq!(cohort_label("zone2", &z), "Minimoonoir");
+        // Required nowhere, so the zone that lets it write.
+        assert_eq!(cohort_label("members", &z), "Welcome");
+        assert_eq!(cohort_label("family", &z), "Welcome");
+        // Unknown to every zone: the capitalised id.
+        assert_eq!(cohort_label("friends", &z), "Friends");
+    }
+
+    #[test]
+    fn member_badges_show_every_zone_once() {
+        let z = live_zones();
+        let labels = |c: &[&str]| -> Vec<String> {
+            let held = held(c);
+            badges(&held, &z).into_iter().map(|(_, l)| l).collect()
+        };
+        assert_eq!(
+            labels(&["members", "minimoonoir"]),
+            ["Welcome", "Minimoonoir"]
+        );
+        assert_eq!(labels(&["zone2", "minimoonoir"]), ["Minimoonoir"]);
+    }
+
+    #[test]
+    fn editor_checkboxes_are_titled_by_the_zone_they_open() {
+        let z = live_zones();
+        let titles: std::collections::HashMap<String, String> =
+            available_cohorts_in(&z).into_iter().collect();
+        assert_eq!(titles["minimoonoir"], "Minimoonoir");
+        assert_eq!(titles["members"], "Welcome");
+        assert!(!titles.contains_key("zone2"), "the generic id stays hidden");
     }
 }
