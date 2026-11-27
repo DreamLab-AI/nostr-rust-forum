@@ -1427,3 +1427,9 @@ html.bbs-reduced-motion .sentry-critical.on,
 html.bbs-reduced-motion .sentry-radar::before {
   animation: none;
 }
+
+/* A post opened from a link (notification, search, bookmark): outlined once. */
+.bbs-post.bbs-post-focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

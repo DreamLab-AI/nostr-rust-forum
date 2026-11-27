@@ -44,6 +44,7 @@ use crate::views::{
     dm::{DmChatView, DmListView},
     events::EventsView,
     games::{GamesView, PokerView},
+    go::GoView,
     governance::AgentsView,
     kanban::KanbanView,
     knowledge::KnowledgeView,
@@ -347,9 +348,13 @@ pub fn App() -> impl IntoView {
                         zone,
                         channel_id,
                         root_id,
+                        focus,
                     } => {
-                        view! { <ThreadView zone=zone channel_id=channel_id root_id=root_id/> }
+                        view! { <ThreadView zone=zone channel_id=channel_id root_id=root_id focus=focus/> }
                             .into_any()
+                    }
+                    Route::Go { event_id, channel } => {
+                        view! { <GoView event_id=event_id channel=channel/> }.into_any()
                     }
                     Route::LiveFeed => view! { <LiveFeedView/> }.into_any(),
                     Route::Kanban { zone } => view! { <KanbanView zone=zone/> }.into_any(),

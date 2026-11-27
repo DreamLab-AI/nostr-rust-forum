@@ -6,6 +6,10 @@
 //! while keeping `?pwa=1` query parameters intact for ADR-109 zone-bound boot.
 
 use leptos::prelude::*;
+use nostr_bbs_client_core::base_href;
+use nostr_bbs_client_core::stores::zones::{load_zones, resolve_zone_param, zone_slug, Zone};
+use nostr_bbs_client_core::utils::post_link::jump_link;
+use nostr_bbs_client_core::utils::slug_hash::{section_slug, topic_slug};
 
 /// Every navigable location in the re-imagined BBS workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -21,11 +25,21 @@ pub enum Route {
     Zone { slug: String },
     /// A board's topic list (kind-40 channel).
     Board { zone: String, channel_id: String },
-    /// A thread view (root kind-42 + kind-42/1111 replies).
+    /// A thread view (root kind-42 + kind-42/1111 replies), opened at its
+    /// newest post, or at post `focus` when set (a notification, a search
+    /// hit, a bookmark).
     Thread {
         zone: String,
         channel_id: String,
         root_id: String,
+        focus: Option<String>,
+    },
+    /// A link to one post (`event_id`, optionally its channel), resolved to
+    /// the topic that holds it and replaced by that [`Route::Thread`]. The
+    /// BBS form of the forum's `/go/<id>?c=<channel>`.
+    Go {
+        event_id: String,
+        channel: Option<String>,
     },
     /// Per-zone Kanban board (kind-30301 / kind-30302).
     Kanban { zone: String },
@@ -76,7 +90,22 @@ impl Route {
                 zone,
                 channel_id,
                 root_id,
+                focus: None,
             } => format!("#/z/{zone}/b/{channel_id}/t/{root_id}"),
+            Route::Thread {
+                zone,
+                channel_id,
+                root_id,
+                focus: Some(f),
+            } => format!("#/z/{zone}/b/{channel_id}/t/{root_id}/p/{f}"),
+            Route::Go {
+                event_id,
+                channel: None,
+            } => format!("#/go/{event_id}"),
+            Route::Go {
+                event_id,
+                channel: Some(c),
+            } => format!("#/go/{event_id}/c/{c}"),
             Route::Kanban { zone } => format!("#/z/{zone}/kanban"),
             Route::LiveFeed => "#/live".into(),
             Route::DmList => "#/dm".into(),
@@ -101,7 +130,17 @@ impl Route {
 
     /// Parse a `location.hash` string into a [`Route`].
     pub fn from_hash(raw: &str) -> Self {
-        let path = raw.trim().trim_start_matches('#').trim_matches('/');
+        let path = raw.trim().trim_start_matches('#');
+        // A forum-style query (`#/go/<id>?c=<channel>`) is accepted too.
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        let param = |k: &str| {
+            query
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(key, v)| *key == k && !v.is_empty())
+                .map(|(_, v)| v.to_string())
+        };
+        let path = path.trim_matches('/');
         if path.is_empty() {
             return Route::Zones;
         }
@@ -124,6 +163,21 @@ impl Route {
                 zone: (*zone).to_string(),
                 channel_id: (*channel_id).to_string(),
                 root_id: (*root_id).to_string(),
+                focus: param("focus"),
+            },
+            ["z", zone, "b", channel_id, "t", root_id, "p", focus] => Route::Thread {
+                zone: (*zone).to_string(),
+                channel_id: (*channel_id).to_string(),
+                root_id: (*root_id).to_string(),
+                focus: Some((*focus).to_string()),
+            },
+            ["go", event_id] => Route::Go {
+                event_id: (*event_id).to_string(),
+                channel: param("c"),
+            },
+            ["go", event_id, "c", channel] => Route::Go {
+                event_id: (*event_id).to_string(),
+                channel: Some((*channel).to_string()),
             },
             ["live"] | ["chat"] => Route::LiveFeed,
             ["dm"] | ["dms"] | ["inbox"] => Route::DmList,
@@ -166,6 +220,7 @@ impl Route {
             Route::Zone { .. } => "Zone",
             Route::Board { .. } => "Board",
             Route::Thread { .. } => "Thread",
+            Route::Go { .. } => "Opening Post",
             Route::Kanban { .. } => "Kanban",
             Route::LiveFeed => "Live Feed",
             Route::DmList | Route::DmChat { .. } => "Direct Messages",
@@ -222,6 +277,71 @@ impl Route {
             },
         }
     }
+}
+
+impl Route {
+    /// The equivalent page of the modern forum, as an app-relative path
+    /// (prefix it with `base_href`): a board opens its section page, a thread
+    /// its topic page (at the focused post when there is one), a post link
+    /// the forum's own resolver, and the other views their forum
+    /// counterparts. The forum's front page where there is none.
+    pub fn forum_path(&self, zones: &[Zone]) -> String {
+        // The forum accepts a zone's slug or id; links carry the slug.
+        let zone_path = |z: &str| {
+            resolve_zone_param(z, zones)
+                .map(|z| zone_slug(z).to_string())
+                .unwrap_or_else(|| z.to_string())
+        };
+        match self {
+            Route::Zone { slug } => format!("/forums/{}", zone_path(slug)),
+            Route::Board { zone, channel_id } => {
+                format!("/forums/{}/{}", zone_path(zone), section_slug(channel_id))
+            }
+            Route::Thread {
+                zone,
+                channel_id,
+                root_id,
+                focus,
+            } => {
+                let topic = format!(
+                    "/forums/{}/{}/{}",
+                    zone_path(zone),
+                    section_slug(channel_id),
+                    topic_slug(root_id)
+                );
+                match focus {
+                    Some(f) => format!("{topic}?focus={f}"),
+                    None => topic,
+                }
+            }
+            Route::Go { event_id, channel } => jump_link(event_id, channel.as_deref()),
+            Route::Kanban { zone } => format!("/forums/{}/board", zone_path(zone)),
+            Route::Zones | Route::LiveFeed => "/forums".into(),
+            Route::DmList => "/dm".into(),
+            Route::DmChat { pubkey } => format!("/dm/{pubkey}"),
+            Route::Agents => "/governance".into(),
+            Route::Events => "/events".into(),
+            Route::Knowledge => "/knowledge".into(),
+            Route::Wallet => "/wallet".into(),
+            Route::Pod { .. } => "/pod".into(),
+            Route::Profile { pubkey } => format!("/profile/{pubkey}"),
+            Route::Settings => "/settings".into(),
+            Route::Poker { .. } => "/table".into(),
+            Route::Landing
+            | Route::Rebind
+            | Route::Games
+            | Route::Members
+            | Route::Notifications
+            | Route::Bookmarks
+            | Route::Help => "/".into(),
+        }
+    }
+}
+
+/// The href of `route`'s equivalent page in the modern forum
+/// ([`Route::forum_path`] under the forum's base path).
+pub fn forum_href(route: &Route) -> String {
+    base_href(&route.forum_path(&load_zones()))
 }
 
 /// Parse a `/command` string into a [`CommandAction`].
@@ -334,6 +454,26 @@ impl Router {
         let _ = hash;
     }
 
+    /// Navigate to `target` in place of the current history entry (a
+    /// resolver route such as [`Route::Go`] handing over to its result, so
+    /// Back does not return to the resolver).
+    pub fn replace(&self, target: Route) {
+        let effective = self.enforce_pin(target);
+        let hash = effective.to_hash();
+        self.route.set(effective);
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(win) = web_sys::window() {
+                let loc = win.location();
+                if loc.hash().ok().as_deref() != Some(hash.as_str()) {
+                    let _ = loc.replace(&hash);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = hash;
+    }
+
     /// Navigate up one level in the route hierarchy.
     pub fn back(&self) {
         let pinned = self.pinned_zone.get_untracked();
@@ -427,6 +567,21 @@ mod tests {
                 zone: "public".into(),
                 channel_id: "abc123".into(),
                 root_id: "def456".into(),
+                focus: None,
+            },
+            Route::Thread {
+                zone: "public".into(),
+                channel_id: "abc123".into(),
+                root_id: "def456".into(),
+                focus: Some("fff999".into()),
+            },
+            Route::Go {
+                event_id: "e1".into(),
+                channel: None,
+            },
+            Route::Go {
+                event_id: "e1".into(),
+                channel: Some("c1".into()),
             },
             Route::Kanban {
                 zone: "friends".into(),
@@ -501,6 +656,7 @@ mod tests {
             zone: "fam".into(),
             channel_id: "c1".into(),
             root_id: "r1".into(),
+            focus: Some("p1".into()),
         };
         assert_eq!(
             t.parent(None),
@@ -517,5 +673,78 @@ mod tests {
             Route::Zone { slug: "fam".into() }.parent(None),
             Route::Zones
         );
+    }
+
+    #[test]
+    fn forum_style_queries_parse() {
+        assert_eq!(
+            Route::from_hash("#/go/abc?c=chan"),
+            Route::Go {
+                event_id: "abc".into(),
+                channel: Some("chan".into())
+            }
+        );
+        assert_eq!(
+            Route::from_hash("#/go/abc"),
+            Route::Go {
+                event_id: "abc".into(),
+                channel: None
+            }
+        );
+        assert_eq!(
+            Route::from_hash("#/z/z1/b/c1/t/r1?focus=p1"),
+            Route::Thread {
+                zone: "z1".into(),
+                channel_id: "c1".into(),
+                root_id: "r1".into(),
+                focus: Some("p1".into())
+            },
+            "a query never ends up inside the root id"
+        );
+    }
+
+    #[test]
+    fn forum_path_opens_the_equivalent_page() {
+        let cid = "a".repeat(64);
+        let root = "b".repeat(64);
+        let board = Route::Board {
+            zone: "zone-x".into(),
+            channel_id: cid.clone(),
+        };
+        assert_eq!(
+            board.forum_path(&[]),
+            format!("/forums/zone-x/{}", section_slug(&cid))
+        );
+        let thread = Route::Thread {
+            zone: "zone-x".into(),
+            channel_id: cid.clone(),
+            root_id: root.clone(),
+            focus: None,
+        };
+        assert_eq!(
+            thread.forum_path(&[]),
+            format!(
+                "/forums/zone-x/{}/{}",
+                section_slug(&cid),
+                topic_slug(&root)
+            )
+        );
+        let focused = Route::Thread {
+            zone: "zone-x".into(),
+            channel_id: cid.clone(),
+            root_id: root.clone(),
+            focus: Some("p1".into()),
+        };
+        assert!(focused.forum_path(&[]).ends_with("?focus=p1"));
+        assert_eq!(
+            Route::Go {
+                event_id: "e1".into(),
+                channel: Some("chan".into())
+            }
+            .forum_path(&[]),
+            "/go/e1?c=chan"
+        );
+        assert_eq!(Route::Zones.forum_path(&[]), "/forums");
+        assert_eq!(Route::Help.forum_path(&[]), "/");
     }
 }

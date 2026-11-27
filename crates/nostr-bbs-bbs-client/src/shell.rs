@@ -21,7 +21,7 @@ use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
 use crate::components::{launch_sentry, BbsToastBar};
 use crate::config::BbsConfig;
 use crate::prefs::use_bbs_prefs;
-use crate::router::{parse_slash_command, use_router, CommandAction, Route};
+use crate::router::{forum_href, parse_slash_command, use_router, CommandAction, Route};
 
 /// Open state for the global Cmd/Ctrl+K search overlay.
 #[derive(Clone, Copy)]
@@ -535,7 +535,9 @@ fn Sidebar() -> impl IntoView {
                     <span class="tui-side-glyph">"?"</span>
                     <span class="tui-side-label">"Help & Keys"</span>
                 </button>
-                <a class="tui-side-item" href="../" rel="noopener">
+                // The same place in the modern forum: a board's section page,
+                // a thread's topic page.
+                <a class="tui-side-item" href=move || forum_href(&router.route.get()) rel="noopener">
                     <span class="tui-side-glyph">"↗"</span>
                     <span class="tui-side-label">"Modern Forum"</span>
                 </a>
@@ -577,7 +579,9 @@ fn CommandBar() -> impl IntoView {
             {
                 #[cfg(target_arch = "wasm32")]
                 if let Some(win) = web_sys::window() {
-                    let _ = win.location().set_href("../");
+                    let _ = win
+                        .location()
+                        .set_href(&forum_href(&router.route.get_untracked()));
                 }
             }
             CommandAction::Back => router.back(),

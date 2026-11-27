@@ -127,6 +127,9 @@ pub fn BookmarksView() -> impl IntoView {
                                                 zone: b_go.zone.clone(),
                                                 channel_id: b_go.channel_id.clone(),
                                                 root_id: b_go.root_id.clone(),
+                                                // Open at the saved post itself.
+                                                focus: (b_go.event_id != b_go.root_id)
+                                                    .then(|| b_go.event_id.clone()),
                                             })
                                         >"Open Thread →"</button>
                                         <button

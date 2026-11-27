@@ -5,6 +5,7 @@ pub mod bookmarks;
 pub mod dm;
 pub mod events;
 pub mod games;
+pub mod go;
 pub mod governance;
 pub mod kanban;
 pub mod knowledge;

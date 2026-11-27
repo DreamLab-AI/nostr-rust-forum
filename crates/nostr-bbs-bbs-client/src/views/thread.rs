@@ -1,6 +1,13 @@
 //! Board topic list + full threaded conversation view.
 //!
-//! Full parity with `nostr-bbs-forum-client`:
+//! Full parity with `nostr-bbs-forum-client`, on the SAME topic model
+//! (client-core [`topics`](nostr_bbs_client_core::topics)):
+//! - a board lists its TOPICS (kind-42 roots, from the channel window plus
+//!   the section's root list), newest activity first, with the relay's
+//!   exact reply count and last poster; a reply is never listed as a topic
+//! - a thread shows the topic's root and replies oldest first from the
+//!   topic's own paged list, lands at the newest post (or a linked one) and
+//!   pages older replies on request
 //! - NIP-28 kind-42 topics/replies + NIP-22 kind-1111 comments
 //! - End-to-end encrypted zones (ADR-2016/2017) via shared `ZoneKeyStore` / `ZoneWriter`
 //! - Markdown rendering + on-theme phosphor `AsciiImg` with ASCII/Raw toggle
@@ -9,13 +16,12 @@
 //! - Per-identity auto-saved drafts (`draft:v2:`), bookmarks, mute, read positions
 //! - Image picker + clipboard image paste via NIP-98 Solid Pod PUT
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use leptos::prelude::*;
 use nostr_bbs_client_core::auth::use_auth;
 use nostr_bbs_client_core::relay::RelayConnection;
-use nostr_bbs_client_core::stores::channels::use_channel_store;
+use nostr_bbs_client_core::stores::channels::{roots_key, topic_key, use_channel_store};
 use nostr_bbs_client_core::stores::custom_emoji::use_custom_emoji_store;
 use nostr_bbs_client_core::stores::mute::use_mute_store;
 use nostr_bbs_client_core::stores::profile_cache::try_use_profile_cache;
@@ -23,11 +29,17 @@ use nostr_bbs_client_core::stores::reactions::use_reaction_store;
 use nostr_bbs_client_core::stores::read_position::use_read_positions;
 use nostr_bbs_client_core::stores::zones::{load_zones, resolve_zone_param};
 use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
-use nostr_bbs_client_core::utils::{format_relative_time, shorten_pubkey};
+use nostr_bbs_client_core::topics::{
+    board_events, classify_topics, edit_tags, find_topic_root, history_settled, landing_target,
+    latest_post, latest_version, post_anchor_id, thread_events, thread_replies, topic_reply_tags,
+    topic_root_tags, topic_title, with_topic_stats, Landing, ReplyView, TopicSummary,
+};
+use nostr_bbs_client_core::utils::lookup::zone_is_gated;
+use nostr_bbs_client_core::utils::scroll_anchor;
+use nostr_bbs_client_core::utils::{format_relative_time, set_timeout_once, shorten_pubkey};
 use nostr_bbs_client_core::zone_crypto::store::{try_use_zone_key_store, ZoneWriter};
 use nostr_bbs_client_core::zone_crypto::{encryption_enabled, has_zk_tag};
 use nostr_bbs_core::event::{NostrEvent, UnsignedEvent};
-use nostr_bbs_core::thread::{channel_message_tags, group_threads, thread_messages};
 
 use crate::ascii_img::{extract_image_urls, AsciiImg};
 use crate::components::{AuthorChip, EmptyCard, MarkdownBody};
@@ -36,6 +48,10 @@ use crate::router::{use_router, Route};
 use crate::views::bookmarks::{is_bookmarked, toggle_bookmark, BookmarkItem};
 
 const BUILTIN_REACTIONS: &[&str] = &["👍", "❤️", "😂", "🔥", "🎉", "👀", "💯", "🙌"];
+
+/// Id of the scrolling content pane (`shell.rs`): the BBS scrolls it, not
+/// the window.
+const MAIN_PANE_ID: &str = "bbs-main";
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn draft_key(pubkey: &str, scope: &str) -> String {
@@ -74,50 +90,6 @@ fn save_draft(pubkey: Option<&str>, scope: &str, text: &str) {
     let _ = (pubkey, scope, text);
 }
 
-/// Resolve author-latest edits (`["e", target, "", "edit"]`) over a message list.
-fn apply_edits(msgs: &[NostrEvent]) -> (Vec<NostrEvent>, HashMap<String, String>) {
-    let mut latest_edit: HashMap<String, (u64, String, String)> = HashMap::new();
-    let mut is_edit_event: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for ev in msgs {
-        let edit_target = ev.tags.iter().find_map(|t| {
-            if t.first().map(String::as_str) == Some("e")
-                && t.get(3).map(String::as_str) == Some("edit")
-            {
-                t.get(1).cloned()
-            } else {
-                None
-            }
-        });
-        if let Some(target_id) = edit_target {
-            is_edit_event.insert(ev.id.clone());
-            let entry = latest_edit
-                .entry(target_id)
-                .or_insert((0, String::new(), String::new()));
-            if ev.created_at >= entry.0 {
-                *entry = (ev.created_at, ev.pubkey.clone(), ev.content.clone());
-            }
-        }
-    }
-
-    let mut edited_map = HashMap::new();
-    let visible: Vec<NostrEvent> = msgs
-        .iter()
-        .filter(|e| !is_edit_event.contains(&e.id))
-        .cloned()
-        .map(|mut e| {
-            if let Some((_, editor_pk, new_content)) = latest_edit.get(&e.id) {
-                if editor_pk == &e.pubkey {
-                    e.content = new_content.clone();
-                    edited_map.insert(e.id.clone(), new_content.clone());
-                }
-            }
-            e
-        })
-        .collect();
-    (visible, edited_map)
-}
-
 fn snippet(content: &str, max: usize) -> String {
     let line = content
         .lines()
@@ -135,7 +107,53 @@ fn snippet(content: &str, max: usize) -> String {
     out
 }
 
-/// Board topic list (`#/z/<zone>/b/<channel_id>`).
+/// "N reply" / "N replies".
+fn replies_label(n: u32) -> String {
+    format!("{n} repl{}", if n == 1 { "y" } else { "ies" })
+}
+
+/// The content pane, for scroll anchoring and landing.
+fn main_pane() -> Option<web_sys::HtmlElement> {
+    use wasm_bindgen::JsCast;
+    web_sys::window()?
+        .document()?
+        .get_element_by_id(MAIN_PANE_ID)?
+        .dyn_into::<web_sys::HtmlElement>()
+        .ok()
+}
+
+/// Page `key`'s list one step (`older`, else newer) keeping the reader's
+/// place: the row on screen before the page lands is where it is after.
+fn page_keeping_place(
+    relay: &RelayConnection,
+    key: &str,
+    needles: Vec<String>,
+    gated: bool,
+    older: bool,
+) {
+    let store = use_channel_store();
+    let anchor: Rc<std::cell::RefCell<Option<scroll_anchor::Anchor>>> = Rc::default();
+    let before = {
+        let anchor = anchor.clone();
+        Rc::new(move || {
+            let pane = main_pane();
+            *anchor.borrow_mut() = scroll_anchor::capture(pane.as_deref());
+        }) as Rc<dyn Fn()>
+    };
+    let after = Rc::new(move || {
+        if let Some(a) = anchor.borrow_mut().take() {
+            scroll_anchor::restore(a, main_pane());
+        }
+    }) as Rc<dyn Fn()>;
+    if older {
+        store.load_older(relay, key, needles, gated, before, after);
+    } else {
+        store.load_newer(relay, key, needles, gated, before, after);
+    }
+}
+
+/// Board topic list (`#/z/<zone>/b/<channel_id>`): the section's topics,
+/// newest activity first, as the forum's section page lists them.
 #[component]
 pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     let router = use_router();
@@ -145,13 +163,6 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     let read_pos = use_read_positions();
     let zk_store = try_use_zone_key_store();
     let enc_gate = encryption_enabled();
-
-    let cid_sub = channel_id.clone();
-    let relay_sub = relay.clone();
-    Effect::new(move |_| {
-        channels.ensure_subscribed(&relay_sub, &cid_sub);
-        channels.request_topic_roots(&relay_sub, &cid_sub, false);
-    });
 
     let zones = load_zones();
     let resolved_zone = resolve_zone_param(&zone, &zones).cloned();
@@ -164,13 +175,98 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         .map(|z| z.id.clone())
         .unwrap_or_else(|| zone.clone());
     let is_enc = enc_gate && resolved_zone.as_ref().is_some_and(|z| z.encrypted);
+    // A gated zone withholds history until AUTH: only the authenticated
+    // answer counts (`SyncReceipt::settles`).
+    let gated = zone_is_gated(&zone, &zones);
+    let cid = StoredValue::new(channel_id.clone());
+
+    // The channel's history, then (once that answer counts) its first page
+    // for paging and the section's root list: every topic, dormant ones
+    // included, without paging the channel. Asked before AUTH in a gated
+    // zone the root list came back empty and was never asked again.
+    {
+        let relay = relay.clone();
+        Effect::new(move |_| {
+            let cid = cid.get_value();
+            channels.ensure_subscribed(&relay, &cid);
+            if channels.history_receipt(&cid).settles(gated) {
+                channels.settle_first_page(&cid, gated);
+                channels.request_topic_roots(&relay, &cid, gated);
+            }
+        });
+    }
+
+    // Topics: the roots among the window and the root list, replies folded
+    // in (client-core, as the forum's section page). A Memo, so the list is
+    // classified once per store change.
+    let classified = Memo::new(move |_| {
+        let cid = cid.get_value();
+        channels.channel_messages.with(|m| {
+            let window = m.get(&cid).map(Vec::as_slice).unwrap_or(&[]);
+            let roots = m.get(&roots_key(&cid)).map(Vec::as_slice).unwrap_or(&[]);
+            classify_topics(&cid, &board_events(window, roots))
+        })
+    });
+    // The window holds a fraction of a long topic: the relay's exact reply
+    // total and newest reply where they are in.
+    let topics = Memo::new(move |_| {
+        with_topic_stats(classified.get(), |t| {
+            (
+                channels.total_for(&topic_key(&t.id)),
+                channels.topic_latest(&t.id),
+            )
+        })
+    });
+    {
+        let relay = relay.clone();
+        Effect::new(move |_| {
+            let cid = cid.get_value();
+            if !channels.history_receipt(&cid).settles(gated) {
+                return;
+            }
+            let ids: Vec<String> = topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect());
+            channels.request_topic_stats(&relay, &cid, &ids, gated);
+        });
+    }
+
+    // What counts as new is what arrived since the reader last opened the
+    // board; opening it then marks the channel read at its newest post.
+    let last_read_at_open = read_pos
+        .last_read_timestamp(channel_id.clone())
+        .get_untracked();
+    Effect::new(move |_| {
+        let cid = cid.get_value();
+        let latest = channels
+            .channel_messages
+            .with(|m| m.get(&cid).and_then(|evs| latest_post(evs)));
+        if let Some((id, ts)) = latest {
+            read_pos.mark_read(&cid, &id, ts);
+        }
+    });
+
+    let settled = Memo::new(move |_| {
+        let cid = cid.get_value();
+        channels.history_receipt(&cid).settles(gated) && channels.topic_roots_answered(&cid)
+    });
+    // Older history adds topics only while the root list is incomplete.
+    let can_load_older = Memo::new(move |_| {
+        let cid = cid.get_value();
+        !channels.topic_roots_complete(&cid)
+            && channels.history_cursor(&cid).next_request().is_some()
+    });
+    let loading_older = Memo::new(move |_| channels.history_cursor(&cid.get_value()).loading);
 
     let show_new_topic = RwSignal::new(false);
-    let cid_title = channel_id.clone();
-    let cid_list = channel_id.clone();
-    let cid_composer = channel_id.clone();
+    let channel_name = move || {
+        let id = cid.get_value();
+        channels
+            .channels
+            .with(|cs| cs.iter().find(|c| c.id == id).map(|c| c.name.clone()))
+            .unwrap_or_else(|| shorten_pubkey(&id))
+    };
     let zone_back = zone.clone();
-    let zone_for_rows = zone.clone();
+    let zone_rows = StoredValue::new(zone.clone());
+    let relay_older = relay.clone();
 
     view! {
         <div class="tui-container">
@@ -181,37 +277,12 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                     on:click=move |_| router.go(Route::Zone { slug: zone_back.clone() })
                 >"← " {zone_name.clone()}</button>
                 <span>"/"</span>
-                <strong>
-                    "# "
-                    {move || {
-                        channels
-                            .channels
-                            .get()
-                            .into_iter()
-                            .find(|c| c.id == cid_title)
-                            .map(|c| c.name)
-                            .unwrap_or_else(|| shorten_pubkey(&cid_title))
-                    }}
-                </strong>
+                <strong>"# " {channel_name}</strong>
             </div>
 
             <div class="tui-page-head">
                 <div>
-                    <h1 class="tui-page-title">
-                        "# "
-                        {
-                            let cid_h = channel_id.clone();
-                            move || {
-                                channels
-                                    .channels
-                                    .get()
-                                    .into_iter()
-                                    .find(|c| c.id == cid_h)
-                                    .map(|c| c.name)
-                                    .unwrap_or_else(|| shorten_pubkey(&cid_h))
-                            }
-                        }
-                    </h1>
+                    <h1 class="tui-page-title">"# " {channel_name}</h1>
                     {is_enc.then(|| {
                         let zid = zone_id.clone();
                         move || {
@@ -239,102 +310,168 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
 
             <Show when=move || show_new_topic.get() fallback=|| ()>
                 <PostComposer
-                    channel_id=cid_composer.clone()
+                    channel_id=cid.get_value()
                     zone_id=zone_id.clone()
+                    topic=None
                     reply_to=RwSignal::new(None)
-                    default_reply=None
                     placeholder="Start a new topic (Markdown supported · paste or attach images)…"
                     on_sent=Callback::new(move |_| show_new_topic.set(false))
                 />
             </Show>
 
             {move || {
-                let raw = channels
-                    .channel_messages
-                    .get()
-                    .get(&cid_list)
-                    .cloned()
-                    .unwrap_or_default();
-                let (visible, _) = apply_edits(&raw);
-                let threads = group_threads(&visible, &cid_list);
-                let last_read = read_pos.last_read_timestamp(cid_list.clone()).get();
-
-                if threads.is_empty() {
-                    let body = if auth.is_authenticated().get() {
-                        "No topics in this board yet. Tap '+ New Topic' to start the conversation."
-                    } else {
-                        "No topics loaded yet. If this is a gated zone, sign in to read and post."
-                    };
-                    return view! { <EmptyCard title="Board is empty" body=body /> }.into_any();
+                if !topics.with(Vec::is_empty) {
+                    return ().into_any();
                 }
-
-                view! {
-                    <div class="tui-stack">
-                        {threads.into_iter().map(|t| {
-                            let root_id = t.root.id.clone();
-                            let root_nav = root_id.clone();
-                            let z_nav = zone_for_rows.clone();
-                            let cid_nav = cid_list.clone();
-                            let title = snippet(&t.root.content, 110);
-                            let is_unread = t.last_activity > last_read && last_read > 0;
-                            let is_e2e = has_zk_tag(&t.root.tags);
-
-                            view! {
-                                <div
-                                    class="tui-card tui-card-interactive tui-stack"
-                                    role="button"
-                                    tabindex="0"
-                                    on:click=move |_| router.go(Route::Thread {
-                                        zone: z_nav.clone(),
-                                        channel_id: cid_nav.clone(),
-                                        root_id: root_nav.clone(),
-                                    })
-                                >
-                                    <div class="tui-row-between">
-                                        <div class="tui-row">
-                                            {is_unread.then(|| view! {
-                                                <span class="bbs-badge bbs-badge-accent">"NEW"</span>
-                                            })}
-                                            {is_e2e.then(|| view! {
-                                                <span class="bbs-badge bbs-badge-ok">"🔒"</span>
-                                            })}
-                                            <strong>{title}</strong>
-                                        </div>
-                                        <span class="bbs-badge">
-                                            {format!("{} repl{}", t.reply_count, if t.reply_count == 1 { "y" } else { "ies" })}
-                                        </span>
-                                    </div>
-                                    <div class="tui-row-between" style="font-size:0.8rem">
-                                        <AuthorChip pubkey=t.root.pubkey.clone() />
-                                        <span class="tui-muted">{format_relative_time(t.last_activity)}</span>
-                                    </div>
-                                </div>
-                            }
-                        }).collect_view()}
-                    </div>
-                }.into_any()
+                let (title, body) = if !settled.get() {
+                    ("Loading topics…", "Fetching this board's topics (and zone keys if encrypted) from the relay.")
+                } else if auth.is_authenticated().get() {
+                    ("Board is empty", "No topics in this board yet. Tap '+ New Topic' to start the conversation.")
+                } else {
+                    ("Board is empty", "No topics loaded yet. If this is a gated zone, sign in to read and post.")
+                };
+                view! { <EmptyCard title=title body=body /> }.into_any()
             }}
+
+            <div class="tui-stack">
+                <For
+                    each=move || topics.get()
+                    key=|t| (t.id.clone(), t.reply_count, t.last_activity, t.content.len(), t.last_pubkey.clone())
+                    children=move |t: TopicSummary| {
+                        let is_unread = t.last_activity > last_read_at_open;
+                        view! {
+                            <TopicRow
+                                topic=t
+                                zone=zone_rows.get_value()
+                                channel_id=cid.get_value()
+                                is_unread=is_unread
+                                encrypted=is_enc
+                            />
+                        }
+                    }
+                />
+            </div>
+
+            <Show when=move || can_load_older.get() fallback=|| ()>
+                {
+                    let relay = relay_older.clone();
+                    view! {
+                        <button
+                            type="button"
+                            class="bbs-btn bbs-btn-sm"
+                            disabled=move || loading_older.get()
+                            on:click=move |_| {
+                                let cid = cid.get_value();
+                                page_keeping_place(&relay, &cid, vec![cid.clone()], gated, true);
+                            }
+                        >
+                            {move || if loading_older.get() { "… Loading" } else { "▼ Load older topics" }}
+                        </button>
+                    }
+                }
+            </Show>
         </div>
     }
 }
 
-/// Threaded conversation view (`#/z/<zone>/b/<channel_id>/t/<root_id>`).
+/// One topic row: title, NEW and lock badges, reply count, the most recent
+/// poster and the time of the latest activity, and the starter when someone
+/// else spoke last.
 #[component]
-pub fn ThreadView(zone: String, channel_id: String, root_id: String) -> impl IntoView {
+fn TopicRow(
+    topic: TopicSummary,
+    zone: String,
+    channel_id: String,
+    is_unread: bool,
+    encrypted: bool,
+) -> impl IntoView {
+    let router = use_router();
+    let title = topic_title(&topic.content);
+    let started_by_other = topic.reply_count > 0 && topic.last_pubkey != topic.pubkey;
+    let root_id = topic.id.clone();
+    view! {
+        <div
+            class="tui-card tui-card-interactive tui-stack"
+            role="button"
+            tabindex="0"
+            data-anchor-id=topic.id.clone()
+            on:click=move |_| router.go(Route::Thread {
+                zone: zone.clone(),
+                channel_id: channel_id.clone(),
+                root_id: root_id.clone(),
+                focus: None,
+            })
+        >
+            <div class="tui-row-between">
+                <div class="tui-row">
+                    {is_unread.then(|| view! { <span class="bbs-badge bbs-badge-accent">"NEW"</span> })}
+                    {encrypted.then(|| view! { <span class="bbs-badge bbs-badge-ok">"🔒"</span> })}
+                    <strong>{title}</strong>
+                </div>
+                <span class="bbs-badge">{replies_label(topic.reply_count)}</span>
+            </div>
+            <div class="tui-row-between" style="font-size:0.8rem">
+                <div class="tui-row">
+                    <span class="tui-muted">"last by"</span>
+                    <AuthorChip pubkey=topic.last_pubkey.clone() />
+                    {started_by_other.then(|| view! {
+                        <span class="tui-muted">"· started by"</span>
+                        <AuthorChip pubkey=topic.pubkey.clone() />
+                    })}
+                </div>
+                <span class="tui-muted">{format_relative_time(topic.last_activity)}</span>
+            </div>
+        </div>
+    }
+}
+
+/// Scroll the landing into place inside the content pane: a focus target is
+/// centred (and outlined once when `flash`); otherwise the pane goes to the
+/// very bottom, where the newest post sits above the reply composer.
+fn pin_landing(target: &str, is_focus: bool, flash: bool) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    if is_focus {
+        let Some(el) = doc.get_element_by_id(&post_anchor_id(target)) else {
+            return;
+        };
+        let opts = web_sys::ScrollIntoViewOptions::new();
+        opts.set_block(web_sys::ScrollLogicalPosition::Center);
+        el.scroll_into_view_with_scroll_into_view_options(&opts);
+        if flash {
+            let cl = el.class_list();
+            let _ = cl.add_1("bbs-post-focus");
+            set_timeout_once(
+                move || {
+                    let _ = cl.remove_1("bbs-post-focus");
+                },
+                2_500,
+            );
+        }
+        return;
+    }
+    if let Some(pane) = doc.get_element_by_id(MAIN_PANE_ID) {
+        pane.set_scroll_top(pane.scroll_height());
+    }
+}
+
+/// Threaded conversation view (`#/z/<zone>/b/<channel_id>/t/<root_id>`,
+/// `…/p/<focus>` for a linked post), as the forum's thread page shows it:
+/// the topic's root and replies oldest first, from the topic's own paged
+/// list, landing at the newest post (or `focus`).
+#[component]
+pub fn ThreadView(
+    zone: String,
+    channel_id: String,
+    root_id: String,
+    focus: Option<String>,
+) -> impl IntoView {
     let router = use_router();
     let relay = expect_context::<RelayConnection>();
     let channels = use_channel_store();
-    let read_pos = use_read_positions();
-    let auth = use_auth();
     let mute = use_mute_store();
-
-    let cid_sub = channel_id.clone();
-    let root_sub = root_id.clone();
-    let relay_sub = relay.clone();
-    Effect::new(move |_| {
-        channels.ensure_subscribed(&relay_sub, &cid_sub);
-        channels.fetch_by_id(&relay_sub, &root_sub);
-    });
+    let read_pos = use_read_positions();
 
     let zones = load_zones();
     let resolved_zone = resolve_zone_param(&zone, &zones).cloned();
@@ -343,23 +480,271 @@ pub fn ThreadView(zone: String, channel_id: String, root_id: String) -> impl Int
         .map(|z| z.id.clone())
         .unwrap_or_else(|| zone.clone());
     let is_enc = encryption_enabled() && resolved_zone.as_ref().is_some_and(|z| z.encrypted);
+    let gated = zone_is_gated(&zone, &zones);
+    let cid = StoredValue::new(channel_id.clone());
+    let wanted_root = StoredValue::new(root_id.to_lowercase());
 
-    let root_author = channels
-        .channel_messages
-        .get_untracked()
-        .get(&channel_id)
-        .and_then(|v| v.iter().find(|e| e.id == root_id))
-        .map(|e| e.pubkey.clone())
-        .unwrap_or_default();
-    let default_reply = Some((root_id.clone(), root_author));
-    let reply_to = RwSignal::new(default_reply.clone());
+    {
+        let relay = relay.clone();
+        Effect::new(move |_| channels.ensure_subscribed(&relay, &cid.get_value()));
+    }
+
+    // The topic's own paged list (`topic:<root>`, paged by `#e:[root]`),
+    // once the root is known; live posts still arrive in the channel list.
+    let topic_list = RwSignal::new(None::<String>);
+    // `Signal::derive` (not `Memo`): `NostrEvent` is not `PartialEq`.
+    let events = Signal::derive(move || {
+        let cid = cid.get_value();
+        let channel = channels.list_events(&cid);
+        let roots = channels.list_events(&roots_key(&cid));
+        let topic = topic_list.get().map(|key| {
+            (
+                channels.list_events(&key),
+                channels.history_cursor(&key).newer_from,
+            )
+        });
+        thread_events(&channel, &roots, topic)
+    });
+
+    // The root, once seen, is kept: paging towards newer replies evicts the
+    // oldest messages, and a root is usually its topic's oldest.
+    let pinned_root = StoredValue::new(None::<NostrEvent>);
+    let topic_root = Signal::derive(move || {
+        let want = wanted_root.get_value();
+        let found = events.with(|evs| {
+            find_topic_root(evs, &cid.get_value(), |id| id.eq_ignore_ascii_case(&want))
+        });
+        match found {
+            Some(root) => {
+                pinned_root.set_value(Some(root.clone()));
+                Some(root)
+            }
+            None => pinned_root.get_value(),
+        }
+    });
+
+    // A root not loaded yet: ask the section's root list once the history
+    // answer counts, then the root itself by id (a sealed root by the inner
+    // id its envelope names).
+    {
+        let relay = relay.clone();
+        let fetched = StoredValue::new(false);
+        Effect::new(move |_| {
+            if topic_root.with(Option::is_some) {
+                return;
+            }
+            let cid = cid.get_value();
+            if !channels.history_receipt(&cid).settles(gated) {
+                return;
+            }
+            channels.request_topic_roots(&relay, &cid, gated);
+            if !fetched.get_value() {
+                fetched.set_value(true);
+                channels.fetch_by_id(&relay, &wanted_root.get_value());
+            }
+        });
+    }
+
+    // Start the topic's own list once its root is known: register it, load
+    // its newest page and ask the relay for its true reply count.
+    {
+        let relay = relay.clone();
+        Effect::new(move |_| {
+            let Some(root) = topic_root.get() else {
+                return;
+            };
+            let cid = cid.get_value();
+            let key = channels.register_topic(&cid, &root.id);
+            if topic_list.get_untracked().as_deref() != Some(key.as_str()) {
+                topic_list.set(Some(key.clone()));
+            }
+            let cursor = channels.history_cursor(&key);
+            if !cursor.started && !cursor.loading {
+                channels.reload_newest(&relay, &key, vec![root.id.to_lowercase()], gated);
+            }
+            channels.request_total_of(&relay, &key, &root.id.to_lowercase());
+        });
+    }
+
+    // Replies oldest first, each at its author's latest edit, quotes
+    // resolved (client-core, as the forum's thread page).
+    let replies = Memo::new(move |_| {
+        let Some(root) = topic_root.get() else {
+            return Vec::<ReplyView>::new();
+        };
+        events.with(|evs| thread_replies(&root, evs))
+    });
+    let root_view = Memo::new(move |_| {
+        let root = topic_root.get()?;
+        let (content, created_at, edited) = events.with(|evs| latest_version(&root, evs));
+        Some(ReplyView {
+            id: root.id.clone(),
+            pubkey: root.pubkey.clone(),
+            content,
+            created_at,
+            edited,
+            quote: None,
+            tags: root.tags.clone(),
+        })
+    });
+
+    // The topic's true reply count: the relay's count plus replies seen since.
+    Effect::new(move |_| {
+        let Some(key) = topic_list.get() else {
+            return;
+        };
+        replies.with(|rs| {
+            for r in rs {
+                channels.note_inserted(&key, &r.id, r.created_at);
+            }
+        });
+    });
+    let reply_total = Memo::new(move |_| {
+        let shown = replies.with(Vec::len) as u32;
+        topic_list
+            .get()
+            .map_or(shown, |key| channels.total_for(&key).max(shown))
+    });
+
+    // Reading the topic marks its channel read at the newest post held.
+    Effect::new(move |_| {
+        let cid = cid.get_value();
+        if let Some((id, ts)) = events.with(|evs| latest_post(evs)) {
+            read_pos.mark_read(&cid, &id, ts);
+        }
+    });
+
+    // Paging the topic's own list.
+    let cursor = Memo::new(move |_| topic_list.get().map(|key| channels.history_cursor(&key)));
+    let can_load_older =
+        Memo::new(move |_| cursor.with(|c| c.as_ref().is_some_and(|c| c.next_request().is_some())));
+    let detached =
+        Memo::new(move |_| cursor.with(|c| c.as_ref().is_some_and(|c| c.newer_from.is_some())));
+    let paging = Memo::new(move |_| cursor.with(|c| c.as_ref().is_some_and(|c| c.loading)));
+    let page = {
+        let relay = relay.clone();
+        move |older: bool| {
+            let (Some(key), Some(root)) = (topic_list.get_untracked(), topic_root.get_untracked())
+            else {
+                return;
+            };
+            page_keeping_place(&relay, &key, vec![root.id.to_lowercase()], gated, older);
+        }
+    };
+    let page_older = page.clone();
+    let page_newer = page;
+
+    // -- Landing ----------------------------------------------------------
+    //
+    // Opening a topic lands at the very bottom: the newest post with the
+    // reply composer under it. A linked post (`focus`) is centred instead and
+    // outlined once. Replies stream in and media grows posts after first
+    // paint, so the pin re-applies on every reply and every resize of the
+    // thread until the ceiling or until the reader scrolls, taps or types
+    // (client-core `Landing`, as the forum's thread page).
+    let focus = StoredValue::new(focus);
+    let landing = StoredValue::new(Landing::default());
+    let schedule_pin = move |final_pin: bool| {
+        set_timeout_once(
+            move || {
+                let Some(state) = landing.try_get_value() else {
+                    return;
+                };
+                if !state.may_pin(final_pin) {
+                    return;
+                }
+                let Some((target, is_focus)) = state.target else {
+                    return;
+                };
+                let flash = is_focus && !state.flashed;
+                if flash {
+                    landing.try_update_value(|l| l.flashed = true);
+                }
+                pin_landing(&target, is_focus, flash);
+            },
+            60,
+        );
+    };
+    let landing_history_settled = Memo::new(move |_| {
+        let cid = cid.get_value();
+        let topic = topic_list.get().map(|key| channels.history_cursor(&key));
+        history_settled(
+            channels.history_receipt(&cid).settles(gated),
+            topic.as_ref(),
+        )
+    });
+    Effect::new(move |_| {
+        let Some(root) = topic_root.get() else {
+            return;
+        };
+        let reply_ids: Vec<String> = replies.with(|rs| rs.iter().map(|r| r.id.clone()).collect());
+        let settled = landing_history_settled.get();
+        let target = focus.with_value(|f| landing_target(f.as_deref(), &root.id, &reply_ids));
+        let now = js_sys::Date::now();
+        let (repin, final_pin) = landing
+            .try_update_value(|l| {
+                if l.touched {
+                    return (false, false);
+                }
+                l.target = target;
+                let final_pin = l.note_history(settled);
+                (l.grow(now), final_pin)
+            })
+            .unwrap_or((false, false));
+        if repin || final_pin {
+            schedule_pin(final_pin);
+        }
+    });
+    // Growth of the thread (images, embeds) re-pins too.
+    let thread_ref = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        use wasm_bindgen::JsCast;
+        let Some(el) = thread_ref.get() else {
+            return;
+        };
+        let on_resize = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+            let now = js_sys::Date::now();
+            if landing.try_update_value(|l| l.grow(now)).unwrap_or(false) {
+                schedule_pin(false);
+            }
+        });
+        if let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) {
+            observer.observe(&el);
+            let guard = send_wrapper::SendWrapper::new((observer, on_resize));
+            on_cleanup(move || {
+                let (observer, on_resize) = guard.take();
+                observer.disconnect();
+                drop(on_resize);
+            });
+        }
+    });
+    // Any deliberate input by the reader ends the landing phase.
+    let end_landing = move || {
+        let now = js_sys::Date::now();
+        landing.try_update_value(|l| l.reader_input(now));
+    };
+    let input_listeners = [
+        window_event_listener(leptos::ev::wheel, move |_| end_landing()),
+        window_event_listener(leptos::ev::touchmove, move |_| end_landing()),
+        window_event_listener(leptos::ev::keydown, move |_| end_landing()),
+        window_event_listener(leptos::ev::pointerdown, move |_| end_landing()),
+    ];
+    on_cleanup(move || input_listeners.into_iter().for_each(|h| h.remove()));
+
+    // The post the next reply quotes (None = a plain reply to the topic).
+    let reply_to = RwSignal::new(None::<(String, String)>);
+    let topic_sig: Signal<Option<NostrEvent>> = topic_root;
 
     let z_back = zone.clone();
     let cid_back = channel_id.clone();
-    let cid_msgs = channel_id.clone();
-    let root_msgs = root_id.clone();
-    let cid_comp = channel_id.clone();
-    let zone_for_bm = zone.clone();
+    let zone_cards = StoredValue::new(zone.clone());
+    let topic_heading = move || {
+        root_view.with(|r| {
+            r.as_ref()
+                .map(|r| snippet(&r.content, 90))
+                .unwrap_or_else(|| "Thread".to_string())
+        })
+    };
 
     view! {
         <div class="tui-container">
@@ -373,86 +758,85 @@ pub fn ThreadView(zone: String, channel_id: String, root_id: String) -> impl Int
                     })
                 >"← Topics"</button>
                 <span>"/"</span>
-                <strong>"Thread"</strong>
+                <strong>{topic_heading}</strong>
                 {is_enc.then(|| view! { <span class="bbs-badge bbs-badge-ok">"🔒 E2E"</span> })}
+                {move || topic_root.with(Option::is_some).then(|| view! {
+                    <span class="bbs-badge">{move || replies_label(reply_total.get())}</span>
+                })}
             </div>
 
-            {move || {
-                let raw = channels
-                    .channel_messages
-                    .get()
-                    .get(&cid_msgs)
-                    .cloned()
-                    .unwrap_or_default();
-                let (visible, edited_map) = apply_edits(&raw);
-                let msgs = thread_messages(&visible, &cid_msgs, &root_msgs);
+            <div class="tui-stack" node_ref=thread_ref>
+                {move || (topic_root.with(Option::is_none)).then(|| view! {
+                    <EmptyCard
+                        title="Loading thread…"
+                        body="Fetching messages (and zone keys if encrypted) from the relay."
+                    />
+                })}
 
-                if let Some(last) = msgs.last() {
-                    read_pos.mark_read(&cid_msgs, &last.id, last.created_at);
-                }
+                {move || {
+                    let older = page_older.clone();
+                    can_load_older.get().then(move || view! {
+                        <button
+                            type="button"
+                            class="bbs-btn bbs-btn-sm"
+                            disabled=move || paging.get()
+                            on:click=move |_| older(true)
+                        >
+                            {move || if paging.get() { "… Loading" } else { "▲ Load older posts" }}
+                        </button>
+                    })
+                }}
 
-                if msgs.is_empty() {
-                    return view! {
-                        <EmptyCard
-                            title="Loading thread…"
-                            body="Fetching messages (and zone keys if encrypted) from the relay."
+                {move || root_view.get().map(|r| view! {
+                    <ThreadPost
+                        post=r
+                        is_root=true
+                        is_encrypted_zone=is_enc
+                        zone=zone_cards.get_value()
+                        channel_id=cid.get_value()
+                        topic=topic_sig
+                        reply_to=reply_to
+                        muted_check=mute
+                    />
+                })}
+
+                <For
+                    each=move || replies.get()
+                    key=|r| (r.id.clone(), nostr_bbs_client_core::topics::view_key(r))
+                    children=move |r: ReplyView| view! {
+                        <ThreadPost
+                            post=r
+                            is_root=false
+                            is_encrypted_zone=is_enc
+                            zone=zone_cards.get_value()
+                            channel_id=cid.get_value()
+                            topic=topic_sig
+                            reply_to=reply_to
+                            muted_check=mute
                         />
-                    }.into_any();
-                }
+                    }
+                />
 
-                let my_pk = auth.pubkey().get();
-
-                view! {
-                    <div class="tui-stack">
-                        {msgs.into_iter().map(|ev| {
-                            let is_root = ev.id == root_msgs;
-                            let is_edited = edited_map.contains_key(&ev.id);
-                            let is_mine = my_pk.as_deref() == Some(ev.pubkey.as_str());
-                            let muted = mute.is_user_muted(&ev.pubkey);
-                            let reveal_muted = RwSignal::new(false);
-                            let ev_clone = ev.clone();
-                            let z_bm = zone_for_bm.clone();
-                            let cid_bm = cid_msgs.clone();
-                            let root_bm = root_msgs.clone();
-
-                            view! {
-                                {move || if muted && !reveal_muted.get() {
-                                    view! {
-                                        <div class="tui-card tui-row-between">
-                                            <span class="tui-muted">"Muted author hidden"</span>
-                                            <button
-                                                type="button"
-                                                class="bbs-btn bbs-btn-sm"
-                                                on:click=move |_| reveal_muted.set(true)
-                                            >"Show anyway"</button>
-                                        </div>
-                                    }.into_any()
-                                } else {
-                                    view! {
-                                        <PostCard
-                                            event=ev_clone.clone()
-                                            is_root=is_root
-                                            is_edited=is_edited
-                                            is_mine=is_mine
-                                            is_encrypted_zone=is_enc
-                                            zone=z_bm.clone()
-                                            channel_id=cid_bm.clone()
-                                            root_id=root_bm.clone()
-                                            reply_to=reply_to
-                                        />
-                                    }.into_any()
-                                }}
-                            }
-                        }).collect_view()}
-                    </div>
-                }.into_any()
-            }}
+                {move || {
+                    let newer = page_newer.clone();
+                    detached.get().then(move || view! {
+                        <button
+                            type="button"
+                            class="bbs-btn bbs-btn-sm"
+                            disabled=move || paging.get()
+                            on:click=move |_| newer(false)
+                        >
+                            {move || if paging.get() { "… Loading" } else { "▼ Load newer posts" }}
+                        </button>
+                    })
+                }}
+            </div>
 
             <PostComposer
-                channel_id=cid_comp
+                channel_id=channel_id.clone()
                 zone_id=zone_id
+                topic=Some(topic_sig)
                 reply_to=reply_to
-                default_reply=default_reply
                 placeholder="Write a reply (Markdown · @mention · paste/attach image)…"
                 on_sent=Callback::new(|_| {})
             />
@@ -460,18 +844,68 @@ pub fn ThreadView(zone: String, channel_id: String, root_id: String) -> impl Int
     }
 }
 
+/// One post of a thread, hidden behind "Show anyway" when its author is
+/// muted, and otherwise a [`PostCard`].
+#[component]
+fn ThreadPost(
+    post: ReplyView,
+    is_root: bool,
+    is_encrypted_zone: bool,
+    zone: String,
+    channel_id: String,
+    topic: Signal<Option<NostrEvent>>,
+    reply_to: RwSignal<Option<(String, String)>>,
+    muted_check: nostr_bbs_client_core::stores::mute::MuteStore,
+) -> impl IntoView {
+    let auth = use_auth();
+    let muted = muted_check.is_user_muted(&post.pubkey);
+    let reveal_muted = RwSignal::new(false);
+    let author = post.pubkey.clone();
+    let is_mine = move || auth.pubkey().get().as_deref() == Some(author.as_str());
+    let post = StoredValue::new(post);
+    move || {
+        if muted && !reveal_muted.get() {
+            view! {
+                <div class="tui-card tui-row-between">
+                    <span class="tui-muted">"Muted author hidden"</span>
+                    <button
+                        type="button"
+                        class="bbs-btn bbs-btn-sm"
+                        on:click=move |_| reveal_muted.set(true)
+                    >"Show anyway"</button>
+                </div>
+            }
+            .into_any()
+        } else {
+            view! {
+                <PostCard
+                    post=post.get_value()
+                    is_root=is_root
+                    is_mine=is_mine()
+                    is_encrypted_zone=is_encrypted_zone
+                    zone=zone.clone()
+                    channel_id=channel_id.clone()
+                    topic=topic
+                    reply_to=reply_to
+                />
+            }
+            .into_any()
+        }
+    }
+}
+
 /// One rendered post card with Markdown, ASCII/Raw image toggle, reactions,
 /// reply, bookmark, edit, delete, and report controls.
 #[component]
 fn PostCard(
-    event: NostrEvent,
+    post: ReplyView,
     is_root: bool,
-    is_edited: bool,
     is_mine: bool,
     is_encrypted_zone: bool,
     zone: String,
     channel_id: String,
-    root_id: String,
+    /// The topic's root, for the tags of an edit and a bookmark's thread.
+    topic: Signal<Option<NostrEvent>>,
     reply_to: RwSignal<Option<(String, String)>>,
 ) -> impl IntoView {
     let auth = use_auth();
@@ -480,14 +914,15 @@ fn PostCard(
     let reactions_store = use_reaction_store();
     let custom_emoji = use_custom_emoji_store();
 
-    let ev_id = event.id.clone();
-    let author_pk = event.pubkey.clone();
-    let is_e2e = has_zk_tag(&event.tags);
-    let imgs = extract_image_urls(&event.content);
+    let ev_id = post.id.clone();
+    let author_pk = post.pubkey.clone();
+    let is_e2e = has_zk_tag(&post.tags);
+    let is_edited = post.edited;
+    let imgs = extract_image_urls(&post.content);
 
     let show_picker = RwSignal::new(false);
     let editing = RwSignal::new(false);
-    let edit_text = RwSignal::new(event.content.clone());
+    let edit_text = RwSignal::new(post.content.clone());
     let bm_tick = RwSignal::new(0u32);
 
     let reactions_sig = reactions_store.reactions_for(&ev_id);
@@ -559,11 +994,15 @@ fn PostCard(
             let ev_id = ev_id.clone();
             let relay = relay.clone();
             editing.set(false);
+            // As the forum tags an edit: it stays in the topic's paged list
+            // and keeps reaching the root author.
+            let root = topic.get_untracked();
+            let tags = edit_tags(
+                &cid,
+                root.as_ref().map(|r| (r.id.as_str(), r.pubkey.as_str())),
+                &ev_id,
+            );
             wasm_bindgen_futures::spawn_local(async move {
-                let tags = vec![
-                    vec!["e".into(), cid.clone(), String::new(), "root".into()],
-                    vec!["e".into(), ev_id, String::new(), "edit".into()],
-                ];
                 let unsigned = UnsignedEvent {
                     pubkey: me,
                     created_at: (js_sys::Date::now() / 1000.0) as u64,
@@ -657,9 +1096,9 @@ fn PostCard(
     let bm_preview = if is_encrypted_zone {
         "🔒 Encrypted post".to_string()
     } else {
-        snippet(&event.content, 100)
+        snippet(&post.content, 100)
     };
-    let bm_created = event.created_at;
+    let bm_created = post.created_at;
 
     let reply_id = ev_id.clone();
     let reply_pk = author_pk.clone();
@@ -671,6 +1110,8 @@ fn PostCard(
             class="bbs-post"
             class:bbs-post-root=is_root
             class:bbs-post-reply-indent=!is_root
+            id=post_anchor_id(&post.id)
+            data-anchor-id=post.id.clone()
         >
             <header class="bbs-post-header">
                 <div class="tui-row">
@@ -678,8 +1119,14 @@ fn PostCard(
                     {is_e2e.then(|| view! { <span class="bbs-badge bbs-badge-ok">"🔒"</span> })}
                     {is_edited.then(|| view! { <span class="bbs-badge">"edited"</span> })}
                 </div>
-                <span class="bbs-post-meta">{format_relative_time(event.created_at)}</span>
+                <span class="bbs-post-meta">{format_relative_time(post.created_at)}</span>
             </header>
+
+            {post.quote.clone().map(|q| view! {
+                <div class="bbs-quote tui-muted" style="font-size:0.82rem;border-left:2px solid var(--border);padding-left:0.5rem">
+                    "↳ " <AuthorChip pubkey=q.pubkey /> " " {q.snippet}
+                </div>
+            })}
 
             {move || if editing.get() {
                 view! {
@@ -700,7 +1147,7 @@ fn PostCard(
                     </div>
                 }.into_any()
             } else {
-                view! { <MarkdownBody content=event.content.clone() /> }.into_any()
+                view! { <MarkdownBody content=post.content.clone() /> }.into_any()
             }}
 
             {(!imgs.is_empty()).then(|| view! {
@@ -738,7 +1185,15 @@ fn PostCard(
                 <button
                     type="button"
                     class="bbs-btn bbs-btn-ghost bbs-btn-sm"
-                    on:click=move |_| reply_to.set(Some((reply_id.clone(), reply_pk.clone())))
+                    on:click=move |_| {
+                        reply_to.set(Some((reply_id.clone(), reply_pk.clone())));
+                        if let Some(el) = web_sys::window()
+                            .and_then(|w| w.document())
+                            .and_then(|d| d.get_element_by_id("bbs-reply-composer"))
+                        {
+                            el.scroll_into_view();
+                        }
+                    }
                 >"↳ Reply"</button>
 
                 <button
@@ -746,13 +1201,17 @@ fn PostCard(
                     class="bbs-btn bbs-btn-ghost bbs-btn-sm"
                     on:click=move |_| {
                         let pk = auth.pubkey().get_untracked();
+                        let root_id = topic
+                            .get_untracked()
+                            .map(|r| r.id)
+                            .unwrap_or_else(|| bm_id.clone());
                         let saved = toggle_bookmark(
                             pk.as_deref(),
                             BookmarkItem {
                                 event_id: bm_id.clone(),
                                 zone: zone.clone(),
                                 channel_id: channel_id.clone(),
-                                root_id: root_id.clone(),
+                                root_id,
                                 author: bm_author.clone(),
                                 preview: bm_preview.clone(),
                                 created_at: bm_created,
@@ -871,12 +1330,16 @@ fn PostImage(src: String) -> impl IntoView {
 }
 
 /// Rich Markdown + Image + Encrypted-Zone Composer shared by BoardView and ThreadView.
+///
+/// `topic` is `None` for a new topic (a root with the topic marker) and the
+/// topic's root for a reply, which threads under the root as the forum's
+/// replies do; `reply_to` is the post a reply quotes (`None` = the topic).
 #[component]
 fn PostComposer(
     channel_id: String,
     zone_id: String,
+    topic: Option<Signal<Option<NostrEvent>>>,
     reply_to: RwSignal<Option<(String, String)>>,
-    default_reply: Option<(String, String)>,
     placeholder: &'static str,
     on_sent: Callback<()>,
 ) -> impl IntoView {
@@ -902,7 +1365,6 @@ fn PostComposer(
     let submit = {
         let cid = channel_id.clone();
         let relay = relay.clone();
-        let default_reply = default_reply.clone();
         move || {
             let body = text.get_untracked().trim().to_string();
             if body.is_empty() || sending.get_untracked() {
@@ -912,16 +1374,28 @@ fn PostComposer(
                 toasts.show("Sign in first to post", ToastVariant::Warning);
                 return;
             };
+            // Built now, from the resolved root: a reply threads under the
+            // topic root (quoting the tapped post), a new topic carries the
+            // topic marker, exactly as the forum tags them.
+            let rtarget = reply_to.get_untracked();
+            let mut tags = match topic {
+                None => topic_root_tags(&cid),
+                Some(root) => {
+                    let Some(root) = root.get_untracked() else {
+                        toasts.show("The topic is still loading", ToastVariant::Warning);
+                        return;
+                    };
+                    let quote = rtarget.as_ref().map(|(id, pk)| (id.as_str(), pk.as_str()));
+                    topic_reply_tags(&cid, &root.id, &root.pubkey, quote)
+                }
+            };
             let writer = ZoneWriter::capture();
             let me = signer.public_key().to_string();
-            let rtarget = reply_to.get_untracked();
             let cid = cid.clone();
             let relay = relay.clone();
-            let default_reply = default_reply.clone();
             sending.set(true);
 
             wasm_bindgen_futures::spawn_local(async move {
-                let mut tags = channel_message_tags(&cid, rtarget);
                 // Resolve @handles against ProfileCache
                 if let Some(pc) = try_use_profile_cache() {
                     let handles: Vec<String> = body
@@ -994,7 +1468,7 @@ fn PostComposer(
                         });
                         let _ = relay.publish_with_ack(&signed, Some(cb));
                         text.set(String::new());
-                        reply_to.set(default_reply);
+                        reply_to.set(None);
                         on_sent.run(());
                     }
                     Err(e) => toasts.show(format!("Sign failed: {e}"), ToastVariant::Error),
@@ -1064,7 +1538,6 @@ fn PostComposer(
 
     let submit_click = submit.clone();
     let submit_key = submit.clone();
-    let default_clear = default_reply.clone();
 
     view! {
         {move || if !auth.is_authenticated().get() {
@@ -1079,24 +1552,20 @@ fn PostComposer(
                 </div>
             }.into_any()
         } else {
-            let dc = default_clear.clone();
             let sc = submit_click.clone();
             let sk = submit_key.clone();
             let op = on_pick_file.clone();
             view! {
-                <div class="bbs-composer">
-                    {move || reply_to.get().map(|(id, _)| {
-                        let dc = dc.clone();
-                        view! {
-                            <div class="tui-row-between" style="font-size:0.8rem">
-                                <span class="tui-muted">"↳ Replying to " {shorten_pubkey(&id)}</span>
-                                <button
-                                    type="button"
-                                    class="bbs-btn bbs-btn-ghost bbs-btn-sm"
-                                    on:click=move |_| reply_to.set(dc.clone())
-                                >"Reset target"</button>
-                            </div>
-                        }
+                <div class="bbs-composer" id="bbs-reply-composer">
+                    {move || reply_to.get().map(|(id, _)| view! {
+                        <div class="tui-row-between" style="font-size:0.8rem">
+                            <span class="tui-muted">"↳ Quoting " {shorten_pubkey(&id)} " · replies to the topic"</span>
+                            <button
+                                type="button"
+                                class="bbs-btn bbs-btn-ghost bbs-btn-sm"
+                                on:click=move |_| reply_to.set(None)
+                            >"Reply to topic"</button>
+                        </div>
                     })}
                     <textarea
                         class="bbs-textarea"

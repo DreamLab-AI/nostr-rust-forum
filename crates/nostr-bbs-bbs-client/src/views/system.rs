@@ -5,11 +5,14 @@
 use leptos::prelude::*;
 use nostr_bbs_client_core::auth::{nip07, use_auth, AuthStore, KeyPersistence};
 use nostr_bbs_client_core::relay::RelayConnection;
+use nostr_bbs_client_core::stores::channels::{use_channel_store, ChannelMeta};
 use nostr_bbs_client_core::stores::custom_emoji::use_custom_emoji_store;
 use nostr_bbs_client_core::stores::mute::use_mute_store;
 use nostr_bbs_client_core::stores::notifications::use_notification_store;
 use nostr_bbs_client_core::stores::preferences::{save_preferences, use_preferences};
+use nostr_bbs_client_core::stores::zones::{load_zones, section_to_zone, zone_slug, Zone};
 use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
+use nostr_bbs_client_core::utils::post_link::CHANNEL_HINT_PARAM;
 use nostr_bbs_client_core::utils::{bake, devices};
 
 use crate::components::{launch_sentry, qr_svg, AuthorChip, CopyKeyBtn, EmptyCard};
@@ -96,6 +99,7 @@ pub fn LandingView() -> impl IntoView {
 pub fn NotificationsView() -> impl IntoView {
     let notifs = use_notification_store();
     let router = use_router();
+    let channels = use_channel_store();
 
     view! {
         <div class="bbs-view">
@@ -164,14 +168,18 @@ pub fn NotificationsView() -> impl IntoView {
                                         })}
                                         {link.map(|l| {
                                             let id_open = id.clone();
-                                            let target_route = route_from_forum_link(&l);
                                             view! {
                                                 <button
                                                     type="button"
                                                     class="bbs-btn bbs-btn-primary bbs-btn-sm"
                                                     on:click=move |_| {
                                                         notifs.mark_read(&id_open);
-                                                        router.go(target_route.clone());
+                                                        // Resolved on click: the channel list may
+                                                        // have loaded since the card rendered.
+                                                        let target = channels.channels.with_untracked(|cs| {
+                                                            route_from_forum_link(&l, cs, &load_zones())
+                                                        });
+                                                        router.go(target);
                                                     }
                                                 >
                                                     "OPEN →"
@@ -192,6 +200,7 @@ pub fn NotificationsView() -> impl IntoView {
 /// Settings, Display, Identity, Custom Emoji, Mutes, Device Keys, and PWA install (`#/settings`).
 #[component]
 pub fn SettingsView() -> impl IntoView {
+    let router = use_router();
     let cfg = expect_context::<BbsConfig>();
     let auth = use_auth();
     let prefs = use_bbs_prefs();
@@ -359,7 +368,7 @@ pub fn SettingsView() -> impl IntoView {
                                 </div>
 
                                 <div class="bbs-row-wrap">
-                                    <a href="../" class="bbs-btn bbs-btn-sm">"OPEN MAIN FORUM ↗"</a>
+                                    <a href=move || crate::router::forum_href(&router.route.get()) class="bbs-btn bbs-btn-sm">"OPEN MAIN FORUM ↗"</a>
                                     {pwa_enabled.then(move || {
                                         let zb = z_bake.clone();
                                         view! {
@@ -976,26 +985,48 @@ pub fn HelpView() -> impl IntoView {
     }
 }
 
-fn route_from_forum_link(link: &str) -> Route {
+/// The BBS route for a notification's forum link (as the notification store
+/// builds them): a post link (`/go/<id>?c=<channel>`, client-core
+/// `post_link`) opens the [`Route::Go`] resolver, which lands in the post's
+/// topic at the post; a channel link (`/chat/<id>`, legacy `/channels/<id>`)
+/// opens its board in the channel's own zone; a DM link the conversation.
+fn route_from_forum_link(link: &str, channels: &[ChannelMeta], zones: &[Zone]) -> Route {
     let trimmed = link.trim_start_matches('/');
-    if let Some(pk) = trimmed.strip_prefix("dm/") {
-        return Route::DmChat {
-            pubkey: pk.to_string(),
-        };
-    }
-    if let Some(rest) = trimmed.strip_prefix("channels/") {
-        let mut parts = rest.split('/');
-        if let Some(ch) = parts.next() {
-            return Route::Board {
-                zone: "public".into(),
-                channel_id: ch.to_string(),
-            };
+    let (path, query) = trimmed.split_once('?').unwrap_or((trimmed, ""));
+    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    let head = segs.next().unwrap_or("");
+    let arg = segs.next().map(str::to_string);
+    let board = |cid: String| {
+        let zone = channels
+            .iter()
+            .find(|c| c.id == cid)
+            .and_then(|c| section_to_zone(&c.section, zones))
+            .map(|z| {
+                zones
+                    .iter()
+                    .find(|zone| zone.id == z)
+                    .map_or(z.clone(), |zone| zone_slug(zone).to_string())
+            })
+            .unwrap_or_else(|| "public".into());
+        Route::Board {
+            zone,
+            channel_id: cid,
         }
+    };
+    match (head, arg) {
+        ("go", Some(id)) => Route::Go {
+            event_id: id,
+            channel: query
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, v)| *k == CHANNEL_HINT_PARAM && !v.is_empty())
+                .map(|(_, v)| v.to_string()),
+        },
+        ("dm", Some(pk)) => Route::DmChat { pubkey: pk },
+        ("chat" | "channels", Some(cid)) => board(cid),
+        ("governance", _) => Route::Agents,
+        _ => Route::LiveFeed,
     }
-    if trimmed.starts_with("governance") {
-        return Route::Agents;
-    }
-    Route::LiveFeed
 }
 
 fn format_ts(secs: u64) -> String {
@@ -1010,5 +1041,66 @@ fn format_ts(secs: u64) -> String {
     #[cfg(not(target_arch = "wasm32"))]
     {
         format!("{secs}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(id: &str, section: &str) -> ChannelMeta {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "description": "", "section": section,
+            "picture": "", "created_at": 0
+        }))
+        .expect("channel")
+    }
+
+    fn zone(id: &str, slug: &str) -> Zone {
+        serde_json::from_value(serde_json::json!({ "id": id, "slug": slug, "name": id }))
+            .expect("zone")
+    }
+
+    #[test]
+    fn notification_links_open_the_post_or_its_board() {
+        let chans = [channel("c1", "z1-rants")];
+        let zones = [zone("z1", "mini")];
+        // A reply notification (client-core `post_link`): the resolver.
+        assert_eq!(
+            route_from_forum_link("/go/e1?c=c1", &chans, &zones),
+            Route::Go {
+                event_id: "e1".into(),
+                channel: Some("c1".into())
+            }
+        );
+        assert_eq!(
+            route_from_forum_link("/go/e1", &chans, &zones),
+            Route::Go {
+                event_id: "e1".into(),
+                channel: None
+            }
+        );
+        // A channel link: its board, in the channel's own zone.
+        assert_eq!(
+            route_from_forum_link("/chat/c1", &chans, &zones),
+            Route::Board {
+                zone: "mini".into(),
+                channel_id: "c1".into()
+            }
+        );
+        assert_eq!(
+            route_from_forum_link("/dm/pk", &chans, &zones),
+            Route::DmChat {
+                pubkey: "pk".into()
+            }
+        );
+        assert_eq!(
+            route_from_forum_link("/governance", &chans, &zones),
+            Route::Agents
+        );
+        assert_eq!(
+            route_from_forum_link("/elsewhere", &chans, &zones),
+            Route::LiveFeed
+        );
     }
 }

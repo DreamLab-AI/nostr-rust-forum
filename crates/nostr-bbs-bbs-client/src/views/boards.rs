@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use nostr_bbs_client_core::auth::use_auth;
 use nostr_bbs_client_core::relay::RelayConnection;
 use nostr_bbs_client_core::stores::channels::use_channel_store;
+use nostr_bbs_client_core::stores::read_position::use_read_positions;
 use nostr_bbs_client_core::stores::zone_access::use_zone_access;
 use nostr_bbs_client_core::stores::zones::{
     load_zones, resolve_zone_param, section_cmp, section_to_zone, zone_slug, ZoneVisibility,
@@ -145,6 +146,7 @@ pub fn ZonesView() -> impl IntoView {
 pub fn ZoneView(slug: String) -> impl IntoView {
     let router = use_router();
     let channels = use_channel_store();
+    let read_pos = use_read_positions();
     let relay = expect_context::<RelayConnection>();
     let zk_store = try_use_zone_key_store();
     let enc_gate = encryption_enabled();
@@ -263,6 +265,9 @@ pub fn ZoneView(slug: String) -> impl IntoView {
                 }
 
                 let last_map = channels.last_active.get();
+                // Unread per board, as the forum index's "N new" chip counts
+                // it: messages newer than the board's read position.
+                let read_ts = read_pos.read_timestamps();
                 view! {
                     <div class="tui-stack">
                         {list.into_iter().map(|ch| {
@@ -270,6 +275,14 @@ pub fn ZoneView(slug: String) -> impl IntoView {
                             let cid_click = cid.clone();
                             let z_nav = slug_for_rows.clone();
                             let count = channels.count_for(&cid);
+                            let unread = channels.channel_messages.with(|m| {
+                                m.get(&cid).map_or(0, |evs| {
+                                    nostr_bbs_client_core::topics::unread_count(
+                                        evs,
+                                        read_ts.get(&cid).copied().unwrap_or(0),
+                                    )
+                                })
+                            });
                             let last_ts = last_map.get(&cid).copied().unwrap_or(ch.created_at);
                             let relay_click = relay.clone();
 
@@ -296,6 +309,9 @@ pub fn ZoneView(slug: String) -> impl IntoView {
                                             })}
                                         </div>
                                         <div class="tui-row">
+                                            {(unread > 0).then(|| view! {
+                                                <span class="bbs-badge bbs-badge-accent">{format!("{unread} new")}</span>
+                                            })}
                                             <span class="bbs-badge">{format!("{count} posts")}</span>
                                             <span class="tui-muted" style="font-size:0.78rem">
                                                 {format_relative_time(last_ts)}
@@ -377,6 +393,7 @@ pub fn LiveFeedView() -> impl IntoView {
                                         zone: z_slug.clone(),
                                         channel_id: cid_go.clone(),
                                         root_id: root_id.clone(),
+                                        focus: None,
                                     })
                                 >
                                     <div class="tui-row-between">

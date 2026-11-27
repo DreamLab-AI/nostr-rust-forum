@@ -10,6 +10,7 @@ use leptos::prelude::*;
 use nostr_bbs_client_core::stores::channels::use_channel_store;
 use nostr_bbs_client_core::stores::profile_cache::try_use_profile_cache;
 use nostr_bbs_client_core::stores::zones::{load_zones, section_to_zone};
+use nostr_bbs_client_core::utils::post_link::channel_of;
 use nostr_bbs_client_core::utils::sealed_search;
 
 use crate::router::{use_router, Route};
@@ -77,6 +78,7 @@ pub fn SearchOverlay() -> impl IntoView {
                                 .and_then(|t| t.get(1))
                                 .cloned()
                                 .unwrap_or_else(|| szones.first().cloned().unwrap_or_default());
+                            // Open AT the post, as a POST hit does.
                             found.push(Hit {
                                 kind: "🔒 SEALED",
                                 title: preview,
@@ -84,7 +86,10 @@ pub fn SearchOverlay() -> impl IntoView {
                                     "zone:{zone_tag} · score {:.0}%",
                                     h.score * 100.0
                                 ),
-                                route: Route::Zone { slug: zone_tag },
+                                route: Route::Go {
+                                    event_id: h.event.id.clone(),
+                                    channel: channel_of(&h.event),
+                                },
                             });
                         }
                     }
@@ -140,32 +145,37 @@ pub fn SearchOverlay() -> impl IntoView {
             }
         }
 
-        // 3. Matching loaded channel messages
+        // 3. Matching loaded channel messages. The store's lists include
+        // `topic:<root>` and `roots:<channel>` lists, which are not channels
+        // and repeat posts: each post counts once, under its own channel tag,
+        // and opens AT the post (the `Go` resolver finds its topic).
         let ch_list = channels.channels.get();
-        for (cid, evs) in channels.channel_messages.get() {
-            let ch_meta = ch_list.iter().find(|c| c.id == cid);
-            let ch_name = ch_meta.map(|c| c.name.as_str()).unwrap_or("board");
-            let z = ch_meta
-                .and_then(|c| section_to_zone(&c.section, &zones))
-                .unwrap_or_else(|| "public".into());
+        let mut seen = std::collections::HashSet::new();
+        for evs in channels.channel_messages.get().into_values() {
             for ev in evs {
-                if ev.content.to_ascii_lowercase().contains(&q) {
-                    let root_id =
-                        nostr_bbs_core::thread::reply_parent(&ev).unwrap_or_else(|| ev.id.clone());
-                    let title: String = ev.content.chars().take(100).collect();
-                    out.push(Hit {
-                        kind: "POST",
-                        title,
-                        subtitle: format!("#{ch_name}"),
-                        route: Route::Thread {
-                            zone: z.clone(),
-                            channel_id: cid.clone(),
-                            root_id,
-                        },
-                    });
-                    if out.len() >= 40 {
-                        return out;
-                    }
+                if !ev.content.to_ascii_lowercase().contains(&q)
+                    || !seen.insert(ev.id.to_ascii_lowercase())
+                {
+                    continue;
+                }
+                let cid = channel_of(&ev);
+                let ch_name = cid
+                    .as_deref()
+                    .and_then(|c| ch_list.iter().find(|m| m.id == c))
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("board");
+                let title: String = ev.content.chars().take(100).collect();
+                out.push(Hit {
+                    kind: "POST",
+                    title,
+                    subtitle: format!("#{ch_name}"),
+                    route: Route::Go {
+                        event_id: ev.id.clone(),
+                        channel: cid,
+                    },
+                });
+                if out.len() >= 40 {
+                    return out;
                 }
             }
         }

@@ -8,7 +8,7 @@ mod components;
 mod pages;
 
 pub(crate) use nostr_bbs_client_core::{
-    auth, dm, poker, relay, stores, utils, wallet, zone_crypto,
+    auth, dm, poker, relay, stores, topics, utils, wallet, zone_crypto,
 };
 
 use app::App;

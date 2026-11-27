@@ -14,6 +14,7 @@ pub mod poker;
 pub mod relay;
 pub mod stores;
 pub mod toast;
+pub mod topics;
 pub mod types;
 pub mod utils;
 pub mod wallet;
