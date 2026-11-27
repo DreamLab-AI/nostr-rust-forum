@@ -1,15 +1,19 @@
 //! Member Directory & Rich Profile View (did:nostr, WebID, NIP-58 badges,
 //! mute/DM actions, and in-BBS non-clobbering kind-0 profile editing).
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use leptos::prelude::*;
 use nostr_bbs_client_core::auth::use_auth;
-use nostr_bbs_client_core::relay::RelayConnection;
+use nostr_bbs_client_core::relay::{Filter, RelayConnection};
 use nostr_bbs_client_core::stores::badges::{badge_def, use_badges};
 use nostr_bbs_client_core::stores::mute::use_mute_store;
 use nostr_bbs_client_core::stores::profile_cache::try_use_profile_cache;
 use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
-use nostr_bbs_client_core::utils::shorten_pubkey;
+use nostr_bbs_client_core::utils::{set_timeout_once, shorten_pubkey};
 use nostr_bbs_core::event::UnsignedEvent;
+use serde_json::{Map, Value};
 
 use crate::components::{CopyKeyBtn, EmptyCard};
 use crate::config::BbsConfig;
@@ -128,37 +132,132 @@ pub fn ProfileView(pubkey: String) -> impl IntoView {
     let edit_name = RwSignal::new(String::new());
     let edit_about = RwSignal::new(String::new());
     let saving = RwSignal::new(false);
+    // The member's current kind-0, which a save starts from (see
+    // `merge_profile_edit`). Captured here: the publish task has no owner.
+    let base = RwSignal::new(ProfileBase::Idle);
+    // Bumped by each load, so a superseded load's answer or timeout (the
+    // editor closed and reopened meanwhile) cannot overwrite a newer one.
+    let load_generation = StoredValue::new(0u32);
+    let profile_cache = try_use_profile_cache();
 
     let pk_view = pubkey.clone();
     let pk_save = pubkey.clone();
+
+    // Fetch the newest kind-0 of `pubkey` from the relay and pre-fill the
+    // form from it. The profile cache cannot serve: it keeps only the fields
+    // it displays, and a kind-0 is replaced whole.
+    let load_base = {
+        let relay = relay.clone();
+        let pubkey = pubkey.clone();
+        move || {
+            load_generation.update_value(|g| *g = g.wrapping_add(1));
+            let generation = load_generation.get_value();
+            let current = move || load_generation.try_get_value() == Some(generation);
+            base.set(ProfileBase::Loading);
+            let newest = Rc::new(Cell::new(None::<u64>));
+            let on_event = {
+                let newest = newest.clone();
+                let author = pubkey.clone();
+                Rc::new(move |ev: nostr_bbs_core::NostrEvent| {
+                    if !current()
+                        || ev.kind != 0
+                        || ev.pubkey != author
+                        || newest.get().is_some_and(|ts| ts >= ev.created_at)
+                    {
+                        return;
+                    }
+                    newest.set(Some(ev.created_at));
+                    let next = match parse_kind0(&ev.content) {
+                        Some(obj) => {
+                            let (name, about) = form_values(&obj);
+                            let _ = edit_name.try_set(name);
+                            let _ = edit_about.try_set(about);
+                            ProfileBase::Loaded(obj)
+                        }
+                        None => ProfileBase::Unreadable(
+                            "your current profile on the relay is not valid JSON".into(),
+                        ),
+                    };
+                    let _ = base.try_set(next);
+                })
+            };
+            let settle = move |outcome: ProfileBase| {
+                if !current() {
+                    return;
+                }
+                base.try_update(|b| {
+                    if *b == ProfileBase::Loading {
+                        *b = outcome;
+                    }
+                });
+            };
+            let on_answer = Rc::new(move |_authenticated: bool| {
+                // End of stored events with no kind-0: the member has none yet.
+                settle(ProfileBase::NotFound);
+            });
+            let on_closed = Rc::new(move |reason: String| {
+                settle(ProfileBase::Unreadable(format!(
+                    "the relay refused: {reason}"
+                )));
+            });
+            let sub_id = relay.subscribe_with_receipt_or_closed(
+                vec![Filter {
+                    kinds: Some(vec![0]),
+                    authors: Some(vec![pubkey.clone()]),
+                    limit: Some(1),
+                    ..Default::default()
+                }],
+                on_event,
+                on_answer,
+                on_closed,
+            );
+            let relay = relay.clone();
+            set_timeout_once(
+                move || {
+                    relay.unsubscribe(&sub_id);
+                    settle(ProfileBase::Unreadable("the relay did not answer".into()));
+                },
+                PROFILE_LOAD_TIMEOUT_MS,
+            );
+        }
+    };
+    let load_base = StoredValue::new_local(load_base);
 
     let save_profile = move |_| {
         let Some(signer) = auth.get_signer() else {
             return;
         };
-        let dn = edit_name.get_untracked().trim().to_string();
-        let ab = edit_about.get_untracked().trim().to_string();
-        // Non-clobbering kind-0 merge: preserve existing fields from ProfileCache
-        let existing = try_use_profile_cache().and_then(|pc| pc.lookup(&pk_save));
-        let mut obj = serde_json::Map::new();
-        if let Some(ex) = existing {
-            if let Some(n) = ex.name {
-                obj.insert("name".into(), serde_json::Value::String(n));
-            }
-            if let Some(pic) = ex.picture {
-                obj.insert("picture".into(), serde_json::Value::String(pic));
-            }
-            if let Some(n05) = ex.nip05 {
-                obj.insert("nip05".into(), serde_json::Value::String(n05));
-            }
+        if signer.public_key() != pk_save {
+            toasts.show("You can only edit your own profile", ToastVariant::Error);
+            return;
         }
-        if !dn.is_empty() {
-            obj.insert("display_name".into(), serde_json::Value::String(dn.clone()));
-            obj.entry("name")
-                .or_insert_with(|| serde_json::Value::String(dn.clone()));
-        }
-        obj.insert("about".into(), serde_json::Value::String(ab.clone()));
-        let content = serde_json::Value::Object(obj).to_string();
+        let existing = match base.get_untracked() {
+            ProfileBase::Loaded(obj) => Some(obj),
+            ProfileBase::NotFound => None,
+            ProfileBase::Idle | ProfileBase::Loading => {
+                toasts.show(
+                    "Still reading your current profile; try again in a moment",
+                    ToastVariant::Warning,
+                );
+                return;
+            }
+            ProfileBase::Unreadable(why) => {
+                toasts.show(
+                    format!(
+                        "Not saved: {why}, so fields set elsewhere (picture, NIP-05, \
+                         lightning address…) would be lost. Retry loading first."
+                    ),
+                    ToastVariant::Error,
+                );
+                return;
+            }
+        };
+        let merged = merge_profile_edit(
+            existing,
+            &edit_name.get_untracked(),
+            &edit_about.get_untracked(),
+        );
+        let content = Value::Object(merged.clone()).to_string();
 
         let unsigned = UnsignedEvent {
             pubkey: signer.public_key().to_string(),
@@ -175,15 +274,16 @@ pub fn ProfileView(pubkey: String) -> impl IntoView {
                 Ok(signed) => {
                     let ts = signed.created_at;
                     relay.publish(&signed);
-                    if let Some(pc) = try_use_profile_cache() {
+                    if let Some(pc) = profile_cache {
                         pc.upsert_from_kind0(&pk_up, &content, ts);
                     }
-                    editing.set(false);
+                    let _ = base.try_set(ProfileBase::Loaded(merged));
+                    let _ = editing.try_set(false);
                     toasts.show("Profile updated (kind-0)", ToastVariant::Success);
                 }
                 Err(e) => toasts.show(format!("Profile sign failed: {e}"), ToastVariant::Error),
             }
-            saving.set(false);
+            let _ = saving.try_set(false);
         });
     };
 
@@ -198,7 +298,7 @@ pub fn ProfileView(pubkey: String) -> impl IntoView {
             </div>
 
             {move || {
-                let entry = try_use_profile_cache().and_then(|pc| pc.lookup_reactive(&pk_view));
+                let entry = profile_cache.and_then(|pc| pc.lookup_reactive(&pk_view));
                 let name = entry
                     .as_ref()
                     .and_then(|e| e.best_label())
@@ -210,8 +310,6 @@ pub fn ProfileView(pubkey: String) -> impl IntoView {
                 let is_muted = mute.is_user_muted(&pk_view);
                 let pk_dm = pk_view.clone();
                 let pk_mute = pk_view.clone();
-                let name_edit_init = name.clone();
-                let about_edit_init = about.clone();
                 let save_click = Callback::new(save_profile.clone());
 
                 view! {
@@ -245,9 +343,13 @@ pub fn ProfileView(pubkey: String) -> impl IntoView {
                                         type="button"
                                         class="bbs-btn bbs-btn-sm"
                                         on:click=move |_| {
-                                            edit_name.set(name_edit_init.clone());
-                                            edit_about.set(about_edit_init.clone());
-                                            editing.update(|v| *v = !*v);
+                                            let opening = !editing.get_untracked();
+                                            editing.set(opening);
+                                            // Every opening re-reads the current
+                                            // kind-0: it may have changed elsewhere.
+                                            if opening {
+                                                load_base.with_value(|load| load());
+                                            }
                                         }
                                     >{move || if editing.get() { "Cancel Edit" } else { "Edit Profile" }}</button>
                                 })}
@@ -278,19 +380,43 @@ pub fn ProfileView(pubkey: String) -> impl IntoView {
                     <Show when=move || editing.get() fallback=|| ()>
                         <div class="tui-card tui-stack">
                             <strong>"Edit Profile (kind-0)"</strong>
+                            {move || match base.get() {
+                                ProfileBase::Idle | ProfileBase::Loading => view! {
+                                    <p class="tui-muted">"Reading your current profile from the relay…"</p>
+                                }.into_any(),
+                                ProfileBase::Unreadable(why) => view! {
+                                    <p class="bbs-badge bbs-badge-warn" role="alert">
+                                        {format!("Cannot edit: {why}. Saving now could erase fields set elsewhere.")}
+                                    </p>
+                                    <button
+                                        type="button"
+                                        class="bbs-btn bbs-btn-sm"
+                                        on:click=move |_| load_base.with_value(|load| load())
+                                    >"Retry loading"</button>
+                                }.into_any(),
+                                ProfileBase::Loaded(_) | ProfileBase::NotFound => view! {
+                                    <p class="tui-muted" style="font-size:0.8rem">
+                                        "Only the display name and bio change; every other profile field is kept."
+                                    </p>
+                                }.into_any(),
+                            }}
                             <div>
-                                <label class="bbs-label">"Display Name"</label>
+                                <label class="bbs-label" for="bbs-profile-display-name">"Display Name"</label>
                                 <input
+                                    id="bbs-profile-display-name"
                                     class="bbs-input"
                                     type="text"
+                                    disabled=move || !base.get().may_save()
                                     prop:value=move || edit_name.get()
                                     on:input=move |ev| edit_name.set(event_target_value(&ev))
                                 />
                             </div>
                             <div>
-                                <label class="bbs-label">"About / Bio"</label>
+                                <label class="bbs-label" for="bbs-profile-about">"About / Bio"</label>
                                 <textarea
+                                    id="bbs-profile-about"
                                     class="bbs-textarea"
+                                    disabled=move || !base.get().may_save()
                                     prop:value=move || edit_about.get()
                                     on:input=move |ev| edit_about.set(event_target_value(&ev))
                                 ></textarea>
@@ -298,7 +424,7 @@ pub fn ProfileView(pubkey: String) -> impl IntoView {
                             <button
                                 type="button"
                                 class="bbs-btn bbs-btn-primary"
-                                disabled=move || saving.get()
+                                disabled=move || saving.get() || !base.get().may_save()
                                 on:click=move |ev| save_click.run(ev)
                             >{move || if saving.get() { "Saving…" } else { "Publish Profile ▶" }}</button>
                         </div>
@@ -327,5 +453,142 @@ pub fn ProfileView(pubkey: String) -> impl IntoView {
                 }
             }}
         </div>
+    }
+}
+
+/// How long the profile editor waits for the relay's answer about the
+/// member's current kind-0 before refusing to save.
+const PROFILE_LOAD_TIMEOUT_MS: i32 = 8_000;
+
+/// What a profile save starts from.
+#[derive(Clone, Debug, PartialEq)]
+enum ProfileBase {
+    /// The editor has not asked yet.
+    Idle,
+    /// Waiting for the relay.
+    Loading,
+    /// The member's newest kind-0 content.
+    Loaded(Map<String, Value>),
+    /// The relay answered with no kind-0: the member has none yet.
+    NotFound,
+    /// The current kind-0 could not be read (timeout, refusal, bad JSON).
+    /// Saving would replace it blind, so it is refused.
+    Unreadable(String),
+}
+
+impl ProfileBase {
+    /// Whether a save may proceed: only from a known starting point.
+    fn may_save(&self) -> bool {
+        matches!(self, ProfileBase::Loaded(_) | ProfileBase::NotFound)
+    }
+}
+
+/// The JSON object of a kind-0's content, or `None` when it is not one.
+fn parse_kind0(content: &str) -> Option<Map<String, Value>> {
+    match serde_json::from_str(content) {
+        Ok(Value::Object(obj)) => Some(obj),
+        _ => None,
+    }
+}
+
+/// The form's starting values: the kind-0's own `display_name` and `about`
+/// (never a derived label, which saving would then write as a name).
+fn form_values(obj: &Map<String, Value>) -> (String, String) {
+    let field = |k: &str| {
+        obj.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    (field("display_name"), field("about"))
+}
+
+/// The kind-0 content a save publishes: the member's current content
+/// (`existing`, `None` when they have none) with only the two fields the form
+/// edits changed. A kind-0 is replaced whole, so every other field (`name`,
+/// `picture`, `banner`, `nip05`, `lud16`, `website`, fields other clients
+/// set) is carried over untouched. An empty value removes its field, which is
+/// how clearing it works.
+fn merge_profile_edit(
+    existing: Option<Map<String, Value>>,
+    display_name: &str,
+    about: &str,
+) -> Map<String, Value> {
+    let mut obj = existing.unwrap_or_default();
+    for (key, value) in [("display_name", display_name), ("about", about)] {
+        let value = value.trim();
+        if value.is_empty() {
+            obj.remove(key);
+        } else {
+            obj.insert(key.into(), Value::String(value.to_string()));
+        }
+    }
+    obj
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(json: &str) -> Map<String, Value> {
+        parse_kind0(json).expect("object")
+    }
+
+    #[test]
+    fn a_save_changes_only_the_edited_fields() {
+        let existing = obj(
+            r#"{"name":"alice","display_name":"Alice","about":"old","picture":"https://p/a.png",
+                "banner":"https://p/b.png","nip05":"alice@example.com","lud16":"alice@ln.example",
+                "website":"https://alice.example","bot":false,"custom":{"k":1}}"#,
+        );
+        let out = merge_profile_edit(Some(existing.clone()), "  Alice B ", "new bio");
+        assert_eq!(out["display_name"], "Alice B");
+        assert_eq!(out["about"], "new bio");
+        for key in [
+            "name", "picture", "banner", "nip05", "lud16", "website", "bot", "custom",
+        ] {
+            assert_eq!(out.get(key), existing.get(key), "{key} is kept");
+        }
+        assert_eq!(out.len(), existing.len());
+    }
+
+    #[test]
+    fn clearing_a_field_removes_it_and_nothing_else() {
+        let existing =
+            obj(r#"{"name":"alice","display_name":"Alice","about":"bio","lud16":"a@b"}"#);
+        let out = merge_profile_edit(Some(existing), "Alice", "  ");
+        assert!(!out.contains_key("about"));
+        assert_eq!(out["name"], "alice");
+        assert_eq!(out["lud16"], "a@b");
+    }
+
+    #[test]
+    fn no_existing_profile_writes_just_the_form() {
+        let out = merge_profile_edit(None, "New", "");
+        assert_eq!(Value::Object(out).to_string(), r#"{"display_name":"New"}"#);
+    }
+
+    #[test]
+    fn the_form_starts_from_the_profiles_own_fields() {
+        assert_eq!(
+            form_values(&obj(r#"{"name":"alice","about":"hi"}"#)),
+            (String::new(), "hi".to_string()),
+            "a name alone is not offered as the display name"
+        );
+        assert_eq!(
+            form_values(&obj(r#"{"display_name":"Alice","about":7}"#)),
+            ("Alice".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn only_a_known_starting_point_may_be_saved_over() {
+        assert!(parse_kind0("not json").is_none());
+        assert!(parse_kind0("[1]").is_none());
+        assert!(ProfileBase::Loaded(Map::new()).may_save());
+        assert!(ProfileBase::NotFound.may_save());
+        assert!(!ProfileBase::Idle.may_save());
+        assert!(!ProfileBase::Loading.may_save());
+        assert!(!ProfileBase::Unreadable("x".into()).may_save());
     }
 }
