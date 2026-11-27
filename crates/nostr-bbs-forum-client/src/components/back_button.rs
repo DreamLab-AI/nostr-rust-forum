@@ -10,8 +10,8 @@
 //! [`provide_scroll_memory`] keeps each list page's scroll position for the
 //! session and puts it back when the member returns to that page, by Back,
 //! by the system back gesture or by going up. The browser's own restoration
-//! runs before the topic list has rendered, which is why members were "sent
-//! back to the top of the forum".
+//! runs before a list has rendered, so on its own it can land short of (or
+//! at the top of) where the member was.
 
 use std::collections::HashMap;
 
@@ -175,15 +175,10 @@ pub fn provide_scroll_memory() -> ScrollMemory {
     };
     provide_context(memory);
 
-    // The browser would restore on popstate before the new page has its
-    // content, landing at the top; this memory does it instead.
-    if let Some(history) = web_sys::window().and_then(|w| w.history().ok()) {
-        let _ = js_sys::Reflect::set(
-            &history,
-            &JsValue::from_str("scrollRestoration"),
-            &JsValue::from_str("manual"),
-        );
-    }
+    // The browser's own restoration stays on (`scrollRestoration = auto`):
+    // it runs before the new page has its content, so it can fall short, and
+    // the restore below re-asserts the saved offset until it holds; but it
+    // still covers reloads, and a page whose runtime has stopped.
 
     let on_scroll = window_event_listener(leptos::ev::scroll, move |_| {
         let Some(y) = scroll_y() else {
@@ -316,7 +311,7 @@ fn back_icon() -> impl IntoView {
 /// The header's Back control: shown on every page but the forum's front page
 /// (`/`, `/forums`, and a single-zone member's home zone, which `/forums`
 /// forwards to). Always visible on narrow screens and in the installed app
-/// (`display-mode: standalone`); on desktop from the `lg` breakpoint, where
+/// (`display-mode: standalone`); on desktop from the `xl` breakpoint, where
 /// the header has room. A 44 px target with the accessible name "Back".
 #[component]
 pub fn BackButton() -> impl IntoView {
@@ -383,7 +378,7 @@ pub fn BackButton() -> impl IntoView {
                 type="button"
                 aria-label="Back"
                 title="Back"
-                class="inline-flex sm:hidden lg:inline-flex [@media(display-mode:standalone)]:inline-flex items-center justify-center shrink-0 w-11 h-11 -ml-2 rounded-lg text-gray-300 hover:text-amber-400 hover:bg-gray-800 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400"
+                class="inline-flex sm:hidden xl:inline-flex [@media(display-mode:standalone)]:inline-flex items-center justify-center shrink-0 w-11 h-11 -ml-2 rounded-lg text-gray-300 hover:text-amber-400 hover:bg-gray-800 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400"
                 on:click=on_click
             >
                 {back_icon()}
