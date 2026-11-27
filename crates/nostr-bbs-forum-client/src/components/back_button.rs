@@ -24,7 +24,7 @@ use crate::app::{base_href, current_app_path};
 use crate::auth::use_auth;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, resolve_zone_param};
-use crate::utils::back_nav::{is_in_app_entry, restores_scroll, ForumRoute, FORUMS};
+use crate::utils::back_nav::{is_in_app_entry, is_up_link, restores_scroll, ForumRoute, FORUMS};
 
 /// How long a restore keeps trying, in 50 ms steps (content arrives late).
 const RESTORE_ATTEMPTS: u32 = 40;
@@ -60,6 +60,52 @@ pub struct ScrollMemory {
     state: StoredValue<ScrollState>,
 }
 
+impl ScrollState {
+    /// The current page's address was replaced in place, `from` → `to` (an
+    /// old-form section or topic URL made canonical): keep one entry, under
+    /// `to`, and let a restore already under way carry on there.
+    fn rename(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        if let Some(y) = self.positions.remove(from) {
+            self.positions.entry(to.to_string()).or_insert(y);
+        }
+        if self.returning_to.as_deref() == Some(from) {
+            self.returning_to = Some(to.to_string());
+        }
+        if self.current == from {
+            self.current = to.to_string();
+            if self.restoring {
+                // The route reaching `to` is the same page, not a fresh visit.
+                self.returning_to = Some(to.to_string());
+            }
+        }
+    }
+}
+
+impl ScrollState {
+    /// History traversal to `path`, with the window at `y`. When the route
+    /// has already reached `path`, `y` is still the outgoing page's offset,
+    /// so it is not saved under `path`, and `path`'s saved offset is
+    /// returned to restore now. Otherwise the outgoing page's offset is kept
+    /// and the restore waits for the route, as for Back going up.
+    fn popped(&mut self, path: &str, y: Option<f64>) -> Option<f64> {
+        if self.current == path {
+            self.returning_to = None;
+            return self.positions.get(path).copied();
+        }
+        if !self.frozen && !self.restoring {
+            if let Some(y) = y {
+                self.positions.insert(self.current.clone(), y);
+            }
+        }
+        self.frozen = true;
+        self.returning_to = Some(path.to_string());
+        None
+    }
+}
+
 fn scroll_y() -> Option<f64> {
     web_sys::window().and_then(|w| w.scroll_y().ok())
 }
@@ -79,6 +125,27 @@ impl ScrollMemory {
             }
             s.frozen = true;
         });
+    }
+
+    /// The page's address is about to be replaced in place, `from` → `to`
+    /// (both base-relative paths); see [`crate::utils::section_url`].
+    pub fn rename(self, from: &str, to: &str) {
+        self.state.update_value(|s| s.rename(from, to));
+    }
+
+    /// History traversal (Back, the back gesture) to `path`. The router's
+    /// own popstate listener was registered first, and the route effect it
+    /// triggers runs as soon as that listener returns, so this usually runs
+    /// after the route has already reached `path`; see [`ScrollState::popped`].
+    fn popped(self, path: String) {
+        let y = scroll_y();
+        let target = self
+            .state
+            .try_update_value(|s| s.popped(&path, y))
+            .flatten();
+        if let Some(y) = target.filter(|_| restores_scroll(&path)) {
+            self.restore(y);
+        }
     }
 
     /// Restore `path`'s saved position when the route reaches it.
@@ -194,9 +261,8 @@ pub fn provide_scroll_memory() -> ScrollMemory {
     // The router updates the location from its own popstate listener, but
     // the DOM is still the outgoing page here: take its offset now.
     let on_pop = window_event_listener(leptos::ev::popstate, move |_| {
-        memory.leave();
         if let Some(pathname) = web_sys::window().and_then(|w| w.location().pathname().ok()) {
-            memory.expect_return(current_app_path(&pathname));
+            memory.popped(current_app_path(&pathname));
         }
     });
     // An in-app link click: capture phase, so it runs before the router's
@@ -207,13 +273,19 @@ pub fn provide_scroll_memory() -> ScrollMemory {
             "click",
             gloo::events::EventListenerOptions::run_in_capture_phase(),
             move |ev| {
-                let on_link = ev
+                let link = ev
                     .target()
                     .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-                    .and_then(|el| el.closest("a[href]").ok().flatten())
-                    .is_some();
-                if on_link {
+                    .and_then(|el| el.closest("a[href]").ok().flatten());
+                if let Some(link) = link {
                     memory.leave();
+                    // A link one level up (a topic's breadcrumb to its
+                    // section, …) is a return, as Back going up is.
+                    let target = link.get_attribute("href").map(|h| current_app_path(&h));
+                    let here = memory.state.with_value(|s| s.current.clone());
+                    if let Some(target) = target.filter(|t| is_up_link(&here, t)) {
+                        memory.expect_return(target);
+                    }
                 }
             },
         )
@@ -384,5 +456,85 @@ pub fn BackButton() -> impl IntoView {
                 {back_icon()}
             </button>
         </Show>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OLD: &str = "/minimoonoir/s6d38b5f106d8";
+    const CANONICAL: &str = "/minimoonoir/s00405652f2bf";
+
+    #[test]
+    fn a_replaced_address_keeps_one_entry_under_the_canonical_path() {
+        let mut s = ScrollState {
+            current: OLD.into(),
+            ..Default::default()
+        };
+        s.positions.insert(OLD.into(), 420.0);
+        s.rename(OLD, CANONICAL);
+        assert_eq!(s.current, CANONICAL);
+        assert_eq!(s.positions.get(CANONICAL), Some(&420.0));
+        assert!(!s.positions.contains_key(OLD));
+        assert_eq!(s.returning_to, None);
+    }
+
+    const TOPIC: &str = "/minimoonoir/s00405652f2bf/teddb1228c6efe63d";
+
+    #[test]
+    fn back_after_the_route_moved_restores_without_saving_the_topic_offset() {
+        // The router's popstate listener ran first: the route is already on
+        // the section, and the window still has the topic's offset.
+        let mut s = ScrollState {
+            current: CANONICAL.into(),
+            ..Default::default()
+        };
+        s.positions.insert(CANONICAL.into(), 900.0);
+        assert_eq!(s.popped(CANONICAL, Some(14274.0)), Some(900.0));
+        assert_eq!(s.positions.get(CANONICAL), Some(&900.0));
+        assert_eq!(s.returning_to, None, "no stale return left behind");
+    }
+
+    #[test]
+    fn back_before_the_route_moved_keeps_the_topic_offset_and_waits() {
+        let mut s = ScrollState {
+            current: TOPIC.into(),
+            ..Default::default()
+        };
+        s.positions.insert(CANONICAL.into(), 900.0);
+        assert_eq!(s.popped(CANONICAL, Some(14274.0)), None);
+        assert_eq!(s.positions.get(TOPIC), Some(&14274.0));
+        assert_eq!(s.positions.get(CANONICAL), Some(&900.0));
+        assert_eq!(s.returning_to.as_deref(), Some(CANONICAL));
+        assert!(s.frozen);
+    }
+
+    #[test]
+    fn a_newer_canonical_offset_wins_over_the_old_one() {
+        let mut s = ScrollState::default();
+        s.positions.insert(OLD.into(), 10.0);
+        s.positions.insert(CANONICAL.into(), 900.0);
+        s.rename(OLD, CANONICAL);
+        assert_eq!(s.positions.get(CANONICAL), Some(&900.0));
+        assert_eq!(s.positions.len(), 1);
+    }
+
+    #[test]
+    fn a_restore_under_way_continues_at_the_canonical_path() {
+        let mut s = ScrollState {
+            current: OLD.into(),
+            restoring: true,
+            ..Default::default()
+        };
+        s.rename(OLD, CANONICAL);
+        assert_eq!(s.returning_to.as_deref(), Some(CANONICAL));
+        // A pending return to the old form follows the rename too.
+        let mut t = ScrollState {
+            returning_to: Some(OLD.into()),
+            ..Default::default()
+        };
+        t.rename(OLD, CANONICAL);
+        assert_eq!(t.returning_to.as_deref(), Some(CANONICAL));
     }
 }

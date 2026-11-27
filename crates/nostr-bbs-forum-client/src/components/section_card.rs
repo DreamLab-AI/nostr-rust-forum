@@ -8,7 +8,7 @@ use leptos_router::components::A;
 
 use crate::app::base_href;
 use crate::utils::format_relative_time;
-use crate::utils::slug_hash::section_slug;
+use crate::utils::section_url::section_path;
 
 /// Card representing a section within a category.
 #[component]
@@ -34,7 +34,7 @@ pub fn SectionCard(
 ) -> impl IntoView {
     // #9: the URL carries a privacy hash of the channel id, never the section
     // name. The real name is resolved for display by the section page.
-    let href = base_href(&format!("/{}/{}", category, section_slug(&channel_id)));
+    let href = base_href(&section_path(&category, &channel_id));
 
     let has_messages = last_activity > 0;
     let activity_display = format_relative_time(last_activity);

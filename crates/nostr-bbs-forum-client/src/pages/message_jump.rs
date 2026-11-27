@@ -33,8 +33,8 @@ use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::channels::{use_channel_store, ChannelStore};
 use crate::stores::zones::{load_zones, section_to_zone, zone_path_for_id};
 use crate::utils::lookup::zone_is_gated;
+use crate::utils::section_url::topic_path;
 use crate::utils::set_timeout_once;
-use crate::utils::slug_hash::{section_slug, topic_slug};
 
 /// Give up on resolving the topic after this long and show the note view.
 const RESOLVE_TIMEOUT_MS: i32 = 6_000;
@@ -464,10 +464,8 @@ pub fn MessageJumpPage() -> impl IntoView {
         let topic_url = |root: &str| {
             zone_id.as_deref().map(|z| {
                 format!(
-                    "/forums/{}/{}/{}?focus={}",
-                    zone_path_for_id(z),
-                    section_slug(&cid),
-                    topic_slug(root),
+                    "{}?focus={}",
+                    topic_path(&zone_path_for_id(z), &cid, root),
                     focus
                 )
             })

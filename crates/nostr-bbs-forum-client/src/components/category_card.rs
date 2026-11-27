@@ -8,7 +8,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::app::base_href;
-use crate::utils::slug_hash::section_slug;
+use crate::utils::section_url::section_path;
 use crate::utils::zone_theme::hex_rgba;
 
 /// Visually rich card representing a forum category.
@@ -18,9 +18,10 @@ pub fn CategoryCard(
     name: String,
     /// Short description text.
     description: String,
-    /// Raw section tag for this category group (e.g. "home-lobby"). Hashed into
-    /// the URL slug (#9) so the section tag/name never appears in the address.
-    section_id: String,
+    /// Kind-40 id of the channel the card opens (one per section tag; see
+    /// [`crate::utils::section_url::representative_channel`]). Hashed into the
+    /// URL (#9), the same section id every other link uses.
+    channel_id: String,
     /// Icon identifier: "globe", "users", "code", or "shield".
     icon: &'static str,
     /// Total post count across all channels in this section.
@@ -49,10 +50,9 @@ pub fn CategoryCard(
     #[prop(optional, into)]
     picture: String,
 ) -> impl IntoView {
-    // #9: the section tag is hashed into the URL — its plaintext (which can
-    // reveal the section name) never appears in the address bar. The section
-    // page resolves the hash back to the real channel for display.
-    let href = base_href(&format!("/{}/{}", zone_slug, section_slug(&section_id)));
+    // #9: the channel id is hashed into the URL, so no section name appears
+    // in the address bar. The section page resolves the hash for display.
+    let href = base_href(&section_path(&zone_slug, &channel_id));
 
     // Inline styles derived from the single resolved accent hex (issue #43),
     // replacing the old per-key Tailwind class tables. Alphas mirror the weights

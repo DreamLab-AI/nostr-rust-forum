@@ -32,6 +32,15 @@ command_arguments = [
     "if command -v wasm-opt >/dev/null 2>&1; then find \"$TRUNK_STAGING_DIR\" -name '*.wasm' -print0 | while IFS= read -r -d '' f; do echo \"wasm-opt: $f\"; wasm-opt -Oz --enable-bulk-memory --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext --enable-reference-types --output \"$f\" \"$f\"; done; else echo 'wasm-opt not found on PATH; skipping size optimisation' >&2; fi"
 ]
 
+# Public-URL links: the manifest and icon <link>s are not Trunk assets, so
+# their relative hrefs would resolve against a deep-linked page's own path.
+# This hook prefixes the ones marked `data-public-url` in index.html with
+# $TRUNK_PUBLIC_URL (when it is absolute). See tools/public-url-links.sh.
+[[hooks]]
+stage = "post_build"
+command = "bash"
+command_arguments = ["tools/public-url-links.sh"]
+
 # Tailwind CSS pre-build:
 #
 # Replaces the legacy <script src='cdn.tailwindcss.com'> Play-CDN script in

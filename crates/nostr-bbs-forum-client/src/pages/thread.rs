@@ -49,12 +49,15 @@ use crate::relay::RelayConnection;
 use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
-use crate::stores::zones::{load_zones, section_routes_to_zone, Zone, ZoneVisibility};
+use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
 use crate::utils::format_relative_time;
 use crate::utils::lookup::{
     deadline_for, key_state_memo, zone_is_encrypted, zone_is_gated, Lookup,
 };
-use crate::utils::slug_hash::{matches_section_slug, matches_topic_slug, section_slug};
+use crate::utils::section_url::{
+    canonical_topic_path, find_by_section_slug, keep_address_canonical, section_path,
+};
+use crate::utils::slug_hash::matches_topic_slug;
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
 use super::section::{category_display_name, resolve_channel};
@@ -402,14 +405,9 @@ fn resolve_section_channel(
     section_slug_param: &str,
     zones: &[Zone],
 ) -> Option<ChannelMeta> {
-    // Hashed form first (#9): match the channel-id hash OR the section-tag hash
-    // (CategoryCard links group by section tag), scoped to the zone.
-    if let Some(found) = channels.iter().find(|c| {
-        let routes = section_routes_to_zone(&c.section, category_slug, zones);
-        routes
-            && (matches_section_slug(&c.id, section_slug_param)
-                || (!c.section.is_empty() && matches_section_slug(&c.section, section_slug_param)))
-    }) {
+    // Hashed form first (#9): the channel-id hash (canonical), or the
+    // section-tag hash old Forums index links carry, scoped to the zone.
+    if let Some(found) = find_by_section_slug(channels, category_slug, section_slug_param, zones) {
         return Some(found.clone());
     }
     // Legacy plaintext fallback (shared with SectionPage).
@@ -839,6 +837,14 @@ pub fn ThreadPage() -> impl IntoView {
         }
     });
 
+    // One URL per topic: an old form (section-tag hash, `/forums/…`, zone id,
+    // full root id) is replaced in place by the canonical one.
+    keep_address_canonical(move || {
+        let ch = resolved_channel.get()?;
+        let root = topic_root.get().map(|r| r.id);
+        canonical_topic_path(&ch, &topic_param(), root.as_deref(), &load_zones())
+    });
+
     // "Continue where you left off" (utils::resume): remember this topic.
     // Route plus zone and section names; the topic title only for an
     // unencrypted zone (`point_for` drops it otherwise), never content.
@@ -850,16 +856,16 @@ pub fn ThreadPage() -> impl IntoView {
             return;
         };
         let root = topic_root.get();
-        let param = section_param();
-        let section = if crate::utils::slug_hash::is_section_slug(&param) {
-            param
-        } else {
-            crate::utils::slug_hash::section_slug(&ch.id)
+        // Always the canonical ids (see `utils::section_url`), whichever form
+        // the address had: an old form is about to be replaced. A full-id
+        // topic link waits for its root.
+        let section = crate::utils::slug_hash::section_slug(&ch.id);
+        let param = topic_param();
+        let topic = match root.as_ref() {
+            Some(r) => crate::utils::slug_hash::topic_slug(&r.id),
+            None if crate::utils::slug_hash::is_topic_slug(&param) => param.to_lowercase(),
+            None => return,
         };
-        let topic = root
-            .as_ref()
-            .map(|r| crate::utils::slug_hash::topic_slug(&r.id))
-            .unwrap_or_else(topic_param);
         let title = root.as_ref().map(|r| first_line(&r.content));
         let name = if ch.name.trim().is_empty() {
             "Section".to_string()
@@ -1226,7 +1232,7 @@ pub fn ThreadPage() -> impl IntoView {
     // Section href (hashed) for breadcrumb back-link — REAL section name shown.
     let section_href = move || {
         match resolved_channel.get() {
-            Some(ch) => format!("/{}/{}", category_url_slug(), section_slug(&ch.id)),
+            Some(ch) => section_path(&category_url_slug(), &ch.id),
             // Preserve whatever section param brought us here.
             None => format!("/{}/{}", category_url_slug(), section_param()),
         }

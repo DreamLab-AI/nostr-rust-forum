@@ -56,8 +56,10 @@ pub fn topic_slug(root_event_id: &str) -> String {
 }
 
 /// True when `slug` has the shape of a section hash (`s` + 12 hex chars).
-/// The section and thread pages use it to keep a hashed URL slug as-is when
-/// remembering the member's place (`utils::resume`).
+/// Pages never keep a section slug from the address as-is (an old link may
+/// carry a section-tag hash; see `utils::section_url`), so only the tests
+/// below use it today.
+#[allow(dead_code)]
 pub fn is_section_slug(slug: &str) -> bool {
     let mut chars = slug.chars();
     match chars.next() {
@@ -69,7 +71,6 @@ pub fn is_section_slug(slug: &str) -> bool {
 }
 
 /// True when `slug` has the shape of a topic hash (`t` + 16 hex chars).
-#[allow(dead_code)] // test-only usage today
 pub fn is_topic_slug(slug: &str) -> bool {
     let mut chars = slug.chars();
     match chars.next() {

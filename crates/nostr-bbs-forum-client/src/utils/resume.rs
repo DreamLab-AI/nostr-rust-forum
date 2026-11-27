@@ -371,4 +371,29 @@ mod tests {
         assert_eq!(storage_key("abc"), "nostrbbs:resume:abc");
         assert_ne!(storage_key("abc"), storage_key("def"));
     }
+
+    #[test]
+    fn a_section_is_remembered_by_its_canonical_url() {
+        use crate::stores::channels::ChannelMeta;
+        use crate::utils::section_url::canonical_section_path;
+        use crate::utils::slug_hash::section_slug;
+        // Minimoonoir's Rants: the pages store the channel-id hash, whichever
+        // form (`s6d38b5f106d8`, the section-tag hash) the address carried.
+        let zs: Vec<Zone> = serde_json::from_str(
+            r#"[{"id":"zone1","slug":"welcome"},{"id":"zone2","slug":"minimoonoir"}]"#,
+        )
+        .unwrap();
+        let rants = ChannelMeta {
+            id: "62e1c0f409f0e35bacefb701e49ba85a8b6168ee48cc4a55eb70df8b8638e1bd".into(),
+            name: "Rants".into(),
+            description: String::new(),
+            section: "zone2-rants".into(),
+            picture: String::new(),
+            created_at: 0,
+        };
+        let slug = section_slug(&rants.id);
+        let p = point_for(&zs, "zone2", Some((&slug, "Rants")), None).unwrap();
+        assert_eq!(p.path, "/minimoonoir/s00405652f2bf");
+        assert_eq!(Some(p.path), canonical_section_path(&rants, &zs));
+    }
 }
