@@ -50,54 +50,33 @@ pub fn SearchOverlay() -> impl IntoView {
         }
     });
 
-    // Trigger sealed per-zone search on query change when sealed zones exist.
+    // Sealed per-zone search: re-run on query change and on every change in
+    // the encrypted index's readiness (each shard that arrives, then ready),
+    // so a query typed while it loads fills in by itself. One search at a
+    // time; a change meanwhile runs once more when it ends, and only the
+    // newest query writes the list.
+    let readiness = Memo::new(move |_| sealed_search::readiness());
+    let run = SealedRun {
+        open: palette.open,
+        query,
+        readiness,
+        hits: sealed_hits,
+        searching: searching_sealed,
+        generation: StoredValue::new(0u64),
+        busy: StoredValue::new(false),
+        again: StoredValue::new(false),
+    };
     Effect::new(move |_| {
+        let open = palette.open.get();
         let q = query.get().trim().to_string();
-        if !palette.open.get() || q.len() < 2 {
+        let _ = readiness.get();
+        run.generation.update_value(|g| *g += 1);
+        if !open || q.len() < 2 {
             sealed_hits.set(Vec::new());
-            return;
-        }
-        let szones = sealed_search::sealed_zones();
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = szones;
-        #[cfg(target_arch = "wasm32")]
-        if !szones.is_empty() {
-            let relay_opt = use_context::<nostr_bbs_client_core::relay::RelayConnection>();
-            let zk_opt = nostr_bbs_client_core::zone_crypto::store::try_use_zone_key_store();
-            if let (Some(relay), Some(zk)) = (relay_opt, zk_opt) {
-                searching_sealed.set(true);
-                wasm_bindgen_futures::spawn_local(async move {
-                    let mut found = Vec::new();
-                    if let Ok(hits) = sealed_search::search(&relay, &zk, &q, 12).await {
-                        for h in hits {
-                            let preview = h.event.content.chars().take(120).collect::<String>();
-                            let zone_tag = h
-                                .event
-                                .tags
-                                .iter()
-                                .find(|t| t.first().map(String::as_str) == Some("zk"))
-                                .and_then(|t| t.get(1))
-                                .cloned()
-                                .unwrap_or_else(|| szones.first().cloned().unwrap_or_default());
-                            // Open AT the post, as a POST hit does.
-                            found.push(Hit {
-                                kind: "🔒 SEALED",
-                                title: preview,
-                                subtitle: format!(
-                                    "zone:{zone_tag} · score {:.0}%",
-                                    h.score * 100.0
-                                ),
-                                route: Route::Go {
-                                    event_id: h.event.id.clone(),
-                                    channel: channel_of(&h.event),
-                                },
-                            });
-                        }
-                    }
-                    sealed_hits.set(found);
-                    searching_sealed.set(false);
-                });
-            }
+        } else if run.busy.get_value() {
+            run.again.set_value(true);
+        } else {
+            run.start(q);
         }
     });
 
@@ -223,17 +202,17 @@ pub fn SearchOverlay() -> impl IntoView {
                             }
                             let mut hits = local_hits.get();
                             hits.extend(sealed_hits.get());
+                            let state = readiness.get();
                             if hits.is_empty() {
-                                let label = if searching_sealed.get() {
-                                    "Searching sealed zones…"
-                                } else {
-                                    "No matching boards, members, or posts."
-                                };
+                                let label = empty_label(&state, searching_sealed.get());
                                 return view! {
-                                    <p class="tui-muted" style="padding:1rem;text-align:center">{label}</p>
+                                    <p class="tui-muted" style="padding:1rem;text-align:center" role="status">{label}</p>
                                 }.into_any();
                             }
                             view! {
+                                {state.notice().map(|n| view! {
+                                    <p class="tui-muted" style="padding:0.25rem 0.5rem;font-size:0.8rem" role="status">{n}</p>
+                                })}
                                 <div class="tui-stack">
                                     {hits.into_iter().map(|h| {
                                         let r = h.route.clone();
@@ -264,5 +243,150 @@ pub fn SearchOverlay() -> impl IntoView {
                 </div>
             </div>
         </Show>
+    }
+}
+
+/// The palette's sealed-search state: one search at a time, re-run once
+/// when the query or the index's readiness changed meanwhile, and only the
+/// newest query writes `hits`.
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(
+        dead_code,
+        reason = "the search loop that reads them runs in the browser only"
+    )
+)]
+struct SealedRun {
+    open: RwSignal<bool>,
+    query: RwSignal<String>,
+    readiness: Memo<sealed_search::Readiness>,
+    hits: RwSignal<Vec<Hit>>,
+    searching: RwSignal<bool>,
+    generation: StoredValue<u64>,
+    busy: StoredValue<bool>,
+    again: StoredValue<bool>,
+}
+
+impl SealedRun {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start(self, _q: String) {}
+
+    #[cfg(target_arch = "wasm32")]
+    fn start(self, q: String) {
+        let szones = sealed_search::sealed_zones();
+        if szones.is_empty() {
+            return;
+        }
+        let relay_opt = use_context::<nostr_bbs_client_core::relay::RelayConnection>();
+        let zk_opt = nostr_bbs_client_core::zone_crypto::store::try_use_zone_key_store();
+        let (Some(relay), Some(zk)) = (relay_opt, zk_opt) else {
+            return;
+        };
+        // Nothing started yet (the browser asked to save data): start now.
+        if self.readiness.get_untracked() == sealed_search::Readiness::Idle {
+            if let Some(signer) = nostr_bbs_client_core::auth::use_auth().get_signer() {
+                sealed_search::start(zk, signer);
+            }
+        }
+        self.busy.set_value(true);
+        self.searching.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut q = q;
+            loop {
+                let generation = self.generation.get_value();
+                let found = match sealed_search::search(&relay, &zk, &q, 12).await {
+                    Ok(hits) => sealed_rows(hits, &szones),
+                    Err(_) => Vec::new(),
+                };
+                if self.generation.try_get_value() == Some(generation) {
+                    self.hits.set(found);
+                }
+                if self.again.try_get_value() == Some(true) {
+                    self.again.set_value(false);
+                    q = self.query.get_untracked().trim().to_string();
+                    if self.open.get_untracked() && q.len() >= 2 {
+                        continue;
+                    }
+                }
+                break;
+            }
+            let _ = self.busy.try_set_value(false);
+            let _ = self.searching.try_set(false);
+        });
+    }
+}
+
+/// What the palette says when nothing matched: never "no matching" while the
+/// encrypted index is still loading, since its matches may not be in yet.
+fn empty_label(state: &sealed_search::Readiness, searching: bool) -> String {
+    if let Some(n) = state.notice() {
+        n
+    } else if searching {
+        "Searching sealed zones…".into()
+    } else {
+        "No matching boards, members, or posts.".into()
+    }
+}
+
+/// Palette rows for sealed hits, opening AT the post as a POST hit does.
+#[cfg(target_arch = "wasm32")]
+fn sealed_rows(hits: Vec<sealed_search::SealedHit>, szones: &[String]) -> Vec<Hit> {
+    hits.into_iter()
+        .map(|h| {
+            let preview = h.event.content.chars().take(120).collect::<String>();
+            let zone_tag = h
+                .event
+                .tags
+                .iter()
+                .find(|t| t.first().map(String::as_str) == Some("zk"))
+                .and_then(|t| t.get(1))
+                .cloned()
+                .unwrap_or_else(|| szones.first().cloned().unwrap_or_default());
+            Hit {
+                kind: "🔒 SEALED",
+                title: preview,
+                subtitle: format!("zone:{zone_tag} · score {:.0}%", h.score * 100.0),
+                route: Route::Go {
+                    event_id: h.event.id.clone(),
+                    channel: channel_of(&h.event),
+                },
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sealed_search::{Readiness, Unavailable};
+
+    #[test]
+    fn no_matching_is_never_said_while_the_encrypted_index_loads() {
+        let loading = Readiness::Loading {
+            loaded: 3,
+            total: 8,
+        };
+        assert!(empty_label(&loading, false).contains("3 of 8"));
+        assert!(empty_label(&loading, true).contains("still loading"));
+        let waiting_for_keys = Readiness::Loading {
+            loaded: 0,
+            total: 0,
+        };
+        assert!(empty_label(&waiting_for_keys, false).contains("still loading"));
+        assert_eq!(
+            empty_label(&Readiness::Ready, true),
+            "Searching sealed zones…"
+        );
+        for settled in [
+            Readiness::Ready,
+            Readiness::Idle,
+            Readiness::Unavailable(Unavailable::NoKeys),
+        ] {
+            assert_eq!(
+                empty_label(&settled, false),
+                "No matching boards, members, or posts."
+            );
+        }
     }
 }

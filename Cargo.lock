@@ -3286,6 +3286,7 @@ dependencies = [
  "bitcoin",
  "comrak",
  "futures",
+ "futures-util",
  "getrandom 0.2.17",
  "gloo",
  "hex",

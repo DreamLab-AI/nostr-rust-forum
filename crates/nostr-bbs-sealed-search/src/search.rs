@@ -82,6 +82,8 @@ pub fn check_sealed(
 }
 
 struct Shard {
+    /// Name of the bin object it was read from.
+    bin_name: String,
     bin: BinLayer,
     q: ObjectRef,
     /// age header length of the q object and its NBSS header length.
@@ -171,11 +173,55 @@ impl Index {
             .q_for(o)
             .ok_or_else(|| format!("no int8 layer for {}", o.name))?;
         self.shards.push(Shard {
+            bin_name: o.name.clone(),
             bin,
             q,
             q_geom: None,
         });
         Ok(())
+    }
+
+    /// Add one shard in a single step: its bin object (as [`Index::add_bin`])
+    /// and the first bytes and full length of its int8 object (as
+    /// [`Index::set_q_prefix`]). Returns the int8 object's entry.
+    ///
+    /// Either both halves verify and the shard is kept, or neither is: a
+    /// query never sees a shard without its rescoring geometry, so shards can
+    /// be added while queries run (the browser worker adds them as they
+    /// arrive). Shards are only appended, so the shard numbers in a query's
+    /// candidates stay valid. Adding a shard already present is a no-op.
+    pub fn add_shard(
+        &mut self,
+        bin: &ObjectRef,
+        bin_sealed: &[u8],
+        q_prefix: &[u8],
+        q_total: usize,
+    ) -> Result<ObjectRef, String> {
+        if let Some(s) = self.shards.iter().find(|s| s.bin_name == bin.name) {
+            return Ok(s.q.clone());
+        }
+        self.add_bin(bin, bin_sealed)?;
+        let q = self.shards.last().map(|s| s.q.clone()).ok_or("no shard")?;
+        if let Err(e) = self.set_q_prefix(&q.name, q_prefix, q_total) {
+            self.shards.pop();
+            return Err(e);
+        }
+        Ok(q)
+    }
+
+    /// The manifest's index version this index was started from.
+    pub fn index_version(&self) -> u64 {
+        self.content.index_version
+    }
+
+    /// Shards resident.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Whether every bin object this member can open is resident.
+    pub fn is_complete(&self) -> bool {
+        self.shards.len() == self.wanted_bins().len()
     }
 
     /// Rows resident.

@@ -9,10 +9,18 @@
 //! On start it posts `{op:"booted"}`. Every request carries an `id`, echoed
 //! in its reply.
 //!
-//! - `{op:"init", id, model:ArrayBuffer, vocab:ArrayBuffer}` → `{op:"ready", id, ms, mem}`
+//! - `{op:"init", id, model:ArrayBuffer|Blob, vocab:ArrayBuffer|Blob}` → `{op:"ready", id, ms, mem}`
+//!   (a `Blob` is read here, so the main thread need not copy the model through its own heap)
 //! - `{op:"load", id, zone, content:string, keys:[{epoch, zone_pk, okm:Uint8Array}], blobs:{name:Blob}}`
 //!   → `{op:"loaded", id, zone, rows, resident_bytes, ms, mem}` (one index per zone; reloading
 //!   a zone replaces it)
+//! - `{op:"add", id, zone, content:string, keys:[…as load], shards:[bin name], blobs:{name:Blob}}`
+//!   → `{op:"added", id, zone, rows, shards, total, complete, resident_bytes, read_ms, open_ms, ms, mem}`:
+//!   adds the named bin objects and their int8 partners to the zone's index as they arrive, each
+//!   shard in one step, so queries answer from the shards added so far. Shards of the index
+//!   version already searchable are appended; a newer version is filled in the background while
+//!   a complete older one keeps answering, and replaces it once complete (`rows`, `shards`,
+//!   `total` and `complete` describe the version being filled).
 //! - `{op:"query", id, zones:[zone], text, k, r, decoys}` → `{op:"hits", id,
 //!   hits:[{zone,id,score,epoch,zone_pk}], decoys:[{zone,id}], embed_ms, first_ms, rescore_ms, mem}`
 //!   (top `k` merged across the zones by score)
@@ -33,6 +41,7 @@ mod worker {
     use std::rc::Rc;
 
     use js_sys::{Array, Object, Reflect, Uint8Array};
+    use nostr_bbs_sealed_search::format::Kind;
     use nostr_bbs_sealed_search::manifest::Content;
     use nostr_bbs_sealed_search::model::Bge;
     use nostr_bbs_sealed_search::seal::SearchKey;
@@ -45,8 +54,11 @@ mod worker {
     #[derive(Default)]
     struct State {
         model: Option<Bge>,
-        /// One index per zone.
+        /// One index per zone: the one queries use.
         indexes: HashMap<String, Index>,
+        /// A newer index version being filled (`add`) while a complete older
+        /// one keeps answering in `indexes`.
+        staging: HashMap<String, Index>,
         /// `q-` object blobs keyed by `zone/name` (names repeat across zones).
         q_blobs: HashMap<String, Blob>,
     }
@@ -103,12 +115,19 @@ mod worker {
         Ok(Uint8Array::new(&ab).to_vec())
     }
 
+    /// Bytes of an `ArrayBuffer` / typed array, or of a whole `Blob`.
+    async fn buffer_or_blob(v: &JsValue) -> Result<Vec<u8>, String> {
+        match v.dyn_ref::<Blob>() {
+            Some(b) => blob_bytes(b, 0, b.size() as usize).await,
+            None => Ok(bytes_of(v)),
+        }
+    }
+
     async fn on_init(msg: JsValue) -> Result<Object, String> {
         let t = now();
-        let model = bytes_of(&get(&msg, "model"));
-        let msg = msg.clone();
-        let vocab =
-            String::from_utf8(bytes_of(&get(&msg, "vocab"))).map_err(|_| "vocab not utf-8")?;
+        let model = buffer_or_blob(&get(&msg, "model")).await?;
+        let vocab = String::from_utf8(buffer_or_blob(&get(&msg, "vocab")).await?)
+            .map_err(|_| "vocab not utf-8")?;
         let bge = Bge::load_gguf_q8(&model, &vocab)?;
         drop(model);
         STATE.with(|s| s.borrow_mut().model = Some(bge));
@@ -120,17 +139,19 @@ mod worker {
         Ok(o)
     }
 
-    async fn on_load(msg: JsValue) -> Result<Object, String> {
-        let t = now();
-        let zone = get(&msg, "zone").as_string().ok_or("zone")?;
+    type Keys = HashMap<(u32, String), SearchKey>;
+
+    /// The zone, its manifest content and the search keys of a `load` / `add`.
+    fn zone_content_keys(msg: &JsValue) -> Result<(String, Content, Keys), String> {
+        let zone = get(msg, "zone").as_string().ok_or("zone")?;
         let content: Content =
-            serde_json::from_str(&get(&msg, "content").as_string().ok_or("content")?)
+            serde_json::from_str(&get(msg, "content").as_string().ok_or("content")?)
                 .map_err(|e| e.to_string())?;
         if content.zone != zone {
             return Err("manifest is for another zone".into());
         }
         let mut keys = HashMap::new();
-        for k in Array::from(&get(&msg, "keys")).iter() {
+        for k in Array::from(&get(msg, "keys")).iter() {
             let epoch = get(&k, "epoch").as_f64().ok_or("epoch")? as u32;
             let pk = get(&k, "zone_pk")
                 .as_string()
@@ -141,6 +162,147 @@ mod worker {
                 .map_err(|_| "okm length")?;
             keys.insert((epoch, pk), SearchKey::from_bytes(okm));
         }
+        Ok((zone, content, keys))
+    }
+
+    /// Bytes of the int8 object read at load: its age header and chunk 0.
+    const Q_PREFIX: usize = 70_000;
+
+    async fn on_add(msg: JsValue) -> Result<Object, String> {
+        let t = now();
+        let (zone, content, keys) = zone_content_keys(&msg)?;
+        let blobs = get(&msg, "blobs");
+        let blob = |name: &str| -> Result<Blob, String> {
+            get(&blobs, name)
+                .dyn_into::<Blob>()
+                .map_err(|_| format!("missing blob {name}"))
+        };
+        // Read everything first: the index is then changed without an await,
+        // so a query never sees half a shard.
+        let mut prepared = Vec::new();
+        for name in Array::from(&get(&msg, "shards"))
+            .iter()
+            .filter_map(|n| n.as_string())
+        {
+            let bin = content
+                .objects
+                .iter()
+                .find(|o| o.name == name && o.kind == Kind::Bin)
+                .ok_or_else(|| format!("{name} is not a bin object of this manifest"))?
+                .clone();
+            let q = content
+                .objects
+                .iter()
+                .find(|o| {
+                    o.kind == Kind::Int8
+                        && o.epoch == bin.epoch
+                        && o.shard == bin.shard
+                        && o.zone_pk == bin.zone_pk
+                })
+                .ok_or_else(|| format!("no int8 layer for {name}"))?
+                .clone();
+            let bb = blob(&bin.name)?;
+            let bin_bytes = blob_bytes(&bb, 0, bb.size() as usize).await?;
+            let qb = blob(&q.name)?;
+            let q_total = qb.size() as usize;
+            let q_prefix = blob_bytes(&qb, 0, q_total.min(Q_PREFIX)).await?;
+            prepared.push((bin, bin_bytes, q.name, qb, q_prefix, q_total));
+        }
+        let t_read = now();
+        let version = content.index_version;
+        let q_names: Vec<String> = content
+            .objects
+            .iter()
+            .filter(|o| o.kind == Kind::Int8)
+            .map(|o| o.name.clone())
+            .collect();
+        let state = STATE.with(|s| s.clone());
+        let mut st = state.borrow_mut();
+        let st = &mut *st;
+        let serving = st.indexes.get(&zone);
+        let into_staging = match serving {
+            Some(ix) if ix.index_version() == version => false,
+            Some(ix) if ix.is_complete() => true,
+            // Nothing searchable yet, or an incomplete older version: fill
+            // the new version in place, so it answers as it arrives.
+            _ => {
+                st.indexes
+                    .insert(zone.clone(), Index::new(content.clone(), keys.clone()));
+                st.staging.remove(&zone);
+                let prefix = format!("{zone}/");
+                st.q_blobs.retain(|k, _| {
+                    k.strip_prefix(&prefix)
+                        .is_none_or(|n| q_names.iter().any(|q| q == n))
+                });
+                false
+            }
+        };
+        if into_staging
+            && st
+                .staging
+                .get(&zone)
+                .is_none_or(|ix| ix.index_version() != version)
+        {
+            st.staging
+                .insert(zone.clone(), Index::new(content.clone(), keys));
+        }
+        let target = if into_staging {
+            st.staging.get_mut(&zone)
+        } else {
+            st.indexes.get_mut(&zone)
+        }
+        .ok_or("index gone")?;
+        let mut first_err = None;
+        for (bin, bin_bytes, q_name, qb, q_prefix, q_total) in prepared {
+            match target.add_shard(&bin, &bin_bytes, &q_prefix, q_total) {
+                Ok(_) => {
+                    st.q_blobs.insert(format!("{zone}/{q_name}"), qb);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        let (rows, shards, total, complete, resident) = (
+            target.rows(),
+            target.shard_count(),
+            target.wanted_bins().len(),
+            target.is_complete(),
+            target.resident_bytes(),
+        );
+        if into_staging && complete {
+            if let Some(ix) = st.staging.remove(&zone) {
+                st.indexes.insert(zone.clone(), ix);
+                // Keep only this version's int8 objects for the zone.
+                let prefix = format!("{zone}/");
+                st.q_blobs.retain(|k, _| {
+                    k.strip_prefix(&prefix)
+                        .is_none_or(|n| q_names.iter().any(|q| q == n))
+                });
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        let o = Object::new();
+        set(&o, "op", "added");
+        set(&o, "id", get(&msg, "id"));
+        set(&o, "zone", zone);
+        set(&o, "rows", rows as f64);
+        set(&o, "shards", shards as f64);
+        set(&o, "total", total as f64);
+        set(&o, "complete", complete);
+        set(&o, "resident_bytes", resident as f64);
+        set(&o, "read_ms", t_read - t);
+        set(&o, "open_ms", now() - t_read);
+        set(&o, "ms", now() - t);
+        set(&o, "mem", mem_bytes());
+        Ok(o)
+    }
+
+    async fn on_load(msg: JsValue) -> Result<Object, String> {
+        let t = now();
+        let (zone, content, keys) = zone_content_keys(&msg)?;
         let blobs = get(&msg, "blobs");
         let blob = |name: &str| -> Result<Blob, String> {
             get(&blobs, name)
@@ -157,7 +319,7 @@ mod worker {
         for q in index.q_needing_prefix() {
             let b = blob(&q.name)?;
             let total = b.size() as usize;
-            let prefix = blob_bytes(&b, 0, total.min(70_000)).await?;
+            let prefix = blob_bytes(&b, 0, total.min(Q_PREFIX)).await?;
             index.set_q_prefix(&q.name, &prefix, total)?;
             q_blobs.insert(format!("{zone}/{}", q.name), b);
         }
@@ -169,6 +331,7 @@ mod worker {
             s.q_blobs.retain(|k, _| !k.starts_with(&prefix));
             s.q_blobs.extend(q_blobs);
             s.indexes.insert(zone.clone(), index);
+            s.staging.remove(&zone);
         });
         let o = Object::new();
         set(&o, "op", "loaded");
@@ -210,13 +373,13 @@ mod worker {
                     Some(ix) => {
                         let cands = ix.first_stage(&q, r.max(k));
                         let plan = ix.plan_rescore(&cands)?;
-                        Some((cands, plan))
+                        Some((cands, plan, ix.index_version()))
                     }
                     None => None,
                 }
             };
             first_ms += now() - ta;
-            let Some((cands, plan)) = planned else {
+            let Some((cands, plan, version)) = planned else {
                 continue;
             };
             let mut fetched: Fetched = HashMap::new();
@@ -235,6 +398,11 @@ mod worker {
             }
             let st = state.borrow();
             let ix = st.indexes.get(zone).ok_or("index gone")?;
+            // Replaced by a newer version while the ranges were read: the
+            // candidates name shards of the old one, so skip the zone.
+            if ix.index_version() != version {
+                continue;
+            }
             let hits = ix.rescore(&q, &cands, &fetched, k)?;
             let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
             let seed = (now() as u64) ^ 0x9e37_79b9_7f4a_7c15 ^ (zone.len() as u64);
@@ -290,6 +458,7 @@ mod worker {
                 let res = match op.as_str() {
                     "init" => on_init(msg).await,
                     "load" => on_load(msg).await,
+                    "add" => on_add(msg).await,
                     "query" => on_query(msg).await,
                     _ => Err(format!("unknown op {op}")),
                 };
