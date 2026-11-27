@@ -192,6 +192,23 @@ pub fn GoView(event_id: String, channel: Option<String>) -> impl IntoView {
         });
     }
 
+    // 1b. Asked before AUTH, a gated zone's relay answers the id lookup with
+    //     nothing; ask once more when the relay has authenticated.
+    {
+        let relay = relay.clone();
+        let authed = relay.authenticated();
+        let refetched = StoredValue::new(false);
+        Effect::new(move |_| {
+            // Tracks the connection too, so it re-runs after effect 1 starts.
+            let connected = conn.get() == ConnectionState::Connected;
+            if !connected || !authed.get() || !started.get_value() || refetched.get_value() {
+                return;
+            }
+            refetched.set_value(true);
+            store.fetch_by_id(&relay, &id.get_value());
+        });
+    }
+
     // 2. Resolve as history and keys arrive.
     {
         let relay = relay.clone();

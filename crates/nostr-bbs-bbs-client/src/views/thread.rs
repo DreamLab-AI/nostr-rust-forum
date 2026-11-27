@@ -923,6 +923,10 @@ fn PostCard(
     let relay = expect_context::<RelayConnection>();
     let toasts = use_toasts();
     let reactions_store = use_reaction_store();
+    // Captured during setup: handlers and the publish task have no reactive
+    // owner, so a context lookup there finds no zone keys and an encrypted
+    // zone's edit would go out unencrypted (and be refused).
+    let writer = ZoneWriter::capture();
     let custom_emoji = use_custom_emoji_store();
 
     let ev_id = post.id.clone();
@@ -999,7 +1003,6 @@ fn PostCard(
             let Some(signer) = auth.get_signer() else {
                 return;
             };
-            let writer = ZoneWriter::capture();
             let me = signer.public_key().to_string();
             let cid = cid.clone();
             let ev_id = ev_id.clone();
@@ -1358,6 +1361,12 @@ fn PostComposer(
 ) -> impl IntoView {
     let router = use_router();
     let auth = use_auth();
+    // Captured during setup, as the forum does: the send handler and its
+    // publish task have no reactive owner, so a context lookup there finds
+    // no zone keys (an encrypted zone's post would go out unencrypted and be
+    // refused) and no profile cache (typed @mentions would get no `p` tag).
+    let writer = ZoneWriter::capture();
+    let profiles = try_use_profile_cache();
     let relay = expect_context::<RelayConnection>();
     let toasts = use_toasts();
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("BbsConfig");
@@ -1403,7 +1412,6 @@ fn PostComposer(
                     topic_reply_tags(&cid, &root.id, &root.pubkey, quote)
                 }
             };
-            let writer = ZoneWriter::capture();
             let me = signer.public_key().to_string();
             let cid = cid.clone();
             let relay = relay.clone();
@@ -1411,7 +1419,7 @@ fn PostComposer(
 
             wasm_bindgen_futures::spawn_local(async move {
                 // Resolve @handles against ProfileCache
-                if let Some(pc) = try_use_profile_cache() {
+                if let Some(pc) = profiles {
                     let handles: Vec<String> = body
                         .split_whitespace()
                         .filter_map(|w| w.strip_prefix('@'))
