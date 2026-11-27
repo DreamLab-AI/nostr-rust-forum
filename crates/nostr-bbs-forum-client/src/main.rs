@@ -25,26 +25,8 @@ fn main() {
     // it (see `stores::relay_scope`); the app mounts once that is done.
     wasm_bindgen_futures::spawn_local(async {
         // Never let a stuck IndexedDB keep the app from mounting: after 3 s
-        // it mounts anyway, the scope stays unrecorded, and the clear is
-        // retried on the next load.
-        let enforce = wasm_bindgen_futures::future_to_promise(async {
-            stores::relay_scope::enforce().await;
-            Ok(wasm_bindgen::JsValue::TRUE)
-        });
-        let timeout = js_sys::Promise::new(&mut |resolve, _| {
-            if let Some(w) = web_sys::window() {
-                let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 3_000);
-            }
-        });
-        let first = js_sys::Promise::race(&js_sys::Array::of2(&enforce, &timeout));
-        if wasm_bindgen_futures::JsFuture::from(first)
-            .await
-            .map(|v| v.is_undefined())
-            .unwrap_or(true)
-        {
-            stores::relay_scope::abandon();
-            web_sys::console::warn_1(&"[relay-scope] storage check timed out; mounting".into());
-        }
+        // it mounts anyway and the clear is retried on the next load.
+        stores::relay_scope::enforce_within(3_000).await;
         leptos::mount::mount_to_body(App);
 
         web_sys::console::log_1(&"[nostr-bbs] mount_to_body complete".into());

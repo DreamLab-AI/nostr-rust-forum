@@ -144,6 +144,32 @@ pub async fn enforce() {
     }
 }
 
+/// [`enforce`], but give up after `timeout_ms` so a stuck IndexedDB never
+/// keeps the app from mounting: the clear is then abandoned before its next
+/// step (see [`abandon`]), the scope stays unrecorded and the clear is
+/// retried on the next load. Await this before mounting the app.
+pub async fn enforce_within(timeout_ms: i32) {
+    let enforce = wasm_bindgen_futures::future_to_promise(async {
+        enforce().await;
+        Ok(wasm_bindgen::JsValue::TRUE)
+    });
+    let timeout = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(w) = web_sys::window() {
+            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, timeout_ms);
+        }
+    });
+    let first = js_sys::Promise::race(&js_sys::Array::of2(&enforce, &timeout));
+    // The timeout resolves with `undefined`, the check with `true`.
+    if wasm_bindgen_futures::JsFuture::from(first)
+        .await
+        .map(|v| v.is_undefined())
+        .unwrap_or(true)
+    {
+        abandon();
+        web_sys::console::warn_1(&"[relay-scope] storage check timed out; mounting".into());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
