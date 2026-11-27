@@ -23,7 +23,7 @@ mod ssrf;
 use serde::Serialize;
 use worker::*;
 
-use nostr_bbs_ascii::{render_bytes, GlyphRamp, RenderOptions};
+use nostr_bbs_ascii::{render_bytes, AsciiError, GlyphRamp, RenderOptions};
 use oembed::TwitterCachePayload;
 use parse::OgCachePayload;
 
@@ -420,32 +420,59 @@ async fn handle_ascii(req: &Request, env: &Env) -> Result<Response> {
         }
     }
 
-    // Miss: SSRF-safe fetch of the image bytes, then render.
+    // Miss: fetch the image bytes (through a service binding for the
+    // deployment's own Workers, SSRF-checked on every hop otherwise), then
+    // render. The upstream answer is checked before anything is decoded, so
+    // an error page is reported as what it is rather than as a corrupt image.
     let headers = Headers::new();
     let _ = headers.set("Accept", "image/*");
     let _ = headers.set("User-Agent", "LinkPreviewAPI/1.0 (ASCII Render Bot)");
 
-    let response = match ssrf::ssrf_fetch_with_redirects(&target_url, &headers).await {
-        Ok(r) => r,
-        Err(e) => {
-            return json_response(
-                &ErrorResponse {
-                    error: e.to_string(),
-                },
-                500,
-                env,
-            )
-        }
+    let bindings = env
+        .var(SERVICE_BINDINGS_VAR)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let host = Url::parse(&target_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    let fetched = match service_binding_for(&bindings, &host) {
+        Some(binding) => fetch_via_binding(env, &binding, &target_url, &headers).await,
+        None => ssrf::ssrf_fetch_with_redirects(&target_url, &headers)
+            .await
+            .map_err(|e| e.to_string()),
     };
+    let response = match fetched {
+        Ok(r) => r,
+        Err(error) => return json_response(&ErrorResponse { error }, 502, env),
+    };
+
+    let content_type = response.headers().get("Content-Type").ok().flatten();
+    if let Some((status, error)) = upstream_problem(response.status_code(), content_type.as_deref())
+    {
+        return json_response(&ErrorResponse { error }, status, env);
+    }
 
     let bytes = match ssrf::read_bytes_capped(response, ssrf::MAX_IMAGE_BYTES).await {
         Ok(b) => b,
+        Err(ssrf::SsrfFetchError::BodyTooLarge) => {
+            return json_response(
+                &ErrorResponse {
+                    error: format!(
+                        "image too large: over {} MB",
+                        ssrf::MAX_IMAGE_BYTES / (1024 * 1024)
+                    ),
+                },
+                413,
+                env,
+            )
+        }
         Err(e) => {
             return json_response(
                 &ErrorResponse {
                     error: e.to_string(),
                 },
-                500,
+                502,
                 env,
             )
         }
@@ -461,9 +488,88 @@ async fn handle_ascii(req: &Request, env: &Env) -> Result<Response> {
             &ErrorResponse {
                 error: e.to_string(),
             },
-            422,
+            ascii_error_status(e),
             env,
         ),
+    }
+}
+
+/// Worker variable naming the service bindings `/ascii` fetches through:
+/// `"host=BINDING, host2=BINDING2"`. A Worker cannot `fetch()` another Worker
+/// on the same Cloudflare zone (the `*.workers.dev` subdomain counts) over the
+/// public internet: the runtime answers with an error page instead (error
+/// 1042). Images on the deployment's own pod Workers therefore need a
+/// `[[services]]` binding in `wrangler.toml` and an entry here. The host must
+/// still pass the egress allow-list.
+const SERVICE_BINDINGS_VAR: &str = "PREVIEW_SERVICE_BINDINGS";
+
+/// The service binding configured for `host` in a [`SERVICE_BINDINGS_VAR`]
+/// value, if any (host compared case-insensitively; malformed entries are
+/// ignored).
+fn service_binding_for(spec: &str, host: &str) -> Option<String> {
+    if host.is_empty() {
+        return None;
+    }
+    spec.split([',', ';', '\n'])
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(h, b)| (h.trim().to_ascii_lowercase(), b.trim()))
+        .find(|(h, b)| h == host && !b.is_empty())
+        .map(|(_, b)| b.to_string())
+}
+
+/// GET `url` through the service binding `binding`: one hop, no redirects
+/// (a redirect out of our own Worker is refused rather than followed outside
+/// the SSRF checks).
+async fn fetch_via_binding(
+    env: &Env,
+    binding: &str,
+    url: &str,
+    headers: &Headers,
+) -> std::result::Result<Response, String> {
+    let fetcher = env
+        .service(binding)
+        .map_err(|e| format!("service binding {binding} unavailable: {e}"))?;
+    let req = ssrf::build_request(url, headers, Method::Get).map_err(|e| e.to_string())?;
+    let response = fetcher
+        .fetch_request(req)
+        .await
+        .map_err(|e| format!("service binding {binding} fetch failed: {e}"))?;
+    if (300..400).contains(&response.status_code()) {
+        return Err("redirect via service binding refused".to_string());
+    }
+    Ok(response)
+}
+
+/// Why an upstream answer cannot be an image, as the `/ascii` status and
+/// message: a non-2xx status (502, naming it), or a declared non-image
+/// content type (415). A missing or generic binary type passes; the bytes are
+/// sniffed when decoded.
+fn upstream_problem(status: u16, content_type: Option<&str>) -> Option<(u16, String)> {
+    if !(200..300).contains(&status) {
+        return Some((502, format!("upstream answered HTTP {status}")));
+    }
+    let media = content_type
+        .and_then(|c| c.split(';').next())
+        .map(|m| m.trim().to_ascii_lowercase())
+        .filter(|m| !m.is_empty())?;
+    let binary = matches!(
+        media.as_str(),
+        "application/octet-stream" | "binary/octet-stream"
+    );
+    if media.starts_with("image/") || binary {
+        None
+    } else {
+        Some((415, format!("not an image: upstream sent {media}")))
+    }
+}
+
+/// HTTP status for a render failure: 415 not an image, 413 too large, 422
+/// corrupt (and any failure a later crate version adds).
+fn ascii_error_status(e: AsciiError) -> u16 {
+    match e {
+        AsciiError::NotAnImage => 415,
+        AsciiError::TooLarge => 413,
+        _ => 422,
     }
 }
 
@@ -584,6 +690,54 @@ async fn scheduled(_event: ScheduledEvent, _env: Env, _ctx: ScheduleContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_errors_are_named_before_decoding() {
+        assert_eq!(
+            upstream_problem(404, Some("text/html")),
+            Some((502, "upstream answered HTTP 404".to_string()))
+        );
+        assert_eq!(
+            upstream_problem(401, Some("application/json")).map(|p| p.0),
+            Some(502)
+        );
+        assert_eq!(
+            upstream_problem(200, Some("text/html; charset=UTF-8")),
+            Some((415, "not an image: upstream sent text/html".to_string()))
+        );
+        assert_eq!(upstream_problem(200, Some("image/jpeg")), None);
+        assert_eq!(upstream_problem(200, Some("IMAGE/WEBP")), None);
+        assert_eq!(
+            upstream_problem(200, Some("application/octet-stream")),
+            None
+        );
+        assert_eq!(upstream_problem(200, None), None);
+    }
+
+    #[test]
+    fn render_failures_have_distinct_statuses() {
+        assert_eq!(ascii_error_status(AsciiError::NotAnImage), 415);
+        assert_eq!(ascii_error_status(AsciiError::TooLarge), 413);
+        assert_eq!(ascii_error_status(AsciiError::Decode), 422);
+    }
+
+    #[test]
+    fn service_bindings_are_matched_by_host() {
+        let spec =
+            "Pods.Example.workers.dev = POD_V2, old-pods.example.workers.dev=POD_V1;bad, empty=";
+        assert_eq!(
+            service_binding_for(spec, "pods.example.workers.dev").as_deref(),
+            Some("POD_V2")
+        );
+        assert_eq!(
+            service_binding_for(spec, "old-pods.example.workers.dev").as_deref(),
+            Some("POD_V1")
+        );
+        assert_eq!(service_binding_for(spec, "empty"), None);
+        assert_eq!(service_binding_for(spec, "cdn.example.com"), None);
+        assert_eq!(service_binding_for("", "pods.example.workers.dev"), None);
+        assert_eq!(service_binding_for(spec, ""), None);
+    }
 
     // Cache key tests
     #[test]

@@ -240,33 +240,139 @@ pub fn render_luma(src: &[u8], src_w: u32, src_h: u32, opts: &RenderOptions) -> 
 
 /// Decode an encoded image (PNG/JPEG/GIF/WebP/BMP) and render it to ASCII.
 ///
-/// Server-side only (preview/pod workers). Returns [`AsciiError`] on an
-/// unsupported/corrupt image or one exceeding [`MAX_PIXELS`].
+/// Server-side only (preview/pod workers). The format is sniffed from the
+/// bytes (never trusted from a header), the dimensions are read from the
+/// image header and checked against [`MAX_PIXELS`] **before** any pixel buffer
+/// is allocated, and the decode itself is bounded:
+///
+/// * a JPEG is downscaled while it is decoded (DCT scaling to 1/2, 1/4 or
+///   1/8), so a 12-megapixel photo decodes to well under a megapixel;
+/// * any other format decodes at full size within [`MAX_DECODE_BYTES`].
+///
+/// A GIF renders its first frame.
+///
+/// # Errors
+///
+/// [`AsciiError::NotAnImage`] when the bytes are not a supported image
+/// format, [`AsciiError::TooLarge`] past either budget, and
+/// [`AsciiError::Decode`] for a recognised but corrupt image.
+///
+/// # Examples
+///
+/// ```
+/// use nostr_bbs_ascii::{render_bytes, AsciiError, RenderOptions};
+///
+/// let not_an_image = b"<!doctype html><title>404</title>";
+/// assert_eq!(
+///     render_bytes(not_an_image, &RenderOptions::default()).unwrap_err(),
+///     AsciiError::NotAnImage
+/// );
+/// ```
 #[cfg(feature = "decode")]
 pub fn render_bytes(bytes: &[u8], opts: &RenderOptions) -> Result<AsciiArt, AsciiError> {
-    use image::GenericImageView as _;
+    use image::ImageFormat;
 
-    let img = image::load_from_memory(bytes).map_err(|_| AsciiError::Decode)?;
-    let (w, h) = img.dimensions();
-    if (w as u64) * (h as u64) > MAX_PIXELS {
-        return Err(AsciiError::TooLarge);
-    }
+    let format = match image::guess_format(bytes) {
+        Ok(
+            f @ (ImageFormat::Png
+            | ImageFormat::Jpeg
+            | ImageFormat::Gif
+            | ImageFormat::WebP
+            | ImageFormat::Bmp),
+        ) => f,
+        _ => return Err(AsciiError::NotAnImage),
+    };
+    let reader = || image::io::Reader::with_format(std::io::Cursor::new(bytes), format);
+    let (w, h) = reader().into_dimensions().map_err(|_| AsciiError::Decode)?;
+    check_pixels(w, h)?;
+
+    let img = if format == ImageFormat::Jpeg {
+        decode_jpeg_scaled(bytes, opts)?
+    } else {
+        let mut r = reader();
+        let mut limits = image::io::Limits::default();
+        limits.max_alloc = Some(MAX_DECODE_BYTES);
+        r.limits(limits);
+        r.decode().map_err(map_image_error)?
+    };
     let luma = img.to_luma8();
+    let (w, h) = luma.dimensions();
     Ok(render_luma(luma.as_raw(), w, h, opts))
 }
 
-/// Upper bound on decoded image area (megapixels) accepted by [`render_bytes`]
-/// — a guard against decompression-bomb inputs within the worker's CPU budget.
+/// Refuse an image whose header declares more than [`MAX_PIXELS`].
+#[cfg(feature = "decode")]
+fn check_pixels(w: u32, h: u32) -> Result<(), AsciiError> {
+    if w == 0 || h == 0 {
+        return Err(AsciiError::Decode);
+    }
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return Err(AsciiError::TooLarge);
+    }
+    Ok(())
+}
+
+/// Classify a decoder failure: a limit is "too large", anything else corrupt.
+#[cfg(feature = "decode")]
+fn map_image_error(e: image::ImageError) -> AsciiError {
+    match e {
+        image::ImageError::Limits(_) => AsciiError::TooLarge,
+        _ => AsciiError::Decode,
+    }
+}
+
+/// The smallest source size a render needs: a few source pixels per cell
+/// across, so the nearest-sample projection still reads well.
+#[cfg(feature = "decode")]
+fn wanted_source_width(opts: &RenderOptions) -> u16 {
+    let cols = opts.sanitized().cols;
+    u16::try_from((cols * 4).max(256)).unwrap_or(u16::MAX)
+}
+
+/// Decode a JPEG downscaled during decode (DCT scaling), bounded by
+/// [`MAX_DECODE_BYTES`] for the output buffer.
+#[cfg(feature = "decode")]
+fn decode_jpeg_scaled(
+    bytes: &[u8],
+    opts: &RenderOptions,
+) -> Result<image::DynamicImage, AsciiError> {
+    use image::ImageDecoder as _;
+
+    let mut dec = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(map_image_error)?;
+    let want = wanted_source_width(opts);
+    // Ask for at least `want` across; the decoder picks the smallest DCT
+    // scale that still meets it in one axis, never upscaling.
+    dec.scale(want, want).map_err(map_image_error)?;
+    if dec.total_bytes() > MAX_DECODE_BYTES {
+        return Err(AsciiError::TooLarge);
+    }
+    image::DynamicImage::from_decoder(dec).map_err(map_image_error)
+}
+
+/// Upper bound on image area (pixels) accepted by [`render_bytes`], read from
+/// the image header before anything is decoded: a guard against
+/// decompression bombs. Comfortably above a 12-megapixel phone photo.
 #[cfg(feature = "decode")]
 pub const MAX_PIXELS: u64 = 24_000_000;
+
+/// Upper bound on the pixel buffer a full-size (non-JPEG) decode may allocate
+/// in [`render_bytes`]: a 12-megapixel RGBA image fits, within a Worker's
+/// 128 MB memory.
+#[cfg(feature = "decode")]
+pub const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Failure modes of [`render_bytes`].
 #[cfg(feature = "decode")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AsciiError {
-    /// The bytes were not a decodable image in a supported format.
+    /// The bytes are not an image in a supported format (an HTML error page,
+    /// JSON, SVG, an unknown format).
+    NotAnImage,
+    /// A supported format whose bytes are corrupt or truncated.
     Decode,
-    /// The decoded image exceeded [`MAX_PIXELS`].
+    /// Over [`MAX_PIXELS`] or [`MAX_DECODE_BYTES`].
     TooLarge,
 }
 
@@ -274,8 +380,9 @@ pub enum AsciiError {
 impl core::fmt::Display for AsciiError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            AsciiError::Decode => f.write_str("unsupported or corrupt image"),
-            AsciiError::TooLarge => f.write_str("image exceeds maximum pixel budget"),
+            AsciiError::NotAnImage => f.write_str("not an image (or an unsupported format)"),
+            AsciiError::Decode => f.write_str("corrupt or truncated image"),
+            AsciiError::TooLarge => f.write_str("image too large to render"),
         }
     }
 }
@@ -436,5 +543,142 @@ mod tests {
         let ansi = art.to_ansi((255, 176, 0));
         assert!(ansi.contains("\x1b[38;2;"));
         assert!(ansi.ends_with("\x1b[0m\n"));
+    }
+}
+
+#[cfg(all(test, feature = "decode"))]
+mod decode_tests {
+    use super::*;
+    use image::{DynamicImage, ImageOutputFormat, RgbImage};
+
+    /// A synthetic photo-like test card (gradients plus a hard-edged
+    /// pattern), generated here: no member content in the tests.
+    fn test_card(w: u32, h: u32) -> DynamicImage {
+        DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
+            let check = if (x / 120 + y / 120) % 2 == 0 { 40 } else { 0 };
+            image::Rgb([
+                ((x * 255 / w) as u8).saturating_add(check),
+                (y * 255 / h) as u8,
+                ((x ^ y) % 256) as u8,
+            ])
+        }))
+    }
+
+    fn encode(img: &DynamicImage, fmt: ImageOutputFormat) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, fmt).expect("encode");
+        out.into_inner()
+    }
+
+    fn opts(cols: u32) -> RenderOptions {
+        RenderOptions {
+            cols,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_1920x1440_baseline_jpeg_photo_renders() {
+        let jpeg = encode(&test_card(1920, 1440), ImageOutputFormat::Jpeg(85));
+        assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF], "a JPEG fixture");
+        let art = render_bytes(&jpeg, &opts(68)).expect("renders");
+        assert_eq!(art.cols, 68);
+        // 4:3 at a 0.5 cell aspect: 68 × 0.75 × 0.5 ≈ 26 rows.
+        assert_eq!(art.rows, 26);
+        assert!(art.to_html().starts_with("<pre class=\"ascii-img\""));
+    }
+
+    #[test]
+    fn a_12_megapixel_jpeg_renders_downscaled() {
+        let jpeg = encode(&test_card(4000, 3000), ImageOutputFormat::Jpeg(80));
+        let art = render_bytes(&jpeg, &opts(80)).expect("renders");
+        assert_eq!((art.cols, art.rows), (80, 30));
+        // The decode itself was scaled: the JPEG decoder's output for an
+        // 80-column render is at most a quarter of the source width.
+        let mut dec = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&jpeg)).unwrap();
+        let w = wanted_source_width(&opts(80));
+        let (sw, _) = dec.scale(w, w).unwrap();
+        assert!(sw <= 1000, "scaled width {sw}");
+    }
+
+    #[test]
+    fn png_and_gif_render() {
+        let card = test_card(1920, 1440);
+        let png = encode(&card, ImageOutputFormat::Png);
+        assert_eq!(render_bytes(&png, &opts(40)).unwrap().cols, 40);
+        let gif = encode(&test_card(320, 240), ImageOutputFormat::Gif);
+        assert_eq!(render_bytes(&gif, &opts(40)).unwrap().cols, 40);
+    }
+
+    #[test]
+    fn non_images_are_not_images() {
+        for body in [
+            &b"<!DOCTYPE html><html><body>error code: 1042</body></html>"[..],
+            br#"{"error":"Authentication required"}"#,
+            b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+            b"",
+        ] {
+            assert_eq!(
+                render_bytes(body, &opts(40)).unwrap_err(),
+                AsciiError::NotAnImage
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_jpeg_is_corrupt() {
+        let jpeg = encode(&test_card(640, 480), ImageOutputFormat::Jpeg(85));
+        let cut = &jpeg[..200];
+        assert_eq!(
+            render_bytes(cut, &opts(40)).unwrap_err(),
+            AsciiError::Decode
+        );
+    }
+
+    #[test]
+    fn an_oversized_header_is_refused_before_decoding() {
+        // A PNG whose header declares 20000 × 20000 (400 MP): refused from
+        // the header alone, without allocating its pixels.
+        let mut png = encode(&test_card(8, 8), ImageOutputFormat::Png);
+        // IHDR data starts at byte 16: width then height, big-endian.
+        png[16..20].copy_from_slice(&20_000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&20_000u32.to_be_bytes());
+        // Re-seal the IHDR chunk's CRC (over type + data, bytes 12..29).
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        assert_eq!(
+            render_bytes(&png, &opts(40)).unwrap_err(),
+            AsciiError::TooLarge
+        );
+        assert!(check_pixels(4000, 3000).is_ok(), "12 MP is accepted");
+        assert_eq!(check_pixels(6000, 5000), Err(AsciiError::TooLarge));
+    }
+
+    /// CRC-32 (IEEE), as PNG chunks use; bitwise, for a test fixture.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn errors_say_which_failure() {
+        let texts = [
+            AsciiError::NotAnImage.to_string(),
+            AsciiError::Decode.to_string(),
+            AsciiError::TooLarge.to_string(),
+        ];
+        assert!(texts[0].contains("not an image"));
+        assert!(texts[1].contains("corrupt"));
+        assert!(texts[2].contains("too large"));
     }
 }

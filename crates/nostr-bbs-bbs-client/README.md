@@ -16,7 +16,7 @@ all run on the exact same stores and crypto primitives.
 | View / Hash Route | Kit Capability |
 |---|---|
 | `#/zones`, `#/zone/<slug>` | Config-driven zones & boards (`[[zones]]`), kind-40/42, encrypted zone badges |
-| `#/board/<id>`, `#/thread/<ch>/<post>` | NIP-28 / NIP-22 threads, Markdown, reactions + custom emoji, edits, NIP-09 delete, NIP-56 report, encrypted `ZoneWriter`, image upload + ASCII/Raw toggle |
+| `#/board/<id>`, `#/thread/<ch>/<post>` | NIP-28 / NIP-22 threads, Markdown, reactions + custom emoji, edits, NIP-09 delete, NIP-56 report, encrypted `ZoneWriter`, image upload; tap an ASCII image for the original picture (zone media fetched with the member's own credentials) |
 | `#/live` | Cross-board live post feed |
 | `#/kanban/<zone>` | Per-zone Kanban (`30301`/`30302`), approval gates (`31402`), `38000` agent dispatch |
 | `#/events/<zone>` | NIP-52 Calendar & Events (`31923`/`31925`), live RSVPs, free/busy, poker deep links |
@@ -32,12 +32,13 @@ all run on the exact same stores and crypto primitives.
 ## Desktop & Mobile Phone UX
 
 - **Desktop (`>= 900px`)**: Collapsible left sidebar with unread badges, main scrollable viewport, `/` slash command bar, `Ctrl/Cmd+K` global + sealed search, `g <key>` chord navigation.
-- **Mobile (`< 900px`)**: Native vertical scrolling (zero scroll-hijack JS), slide-over navigation drawer, sticky 5-tab thumb bar (`Zones`, `Live`, `DMs`, `Agents`, `More`), `>= 44px` tap targets, `16px` inputs (no iOS auto-zoom), safe-area inset support, and zero horizontal overflow.
+- **Mobile (`< 900px`)**: Native vertical scrolling (zero scroll-hijack JS), slide-over navigation drawer, sticky 5-tab thumb bar (`Zones`, `Live`, `DMs`, `Agents`, `More`), `>= 44px` tap targets, inputs never below `16px` (no iOS auto-zoom), safe-area inset support, and zero horizontal overflow.
+- **Phones (`<= 640px`, or touch screens in portrait below `900px`)**: all text at twice the desktop size. Every size is in `rem` from one root ladder (browser text size × shared font preference × the BBS TEXT SIZE setting × 2 on phones), so the member's browser setting and TEXT SIZE: LARGE still apply; ASCII art is fitted to its container instead of doubling.
 
 ## Configuration (`forum.toml` → `window.__ENV__`)
 
 Projected globals: `THEME`, `NODE_NAME`, `TAGLINE`, `LOCATION`, `BANNER_URL`,
-`LOGO_URL`, `RELAY_URL`, `POD_API`, `PREVIEW_API`, `SEARCH_API`, `ZONE_CONFIG`,
+`LOGO_URL`, `RELAY_URL`, `POD_API`, `POD_API_ALIASES` (BBS only: earlier origins of the same pod storage that old posts still link to, comma separated), `PREVIEW_API`, `SEARCH_API`, `ZONE_CONFIG`,
 `ENCRYPTION_ENABLED`, `BBS_PWA_ENABLED`, `SIDESTR_WALLET`, `SIDESTR_CHAINS`,
 `POKER`, `POKER_CONFIG`, `DEVICE_KEYS_ENABLED` — identical to `nostr-bbs-forum-client`.
 
