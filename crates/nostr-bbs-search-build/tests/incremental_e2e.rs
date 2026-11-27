@@ -1,0 +1,747 @@
+//! The nightly job end to end, against relay-shaped synthetic events: an
+//! archivist builds the base from the relay (imported posts as ADR-2017
+//! sealed envelopes, plus posts written in the forum), then a different
+//! identity, the indexer, runs updates and compactions that reference the
+//! archivist's objects, and a simulated browser verifies and searches every
+//! manifest. No network, no real text: a deterministic stand-in embedder.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use nostr_bbs_core::keys::{signing_key_from_bytes, SecretKey};
+use nostr_bbs_core::sealed::seal_original;
+use nostr_bbs_core::{sign_event, NostrEvent, UnsignedEvent};
+use nostr_bbs_sealed_search::build::q_partner;
+use nostr_bbs_sealed_search::format::Kind;
+use nostr_bbs_sealed_search::manifest::{HighWater, Manifest, KIND};
+use nostr_bbs_sealed_search::seal::SearchKey;
+use nostr_bbs_sealed_search::search::{Fetched, Index};
+use nostr_bbs_sealed_search::DIM;
+use nostr_bbs_search_build::embed::Embedder;
+use nostr_bbs_search_build::harvest::harvest;
+use nostr_bbs_search_build::memrelay::MemRelay;
+use nostr_bbs_search_build::pipeline::{
+    run_compact, run_full, run_update, status, Fold, Job, JobError, Pins, Report,
+    DEFAULT_MAX_MISSING, DEFAULT_OVERLAP_SECS,
+};
+use nostr_bbs_search_build::pod::DirPod;
+use nostr_bbs_search_build::state::State;
+use nostr_bbs_zone_migrate::keys::{KeyRing, KeySource, ZoneKey};
+use sha2::{Digest, Sha256};
+
+const ZONE: &str = "zone2";
+const RELAY: &str = "wss://relay.test";
+const CHANNEL: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const ARCHIVIST: [u8; 32] = [0xa1; 32];
+const INDEXER: [u8; 32] = [0xa2; 32];
+const STRANGER: [u8; 32] = [0xa3; 32];
+const MIGRATOR: [u8; 32] = [0xb1; 32];
+const ALICE: [u8; 32] = [0xc1; 32];
+const BOB: [u8; 32] = [0xc2; 32];
+const ZONE_E1: [u8; 32] = [0xd1; 32];
+const ZONE_E2: [u8; 32] = [0xd2; 32];
+const T0: u64 = 1_700_000_000;
+const SHARD_ROWS: usize = 40;
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    let mut f = std::pin::pin!(f);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+            return v;
+        }
+    }
+}
+
+fn sk(b: [u8; 32]) -> SecretKey {
+    SecretKey::from_bytes(b).expect("test key")
+}
+
+fn pk(b: [u8; 32]) -> String {
+    sk(b).public_key().to_hex()
+}
+
+fn sign(
+    secret: [u8; 32],
+    kind: u64,
+    created_at: u64,
+    tags: Vec<Vec<String>>,
+    content: &str,
+) -> NostrEvent {
+    sign_event(
+        UnsignedEvent {
+            pubkey: pk(secret),
+            created_at,
+            kind,
+            tags,
+            content: content.into(),
+        },
+        &signing_key_from_bytes(&secret).expect("signing key"),
+    )
+    .expect("signed")
+}
+
+fn t(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| s.to_string()).collect()
+}
+
+fn zk(epoch: u32, zone_secret: [u8; 32]) -> Vec<String> {
+    t(&["zk", ZONE, &epoch.to_string(), &pk(zone_secret)])
+}
+
+/// A post written in the forum: NIP-44 from the author to the zone key.
+fn native(author: [u8; 32], at: u64, text: &str, extra: Vec<Vec<String>>) -> NostrEvent {
+    native_under(author, at, text, extra, 1, ZONE_E1)
+}
+
+fn native_under(
+    author: [u8; 32],
+    at: u64,
+    text: &str,
+    extra: Vec<Vec<String>>,
+    epoch: u32,
+    zone_secret: [u8; 32],
+) -> NostrEvent {
+    let zpk: [u8; 32] = hex::decode(pk(zone_secret)).unwrap().try_into().unwrap();
+    let ct = nostr_bbs_core::nip44_encrypt(&author, &zpk, text).expect("nip44");
+    let mut tags = vec![t(&["e", CHANNEL, "", "root"])];
+    tags.extend(extra);
+    tags.push(zk(epoch, zone_secret));
+    sign(author, 42, at, tags, &ct)
+}
+
+/// An imported post: `(original, envelope)`. Only the envelope is on the relay.
+fn imported(author: [u8; 32], at: u64, text: &str) -> (NostrEvent, NostrEvent) {
+    let original = sign(author, 42, at, vec![t(&["e", CHANNEL, "", "root"])], text);
+    let env = seal_original(&original, ZONE, 1, &pk(ZONE_E1), &sk(MIGRATOR)).expect("sealed");
+    (original, env)
+}
+
+fn edit_of(target: &str) -> Vec<Vec<String>> {
+    vec![t(&["e", target, "", "edit"])]
+}
+
+fn kind5(author: [u8; 32], at: u64, target: &str) -> NostrEvent {
+    sign(author, 5, at, vec![t(&["e", target])], "")
+}
+
+/// Deterministic unit vectors from text: the same text always embeds the same.
+struct HashEmbedder {
+    calls: usize,
+}
+
+fn vector(text: &str) -> [f32; DIM] {
+    let seed = Sha256::digest(text.as_bytes());
+    let mut x = u64::from_le_bytes(seed[..8].try_into().unwrap()) | 1;
+    let mut v = [0f32; DIM];
+    for s in v.iter_mut() {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *s = ((x >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
+    }
+    let n = v.iter().map(|a| a * a).sum::<f32>().sqrt();
+    v.iter_mut().for_each(|a| *a /= n);
+    v
+}
+
+impl Embedder for HashEmbedder {
+    fn embed(&mut self, texts: &[&str]) -> Result<Vec<[f32; DIM]>, String> {
+        self.calls += texts.len();
+        Ok(texts.iter().map(|t| vector(t)).collect())
+    }
+}
+
+fn ring(epochs: &[(u32, [u8; 32])]) -> KeyRing {
+    let mut r = KeyRing::new();
+    for (e, s) in epochs {
+        r.insert(ZoneKey::new(ZONE, *e, &hex::encode(s), &pk(*s), KeySource::KeyFile).unwrap())
+            .unwrap();
+    }
+    r
+}
+
+fn pins() -> Pins {
+    Pins {
+        model: "bge-small-en-v1.5".into(),
+        model_sha256: "aa".repeat(32),
+        vocab_sha256: "bb".repeat(32),
+    }
+}
+
+struct Fixture {
+    root: PathBuf,
+    relay: MemRelay,
+    publishers: Vec<String>,
+    /// Imported originals by text, and live posts by text.
+    originals: HashMap<String, (NostrEvent, NostrEvent)>,
+    natives: HashMap<String, NostrEvent>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn base_text(i: usize) -> String {
+    format!("base post number {i}")
+}
+
+/// 100 imported posts and 15 live ones, base built by the archivist (with
+/// 40-row shards: two full shards and a partial one).
+fn fixture(name: &str) -> Fixture {
+    let root = std::env::temp_dir().join(format!("nbss-e2e-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut relay = MemRelay::new(Vec::new());
+    let mut originals = HashMap::new();
+    let mut natives = HashMap::new();
+    for i in 0..100 {
+        let author = if i % 2 == 0 { ALICE } else { BOB };
+        let (o, e) = imported(author, T0 + i as u64, &base_text(i));
+        relay.insert(e.clone());
+        originals.insert(base_text(i), (o, e));
+    }
+    for i in 100..115 {
+        let ev = native(ALICE, T0 + i as u64, &base_text(i), vec![]);
+        relay.insert(ev.clone());
+        natives.insert(base_text(i), ev);
+    }
+    let publishers = vec![pk(ARCHIVIST), pk(INDEXER)];
+    let mut f = Fixture {
+        root,
+        relay,
+        publishers,
+        originals,
+        natives,
+    };
+    // The archivist's base (full build from the relay).
+    let me = sk(ARCHIVIST);
+    let keys = ring(&[(1, ZONE_E1)]);
+    let mut pod = DirPod::new(&f.root, ZONE, &pk(ARCHIVIST));
+    let p = pins();
+    let mut job = job(&me, &keys, &mut pod, &f.publishers, &p);
+    let mut h = block_on(harvest(&mut f.relay, ZONE, &keys, None, &HashSet::new())).unwrap();
+    assert_eq!(h.rows.len(), 115);
+    let rows = std::mem::take(&mut h.rows);
+    let r = block_on(run_full(
+        &mut job,
+        None,
+        rows,
+        &HashSet::new(),
+        Some(&h),
+        &mut HashEmbedder { calls: 0 },
+        false,
+    ))
+    .unwrap();
+    assert_eq!(r.index_version, Some(1));
+    assert_eq!(r.rows_added, 115);
+    f
+}
+
+fn job<'a>(
+    me: &'a SecretKey,
+    ring: &'a KeyRing,
+    pod: &'a mut DirPod,
+    publishers: &'a [String],
+    pins: &'a Pins,
+) -> Job<'a, DirPod> {
+    Job {
+        zone: ZONE,
+        relay_url: RELAY,
+        publishers,
+        me,
+        ring,
+        pod,
+        cache: None,
+        pins: Some(pins),
+        shard_rows: SHARD_ROWS,
+        now: 1_900_000_000,
+        warnings: Vec::new(),
+    }
+}
+
+/// Run one indexer step against the fixture.
+fn indexer<T>(
+    f: &mut Fixture,
+    state: &mut State,
+    step: impl FnOnce(&mut Job<'_, DirPod>, &mut MemRelay, &mut State) -> T,
+) -> T {
+    let me = sk(INDEXER);
+    let keys = ring(&[(1, ZONE_E1)]);
+    let mut pod = DirPod::new(&f.root, ZONE, &pk(INDEXER));
+    let p = pins();
+    let publishers = f.publishers.clone();
+    let mut j = job(&me, &keys, &mut pod, &publishers, &p);
+    step(&mut j, &mut f.relay, state)
+}
+
+fn update(f: &mut Fixture, state: &mut State) -> Result<Report, JobError> {
+    indexer(f, state, |j, r, s| {
+        block_on(run_update(
+            j,
+            r,
+            s,
+            &mut HashEmbedder { calls: 0 },
+            None,
+            DEFAULT_OVERLAP_SECS,
+        ))
+    })
+}
+
+fn compact_partial(f: &mut Fixture, state: &mut State) -> Result<Report, JobError> {
+    indexer(f, state, |j, r, s| {
+        block_on(run_compact(j, r, s, Fold::Partial, DEFAULT_MAX_MISSING))
+    })
+}
+
+/// What a browser does: read `m.json` from every trusted publisher, keep the
+/// newest that verifies over its high-water mark.
+fn browser_manifest(f: &Fixture, hw: Option<&HighWater>) -> Manifest {
+    let mut best: Option<Manifest> = None;
+    for p in &f.publishers {
+        let path = DirPod::new(&f.root, ZONE, p).path(p, "m.json");
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let ev: NostrEvent = serde_json::from_slice(&bytes).unwrap();
+        if let Ok(m) = Manifest::verify(ev, ZONE, RELAY, &f.publishers, hw) {
+            if best
+                .as_ref()
+                .is_none_or(|b| m.content.index_version > b.content.index_version)
+            {
+                best = Some(m);
+            }
+        }
+    }
+    best.expect("a manifest verifies")
+}
+
+struct Loaded {
+    ix: Index,
+    objs: HashMap<String, Vec<u8>>,
+}
+
+fn load(f: &Fixture, m: &Manifest) -> Loaded {
+    let keys: HashMap<(u32, String), SearchKey> = HashMap::from([(
+        (1, pk(ZONE_E1)),
+        SearchKey::derive(
+            &ZONE_E1,
+            ZONE,
+            1,
+            &hex::decode(pk(ZONE_E1)).unwrap().try_into().unwrap(),
+        ),
+    )]);
+    let mut objs = HashMap::new();
+    for o in &m.content.objects {
+        let owner = m.owner_of(o);
+        let path = DirPod::new(&f.root, ZONE, owner).path(owner, &o.name);
+        objs.insert(
+            o.name.clone(),
+            std::fs::read(&path).unwrap_or_else(|_| panic!("{} missing", o.name)),
+        );
+    }
+    let mut ix = Index::new(m.content.clone(), keys);
+    for b in ix.wanted_bins() {
+        let q = q_partner(&m.content, &b).unwrap().clone();
+        let qb = &objs[&q.name];
+        ix.add_shard(&b, &objs[&b.name], &qb[..qb.len().min(70_000)], qb.len())
+            .expect("shard verifies");
+    }
+    assert!(ix.is_complete());
+    Loaded { ix, objs }
+}
+
+/// Top hits as a member sees them: resolved through the relay (as
+/// `verified_hits` does), so a post the relay no longer serves drops out.
+fn shown(f: &mut Fixture, l: &Loaded, text: &str) -> Vec<String> {
+    let hits = search(l, text);
+    let served = block_on(nostr_bbs_search_build::harvest::present(
+        &mut f.relay,
+        &hits,
+    ))
+    .unwrap();
+    hits.into_iter().filter(|h| served.contains(h)).collect()
+}
+
+fn search(l: &Loaded, text: &str) -> Vec<String> {
+    let q = vector(text);
+    let cands = l.ix.first_stage(&q, 80);
+    let plan = l.ix.plan_rescore(&cands).unwrap();
+    let fetched: Fetched = plan
+        .iter()
+        .map(|p| {
+            (
+                p.name.clone(),
+                p.ranges
+                    .iter()
+                    .map(|&(a, b)| (a, l.objs[&p.name][a..b].to_vec()))
+                    .collect(),
+            )
+        })
+        .collect();
+    l.ix.rescore(&q, &cands, &fetched, 5)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect()
+}
+
+fn files(f: &Fixture, who: [u8; 32]) -> HashMap<String, Vec<u8>> {
+    let dir = DirPod::new(&f.root, ZONE, &pk(who)).path(&pk(who), "m.json");
+    let dir = dir.parent().unwrap();
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().to_string(),
+                        std::fs::read(e.path()).unwrap(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn new_state() -> State {
+    State::new(ZONE, RELAY, &pk(INDEXER))
+}
+
+#[test]
+fn an_update_by_the_indexer_shares_the_archivists_base_and_finds_new_posts_not_deleted_ones() {
+    let mut f = fixture("update");
+    let archivist_files = files(&f, ARCHIVIST);
+    let base = browser_manifest(&f, None);
+    let mut state = new_state();
+
+    // First run: no high-water mark yet, so the whole zone is read; every
+    // post is already indexed and nothing is published.
+    let r = update(&mut f, &mut state).unwrap();
+    assert!(!r.published);
+    assert_eq!(r.already_indexed, 115);
+    assert_eq!(state.high_water, Some(T0 + 114));
+
+    // New activity: M new posts, an edit, K deletions three ways.
+    let t1 = T0 + 1_000;
+    let new_texts: Vec<String> = (0..30).map(|i| format!("fresh post {i}")).collect();
+    for (i, text) in new_texts.iter().enumerate() {
+        f.relay.insert(native(BOB, t1 + i as u64, text, vec![]));
+    }
+    // Alice edits her imported post 10 (target: the ORIGINAL id).
+    let (orig10, _) = f.originals[&base_text(10)].clone();
+    f.relay.insert(native(
+        ALICE,
+        t1 + 50,
+        "base post number 10, corrected",
+        edit_of(&orig10.id),
+    ));
+    // Bob may not edit Alice's post 12: ignored.
+    let (orig12, _) = f.originals[&base_text(12)].clone();
+    f.relay
+        .insert(native(BOB, t1 + 51, "hijacked text", edit_of(&orig12.id)));
+    // Deletions: imported post 3 by its envelope id (a moderator: the relay
+    // removes the envelope), imported post 5 by its inner id (the envelope
+    // stays on the relay), live post 105 by its own id.
+    let (orig3, env3) = f.originals[&base_text(3)].clone();
+    f.relay.insert(kind5(ALICE, t1 + 60, &env3.id));
+    f.relay.remove(&env3.id);
+    let (orig5, _) = f.originals[&base_text(5)].clone();
+    f.relay.insert(kind5(BOB, t1 + 61, &orig5.id));
+    let live105 = f.natives[&base_text(105)].clone();
+    f.relay.insert(kind5(ALICE, t1 + 62, &live105.id));
+    f.relay.remove(&live105.id);
+    // One fresh post deleted before the run: never indexed.
+    let doomed = native(BOB, t1 + 70, "regretted post", vec![]);
+    f.relay.insert(doomed.clone());
+    f.relay.insert(kind5(BOB, t1 + 71, &doomed.id));
+
+    let r = update(&mut f, &mut state).unwrap();
+    assert!(r.published);
+    assert_eq!(r.index_version, Some(2));
+    assert_eq!(
+        r.rows_added,
+        30 + 2,
+        "30 fresh posts, the edit, and Bob's ignored edit post itself"
+    );
+    // Post 3's kind-5 names an envelope the relay has removed, so it cannot
+    // be mapped to the original; the relay no longer serves it, so no
+    // browser shows it (and the next compaction drops its row).
+    assert_eq!(r.excluded_added, 3, "posts 5, 10 (superseded) and 105");
+    assert_eq!(state.index_version, Some(2));
+    assert_eq!(state.high_water, Some(t1 + 71));
+
+    // The archivist's pod was not touched.
+    assert_eq!(files(&f, ARCHIVIST), archivist_files);
+
+    let upd = browser_manifest(&f, Some(&base.high_water()));
+    assert_eq!(upd.content.index_version, 2);
+    assert_eq!(upd.event.pubkey, pk(INDEXER));
+    // Every base object listed byte-for-byte: same name, sha256, size, held
+    // by the archivist, header version 1.
+    for o in &base.content.objects {
+        let u = upd
+            .content
+            .objects
+            .iter()
+            .find(|u| u.name == o.name)
+            .expect("base object carried");
+        assert_eq!((u.sha256.as_str(), u.size), (o.sha256.as_str(), o.size));
+        assert_eq!(upd.owner_of(u), pk(ARCHIVIST));
+        assert_eq!(u.effective_version(&upd.content), 1);
+    }
+    // A browser with the base cached by sha256 downloads only the new pair.
+    let cached: HashSet<&str> = base
+        .content
+        .objects
+        .iter()
+        .map(|o| o.sha256.as_str())
+        .collect();
+    let fresh: Vec<_> = upd
+        .content
+        .objects
+        .iter()
+        .filter(|o| !cached.contains(o.sha256.as_str()))
+        .collect();
+    assert_eq!(fresh.len(), 2);
+    assert!(fresh.iter().all(|o| upd.owner_of(o) == pk(INDEXER)));
+
+    let l = load(&f, &upd);
+    // New posts are found, by their own id.
+    let new_ids: HashMap<String, String> = f
+        .relay
+        .clone()
+        .into_events()
+        .into_iter()
+        .filter(|e| e.kind == 42 && e.pubkey == pk(BOB))
+        .map(|e| (e.id.clone(), e.id))
+        .collect();
+    for text in &new_texts {
+        let top = search(&l, text)[0].clone();
+        assert!(new_ids.contains_key(&top), "{text}");
+    }
+    let top = |text: &str| search(&l, text)[0].clone();
+    // Excluded posts are never returned by the index; post 3 is still in the
+    // index but the relay no longer serves it, so it is never shown.
+    for text in [base_text(3), base_text(5), base_text(10), base_text(105)] {
+        let hits = search(&l, &text);
+        for gone in [&orig5.id, &orig10.id, &live105.id] {
+            assert!(!hits.contains(gone), "{text}");
+        }
+        assert!(!shown(&mut f, &l, &text).contains(&orig3.id));
+    }
+    assert!(search(&l, &base_text(3)).contains(&orig3.id));
+    // The edit is found under its own id; post 12 is still Alice's original.
+    let corrected = top("base post number 10, corrected");
+    assert_ne!(corrected, orig10.id);
+    assert_eq!(top(&base_text(12)), orig12.id);
+    // An imported post resolves to its ORIGINAL id (the `#sealed` lookup).
+    let (orig40, env40) = f.originals[&base_text(40)].clone();
+    assert_eq!(top(&base_text(40)), orig40.id);
+    assert_ne!(orig40.id, env40.id);
+    assert_eq!(top("fresh post 0").len(), 64);
+
+    // Refused: the same update re-signed by a key outside the trusted list,
+    // and the base again once the update is accepted (lower version).
+    let stranger = sign(
+        STRANGER,
+        KIND,
+        1,
+        Manifest::tags(&upd.content, RELAY),
+        &serde_json::to_string(&upd.content).unwrap(),
+    );
+    assert!(Manifest::verify(stranger, ZONE, RELAY, &f.publishers, None).is_err());
+    assert!(Manifest::verify(
+        base.event.clone(),
+        ZONE,
+        RELAY,
+        &f.publishers,
+        Some(&upd.high_water())
+    )
+    .is_err());
+    // And a run of the job finds nothing more to do.
+    let r = update(&mut f, &mut state).unwrap();
+    assert!(!r.published);
+}
+
+#[test]
+fn compaction_folds_update_shards_drops_gone_rows_and_retires_objects_a_run_later() {
+    let mut f = fixture("compact");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    // Two nightly updates.
+    for night in 0..2u64 {
+        for i in 0..15u64 {
+            let at = T0 + 10_000 * (night + 1) + i;
+            f.relay
+                .insert(native(BOB, at, &format!("night {night} post {i}"), vec![]));
+        }
+        assert!(update(&mut f, &mut state).unwrap().published);
+    }
+    // Post 110 (a live post in the base's last, partial shard) is deleted by
+    // an admin through the HTTP API: no kind-5, the relay just stops serving it.
+    let live110 = f.natives[&base_text(110)].clone();
+    f.relay.remove(&live110.id);
+    // Post 113 (same shard) is deleted with a kind-5 by its author.
+    let live118 = f.natives[&base_text(113)].clone();
+    f.relay.insert(kind5(ALICE, T0 + 40_000, &live118.id));
+    f.relay.remove(&live118.id);
+    let r = update(&mut f, &mut state).unwrap();
+    assert!(r.published, "the deletion is excluded");
+    let before = indexer(&mut f, &mut state, |j, _, _| block_on(status(j)).unwrap());
+    assert_eq!(before.index_version, 4);
+    assert_eq!(before.excluded, 1);
+    assert_eq!(
+        before.partial_pairs, 3,
+        "the base's last shard and two updates"
+    );
+
+    let r = compact_partial(&mut f, &mut state).unwrap();
+    assert!(r.published);
+    assert_eq!(r.folded_pairs, 3);
+    assert_eq!(r.missing_rows, 1, "post 110: gone from the relay");
+    assert_eq!(r.dropped_rows, 2, "posts 110 and 113");
+    assert_eq!(r.excluded_total, 0, "113 left the list with its row");
+    let after = indexer(&mut f, &mut state, |j, _, _| block_on(status(j)).unwrap());
+    assert_eq!(after.index_version, 5);
+    assert_eq!(after.rows, before.rows - 2);
+    assert_eq!(after.partial_pairs, 1);
+    assert!(
+        after.foreign_objects > 0,
+        "full base shards stay in the archivist's pod"
+    );
+
+    let m = browser_manifest(&f, None);
+    let l = load(&f, &m);
+    assert_eq!(search(&l, "night 1 post 4")[0].len(), 64);
+    for text in [base_text(110), base_text(113)] {
+        let hits = search(&l, &text);
+        assert!(!hits.contains(&live110.id) && !hits.contains(&live118.id));
+    }
+    // The folded update objects are retired, not yet deleted: a browser on
+    // version 4 can still load it.
+    assert_eq!(state.retired.len(), 4);
+    let own = files(&f, INDEXER);
+    assert!(state.retired.iter().all(|n| own.contains_key(n)));
+    // The next run deletes them.
+    let r = update(&mut f, &mut state).unwrap();
+    assert!(!r.published);
+    assert_eq!(r.objects_deleted, 4);
+    let own = files(&f, INDEXER);
+    assert!(state.retired.is_empty());
+    assert!(m
+        .content
+        .objects
+        .iter()
+        .all(|o| m.owner_of(o) != pk(INDEXER) || own.contains_key(&o.name)));
+
+    // compact --all re-homes everything: no archivist object is referenced.
+    let r = indexer(&mut f, &mut state, |j, rl, s| {
+        block_on(run_compact(j, rl, s, Fold::All, DEFAULT_MAX_MISSING))
+    })
+    .unwrap();
+    assert!(r.published);
+    assert_eq!(r.objects_foreign, 0);
+    let m = browser_manifest(&f, None);
+    assert!(m
+        .content
+        .objects
+        .iter()
+        .all(|o| m.owner_of(o) == pk(INDEXER)));
+    assert!(m
+        .content
+        .objects
+        .iter()
+        .all(|o| o.kind != Kind::Bin || o.count as usize <= SHARD_ROWS));
+    let l = load(&f, &m);
+    let (orig7, _) = f.originals[&base_text(7)].clone();
+    assert_eq!(search(&l, &base_text(7))[0], orig7.id);
+}
+
+#[test]
+fn refusals_keep_the_index_and_the_high_water_mark() {
+    let mut f = fixture("refusals");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    let hw = state.high_water;
+
+    // Unauthenticated relay: refused before anything is read (exit 4).
+    let mut anon = MemRelay::new(Vec::new()).unauthenticated();
+    let e = indexer(&mut f, &mut state, |j, _, s| {
+        block_on(run_update(
+            j,
+            &mut anon,
+            s,
+            &mut HashEmbedder { calls: 0 },
+            None,
+            0,
+        ))
+    })
+    .unwrap_err();
+    assert_eq!(e.exit_code(), 4);
+    assert_eq!(state.high_water, hw);
+
+    // A post under an epoch the indexer holds no key for: published around,
+    // and the high-water mark stays below it (exit 3 in the CLI).
+    let t1 = T0 + 5_000;
+    f.relay.insert(native(BOB, t1, "visible post", vec![]));
+    f.relay.insert(native_under(
+        BOB,
+        t1 + 1,
+        "epoch two post",
+        vec![],
+        2,
+        ZONE_E2,
+    ));
+    f.relay
+        .insert(native(BOB, t1 + 2, "later visible post", vec![]));
+    let r = update(&mut f, &mut state).unwrap();
+    assert!(r.published);
+    assert_eq!(r.missing_key, 1);
+    assert_eq!(r.missing_epochs, vec![2]);
+    assert_eq!(state.high_water, Some(t1));
+    assert_eq!(r.rows_added, 2);
+
+    // Too many rows missing from the relay: compaction refused (exit 5).
+    for i in 100..115 {
+        if let Some(ev) = f.natives.get(&base_text(i)) {
+            f.relay.remove(&ev.id.clone());
+        }
+    }
+    f.relay.insert(native(BOB, t1 + 10, "another", vec![]));
+    update(&mut f, &mut state).unwrap();
+    let e = compact_partial(&mut f, &mut state).unwrap_err();
+    assert_eq!(e.exit_code(), 5, "{e}");
+
+    // The pods show an older index than the state recorded (exit 6).
+    let mut ahead = state.clone();
+    ahead.index_version = Some(ahead.index_version.unwrap() + 3);
+    let e = update(&mut f, &mut ahead).unwrap_err();
+    assert_eq!(e.exit_code(), 6);
+    // Nothing on the pods changed version through any refusal.
+    let cur = indexer(&mut f, &mut state, |j, _, _| block_on(status(j)).unwrap());
+    assert_eq!(Some(cur.index_version), state.index_version);
+}
+
+#[test]
+fn an_update_with_another_local_model_is_refused() {
+    let mut f = fixture("model");
+    let mut state = new_state();
+    let me = sk(INDEXER);
+    let keys = ring(&[(1, ZONE_E1)]);
+    let mut pod = DirPod::new(&f.root, ZONE, &pk(INDEXER));
+    let mut other = pins();
+    other.model_sha256 = "cc".repeat(32);
+    let publishers = f.publishers.clone();
+    let mut j = job(&me, &keys, &mut pod, &publishers, &other);
+    let e = block_on(run_update(
+        &mut j,
+        &mut f.relay,
+        &mut state,
+        &mut HashEmbedder { calls: 0 },
+        None,
+        0,
+    ))
+    .unwrap_err();
+    assert!(e.to_string().contains("model"), "{e}");
+}

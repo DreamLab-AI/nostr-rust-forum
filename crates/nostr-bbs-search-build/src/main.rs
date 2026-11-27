@@ -1,24 +1,38 @@
-//! `nostr-bbs-search-build`: build, seal and upload a zone's sealed search
-//! index (keybase-port/analysis/SEALED-SEARCH-DESIGN.md §8).
+//! `nostr-bbs-search-build`: build, update, compact and upload a zone's
+//! sealed search index (sealed-search design §8 and Phase 2).
 //!
 //! ```text
-//! NOSTR_BBS_MIGRATE_KEY=<publisher hex|nsec, from a 0600 file>  \
-//! nostr-bbs-search-build --zone zone2 --input docs.jsonl \
-//!     --keys-file keys.json | --fetch-grants --relay ws://… \
-//!     --model-dir work/models/bge-small-en-v1.5 \
-//!     --relay-url ws://… --pod http://…:8789 [--version N] [--exclude ids.txt] [--dry-run --out dir]
-//! nostr-bbs-search-build model-q8 --model-dir … --out dir    # browser model (GGUF Q8_0) + vocab
+//! # Full build (a new base): rows from a file, or read from the relay.
+//! nostr-bbs-search-build --zone zone2 --input docs.jsonl | --from-relay wss://… \
+//!     --keys-file keys.json | --fetch-grants [--relay wss://…] \
+//!     --model-dir work/models/bge-small-en-v1.5 --model-q8 stack/models/bge-small-en-v1.5-q8_0.gguf \
+//!     --relay-url wss://… --publishers "<archivist>,<admin>,<indexer>" \
+//!     --pod https://… | --pod-dir DIR  [--state zone2.json] [--dry-run --out DIR]
+//! # Incremental update: new posts since the state's high-water mark.
+//! nostr-bbs-search-build update  --zone zone2 --from-relay wss://… --state zone2.json [--cache-dir DIR] …
+//! # Fold update shards (or everything, --all) into fresh shards.
+//! nostr-bbs-search-build compact --zone zone2 --from-relay wss://… --state zone2.json [--all] …
+//! # The newest index on the pods, or one field of it.
+//! nostr-bbs-search-build status  --zone zone2 [--field partial_pairs] …
+//! # Browser model (GGUF Q8_0) + vocab.
+//! nostr-bbs-search-build model-q8 --model-dir … --out DIR
 //! ```
 //!
-//! Input rows (JSONL): `{"id": <event id hex>, "text": <plaintext>, "epoch": u32, "zone_pk": <hex>}`.
-//! Each row is sealed under its own epoch's key, and the key's pubkey must
-//! equal `zone_pk` (review M3/M4). Ids in `--exclude` (deleted / superseded,
-//! review M5) are skipped.
+//! Input rows (JSONL, `--input`): `{"id": <event id hex>, "text": <plaintext>,
+//! "epoch": u32, "zone_pk": <hex>}`; ids in `--exclude` are skipped. With
+//! `--from-relay` (or `--from-events`, a NIP-01 JSONL export of the zone's
+//! events) the rows are read and opened in memory, never written.
 //!
-//! Embeddings are computed **locally** with candle (FP32 bge-small-en-v1.5);
-//! there is no remote-embedding option (review M6: the LAN embedder logs
-//! request bodies). Zone keys come only from zone-migrate's key file or its
-//! `--fetch-grants`; the publisher key only from the environment.
+//! The publisher key comes from `NOSTR_BBS_MIGRATE_KEY` or `--key-file` (a
+//! file only its owner can read), never from argv. Zone keys come from
+//! zone-migrate's key file or the publisher's own grants. Embeddings are
+//! computed locally (FP32 candle).
+//!
+//! Exit codes: 0 done (published, or nothing new); 1 error; 2 usage; 3
+//! published, but posts under an epoch whose key is not held were held back;
+//! 4 the relay session is not NIP-42 authenticated; 5 a compaction found too
+//! many rows missing from the relay; 6 the pods show an older index than the
+//! state recorded (rollback or withholding).
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
@@ -30,107 +44,167 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
     use std::process::ExitCode;
-    use std::time::Instant;
 
     use clap::{Parser, Subcommand};
     use nostr_bbs_core::keys::SecretKey;
-    use nostr_bbs_core::{sign_event, UnsignedEvent};
-    use nostr_bbs_sealed_search::build::{build, BuildSpec, DocRow, KeyMap};
-    use nostr_bbs_sealed_search::manifest::{Content, Manifest, KIND};
-    use nostr_bbs_sealed_search::model::{to_gguf_q8, Bge, DIM};
-    use nostr_bbs_sealed_search::seal::SearchKey;
+    use nostr_bbs_core::NostrEvent;
+    use nostr_bbs_sealed_search::model::{to_gguf_q8, DIM};
     use nostr_bbs_sealed_search::search::sha256_hex;
-    use nostr_bbs_zone_migrate::identity::{identity_from_env, IDENTITY_ENV};
+    use nostr_bbs_search_build::embed::{BgeEmbedder, Embedder};
+    use nostr_bbs_search_build::harvest::{harvest, ZoneRow};
+    use nostr_bbs_search_build::memrelay::MemRelay;
+    use nostr_bbs_search_build::pipeline::{
+        run_compact, run_full, run_update, status, Fold, Job, JobError, Pins, DEFAULT_MAX_MISSING,
+        DEFAULT_OVERLAP_SECS,
+    };
+    use nostr_bbs_search_build::pod::{DirPod, DryRun, HttpPod, ObjectCache, Pod};
+    use nostr_bbs_search_build::secrets::load_identity;
+    use nostr_bbs_search_build::state::State;
     use nostr_bbs_zone_migrate::keys::{parse_key_file, KeyRing};
+    use nostr_bbs_zone_migrate::net::NetRelay;
+    use nostr_bbs_zone_migrate::relay::{DeleteOutcome, Filter, PublishOutcome, Relay, RelayError};
     use zeroize::Zeroizing;
 
     #[derive(Parser)]
-    #[command(about = "Build, seal and upload a zone's sealed search index")]
+    #[command(about = "Build, update, compact and upload a zone's sealed search index")]
     struct Cli {
         #[command(subcommand)]
         cmd: Option<Cmd>,
         /// Zone id (e.g. zone2).
-        #[arg(long)]
+        #[arg(long, global = true)]
         zone: Option<String>,
-        /// JSONL rows: {"id","text","epoch","zone_pk"}.
-        #[arg(long)]
+        /// Full build: JSONL rows {"id","text","epoch","zone_pk"}.
+        #[arg(long, global = true)]
         input: Option<PathBuf>,
-        /// Ids to leave out (deleted or superseded), one hex id per line.
-        #[arg(long)]
+        /// Full build from --input: ids to leave out, one hex id per line.
+        #[arg(long, global = true)]
         exclude: Option<PathBuf>,
+        /// Read the zone's posts from this relay (NIP-42 as the publisher).
+        #[arg(long, global = true)]
+        from_relay: Option<String>,
+        /// Read the zone's posts from a NIP-01 JSONL export instead of a relay.
+        #[arg(long, global = true)]
+        from_events: Option<PathBuf>,
         /// zone-migrate key file.
-        #[arg(long)]
+        #[arg(long, global = true)]
         keys_file: Option<PathBuf>,
-        /// Fetch zone-key grants addressed to the publisher (zone-migrate --fetch-grants).
-        #[arg(long)]
+        /// Fetch zone-key grants addressed to the publisher.
+        #[arg(long, global = true)]
         fetch_grants: bool,
-        /// Relay WebSocket URL for --fetch-grants.
-        #[arg(long)]
+        /// Relay WebSocket URL for --fetch-grants (default: --from-relay).
+        #[arg(long, global = true)]
         relay: Option<String>,
-        /// Origin header for the relay connection.
-        #[arg(long, default_value = "http://localhost")]
+        /// Origin header for relay connections.
+        #[arg(long, global = true, default_value = "http://localhost")]
         origin: String,
         /// The deployment's relay URL as clients use it (bound into the manifest).
-        #[arg(long)]
+        #[arg(long, global = true)]
         relay_url: Option<String>,
         /// bge-small-en-v1.5 checkpoint directory (pytorch_model.bin, vocab.txt).
-        #[arg(long)]
+        #[arg(long, global = true)]
         model_dir: Option<PathBuf>,
         /// Browser model file (GGUF Q8_0) whose SHA-256 the manifest pins.
-        #[arg(long)]
+        #[arg(long, global = true)]
         model_q8: Option<PathBuf>,
-        /// Pod base URL (e.g. http://172.20.0.10:8789).
-        #[arg(long)]
+        /// Pod base URL (e.g. https://pods.example.org).
+        #[arg(long, global = true)]
         pod: Option<String>,
-        /// Comma-separated publisher pubkeys clients accept (e.g.
-        /// "`<archivist>,<admin>`"); this key must be one of them. Defaults to
-        /// this key alone. Used to verify the previously published manifest.
-        #[arg(long)]
+        /// A directory laid out as the pods are, instead of --pod (local runs).
+        #[arg(long, global = true)]
+        pod_dir: Option<PathBuf>,
+        /// Comma-separated trusted publishers (clients' SEARCH_PUBLISHERS);
+        /// this key must be one of them. Default: this key alone.
+        #[arg(long, global = true)]
         publishers: Option<String>,
-        /// Index version (default: current pod version + 1, or 1).
-        #[arg(long)]
-        version: Option<u64>,
+        /// Publisher key file (mode 0600); else NOSTR_BBS_MIGRATE_KEY.
+        #[arg(long, global = true)]
+        key_file: Option<PathBuf>,
+        /// State file (high-water mark, last version, objects to delete).
+        #[arg(long, global = true)]
+        state: Option<PathBuf>,
+        /// Cache of downloaded sealed objects (ciphertext, by SHA-256).
+        #[arg(long, global = true)]
+        cache_dir: Option<PathBuf>,
+        /// Update: read posts from this created_at instead of the state's
+        /// high-water mark (0 reads the whole zone: a reconcile).
+        #[arg(long, global = true)]
+        since: Option<u64>,
+        /// Update: seconds re-read before the high-water mark.
+        #[arg(long, global = true, default_value_t = DEFAULT_OVERLAP_SECS)]
+        overlap_secs: u64,
+        /// Compact: largest share of folded rows that may be missing from the relay.
+        #[arg(long, global = true, default_value_t = DEFAULT_MAX_MISSING)]
+        max_missing: f64,
+        /// Full build: publish a v1 manifest (only for a publisher no v2
+        /// manifest of this zone has ever come from).
+        #[arg(long, global = true)]
+        manifest_v1: bool,
         /// Rows per shard.
-        #[arg(long, default_value_t = 32768)]
+        #[arg(long, global = true, default_value_t = 32768)]
         shard_rows: usize,
         /// Embedding batch size.
-        #[arg(long, default_value_t = 16)]
+        #[arg(long, global = true, default_value_t = 16)]
         batch: usize,
         /// Concurrent embedding workers (default: half the CPUs).
-        #[arg(long)]
+        #[arg(long, global = true)]
         workers: Option<usize>,
-        /// Write sealed objects + m.json here and do not upload.
-        #[arg(long)]
+        /// Write new objects and m.json to --out and change nothing.
+        #[arg(long, global = true)]
         dry_run: bool,
         /// Output directory (dry run, or model-q8).
-        #[arg(long)]
+        #[arg(long, global = true)]
         out: Option<PathBuf>,
-        /// Measurement only, with --dry-run: also write the FP32 embeddings
-        /// (row order of the input) here. Embeddings are plaintext-equivalent,
-        /// so this is refused without --dry-run.
-        #[arg(long)]
+        /// Measurement only, full build with --dry-run: also write the FP32
+        /// embeddings (row order) here. Embeddings are plaintext-equivalent.
+        #[arg(long, global = true)]
         dump_vectors: Option<PathBuf>,
     }
 
     #[derive(Subcommand)]
     enum Cmd {
+        /// Index posts written since the last run into additional shards.
+        Update,
+        /// Fold update shards into fresh shards (--all: every shard).
+        Compact {
+            /// Fold every shard pair, re-homing the whole index in this pod.
+            #[arg(long)]
+            all: bool,
+        },
+        /// Show the newest index on the pods.
+        Status {
+            /// Print only this field (e.g. partial_pairs, excluded, index_version).
+            #[arg(long)]
+            field: Option<String>,
+        },
         /// Write the browser model (GGUF Q8_0) and vocab.txt to --out.
         ModelQ8,
     }
 
-    struct Fail(String);
-    impl<E: std::fmt::Display> From<E> for Fail {
-        fn from(e: E) -> Self {
-            Fail(e.to_string())
+    struct Fail(String, u8);
+
+    impl From<String> for Fail {
+        fn from(e: String) -> Self {
+            Fail(e, 1)
+        }
+    }
+
+    impl From<JobError> for Fail {
+        fn from(e: JobError) -> Self {
+            let code = e.exit_code();
+            Fail(e.to_string(), code)
         }
     }
 
     fn req<T: Clone>(v: &Option<T>, name: &str) -> Result<T, Fail> {
         v.clone()
-            .ok_or_else(|| Fail(format!("--{name} is required")))
+            .ok_or_else(|| Fail(format!("--{name} is required"), 2))
+    }
+
+    fn io<T, E: std::fmt::Display>(r: Result<T, E>) -> Result<T, Fail> {
+        r.map_err(|e| Fail(e.to_string(), 1))
     }
 
     pub fn main() -> ExitCode {
@@ -138,13 +212,97 @@ mod native {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("runtime");
+            .expect("tokio runtime builds");
         match rt.block_on(run(cli)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(Fail(m)) => {
+            Ok(code) => ExitCode::from(code),
+            Err(Fail(m, code)) => {
                 eprintln!("error: {m}");
-                ExitCode::FAILURE
+                ExitCode::from(code)
             }
+        }
+    }
+
+    /// Either pod implementation (the pipeline is generic; `Pod` has async
+    /// methods, so no trait object).
+    enum AnyPod {
+        Http(HttpPod),
+        Dir(DirPod),
+    }
+
+    impl Pod for AnyPod {
+        async fn get(&mut self, owner: &str, name: &str) -> Result<Option<Vec<u8>>, String> {
+            match self {
+                Self::Http(p) => p.get(owner, name).await,
+                Self::Dir(p) => p.get(owner, name).await,
+            }
+        }
+        async fn put(&mut self, name: &str, bytes: &[u8], ct: &str) -> Result<(), String> {
+            match self {
+                Self::Http(p) => p.put(name, bytes, ct).await,
+                Self::Dir(p) => p.put(name, bytes, ct).await,
+            }
+        }
+        async fn delete(&mut self, name: &str) -> Result<(), String> {
+            match self {
+                Self::Http(p) => p.delete(name).await,
+                Self::Dir(p) => p.delete(name).await,
+            }
+        }
+    }
+
+    enum AnyRelay {
+        Net(Box<NetRelay>),
+        Mem(MemRelay),
+    }
+
+    impl Relay for AnyRelay {
+        fn session_authenticated(&self) -> bool {
+            match self {
+                Self::Net(r) => r.authenticated(),
+                Self::Mem(r) => r.session_authenticated(),
+            }
+        }
+        async fn query(&mut self, f: &Filter) -> Result<Vec<NostrEvent>, RelayError> {
+            match self {
+                Self::Net(r) => r.query(f).await,
+                Self::Mem(r) => r.query(f).await,
+            }
+        }
+        async fn publish(&mut self, e: &NostrEvent) -> Result<PublishOutcome, RelayError> {
+            match self {
+                Self::Net(r) => r.publish(e).await,
+                Self::Mem(r) => r.publish(e).await,
+            }
+        }
+        async fn is_admin(&mut self, pk: &str) -> Result<bool, RelayError> {
+            match self {
+                Self::Net(r) => r.is_admin(pk).await,
+                Self::Mem(r) => r.is_admin(pk).await,
+            }
+        }
+        async fn delete_events(
+            &mut self,
+            ids: &[String],
+            reason: &str,
+        ) -> Result<DeleteOutcome, RelayError> {
+            match self {
+                Self::Net(r) => r.delete_events(ids, reason).await,
+                Self::Mem(r) => r.delete_events(ids, reason).await,
+            }
+        }
+    }
+
+    /// Records every vector it returns (the measurement-only --dump-vectors).
+    struct Dumping<E> {
+        inner: E,
+        vecs: Vec<[f32; DIM]>,
+    }
+
+    impl<E: Embedder> Embedder for Dumping<E> {
+        fn embed(&mut self, texts: &[&str]) -> Result<Vec<[f32; DIM]>, String> {
+            let v = self.inner.embed(texts)?;
+            self.vecs.extend_from_slice(&v);
+            Ok(v)
         }
     }
 
@@ -156,94 +314,89 @@ mod native {
         zone_pk: String,
     }
 
-    fn hex32(s: &str, what: &str) -> Result<[u8; 32], Fail> {
-        let v = hex::decode(s).map_err(|_| Fail(format!("{what} is not hex")))?;
-        v.try_into()
-            .map_err(|_| Fail(format!("{what} is not 32 bytes")))
+    async fn connect(cli: &Cli, url: &str, me: &SecretKey) -> Result<NetRelay, Fail> {
+        NetRelay::connect(url, &cli.origin, me)
+            .await
+            .map_err(|e| Fail(e.to_string(), 1))
     }
 
     async fn load_keys(cli: &Cli, me: &SecretKey) -> Result<KeyRing, Fail> {
         let mut ring = KeyRing::new();
         if let Some(path) = &cli.keys_file {
-            let text = Zeroizing::new(std::fs::read_to_string(path)?);
-            for key in parse_key_file(&text)?.keys {
-                ring.insert(key)?;
+            let text = Zeroizing::new(io(std::fs::read_to_string(path))?);
+            for key in io(parse_key_file(&text))?.keys {
+                io(ring.insert(key))?;
             }
         }
         if cli.fetch_grants {
-            let url = req(&cli.relay, "relay")?;
-            let mut relay =
-                nostr_bbs_zone_migrate::net::NetRelay::connect(&url, &cli.origin, me).await?;
+            let url = cli
+                .relay
+                .clone()
+                .or_else(|| cli.from_relay.clone())
+                .ok_or_else(|| Fail("--fetch-grants needs --relay or --from-relay".into(), 2))?;
+            let mut relay = connect(cli, &url, me).await?;
             let harvest =
-                nostr_bbs_zone_migrate::grants::fetch_grants(&mut relay, me, None).await?;
+                io(nostr_bbs_zone_migrate::grants::fetch_grants(&mut relay, me, None).await)?;
             for r in &harvest.rejected {
                 eprintln!("refused grant {}: {}", r.wrap_id, r.reason);
             }
             for key in harvest.keys {
-                ring.insert(key)?;
+                io(ring.insert(key))?;
             }
         }
         if ring.is_empty() {
             return Err(Fail(
                 "no zone keys (use --keys-file or --fetch-grants)".into(),
+                2,
             ));
         }
         Ok(ring)
     }
 
-    fn pod_url(pod: &str, publisher: &str, zone: &str, name: &str) -> String {
-        format!(
-            "{}/pods/{publisher}/media/zones/{zone}/search/{name}",
-            pod.trim_end_matches('/')
-        )
-    }
-
-    async fn pod_request(
-        http: &reqwest::Client,
-        sk: &SecretKey,
-        method: reqwest::Method,
-        url: &str,
-        body: Option<(Vec<u8>, &str)>,
-    ) -> Result<reqwest::Response, Fail> {
-        let token = nostr_bbs_core::nip98::create_token(
-            sk.as_bytes(),
-            url,
-            method.as_str(),
-            body.as_ref().map(|(b, _)| b.as_slice()),
-        )?;
-        let mut r = http
-            .request(method, url)
-            .header("Authorization", format!("Nostr {token}"));
-        if let Some((b, ct)) = body {
-            r = r.header("Content-Type", ct).body(b);
+    async fn open_relay(cli: &Cli, me: &SecretKey) -> Result<Option<AnyRelay>, Fail> {
+        if let Some(url) = &cli.from_relay {
+            return Ok(Some(AnyRelay::Net(Box::new(connect(cli, url, me).await?))));
         }
-        Ok(r.send().await?)
+        if let Some(path) = &cli.from_events {
+            return Ok(Some(AnyRelay::Mem(MemRelay::from_jsonl(path)?)));
+        }
+        Ok(None)
     }
 
-    async fn run(cli: Cli) -> Result<(), Fail> {
+    fn pins(cli: &Cli) -> Result<Option<Pins>, Fail> {
+        let (Some(dir), Some(q8)) = (&cli.model_dir, &cli.model_q8) else {
+            return Ok(None);
+        };
+        Ok(Some(Pins {
+            model: "bge-small-en-v1.5".into(),
+            model_sha256: sha256_hex(&io(std::fs::read(q8))?),
+            vocab_sha256: sha256_hex(&io(std::fs::read(dir.join("vocab.txt")))?),
+        }))
+    }
+
+    fn print_json<T: serde::Serialize>(v: &T) -> Result<(), Fail> {
+        println!("{}", io(serde_json::to_string(v))?);
+        Ok(())
+    }
+
+    async fn run(cli: Cli) -> Result<u8, Fail> {
         if let Some(Cmd::ModelQ8) = cli.cmd {
             let dir = req(&cli.model_dir, "model-dir")?;
             let out = req(&cli.out, "out")?;
-            std::fs::create_dir_all(&out)?;
-            let g = to_gguf_q8(&dir).map_err(Fail)?;
-            std::fs::write(out.join("bge-small-en-v1.5-q8_0.gguf"), &g)?;
-            std::fs::copy(dir.join("vocab.txt"), out.join("vocab.txt"))?;
+            io(std::fs::create_dir_all(&out))?;
+            let g = to_gguf_q8(&dir)?;
+            io(std::fs::write(out.join("bge-small-en-v1.5-q8_0.gguf"), &g))?;
+            io(std::fs::copy(dir.join("vocab.txt"), out.join("vocab.txt")))?;
             println!(
                 "{{\"model_q8_mb\":{:.1},\"model_sha256\":\"{}\"}}",
                 g.len() as f64 / 1048576.0,
                 sha256_hex(&g)
             );
-            return Ok(());
+            return Ok(0);
         }
         let zone = req(&cli.zone, "zone")?;
         let relay_url = req(&cli.relay_url, "relay-url")?;
-        let model_dir = req(&cli.model_dir, "model-dir")?;
-        let model_q8 = req(&cli.model_q8, "model-q8")?;
-        let me = identity_from_env().map_err(|_| {
-            Fail(format!(
-                "set {IDENTITY_ENV} to the publisher key (hex or nsec)"
-            ))
-        })?;
+        let me = load_identity(cli.key_file.as_deref()).map_err(|e| Fail(e.to_string(), 2))?;
         let publisher = me.public_key().to_hex();
         let publishers = match &cli.publishers {
             Some(l) => nostr_bbs_sealed_search::manifest::parse_publishers(l),
@@ -252,243 +405,196 @@ mod native {
         if !publishers.contains(&publisher) {
             return Err(Fail(
                 "this key is not in --publishers; clients would refuse its manifest".into(),
+                2,
             ));
         }
-
-        // Rows.
-        let exclude: HashSet<String> = match &cli.exclude {
-            Some(p) => std::fs::read_to_string(p)?
-                .lines()
-                .map(|l| l.trim().to_lowercase())
-                .filter(|l| !l.is_empty())
-                .collect(),
-            None => HashSet::new(),
+        if cli.dump_vectors.is_some() && !cli.dry_run {
+            return Err(Fail("--dump-vectors requires --dry-run".into(), 2));
+        }
+        let inner = match (&cli.pod_dir, &cli.pod) {
+            (Some(dir), _) => AnyPod::Dir(DirPod::new(dir, &zone, &publisher)),
+            (None, Some(url)) => AnyPod::Http(HttpPod::new(url, &zone, &me)?),
+            (None, None) => return Err(Fail("--pod or --pod-dir is required".into(), 2)),
         };
-        let text = std::fs::read_to_string(req(&cli.input, "input")?)?;
-        let mut rows_in: Vec<InRow> = Vec::new();
-        let mut skipped = 0usize;
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let r: InRow = serde_json::from_str(line)?;
-            if exclude.contains(&r.id.to_lowercase()) {
-                skipped += 1;
-                continue;
+        if cli.dry_run {
+            let out = req(&cli.out, "out")?;
+            let mut pod = DryRun::new(inner, &out);
+            let code = execute(&cli, &mut pod, &zone, &relay_url, &publishers, &me).await?;
+            if !pod.would_delete.is_empty() {
+                eprintln!("dry run: would delete {}", pod.would_delete.join(", "));
             }
-            rows_in.push(r);
+            Ok(code)
+        } else {
+            let mut pod = inner;
+            execute(&cli, &mut pod, &zone, &relay_url, &publishers, &me).await
         }
+    }
 
-        // Keys: each row's (epoch, zone_pk) must be a held key for this zone.
-        let ring = load_keys(&cli, &me).await?;
-        let mut keys: KeyMap = HashMap::new();
-        for r in &rows_in {
-            let pk = hex32(&r.zone_pk, "zone_pk")?;
-            if keys.contains_key(&(r.epoch, pk)) {
-                continue;
-            }
-            let k = ring
-                .get(&zone, r.epoch)
-                .ok_or_else(|| Fail(format!("no key for {zone} epoch {}", r.epoch)))?;
-            if !k.pubkey().eq_ignore_ascii_case(&r.zone_pk) {
-                return Err(Fail(format!(
-                    "row zone_pk does not match the held key for epoch {}",
-                    r.epoch
-                )));
-            }
-            keys.insert(
-                (r.epoch, pk),
-                SearchKey::derive(k.secret(), &zone, r.epoch, &pk),
-            );
-        }
-
-        // Embed locally (FP32), batched by length.
-        let model = Bge::load_fp32_dir(&model_dir).map_err(Fail)?;
-        let t0 = Instant::now();
-        let mut order: Vec<(usize, Vec<u32>)> = rows_in
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (i, model.encode(&r.text)))
-            .collect();
-        order.sort_by_key(|x| x.1.len());
-        // Length-sorted batches, processed by several workers at once: the
-        // per-op overhead of small GEMMs and single-threaded elementwise ops
-        // dominates one forward pass, so concurrency is what scales.
-        let batches: Vec<&[(usize, Vec<u32>)]> = order.chunks(cli.batch.max(1)).collect();
+    async fn execute<P: Pod>(
+        cli: &Cli,
+        pod: &mut P,
+        zone: &str,
+        relay_url: &str,
+        publishers: &[String],
+        me: &SecretKey,
+    ) -> Result<u8, Fail> {
+        let publisher = me.public_key().to_hex();
+        let pins = pins(cli)?;
+        let cache = cli.cache_dir.as_deref().map(ObjectCache::new);
+        let now = io(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))?.as_secs();
+        let state_path: Option<&Path> = cli.state.as_deref();
+        let mut state = match state_path {
+            Some(p) => Some(State::load_or_new(p, zone, relay_url, &publisher)?),
+            None => None,
+        };
+        let needs_keys = !matches!(cli.cmd, Some(Cmd::Status { .. }));
+        let ring = if needs_keys {
+            load_keys(cli, me).await?
+        } else {
+            KeyRing::new()
+        };
+        let mut job = Job {
+            zone,
+            relay_url,
+            publishers,
+            me,
+            ring: &ring,
+            pod,
+            cache: cache.as_ref(),
+            pins: pins.as_ref(),
+            shard_rows: cli.shard_rows,
+            now,
+            warnings: Vec::new(),
+        };
         let workers = cli.workers.unwrap_or_else(|| {
             std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1))
         });
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let results: std::sync::Mutex<Vec<(usize, [f32; DIM])>> =
-            std::sync::Mutex::new(Vec::with_capacity(rows_in.len()));
-        let failure: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-        std::thread::scope(|sc| {
-            for _ in 0..workers {
-                sc.spawn(|| loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(chunk) = batches.get(i) else { break };
-                    let ids: Vec<Vec<u32>> = chunk.iter().map(|x| x.1.clone()).collect();
-                    match model.embed_ids(&ids) {
-                        Ok(vs) => {
-                            let mut r = results.lock().expect("results lock");
-                            for (j, v) in vs.into_iter().enumerate() {
-                                r.push((chunk[j].0, v));
-                            }
-                        }
-                        Err(e) => {
-                            *failure.lock().expect("failure lock") = Some(e);
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-        if let Some(e) = failure.into_inner().expect("failure lock") {
-            return Err(Fail(e));
-        }
-        let mut vecs = vec![[0f32; DIM]; rows_in.len()];
-        for (i, v) in results.into_inner().expect("results lock") {
-            vecs[i] = v;
-        }
-        let embed_s = t0.elapsed().as_secs_f64();
-        if let Some(p) = &cli.dump_vectors {
-            if !cli.dry_run {
-                return Err(Fail("--dump-vectors requires --dry-run".into()));
-            }
-            let bytes: Vec<u8> = vecs
-                .iter()
-                .flat_map(|v| v.iter().flat_map(|x| x.to_le_bytes()))
-                .collect();
-            std::fs::write(p, bytes)?;
-        }
-        let rows: Vec<DocRow> = rows_in
-            .iter()
-            .zip(vecs)
-            .map(|(r, vec)| {
-                Ok(DocRow {
-                    id: hex32(&r.id, "id")?,
-                    epoch: r.epoch,
-                    zone_pk: hex32(&r.zone_pk, "zone_pk")?,
-                    vec,
-                })
-            })
-            .collect::<Result<_, Fail>>()?;
-        drop(rows_in);
+        let model_dir = || req(&cli.model_dir, "model-dir");
 
-        // Version: explicit, else the pod's current + 1.
-        let http = reqwest::Client::new();
-        let mut previous: Option<Content> = None;
-        if let Some(pod) = &cli.pod {
-            let url = pod_url(pod, &publisher, &zone, "m.json");
-            let resp = pod_request(&http, &me, reqwest::Method::GET, &url, None).await?;
-            if resp.status().is_success() {
-                let ev: nostr_bbs_core::NostrEvent = serde_json::from_slice(&resp.bytes().await?)?;
-                let m = Manifest::verify(ev, &zone, &relay_url, &publishers, None).map_err(Fail)?;
-                previous = Some(m.content);
+        let report = match &cli.cmd {
+            Some(Cmd::Status { field }) => {
+                let s = status(&mut job).await?;
+                match field {
+                    Some(f) => println!(
+                        "{}",
+                        s.field(f)
+                            .ok_or_else(|| Fail(format!("unknown field {f}"), 2))?
+                    ),
+                    None => print_json(&s)?,
+                }
+                return Ok(0);
             }
-        }
-        let version = cli
-            .version
-            .unwrap_or_else(|| previous.as_ref().map_or(1, |p| p.index_version + 1));
-        if previous
-            .as_ref()
-            .is_some_and(|p| version <= p.index_version)
-        {
-            return Err(Fail(format!(
-                "version {version} is not above the published one"
-            )));
-        }
-
-        // Build + sign.
-        let q8 = std::fs::read(&model_q8)?;
-        let vocab = std::fs::read(model_dir.join("vocab.txt"))?;
-        let t1 = Instant::now();
-        let built = build(
-            &BuildSpec {
-                zone: &zone,
-                version,
-                model: "bge-small-en-v1.5",
-                model_sha256: &sha256_hex(&q8),
-                vocab_sha256: &sha256_hex(&vocab),
-                shard_rows: cli.shard_rows,
-            },
-            &rows,
-            &keys,
-        )
-        .map_err(Fail)?;
-        let seal_s = t1.elapsed().as_secs_f64();
-        let sk = nostr_bbs_core::keys::signing_key_from_bytes(me.as_bytes())?;
-        let unsigned = UnsignedEvent {
-            pubkey: publisher.clone(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-            kind: KIND,
-            tags: Manifest::tags(&built.content, &relay_url),
-            content: serde_json::to_string(&built.content)?,
-        };
-        let event = sign_event(unsigned, &sk).map_err(|e| Fail(format!("{e:?}")))?;
-        let manifest_json = serde_json::to_vec(&event)?;
-        let sealed_bytes: usize = built.objects.iter().map(|(_, b)| b.len()).sum();
-
-        if cli.dry_run {
-            let out = req(&cli.out, "out")?;
-            std::fs::create_dir_all(&out)?;
-            for (name, b) in &built.objects {
-                std::fs::write(out.join(name), b)?;
-            }
-            std::fs::write(out.join("m.json"), &manifest_json)?;
-        } else {
-            let pod = req(&cli.pod, "pod")?;
-            for (name, b) in &built.objects {
-                let url = pod_url(&pod, &publisher, &zone, name);
-                let r = pod_request(
-                    &http,
-                    &me,
-                    reqwest::Method::PUT,
-                    &url,
-                    Some((b.clone(), "application/octet-stream")),
+            Some(Cmd::Update) => {
+                let mut relay = open_relay(cli, me)
+                    .await?
+                    .ok_or_else(|| Fail("update needs --from-relay or --from-events".into(), 2))?;
+                let st = state
+                    .as_mut()
+                    .ok_or_else(|| Fail("update needs --state".into(), 2))?;
+                let mut emb = BgeEmbedder::new(&model_dir()?, cli.batch, workers);
+                run_update(
+                    &mut job,
+                    &mut relay,
+                    st,
+                    &mut emb,
+                    cli.since,
+                    cli.overlap_secs,
                 )
-                .await?;
-                if !r.status().is_success() {
-                    return Err(Fail(format!("PUT {name}: HTTP {}", r.status())));
-                }
+                .await?
             }
-            let url = pod_url(&pod, &publisher, &zone, "m.json");
-            let r = pod_request(
-                &http,
-                &me,
-                reqwest::Method::PUT,
-                &url,
-                Some((manifest_json.clone(), "application/json")),
-            )
-            .await?;
-            if !r.status().is_success() {
-                return Err(Fail(format!("PUT m.json: HTTP {}", r.status())));
+            Some(Cmd::Compact { all }) => {
+                let mut relay = open_relay(cli, me)
+                    .await?
+                    .ok_or_else(|| Fail("compact needs --from-relay or --from-events".into(), 2))?;
+                let st = state
+                    .as_mut()
+                    .ok_or_else(|| Fail("compact needs --state".into(), 2))?;
+                let fold = if *all { Fold::All } else { Fold::Partial };
+                run_compact(&mut job, &mut relay, st, fold, cli.max_missing).await?
             }
-            // Superseded objects go (review M5).
-            if let Some(prev) = previous {
-                let keep: HashSet<&str> = built
-                    .content
-                    .objects
-                    .iter()
-                    .map(|o| o.name.as_str())
-                    .collect();
-                for o in prev
-                    .objects
-                    .iter()
-                    .filter(|o| !keep.contains(o.name.as_str()))
-                {
-                    let url = pod_url(&pod, &publisher, &zone, &o.name);
-                    let _ = pod_request(&http, &me, reqwest::Method::DELETE, &url, None).await?;
+            Some(Cmd::ModelQ8) => unreachable!("handled before the job is set up"),
+            None => {
+                let base = BgeEmbedder::new(&model_dir()?, cli.batch, workers);
+                let mut emb = Dumping {
+                    inner: base,
+                    vecs: Vec::new(),
+                };
+                let report = if let Some(input) = &cli.input {
+                    let exclude: HashSet<String> = match &cli.exclude {
+                        Some(p) => io(std::fs::read_to_string(p))?
+                            .lines()
+                            .map(|l| l.trim().to_lowercase())
+                            .filter(|l| !l.is_empty())
+                            .collect(),
+                        None => HashSet::new(),
+                    };
+                    let text = Zeroizing::new(io(std::fs::read_to_string(input))?);
+                    let mut rows = Vec::new();
+                    for (i, line) in text
+                        .lines()
+                        .enumerate()
+                        .filter(|(_, l)| !l.trim().is_empty())
+                    {
+                        let r: InRow = serde_json::from_str(line)
+                            .map_err(|_| Fail(format!("input line {} is malformed", i + 1), 1))?;
+                        rows.push(ZoneRow {
+                            id: r.id.to_lowercase(),
+                            text: Zeroizing::new(r.text),
+                            epoch: r.epoch,
+                            zone_pk: r.zone_pk.to_lowercase(),
+                            created_at: 0,
+                        });
+                    }
+                    run_full(
+                        &mut job,
+                        state.as_mut(),
+                        rows,
+                        &exclude,
+                        None,
+                        &mut emb,
+                        cli.manifest_v1,
+                    )
+                    .await?
+                } else {
+                    let mut relay = open_relay(cli, me).await?.ok_or_else(|| {
+                        Fail(
+                            "a full build needs --input, --from-relay or --from-events".into(),
+                            2,
+                        )
+                    })?;
+                    let mut h = harvest(&mut relay, zone, &ring, None, &HashSet::new())
+                        .await
+                        .map_err(JobError::from)?;
+                    let rows = std::mem::take(&mut h.rows);
+                    run_full(
+                        &mut job,
+                        state.as_mut(),
+                        rows,
+                        &HashSet::new(),
+                        Some(&h),
+                        &mut emb,
+                        cli.manifest_v1,
+                    )
+                    .await?
+                };
+                if let Some(p) = &cli.dump_vectors {
+                    let bytes: Vec<u8> = emb
+                        .vecs
+                        .iter()
+                        .flat_map(|v| v.iter().flat_map(|x| x.to_le_bytes()))
+                        .collect();
+                    io(std::fs::write(p, bytes))?;
                 }
+                report
+            }
+        };
+        if !cli.dry_run {
+            if let (Some(p), Some(s)) = (state_path, state.as_mut()) {
+                s.updated_at = now;
+                s.save(p)?;
             }
         }
-        println!(
-            "{{\"zone\":\"{zone}\",\"version\":{version},\"rows\":{},\"skipped\":{skipped},\"objects\":{},\"sealed_mb\":{:.1},\"embed_s\":{embed_s:.1},\"embed_rows_per_s\":{:.0},\"seal_s\":{seal_s:.1},\"uploaded\":{}}}",
-            rows.len(),
-            built.objects.len(),
-            sealed_bytes as f64 / 1048576.0,
-            rows.len() as f64 / embed_s.max(1e-9),
-            !cli.dry_run
-        );
-        Ok(())
+        print_json(&report)?;
+        Ok(if report.missing_key > 0 { 3 } else { 0 })
     }
 }

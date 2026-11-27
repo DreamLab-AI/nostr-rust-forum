@@ -185,6 +185,8 @@ impl FakeRelay {
             && tag_match("e", &f.e_tags)
             && tag_match("p", &f.p_tags)
             && tag_match("zk", &f.zk_tags)
+            && tag_match("sealed", &f.sealed_tags)
+            && f.since.is_none_or(|s| ev.created_at >= s)
             && f.until.is_none_or(|u| ev.created_at <= u)
     }
 }
