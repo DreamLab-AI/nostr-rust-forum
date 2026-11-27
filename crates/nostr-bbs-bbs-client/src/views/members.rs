@@ -191,9 +191,15 @@ pub fn ProfileView(pubkey: String) -> impl IntoView {
                     }
                 });
             };
-            let on_answer = Rc::new(move |_authenticated: bool| {
-                // End of stored events with no kind-0: the member has none yet.
-                settle(ProfileBase::NotFound);
+            let on_answer = Rc::new(move |authenticated: bool| {
+                // End of stored events with no kind-0: the member has none
+                // yet, but only on an authenticated answer. An answer sent
+                // before AUTH may withhold it, and saving over a withheld
+                // profile is the overwrite this guards against; the
+                // post-AUTH replay answers again, or the timeout refuses.
+                if authenticated {
+                    settle(ProfileBase::NotFound);
+                }
             });
             let on_closed = Rc::new(move |reason: String| {
                 settle(ProfileBase::Unreadable(format!(
