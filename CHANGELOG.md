@@ -18,6 +18,11 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Forum client: cleared notices stay cleared; topic heading (2026-11-27)
+
+- **Notifications.** "New section" and admin "New member" notices came back after Clear and a reload, because only post and DM ids were persisted. Announced section ids and member pubkeys now live in the per-account sync state (bounded at 1,000 each, oldest evicted first; state stored by older builds still loads). Not seen in a browser.
+- **Topic page.** A heading shows the topic title with its section beneath; the breadcrumb wraps, and long link crumbs truncate, so the topic name is no longer clipped. Modern client only. Not seen in a browser.
+
 ### Sealed search: incremental nightly updates (2026-11-27)
 
 Sealed-search crate, builder, client core and search worker. Nothing is deployed or scheduled by this change; operator

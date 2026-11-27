@@ -61,7 +61,8 @@ fn home_icon() -> impl IntoView {
 
 /// Breadcrumb navigation trail.
 ///
-/// Renders items in a horizontally-scrollable row. The last item is styled as
+/// Renders items in a wrapping row (earlier link crumbs truncate with an
+/// ellipsis; the last is never clipped). The last item is styled as
 /// the current page (white text, no link). Earlier items are gray links that
 /// highlight the zone accent on hover (`.za-hover-text`, issue #43) — falling
 /// back to brand amber outside a zone context. A home icon is prepended when
@@ -120,7 +121,7 @@ pub(crate) fn Breadcrumb(
         .collect();
 
     view! {
-        <nav class="breadcrumb-nav scrollbar-none">
+        <nav class="breadcrumb-nav" aria-label="Breadcrumb">
             {entries}
         </nav>
     }

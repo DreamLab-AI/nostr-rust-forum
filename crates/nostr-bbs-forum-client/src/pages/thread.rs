@@ -1044,6 +1044,48 @@ pub fn ThreadPage() -> impl IntoView {
                 }
             }}
 
+            // Topic heading: the breadcrumb alone is small grey text, so the
+            // topic title and its section are repeated here, large and
+            // wrapping, where a member looks first. While the lookup is still
+            // running the title slot shows a muted placeholder (rather than
+            // the stand-in "Topic" the breadcrumb falls back to); once it has
+            // failed, the error card below speaks for the page and no heading
+            // is drawn. Colour comes from the Tailwind text utilities so the
+            // light palette in `stores/preferences.rs` applies.
+            {move || {
+                // `try_get`/`try_with`: see the breadcrumb above.
+                let title = match lookup.try_get()? {
+                    Lookup::Found => view! {
+                        <h1 class="topic-heading-title text-white">{topic_title()}</h1>
+                    }
+                    .into_any(),
+                    Lookup::Loading | Lookup::KeysLoading => view! {
+                        <h1 class="topic-heading-title text-gray-500">"Loading topic\u{2026}"</h1>
+                    }
+                    .into_any(),
+                    Lookup::NotFound | Lookup::TimedOut | Lookup::KeysTimedOut => {
+                        return None;
+                    }
+                };
+                let section = if resolved_channel.try_with(Option::is_some)? {
+                    view! {
+                        "In section "
+                        <A href=base_href(&section_href()) attr:class="za-hover-text">
+                            {section_name()}
+                        </A>
+                    }
+                    .into_any()
+                } else {
+                    view! { "In section \u{2026}" }.into_any()
+                };
+                Some(view! {
+                    <header class="topic-heading">
+                        {title}
+                        <p class="topic-heading-section text-gray-400">{section}</p>
+                    </header>
+                })
+            }}
+
             // `try_*` in the nested closures below: Leptos 0.7 drops them a
             // task hop after the route disposed this page, and a store write
             // in between re-runs them (see `history_loader::read_cursor`).
