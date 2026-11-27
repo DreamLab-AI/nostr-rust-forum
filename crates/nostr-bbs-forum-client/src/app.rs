@@ -167,8 +167,6 @@ const HOME_LINK_CLASS: &str =
 const NAV_LABEL_CLASS: &str = "sr-only xl:not-sr-only whitespace-nowrap";
 /// The home mark: the brand hexagon, filled orange, 32 px.
 const HOME_MARK_CLASS: &str = "w-8 h-8 shrink-0 text-amber-400";
-/// The wordmark beside the mark, from `sm` up, whole (never truncated).
-const HOME_WORDMARK_CLASS: &str = "hidden sm:inline whitespace-nowrap text-xl font-bold";
 
 /// The header's home mark (orange, so it is never confused with the grey Back).
 fn home_mark() -> impl IntoView {
@@ -1274,8 +1272,9 @@ fn Layout(children: Children) -> impl IntoView {
                             attr:aria-label="Community home"
                             attr:title="Community home"
                         >
+                            // Icon only, at every width (operator, 2026-11-27): the
+                            // accessible name and tooltip carry the label.
                             {home_mark()}
-                            <span class=HOME_WORDMARK_CLASS>{crate::utils::relay_url::brand_label()}</span>
                         </A>
                     </div>
 
@@ -1846,7 +1845,7 @@ mod tests {
 
     #[test]
     fn nav_labels_stay_readable_to_screen_readers_when_compact() {
-        // Below xl the nav shows icons only, so the home wordmark keeps its
+        // Below xl the nav shows icons only, so the home control keeps its
         // room; the labels stay as accessible names, never display:none.
         let c = classes(NAV_LABEL_CLASS);
         assert!(c.contains(&"sr-only") && c.contains(&"xl:not-sr-only"));
@@ -1854,14 +1853,15 @@ mod tests {
     }
 
     #[test]
-    fn the_wordmark_shows_from_sm_up_without_truncating() {
-        let c = classes(HOME_WORDMARK_CLASS);
-        for want in ["hidden", "sm:inline", "whitespace-nowrap"] {
-            assert!(
-                c.contains(&want),
-                "{want} missing from {HOME_WORDMARK_CLASS}"
-            );
-        }
-        assert!(!c.contains(&"truncate"));
+    fn the_home_control_is_the_mark_alone() {
+        // No wordmark beside the icon at any width; the link keeps its name.
+        let src = include_str!("app.rs");
+        let link = src
+            .split("attr:aria-label=\"Community home\"")
+            .nth(1)
+            .and_then(|rest| rest.split("</A>").next())
+            .expect("home link in the header");
+        assert!(link.contains("home_mark()"));
+        assert!(!link.contains("<span"), "no text beside the home mark");
     }
 }
