@@ -43,7 +43,9 @@ use nostr_bbs_client_core::zone_crypto::store::{try_use_zone_key_store, ZoneWrit
 use nostr_bbs_client_core::zone_crypto::{encryption_enabled, has_zk_tag};
 use nostr_bbs_core::event::{NostrEvent, UnsignedEvent};
 
-use crate::ascii_img::{extract_image_urls, AsciiImg};
+use crate::ascii_img::{
+    extract_image_urls, is_protected_media, media_file_name, AsciiImg, MediaPlaceholder,
+};
 use crate::components::{AuthorChip, EmptyCard, MarkdownBody};
 use crate::config::BbsConfig;
 use crate::router::{use_router, Route};
@@ -934,6 +936,32 @@ fn PostCard(
     let is_e2e = has_zk_tag(&post.tags);
     let is_edited = post.edited;
     let imgs = extract_image_urls(&post.content);
+    // The post in the forum, for images the BBS cannot render: its
+    // canonical topic URL, focused on this post.
+    let post_forum_href = {
+        let channels = use_channel_store();
+        let root_id = if is_root {
+            Some(post.id.clone())
+        } else {
+            topic.with_untracked(|t| t.as_ref().map(|t| t.id.clone()))
+        };
+        let route = match root_id {
+            Some(root_id) => Route::Thread {
+                zone: zone.clone(),
+                channel_id: channel_id.clone(),
+                root_id,
+                focus: Some(post.id.clone()),
+            },
+            None => Route::Go {
+                event_id: post.id.clone(),
+                channel: Some(channel_id.clone()),
+            },
+        };
+        let zones = load_zones();
+        channels
+            .channels
+            .with_untracked(|cs| nostr_bbs_client_core::base_href(&route.forum_path(&zones, cs)))
+    };
 
     let show_picker = RwSignal::new(false);
     let editing = RwSignal::new(false);
@@ -1168,7 +1196,7 @@ fn PostCard(
 
             {(!imgs.is_empty()).then(|| view! {
                 <div class="tui-stack">
-                    {imgs.into_iter().map(|src| view! { <PostImage src=src /> }).collect_view()}
+                    {imgs.into_iter().map(|src| view! { <PostImage src=src forum_href=post_forum_href.clone() /> }).collect_view()}
                 </div>
             })}
 
@@ -1306,8 +1334,29 @@ fn PostCard(
 }
 
 /// On-theme phosphor ASCII image card with instant `[ASCII / Raw]` toggle + `[open ↗]`.
+///
+/// Protected media (a zone image: see [`is_protected_media`]) gets only a
+/// placeholder naming the file and linking to the post in the forum
+/// (`forum_href`): the raw image and its own URL would both be refused
+/// without the member's credentials, and the ASCII service must never see it.
 #[component]
-fn PostImage(src: String) -> impl IntoView {
+fn PostImage(src: String, forum_href: String) -> impl IntoView {
+    if is_protected_media(&src) {
+        return view! {
+            <div class="bbs-ascii-card">
+                <div class="bbs-ascii-card-head">
+                    <span>"▞ IMG ▚"</span>
+                    <span>"🔒"</span>
+                </div>
+                <MediaPlaceholder
+                    name=media_file_name(&src)
+                    reason="protected zone media"
+                    forum_href=Some(forum_href)
+                />
+            </div>
+        }
+        .into_any();
+    }
     let raw_mode = RwSignal::new(false);
     let cols = {
         #[cfg(target_arch = "wasm32")]
@@ -1339,10 +1388,11 @@ fn PostImage(src: String) -> impl IntoView {
             {move || if raw_mode.get() {
                 view! { <img class="bbs-raw-img" src=src_raw.clone() alt="Attached image" loading="lazy" /> }.into_any()
             } else {
-                view! { <AsciiImg src=src.clone() cols=cols /> }.into_any()
+                view! { <AsciiImg src=src.clone() cols=cols forum_href=forum_href.clone() /> }.into_any()
             }}
         </div>
     }
+    .into_any()
 }
 
 /// Rich Markdown + Image + Encrypted-Zone Composer shared by BoardView and ThreadView.
