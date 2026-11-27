@@ -162,6 +162,9 @@ const HOME_LINK_CLASS: &str =
     "shrink-0 inline-flex items-center gap-2 min-w-11 h-11 px-1 rounded-lg \
      text-amber-400 hover:text-amber-300 hover:bg-gray-800 transition-colors focus:outline-none \
      focus-visible:ring-2 focus-visible:ring-amber-400";
+/// A desktop nav item's text: icons only below `xl` (the labels stay as the
+/// links' accessible names), so the nav leaves the home control its room.
+const NAV_LABEL_CLASS: &str = "sr-only xl:not-sr-only whitespace-nowrap";
 /// The home mark: the brand hexagon, filled orange, 32 px.
 const HOME_MARK_CLASS: &str = "w-8 h-8 shrink-0 text-amber-400";
 /// The wordmark beside the mark, from `sm` up, whole (never truncated).
@@ -1201,9 +1204,9 @@ fn Layout(children: Children) -> impl IntoView {
                 p == prefix || p.starts_with(&format!("{}/", prefix))
             };
             if active {
-                "flex items-center gap-1.5 text-amber-400 transition-colors px-3 py-2 rounded-lg hover:bg-gray-800 font-medium"
+                "flex items-center gap-1.5 text-amber-400 transition-colors px-2 py-2 rounded-lg hover:bg-gray-800 font-medium"
             } else {
-                "flex items-center gap-1.5 text-gray-300 hover:text-white transition-colors px-3 py-2 rounded-lg hover:bg-gray-800"
+                "flex items-center gap-1.5 text-gray-300 hover:text-white transition-colors px-2 py-2 rounded-lg hover:bg-gray-800"
             }
         }
     };
@@ -1274,7 +1277,7 @@ fn Layout(children: Children) -> impl IntoView {
                     </div>
 
                     // Desktop nav
-                    <div class="hidden sm:flex items-center gap-4">
+                    <div class="hidden sm:flex items-center gap-1 shrink-0">
                         <Show
                             when=move || is_authed.get()
                             fallback=move || view! {
@@ -1288,11 +1291,11 @@ fn Layout(children: Children) -> impl IntoView {
                         >
                             <A href=base_href("/dm") attr:class=nav_link_class("/dm")>
                                 {dm_icon()}
-                                "DMs"
+                                <span class=NAV_LABEL_CLASS>"DMs"</span>
                             </A>
                             <A href=base_href("/events") attr:class=nav_link_class("/events")>
                                 {events_icon()}
-                                "Events"
+                                <span class=NAV_LABEL_CLASS>"Events"</span>
                             </A>
                             // Agent Control Surface — read-only member view at
                             // /governance (F1). Any authenticated member reaches
@@ -1300,18 +1303,18 @@ fn Layout(children: Children) -> impl IntoView {
                             // distinct route linked from the page for admins.
                             <A href=base_href("/governance") attr:class=nav_link_class("/governance")>
                                 {governance_icon()}
-                                "Governance"
+                                <span class=NAV_LABEL_CLASS>"Governance"</span>
                             </A>
                             <A href=base_href("/pod") attr:class=nav_link_class("/pod")>
                                 {pod_icon()}
-                                "Pod"
+                                <span class=NAV_LABEL_CLASS>"Pod"</span>
                             </A>
                             // Member wallet (ADR-2015): only where the deployment
                             // switched it on, so other instances' nav is unchanged.
                             {crate::wallet::enabled().then(|| view! {
                                 <A href=base_href("/wallet") attr:class=nav_link_class("/wallet")>
                                     {wallet_icon()}
-                                    "Wallet"
+                                    <span class=NAV_LABEL_CLASS>"Wallet"</span>
                                 </A>
                             })}
                             // Practice poker table: operator flag, wallet, and
@@ -1319,7 +1322,7 @@ fn Layout(children: Children) -> impl IntoView {
                             {move || table_on.get().then(|| view! {
                                 <A href=base_href("/table") attr:class=nav_link_class("/table")>
                                     {table_icon()}
-                                    "Table"
+                                    <span class=NAV_LABEL_CLASS>"Table"</span>
                                 </A>
                             })}
                             // About: the marketing landing, reachable in-app
@@ -1327,12 +1330,12 @@ fn Layout(children: Children) -> impl IntoView {
                             // stays low-key.
                             <A href=base_href("/about") attr:class=nav_link_class("/about")>
                                 {about_icon()}
-                                "About"
+                                <span class=NAV_LABEL_CLASS>"About"</span>
                             </A>
                             {move || is_admin.get().then(|| view! {
                                 <A href=base_href("/admin") attr:class=nav_link_class("/admin")>
                                     {admin_icon()}
-                                    <span class="text-sm">"Admin"</span>
+                                    <span class=format!("{NAV_LABEL_CLASS} text-sm")>"Admin"</span>
                                 </A>
                             })}
                             <button
@@ -1355,9 +1358,9 @@ fn Layout(children: Children) -> impl IntoView {
                             <A href=base_href("/settings") attr:class="text-gray-400 hover:text-white transition-colors p-2 rounded-lg hover:bg-gray-800">
                                 {settings_icon()}
                             </A>
-                            <div class="flex items-center gap-1.5 bg-gray-800 px-3 py-1 rounded-full text-xs text-gray-300">
+                            <div class="hidden xl:flex items-center gap-1.5 bg-gray-800 px-3 py-1 rounded-full text-xs text-gray-300">
                                 {user_icon()}
-                                <span>{header_label}</span>
+                                <span class="whitespace-nowrap">{header_label}</span>
                             </div>
                             <LogoutButton />
                         </Show>
@@ -1540,7 +1543,7 @@ fn LogoutButton() -> impl IntoView {
     view! {
         <button
             on:click=on_logout
-            class="flex items-center gap-1.5 text-gray-400 hover:text-red-400 transition-colors px-3 py-2 rounded-lg border border-transparent hover:border-red-500/20 hover:bg-red-500/10 text-sm"
+            class="flex items-center gap-1.5 whitespace-nowrap text-gray-400 hover:text-red-400 transition-colors px-2 py-2 rounded-lg border border-transparent hover:border-red-500/20 hover:bg-red-500/10 text-sm"
         >
             {logout_icon()}
             "Log Out"
@@ -1836,6 +1839,15 @@ mod tests {
         for want in ["w-8", "h-8", "shrink-0", "text-amber-400"] {
             assert!(c.contains(&want), "{want} missing from {HOME_MARK_CLASS}");
         }
+    }
+
+    #[test]
+    fn nav_labels_stay_readable_to_screen_readers_when_compact() {
+        // Below xl the nav shows icons only, so the home wordmark keeps its
+        // room; the labels stay as accessible names, never display:none.
+        let c = classes(NAV_LABEL_CLASS);
+        assert!(c.contains(&"sr-only") && c.contains(&"xl:not-sr-only"));
+        assert!(!c.contains(&"hidden"));
     }
 
     #[test]

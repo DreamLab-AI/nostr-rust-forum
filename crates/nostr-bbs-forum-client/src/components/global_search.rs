@@ -177,7 +177,10 @@ impl Hit {
                 )
             }
             Self::SemanticMessage { .. } => "semantic match".to_string(),
-            Self::User { .. } => "Member profile".to_string(),
+            // The abbreviated key tells apart two members with one name.
+            Self::User { pubkey, .. } => {
+                format!("Member \u{00b7} {}", crate::utils::shorten_pubkey(pubkey))
+            }
         }
     }
     fn icon(&self) -> (&'static str, &'static str) {
@@ -371,9 +374,12 @@ fn topic_hits(
 }
 
 /// Members whose display name or name contains `query` (case-insensitive),
-/// from the profile cache; alphabetical by their shown name.
+/// from the profile cache; alphabetical by their shown name. A key replaced
+/// by a successor (`successors`, the relay's alias map) is left out, as the
+/// mention picker does, so one member is not listed twice.
 fn user_hits<'a>(
     entries: impl IntoIterator<Item = &'a crate::stores::profile_cache::ProfileEntry>,
+    successors: &std::collections::HashMap<String, String>,
     query: &str,
 ) -> Vec<Hit> {
     let q = query.trim().to_lowercase();
@@ -382,6 +388,7 @@ fn user_hits<'a>(
     }
     let mut found: Vec<(String, String)> = entries
         .into_iter()
+        .filter(|e| !successors.contains_key(&e.pubkey))
         .filter(|e| {
             [&e.display_name, &e.name]
                 .into_iter()
@@ -513,9 +520,11 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
         }
         if matches!(t, Tab::All | Tab::Users) {
             if let Some(cache) = profile_cache {
-                cache
-                    .entries
-                    .with_untracked(|e| out.extend(user_hits(e.values(), q)));
+                cache.entries.with_untracked(|e| {
+                    cache
+                        .successors
+                        .with_untracked(|succ| out.extend(user_hits(e.values(), succ, q)))
+                });
             }
         }
         out
@@ -1009,6 +1018,7 @@ mod tests {
         assert_eq!(out.chars().count(), 80);
     }
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn message_hits_link_with_their_channel_hint() {
@@ -1279,6 +1289,7 @@ mod tests {
             entry("p3", Some("Beema"), Some("beema")),
             entry("p4", None, None),
         ];
+        let none = HashMap::new();
         let pk = |hits: Vec<Hit>| -> Vec<String> {
             hits.into_iter()
                 .filter_map(|h| match h {
@@ -1287,15 +1298,30 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(pk(user_hits(people.iter(), "red")), ["p1"]);
-        assert_eq!(pk(user_hits(people.iter(), "TECHNO")), ["p2"]);
+        assert_eq!(pk(user_hits(people.iter(), &none, "red")), ["p1"]);
+        assert_eq!(pk(user_hits(people.iter(), &none, "TECHNO")), ["p2"]);
         assert_eq!(
-            pk(user_hits(people.iter(), "beema")),
+            pk(user_hits(people.iter(), &none, "beema")),
             ["p3"],
             "matched once"
         );
-        assert!(user_hits(people.iter(), "nobody").is_empty());
-        assert!(user_hits(people.iter(), " ").is_empty());
+        assert!(user_hits(people.iter(), &none, "nobody").is_empty());
+        assert!(user_hits(people.iter(), &none, " ").is_empty());
+    }
+
+    #[test]
+    fn a_replaced_key_is_not_listed_beside_its_successor() {
+        use crate::stores::profile_cache::ProfileEntry;
+        let named = |pk: &str| ProfileEntry {
+            pubkey: pk.into(),
+            display_name: Some("RedDread".into()),
+            ..Default::default()
+        };
+        let people = [named("old"), named("new")];
+        let successors = HashMap::from([("old".to_string(), "new".to_string())]);
+        let hits = user_hits(people.iter(), &successors, "red");
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(&hits[0], Hit::User { pubkey, .. } if pubkey == "new"));
     }
 
     #[test]
