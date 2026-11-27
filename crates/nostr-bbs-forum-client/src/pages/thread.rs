@@ -1614,7 +1614,11 @@ pub fn ThreadPage() -> impl IntoView {
             // the global "Forums" crumb but keep the zone as the landing link;
             // everyone else keeps Home › Forums › {Zone} › {Section} › {Topic}.
             {move || {
-                let slug = category_slug();
+                // `try_with`: this closure can re-run after the route has
+                // disposed the page (see `history_loader::read_cursor`).
+                let Some(slug) = params.try_with(|p| p.get("category").unwrap_or_default()) else {
+                    return ().into_any();
+                };
                 let zone_label = category_display_name(&slug);
                 let zone_href = format!("/{}", category_url_slug());
                 let sec_name = section_name();
@@ -1644,12 +1648,18 @@ pub fn ThreadPage() -> impl IntoView {
                 }
             }}
 
+            // `try_*` in the nested closures below: Leptos 0.7 drops them a
+            // task hop after the route disposed this page, and a store write
+            // in between re-runs them (see `history_loader::read_cursor`).
             {move || {
-                if loading.get() {
+                let Some(loading) = loading.try_get() else {
+                    return ().into_any();
+                };
+                if loading {
                     view! {
                         <div class="flex flex-col items-center justify-center py-20 gap-3">
                             <div class="animate-spin w-6 h-6 border-2 border-[color:var(--zone-accent)] border-t-transparent rounded-full"></div>
-                            <span class="text-gray-400 text-sm">{move || if lookup.get() == Lookup::KeysLoading {
+                            <span class="text-gray-400 text-sm">{move || if lookup.try_get() == Some(Lookup::KeysLoading) {
                                 "Fetching your keys for this zone\u{2026}"
                             } else {
                                 "Loading topic..."
@@ -1701,11 +1711,13 @@ pub fn ThreadPage() -> impl IntoView {
             }}
 
             // Replies
-            <Show when=move || topic_root.get().is_some() && !loading.get()>
+            <Show when=move || {
+                topic_root.try_with(Option::is_some).unwrap_or(false) && loading.try_get() == Some(false)
+            }>
                 <div class="mt-6">
                     <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">
                         {move || {
-                            let n = reply_total.get();
+                            let n = reply_total.try_get().unwrap_or_default();
                             if n == 0 {
                                 "No replies yet".to_string()
                             } else if n == 1 {
@@ -1729,7 +1741,7 @@ pub fn ThreadPage() -> impl IntoView {
                             needles=history_needles
                         />
                         <For
-                            each=move || replies.get()
+                            each=move || replies.try_get().unwrap_or_default()
                             key=|r| (r.id.clone(), view_key(r))
                             children=move |r| view! {
                                 <ReplyCard
@@ -1758,7 +1770,11 @@ pub fn ThreadPage() -> impl IntoView {
 
             // Reply composer (always appends at the bottom; shows a quote chip
             // when the reader tapped "Reply" on a specific post).
-            <Show when=move || is_authed.get() && topic_root.get().is_some() && !loading.get()>
+            <Show when=move || {
+                is_authed.try_get().unwrap_or(false)
+                    && topic_root.try_with(Option::is_some).unwrap_or(false)
+                    && loading.try_get() == Some(false)
+            }>
                 <div id="thread-reply-composer" class="mt-6 bg-gray-800 border border-gray-700 rounded-lg p-3">
                     {move || reply_target.get().map(|t| view! {
                         <div class="flex items-center gap-2 mb-2 px-2 py-1.5 rounded bg-gray-900/60 border-l-2 border-[color:var(--zone-accent)] text-xs">

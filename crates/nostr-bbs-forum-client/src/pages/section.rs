@@ -539,7 +539,11 @@ pub fn SectionPage() -> impl IntoView {
             // the global "Forums" crumb but keep the zone as the landing link;
             // everyone else keeps Home › Forums › {Zone} › {Section}.
             {move || {
-                let slug = category_slug();
+                // `try_with`: this closure can re-run after the route has
+                // disposed the page (see `history_loader::read_cursor`).
+                let Some(slug) = params.try_with(|p| p.get("category").unwrap_or_default()) else {
+                    return ().into_any();
+                };
                 let zone_label = category_display_name(&slug);
                 let zone_href = format!("/{}", category_url_slug());
                 let section_label = header_name();
@@ -574,14 +578,20 @@ pub fn SectionPage() -> impl IntoView {
                         }
                     })}
                     <span class="inline-block mt-2 text-xs text-gray-500 border border-gray-600 rounded px-1.5 py-0.5">
+                        // `try_*` in this page's nested closures: Leptos 0.7
+                        // drops them a task hop after the route disposed the
+                        // page, and a store write in between re-runs them
+                        // (see `history_loader::read_cursor`).
                         {move || {
-                            let n = topics.get().len();
+                            let n = topics.try_with(Vec::len).unwrap_or_default();
                             if n == 1 { "1 topic".to_string() } else { format!("{n} topics") }
                         }}
                     </span>
                 </div>
 
-                <Show when=move || is_authed.get() && !section_loading.get()>
+                <Show when=move || {
+                    is_authed.try_get().unwrap_or(false) && section_loading.try_get() == Some(false)
+                }>
                     <button
                         type="button"
                         on:click=move |_| {
@@ -668,7 +678,9 @@ pub fn SectionPage() -> impl IntoView {
             </Show>
 
             {move || {
-                let state = topics_lookup.get();
+                let Some(state) = topics_lookup.try_get() else {
+                    return ().into_any();
+                };
                 if state.is_loading() {
                     view! {
                         <div class="flex flex-col items-center justify-center py-20 gap-3">
