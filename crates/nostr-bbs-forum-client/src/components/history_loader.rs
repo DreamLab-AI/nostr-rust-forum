@@ -20,7 +20,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::relay::RelayConnection;
-use crate::stores::channels::ChannelStore;
+use crate::stores::channels::{ChannelStore, HistoryCursor};
 use crate::utils::scroll_anchor;
 
 /// Which history a [`HistoryLoader`] fetches.
@@ -52,7 +52,9 @@ pub fn HistoryLoader(
     #[prop(optional, into)]
     exhausted: Option<Signal<bool>>,
 ) -> impl IntoView {
-    let exhausted = move || exhausted.is_some_and(|e| e.get());
+    // Reads in this component's reactive closures use `try_*`: see
+    // [`read_cursor`] for why they can run after the page is gone.
+    let exhausted = move || exhausted.is_some_and(|e| e.try_get().unwrap_or(true));
     let store = expect_context::<ChannelStore>();
     let relay = expect_context::<RelayConnection>();
     let sentinel = NodeRef::<leptos::html::Div>::new();
@@ -102,13 +104,16 @@ pub fn HistoryLoader(
     };
     let request = StoredValue::new_local(Rc::new(request) as Rc<dyn Fn()>);
 
-    let state = Signal::derive(move || channel_id.get().map(|cid| store.history_cursor(&cid)));
+    let state = Signal::derive(move || {
+        channel_id
+            .try_get()
+            .flatten()
+            .map(|cid| store.history_cursor(&cid))
+    });
     let can_request = move || {
-        state.with(|c| {
-            c.as_ref().is_some_and(|c| match direction {
-                HistoryDirection::Older => c.next_request().is_some(),
-                HistoryDirection::Newer => c.next_newer().is_some(),
-            })
+        read_cursor(state).is_some_and(|c| match direction {
+            HistoryDirection::Older => c.next_request().is_some(),
+            HistoryDirection::Newer => c.next_newer().is_some(),
         })
     };
 
@@ -159,17 +164,11 @@ pub fn HistoryLoader(
             && match direction {
                 HistoryDirection::Older => true,
                 HistoryDirection::Newer => {
-                    state.with(|c| c.as_ref().is_some_and(|c| c.newer_from.is_some()))
+                    read_cursor(state).is_some_and(|c| c.newer_from.is_some())
                 }
             }
     };
-    let state_attr = move || match (direction, state.get()) {
-        (_, Some(c)) if c.loading => "loading",
-        (HistoryDirection::Older, Some(c)) if c.exhausted => "start",
-        (HistoryDirection::Older, Some(c)) if c.started => "more",
-        (HistoryDirection::Newer, Some(c)) if c.newer_from.is_some() => "newer",
-        _ => "pending",
-    };
+    let state_attr = move || history_state_attr(direction, read_cursor(state).as_ref());
 
     view! {
         <div
@@ -181,7 +180,7 @@ pub fn HistoryLoader(
             }
             data-history-state=state_attr
         >
-            {move || match (direction, state.get()) {
+            {move || match (direction, read_cursor(state)) {
                 (_, Some(c)) if c.loading => view! { <span>"Loading\u{2026}"</span> }.into_any(),
                 (HistoryDirection::Older, Some(c)) if c.exhausted => {
                     view! { <span>"Start of history"</span> }.into_any()
@@ -191,12 +190,116 @@ pub fn HistoryLoader(
                         class="text-xs text-gray-400 hover:text-gray-200 underline"
                         on:click=move |_| request.with_value(|f| f())
                     >
-                        {label.get_value()}
+                        {label.try_get_value().unwrap_or_default()}
                     </button>
                 }.into_any(),
                 _ => ().into_any(),
             }}
             <div node_ref=sentinel class="h-px w-px"></div>
         </div>
+    }
+}
+
+/// The channel's cursor, or `None` before the channel resolves or once the
+/// page that owns `state` is gone.
+///
+/// Leptos 0.7 drops a page's nested render effects one task hop per level
+/// after the router has already disposed the page's owner. A store write in
+/// that window (the next page's first effects request history for the same
+/// channel) re-runs this loader's attribute and children closures against a
+/// disposed `state`: `get` panicked ("a reactive value that has already been
+/// disposed"), and the aborted task leaked the rest of the old page.
+fn read_cursor(state: Signal<Option<HistoryCursor>>) -> Option<HistoryCursor> {
+    state.try_get().flatten()
+}
+
+/// `data-history-state` for a loader in `direction` at `cursor`.
+fn history_state_attr(direction: HistoryDirection, cursor: Option<&HistoryCursor>) -> &'static str {
+    match (direction, cursor) {
+        (_, Some(c)) if c.loading => "loading",
+        (HistoryDirection::Older, Some(c)) if c.exhausted => "start",
+        (HistoryDirection::Older, Some(c)) if c.started => "more",
+        (HistoryDirection::Newer, Some(c)) if c.newer_from.is_some() => "newer",
+        _ => "pending",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cursor(started: bool, loading: bool, exhausted: bool) -> HistoryCursor {
+        HistoryCursor {
+            started,
+            loading,
+            exhausted,
+            ..HistoryCursor::default()
+        }
+    }
+
+    #[test]
+    fn a_live_cursor_is_read() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let state = Signal::derive(|| Some(cursor(true, false, false)));
+            assert_eq!(read_cursor(state), Some(cursor(true, false, false)));
+            assert_eq!(
+                history_state_attr(HistoryDirection::Older, read_cursor(state).as_ref()),
+                "more"
+            );
+        });
+    }
+
+    #[test]
+    fn the_cursor_of_a_disposed_page_is_none_not_a_panic() {
+        // Section -> topic: the section's two loaders re-ran their attribute
+        // and children closures after the router had disposed the section,
+        // eight panics per click. Reading through `read_cursor` renders the
+        // pending state instead.
+        let owner = Owner::new();
+        let (state, channel) = owner.with(|| {
+            let channel = Signal::derive(|| Some("c".to_string()));
+            (
+                Signal::derive(move || channel.get().map(|_| cursor(true, true, false))),
+                channel,
+            )
+        });
+        owner.cleanup();
+        assert!(channel.try_get().is_none(), "the owner disposed its values");
+        assert_eq!(read_cursor(state), None);
+        assert_eq!(
+            history_state_attr(HistoryDirection::Older, read_cursor(state).as_ref()),
+            "pending"
+        );
+        assert_eq!(history_state_attr(HistoryDirection::Newer, None), "pending");
+    }
+
+    #[test]
+    fn history_state_attr_names_each_phase() {
+        let older = HistoryDirection::Older;
+        assert_eq!(
+            history_state_attr(older, Some(&cursor(true, true, false))),
+            "loading"
+        );
+        assert_eq!(
+            history_state_attr(older, Some(&cursor(true, false, true))),
+            "start"
+        );
+        assert_eq!(
+            history_state_attr(older, Some(&cursor(false, false, false))),
+            "pending"
+        );
+        let newer = HistoryCursor {
+            newer_from: Some(5),
+            ..HistoryCursor::default()
+        };
+        assert_eq!(
+            history_state_attr(HistoryDirection::Newer, Some(&newer)),
+            "newer"
+        );
+        assert_eq!(
+            history_state_attr(HistoryDirection::Newer, Some(&cursor(true, false, false))),
+            "pending"
+        );
     }
 }
