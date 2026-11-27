@@ -2157,6 +2157,45 @@ pub fn topic_key(root: &str) -> String {
     format!("topic:{}", root.to_lowercase())
 }
 
+/// Whether `key` of [`ChannelStore::channel_messages`] is a channel's own
+/// list, as opposed to a topic's paged list ([`topic_key`]) or a section's
+/// root list ([`roots_key`]), which repeat posts the channel list may hold.
+pub fn is_channel_key(key: &str) -> bool {
+    !key.starts_with("topic:") && !key.starts_with("roots:")
+}
+
+/// Every post the store holds, once each (by event id, case-insensitively),
+/// with its channel: the channel list's own id, or for a post held only in a
+/// topic or root list the channel its tags name (`None` when they name none).
+///
+/// The store keeps a post in its channel list and again in its topic's list
+/// and the section's root list, so reading every list shows it two or three
+/// times. Channel lists are read first, so a post they hold is attributed to
+/// them; the result is in no particular order.
+pub fn distinct_posts(
+    lists: &HashMap<String, Vec<NostrEvent>>,
+) -> Vec<(Option<String>, NostrEvent)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let (channel_lists, other_lists): (Vec<_>, Vec<_>) =
+        lists.iter().partition(|(key, _)| is_channel_key(key));
+    for (key, events) in channel_lists {
+        for ev in events {
+            if seen.insert(ev.id.to_ascii_lowercase()) {
+                out.push((Some(key.clone()), ev.clone()));
+            }
+        }
+    }
+    for (_, events) in other_lists {
+        for ev in events {
+            if seen.insert(ev.id.to_ascii_lowercase()) {
+                out.push((crate::utils::post_link::channel_of(ev), ev.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// Which end of a channel's window to evict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvictSide {
@@ -2554,6 +2593,49 @@ pub fn deletion_targets(event: &NostrEvent) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A post in its channel list, its topic's list and the section's root
+    /// list is one post, under its channel; a post only a topic list holds
+    /// is attributed by its tags.
+    #[test]
+    fn distinct_posts_counts_each_post_once_under_its_channel() {
+        let cid = "c".repeat(64);
+        let post = |id: &str| NostrEvent {
+            id: id.to_string(),
+            pubkey: "p".repeat(64),
+            created_at: 1,
+            kind: 42,
+            tags: vec![vec!["e".into(), cid.clone(), String::new(), "root".into()]],
+            content: "hi".into(),
+            sig: String::new(),
+        };
+        let root = post(&"a".repeat(64));
+        let mut upper = root.clone();
+        upper.id = upper.id.to_ascii_uppercase();
+        let only_in_topic = post(&"b".repeat(64));
+        let mut lists = HashMap::new();
+        lists.insert(cid.clone(), vec![root.clone()]);
+        lists.insert(topic_key(&root.id), vec![upper, only_in_topic.clone()]);
+        lists.insert(roots_key(&cid), vec![root.clone()]);
+
+        let mut posts = distinct_posts(&lists);
+        posts.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0].0.as_deref(), Some(cid.as_str()));
+        assert_eq!(posts[0].1.id, root.id, "the channel list's copy wins");
+        assert_eq!(posts[1].0.as_deref(), Some(cid.as_str()));
+        assert_eq!(posts[1].1.id, only_in_topic.id);
+        assert!(posts
+            .iter()
+            .all(|(c, _)| c.as_deref().is_some_and(is_channel_key)));
+    }
+
+    #[test]
+    fn list_keys_are_not_channels() {
+        assert!(is_channel_key(&"c".repeat(64)));
+        assert!(!is_channel_key(&topic_key("R")));
+        assert!(!is_channel_key(&roots_key("c")));
+    }
     use super::*;
 
     // --- subscription shape (regression: deletions crowded out channels) ---

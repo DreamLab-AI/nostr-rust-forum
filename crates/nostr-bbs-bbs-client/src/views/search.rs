@@ -7,9 +7,10 @@
 //!    encrypted zones when configured/ready!
 
 use leptos::prelude::*;
-use nostr_bbs_client_core::stores::channels::use_channel_store;
+use nostr_bbs_client_core::stores::channels::{distinct_posts, use_channel_store};
 use nostr_bbs_client_core::stores::profile_cache::try_use_profile_cache;
 use nostr_bbs_client_core::stores::zones::{load_zones, section_to_zone};
+#[cfg(target_arch = "wasm32")]
 use nostr_bbs_client_core::utils::post_link::channel_of;
 use nostr_bbs_client_core::utils::sealed_search;
 
@@ -147,36 +148,30 @@ pub fn SearchOverlay() -> impl IntoView {
 
         // 3. Matching loaded channel messages. The store's lists include
         // `topic:<root>` and `roots:<channel>` lists, which are not channels
-        // and repeat posts: each post counts once, under its own channel tag,
-        // and opens AT the post (the `Go` resolver finds its topic).
+        // and repeat posts: each post counts once, under its own channel
+        // (`distinct_posts`), and opens AT the post (the `Go` resolver finds its topic).
         let ch_list = channels.channels.get();
-        let mut seen = std::collections::HashSet::new();
-        for evs in channels.channel_messages.get().into_values() {
-            for ev in evs {
-                if !ev.content.to_ascii_lowercase().contains(&q)
-                    || !seen.insert(ev.id.to_ascii_lowercase())
-                {
-                    continue;
-                }
-                let cid = channel_of(&ev);
-                let ch_name = cid
-                    .as_deref()
-                    .and_then(|c| ch_list.iter().find(|m| m.id == c))
-                    .map(|c| c.name.as_str())
-                    .unwrap_or("board");
-                let title: String = ev.content.chars().take(100).collect();
-                out.push(Hit {
-                    kind: "POST",
-                    title,
-                    subtitle: format!("#{ch_name}"),
-                    route: Route::Go {
-                        event_id: ev.id.clone(),
-                        channel: cid,
-                    },
-                });
-                if out.len() >= 40 {
-                    return out;
-                }
+        for (cid, ev) in channels.channel_messages.with(distinct_posts) {
+            if !ev.content.to_ascii_lowercase().contains(&q) {
+                continue;
+            }
+            let ch_name = cid
+                .as_deref()
+                .and_then(|c| ch_list.iter().find(|m| m.id == c))
+                .map(|c| c.name.as_str())
+                .unwrap_or("board");
+            let title: String = ev.content.chars().take(100).collect();
+            out.push(Hit {
+                kind: "POST",
+                title,
+                subtitle: format!("#{ch_name}"),
+                route: Route::Go {
+                    event_id: ev.id.clone(),
+                    channel: cid,
+                },
+            });
+            if out.len() >= 40 {
+                return out;
             }
         }
         out.truncate(40);

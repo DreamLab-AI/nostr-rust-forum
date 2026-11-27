@@ -3,7 +3,7 @@
 use leptos::prelude::*;
 use nostr_bbs_client_core::auth::use_auth;
 use nostr_bbs_client_core::relay::RelayConnection;
-use nostr_bbs_client_core::stores::channels::use_channel_store;
+use nostr_bbs_client_core::stores::channels::{distinct_posts, use_channel_store};
 use nostr_bbs_client_core::stores::read_position::use_read_positions;
 use nostr_bbs_client_core::stores::zone_access::use_zone_access;
 use nostr_bbs_client_core::stores::zones::{
@@ -349,13 +349,14 @@ pub fn LiveFeedView() -> impl IntoView {
 
             {move || {
                 let ch_list = channels.channels.get();
-                let map = channels.channel_messages.get();
-                let mut all: Vec<(String, nostr_bbs_core::NostrEvent)> = Vec::new();
-                for (cid, evs) in map {
-                    for ev in evs {
-                        all.push((cid.clone(), ev));
-                    }
-                }
+                // Each post once, under its channel: the store also holds it
+                // in its topic's list and the section's root list.
+                let mut all: Vec<(String, nostr_bbs_core::NostrEvent)> = channels
+                    .channel_messages
+                    .with(distinct_posts)
+                    .into_iter()
+                    .filter_map(|(cid, ev)| Some((cid?, ev)))
+                    .collect();
                 all.sort_by_key(|(_, e)| std::cmp::Reverse(e.created_at));
                 all.truncate(80);
 
