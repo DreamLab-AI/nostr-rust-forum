@@ -44,36 +44,28 @@ use nostr_bbs_sealed_search::build::{
     Previous,
 };
 use nostr_bbs_sealed_search::format::{BinLayer, Kind, MAX_ROWS};
-use nostr_bbs_sealed_search::manifest::{Manifest, ObjectRef, KIND, V2};
+use nostr_bbs_sealed_search::manifest::{mac_slot, Manifest, ObjectRef, KIND, V2};
 use nostr_bbs_sealed_search::seal::{open, SearchKey};
 use nostr_bbs_sealed_search::search::{check_header, check_sealed, sha256_hex};
 use nostr_bbs_zone_migrate::keys::KeyRing;
 use nostr_bbs_zone_migrate::relay::Relay;
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use crate::embed::Embedder;
-use crate::harvest::{harvest, present, Harvest, HarvestError, Rules, ZoneRow};
+use crate::harvest::{harvest, present, AuthorBook, Harvest, HarvestError, Rules, ZoneRow};
 use crate::pod::{ObjectCache, Pod, JSON, OCTET};
-use crate::state::State;
+use crate::state::{Retired, State};
 
 /// Default overlap re-read before the high-water mark: the relay accepts
 /// events up to `MAX_CREATED_AT_DRIFT_SECS` (7 days) in the past, so a post
 /// stored today may carry a `created_at` that far back. Plus an hour.
 pub const DEFAULT_OVERLAP_SECS: u64 = nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS + 3_600;
 
-/// Default largest share of folded rows a compaction may find missing from
-/// the relay before it refuses (a relay answering incompletely would
-/// otherwise empty the index).
-pub const DEFAULT_MAX_MISSING: f64 = 0.05;
-
 /// Default seconds an object a manifest stopped listing is kept before it is
 /// deleted (48 hours): a browser that read the previous manifest may still be
 /// loading it, and a manual rerun must not cut that short.
 pub const DEFAULT_RETIRE_AFTER_SECS: u64 = 48 * 3600;
-
-/// Missing rows a compaction always tolerates, whatever the share (so one
-/// post deleted through the admin API cannot block a small fold for good).
-pub const MIN_MISSING_ALLOWED: usize = 10;
 
 /// Indexed ids an update asks the relay for before reading the zone: if it
 /// serves none of them, the zone is withheld from this identity.
@@ -142,15 +134,13 @@ pub enum JobError {
     /// The relay session is not NIP-42 authenticated.
     #[error(transparent)]
     Unauthenticated(HarvestError),
-    /// A compaction found too many rows missing from the relay.
-    #[error("{missing} of {checked} folded rows are missing from the relay (limit {limit}); refusing to compact")]
-    TooManyMissing {
-        /// Rows the relay did not return.
-        missing: usize,
-        /// Rows asked for.
-        checked: usize,
-        /// Most allowed.
-        limit: usize,
+    /// The manifest's exclusion list would pass its cap.
+    #[error("the exclusion list would hold {total} ids, over the cap of {cap}: run `compact --all` to empty it")]
+    ExclusionListFull {
+        /// Ids the list would hold.
+        total: usize,
+        /// The cap.
+        cap: usize,
     },
     /// The relay serves none of the zone's indexed posts to this identity:
     /// the zone's read gate withholds them (the indexer lacks the cohort).
@@ -173,12 +163,13 @@ pub enum JobError {
 }
 
 impl JobError {
-    /// Process exit code: 4 unauthenticated relay, 5 too many rows missing,
-    /// 6 rollback, 7 zone withheld by the relay, 1 otherwise.
+    /// Process exit code: 4 unauthenticated relay, 6 rollback, 7 zone withheld
+    /// by the relay, 8 exclusion list full, 1 otherwise (5 is retired: a
+    /// compaction no longer drops rows the relay merely does not serve).
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Unauthenticated(_) => 4,
-            Self::TooManyMissing { .. } => 5,
+            Self::ExclusionListFull { .. } => 8,
             Self::RolledBack { .. } => 6,
             Self::Withheld { .. } => 7,
             Self::Other(_) => 1,
@@ -258,6 +249,8 @@ pub struct Report {
     pub missing_key: usize,
     /// Those epochs.
     pub missing_epochs: Vec<u32>,
+    /// Seconds the relay could not page completely (the mark stays below).
+    pub ambiguous_seconds: Vec<u64>,
     /// The state's high-water mark after the run.
     pub high_water: Option<u64>,
     /// Seconds spent embedding.
@@ -289,6 +282,7 @@ impl Report {
         self.undecryptable = h.undecryptable;
         self.missing_key = h.missing_key;
         self.missing_epochs = h.missing_epochs.iter().copied().collect();
+        self.ambiguous_seconds = h.ambiguous_seconds.clone();
     }
 }
 
@@ -424,10 +418,19 @@ fn key_map<'r>(
 ///
 /// When a pod request fails.
 pub async fn newest_manifest<P: Pod>(job: &mut Job<'_, P>) -> Result<Option<Manifest>, JobError> {
-    Ok(verified_manifests(job)
-        .await?
-        .into_iter()
-        .max_by_key(|m| m.content.index_version))
+    Ok(Manifest::newest(verified_manifests(job).await?))
+}
+
+/// The held zone secret of `(epoch, zone_pk)`, for the manifest MAC.
+fn zone_secret(
+    ring: &KeyRing,
+    zone: &str,
+    epoch: u32,
+    zone_pk: &str,
+) -> Option<Zeroizing<[u8; 32]>> {
+    ring.get(zone, epoch)
+        .filter(|k| k.pubkey().eq_ignore_ascii_case(zone_pk))
+        .map(|k| Zeroizing::new(*k.secret()))
 }
 
 /// Every trusted publisher's manifest that verifies (see [`newest_manifest`]).
@@ -445,7 +448,16 @@ async fn verified_manifests<P: Pod>(job: &mut Job<'_, P>) -> Result<Vec<Manifest
                 continue;
             }
         };
-        match Manifest::verify(ev, job.zone, job.relay_url, job.publishers, None) {
+        let (ring, zone) = (job.ring, job.zone);
+        let secret_for = |e: u32, pk: &str| zone_secret(ring, zone, e, pk);
+        match Manifest::accept(
+            ev,
+            job.zone,
+            job.relay_url,
+            job.publishers,
+            None,
+            secret_for,
+        ) {
             Ok(m) => all.push(m),
             Err(e) => job
                 .warnings
@@ -547,7 +559,8 @@ async fn indexed_ids<P: Pod>(
     Ok(ids)
 }
 
-/// Delete retired objects (the previous run's) that `listed` does not name.
+/// Delete retired objects whose grace period ([`Job::retire_after_secs`])
+/// has passed and that `listed` does not name again; keep the rest.
 async fn delete_retired<P: Pod>(
     job: &mut Job<'_, P>,
     state: &mut State,
@@ -555,15 +568,19 @@ async fn delete_retired<P: Pod>(
     report: &mut Report,
 ) {
     let mut keep = Vec::new();
-    for n in std::mem::take(&mut state.retired) {
-        if listed.contains(&n) {
+    for r in std::mem::take(&mut state.retired) {
+        if listed.contains(&r.name) {
             continue;
         }
-        match job.pod.delete(&n).await {
+        if job.now < r.since.saturating_add(job.retire_after_secs) {
+            keep.push(r);
+            continue;
+        }
+        match job.pod.delete(&r.name).await {
             Ok(()) => report.objects_deleted += 1,
             Err(e) => {
-                job.warnings.push(format!("deleting {n}: {e}"));
-                keep.push(n);
+                job.warnings.push(format!("deleting {}: {e}", r.name));
+                keep.push(r);
             }
         }
     }
@@ -597,18 +614,36 @@ async fn publish<P: Pod>(
     report.objects_added = built.objects.len();
     let sk = nostr_bbs_core::keys::signing_key_from_bytes(job.me.as_bytes())
         .map_err(|e| format!("signing key: {e}"))?;
+    let content_json = serde_json::to_string(&built.content).map_err(|e| e.to_string())?;
+    let tags = if built.content.v == V2 {
+        let (epoch, pk) = mac_slot(&built.content)
+            .ok_or_else(|| "a v2 manifest lists at least one object".to_string())?;
+        let secret = zone_secret(job.ring, job.zone, epoch, &pk)
+            .ok_or_else(|| format!("no held key for epoch {epoch} to MAC the manifest"))?;
+        Manifest::tags_v2(&built.content, &content_json, job.relay_url, &secret)?
+    } else {
+        Manifest::tags(&built.content, job.relay_url)
+    };
     let unsigned = UnsignedEvent {
         pubkey: me.clone(),
         created_at: job.now,
         kind: KIND,
-        tags: Manifest::tags(&built.content, job.relay_url),
-        content: serde_json::to_string(&built.content).map_err(|e| e.to_string())?,
+        tags,
+        content: content_json,
     };
     let ev = sign_event(unsigned, &sk).map_err(|e| format!("signing the manifest: {e:?}"))?;
     // Accept it exactly as a browser would before anything points at it.
     let hw = prev.map(Manifest::high_water);
-    let m = Manifest::verify(ev, job.zone, job.relay_url, job.publishers, hw.as_ref())
-        .map_err(|e| format!("the new manifest would be refused: {e}"))?;
+    let (ring, zone) = (job.ring, job.zone);
+    let m = Manifest::accept(
+        ev,
+        job.zone,
+        job.relay_url,
+        job.publishers,
+        hw.as_ref(),
+        |e, pk| zone_secret(ring, zone, e, pk),
+    )
+    .map_err(|e| format!("the new manifest would be refused: {e}"))?;
     let json = serde_json::to_vec(&m.event).map_err(|e| e.to_string())?;
     job.pod.put("m.json", &json, JSON).await?;
 
@@ -622,9 +657,15 @@ async fn publish<P: Pod>(
     match state {
         Some(state) => {
             delete_retired(job, state, &listed, report).await;
-            state.retired.extend(dropped_now);
-            state.retired.sort();
-            state.retired.dedup();
+            for name in dropped_now {
+                if !state.retired.iter().any(|r| r.name == name) {
+                    state.retired.push(Retired {
+                        name,
+                        since: job.now,
+                    });
+                }
+            }
+            state.retired.sort_by(|a, b| a.name.cmp(&b.name));
             state.index_version = Some(m.content.index_version);
             state.event_id = Some(m.event.id.clone());
         }
@@ -708,7 +749,7 @@ pub async fn run_full<P: Pod, E: Embedder>(
     }
     let all = verified_manifests(job).await?;
     let any_v2 = all.iter().any(|m| m.content.v == V2);
-    let prev = all.into_iter().max_by_key(|m| m.content.index_version);
+    let prev = Manifest::newest(all);
     if let Some(s) = state.as_deref() {
         check_rollback(s, prev.as_ref())?;
     }
@@ -766,6 +807,7 @@ pub async fn run_update<P: Pod, R: Relay, E: Embedder>(
     job: &mut Job<'_, P>,
     relay: &mut R,
     state: &mut State,
+    book: &mut AuthorBook,
     embedder: &mut E,
     since: Option<u64>,
     overlap: u64,
@@ -792,7 +834,7 @@ pub async fn run_update<P: Pod, R: Relay, E: Embedder>(
         now: job.now,
         moderators: job.moderators,
     };
-    let h = harvest(relay, job.zone, job.ring, since, &indexed, &rules).await?;
+    let h = harvest(relay, job.zone, job.ring, since, &indexed, &rules, book).await?;
     report.harvested(&h);
     let exclude: Vec<String> = h
         .exclude
@@ -801,6 +843,13 @@ pub async fn run_update<P: Pod, R: Relay, E: Embedder>(
         .cloned()
         .collect();
     report.excluded_added = exclude.len();
+    let total = cur.content.excluded.len() + exclude.len();
+    if total > job.max_excluded {
+        return Err(JobError::ExclusionListFull {
+            total,
+            cap: job.max_excluded,
+        });
+    }
     if h.rows.is_empty() && exclude.is_empty() {
         let listed = own_names(&cur, &me_hex(job));
         delete_retired(job, state, &listed, &mut report).await;
@@ -839,20 +888,21 @@ pub async fn run_update<P: Pod, R: Relay, E: Embedder>(
     Ok(report)
 }
 
-/// A compaction (see the module docs and [`Fold`]). Rows of folded pairs
-/// that are excluded, or that the relay no longer serves, are left out;
-/// more than `max_missing` (a share of the rows checked) missing refuses the
-/// run.
+/// A compaction (see the module docs and [`Fold`]). Only rows with positive
+/// evidence are left out: those the manifest excludes (a verified,
+/// authorised deletion or supersession). A row the relay does not serve now
+/// is kept and counted: withholding must never become a signed, permanent
+/// exclusion. If the relay serves none of the folded rows, the run is refused
+/// as withheld.
 ///
 /// # Errors
 ///
-/// [`JobError`]; [`JobError::TooManyMissing`] as above.
+/// [`JobError`].
 pub async fn run_compact<P: Pod, R: Relay>(
     job: &mut Job<'_, P>,
     relay: &mut R,
     state: &mut State,
     fold: Fold,
-    max_missing: f64,
 ) -> Result<Report, JobError> {
     let mut report = Report::new("compact", job.zone);
     if !relay.session_authenticated() {
@@ -927,20 +977,10 @@ pub async fn run_compact<P: Pod, R: Relay>(
             asked: to_check.len(),
         });
     }
-    let limit = ((to_check.len() as f64 * max_missing.clamp(0.0, 1.0)).floor() as usize)
-        .max(MIN_MISSING_ALLOWED);
-    if missing.len() > limit {
-        return Err(JobError::TooManyMissing {
-            missing: missing.len(),
-            checked: to_check.len(),
-            limit,
-        });
-    }
     let dropped: HashSet<String> = folded_ids
         .iter()
         .filter(|id| excluded.contains(*id))
         .cloned()
-        .chain(missing.iter().cloned())
         .collect();
     report.folded_pairs = fold_names.len();
     report.dropped_rows = dropped.len();

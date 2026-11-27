@@ -30,14 +30,36 @@ fn pk(b: u8) -> String {
     hex::encode(sk(b).verifying_key().to_bytes())
 }
 
+/// The test zone secret of an epoch.
+fn zone_secret(epoch: u32, zone_pk: &str) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    match (epoch, zone_pk) {
+        (1, p) if p == hex::encode(PK_E1) => Some(zeroize::Zeroizing::new([7; 32])),
+        (2, p) if p == hex::encode(PK_E2) => Some(zeroize::Zeroizing::new([8; 32])),
+        _ => None,
+    }
+}
+
 fn sign(key: u8, content: &Content) -> NostrEvent {
+    let json = serde_json::to_string(content).expect("content json");
+    let tags = if content.v == V2 {
+        let (e, p) = nostr_bbs_sealed_search::manifest::mac_slot(content).expect("objects");
+        Manifest::tags_v2(
+            content,
+            &json,
+            RELAY,
+            &zone_secret(e, &p).expect("test secret"),
+        )
+        .expect("v2 tags")
+    } else {
+        Manifest::tags(content, RELAY)
+    };
     sign_event_deterministic(
         UnsignedEvent {
             pubkey: pk(key),
             created_at: 1,
             kind: KIND,
-            tags: Manifest::tags(content, RELAY),
-            content: serde_json::to_string(content).expect("content json"),
+            tags,
+            content: json,
         },
         &sk(key),
     )
@@ -159,7 +181,14 @@ fn bumped(c: &Content, v: u64) -> Content {
 }
 
 fn verify(ev: NostrEvent, hw: Option<&HighWater>) -> Result<Manifest, String> {
-    Manifest::verify(ev, "zone2", RELAY, &[pk(ARCHIVIST), pk(INDEXER)], hw)
+    Manifest::accept(
+        ev,
+        "zone2",
+        RELAY,
+        &[pk(ARCHIVIST), pk(INDEXER)],
+        hw,
+        zone_secret,
+    )
 }
 
 struct World {

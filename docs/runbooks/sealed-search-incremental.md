@@ -26,9 +26,11 @@ re-uploading the base and without asking browsers to download it again.
 2. **`status --field partial_pairs`**: if it is at least `NBSS_COMPACT_AT`
    (default 14), it runs **`compact`**. That folds every shard pair that is not
    full into fresh full ones. Rows are re-packed verbatim, so no embedding
-   runs. Excluded rows, and rows the relay no longer serves, are dropped.
-3. Optionally, it runs **`compact --all`** once `NBSS_FULL_COMPACT_EXCLUDED_AT`
-   ids are excluded. That re-packs the whole index into the indexer's pod.
+   runs. Only excluded rows (authorised deletions and supersessions) are
+   dropped. A row the relay merely does not serve is kept.
+3. It runs **`compact --all`** once `NBSS_FULL_COMPACT_EXCLUDED_AT` ids are
+   excluded (default 4,096, a quarter of the manifest's cap of 16,384). That
+   re-packs the whole index into the indexer's pod and empties the list.
 
 The job takes a lock (`flock`), keeps within a time budget (`NBSS_TIMEOUT`) and
 logs one JSON report per step: counts only, never text or keys.
@@ -41,8 +43,9 @@ logs one JSON report per step: counts only, never text or keys.
 | 3 | Published, but posts under an epoch the indexer holds no key for were held back. The high-water mark is set just below the oldest of them, so every later run reads them again (more each night, the older they are) until the epoch is granted. |
 | 1 | Error. |
 | 4 | The relay session is not NIP-42 authenticated. Nothing was read. |
-| 5 | A compaction found more of the rows it would fold missing from the relay than allowed (5% of them, but always at least 10). Refused. |
+| 5 | Retired. Compaction no longer refuses or drops on rows the relay does not serve. |
 | 6 | The pods show an older index than this job published. Rollback or withholding; refused. |
+| 8 | The exclusion list would pass its cap (16,384). Refused; run `compact --all`. The default full-compaction threshold keeps this from happening. |
 | 7 | The relay serves none of the zone's already-indexed posts to the indexer. Refused. The relay's zone read gate answers an authenticated non-member with nothing rather than an error, so without this check a missing cohort would look like "nothing new" every night. |
 | 10 | Another run holds the lock. |
 | 11 | Timed out. |
@@ -73,10 +76,45 @@ So a current v1 manifest is a valid v2 manifest.
 
 A v1 manifest that carries any v2 field is refused.
 
+**Zone-key MAC (security review M3).** In v1, a higher version means objects
+sealed at that version, which needs the zone key. In v2 a manifest can re-list
+existing objects at any version. Without more, a listed publisher key alone
+could add exclusions and raise every browser's high-water mark. So a v2
+manifest also carries:
+
+```
+["mac", "hmac-sha256-v1", <epoch>, <zone_pk>, <hex>]
+key = HKDF-SHA256(salt = "nostr-bbs/sealed-search/manifest-mac/v1",
+                  ikm  = zone secret of the newest (epoch, zone_pk) listed,
+                  info = "manifest-mac\0" || zone || "\0" || be32(epoch)
+                         || zone_pk || be64(index_version))
+mac = HMAC-SHA256(key, the event's content string, exactly as signed)
+```
+
+- **Where it is checked.** Browsers and the builder check it with
+  `Manifest::accept` before a manifest is chosen or its version can move the
+  high-water mark. The comparison is constant-time (`verify_slice`).
+- **What it proves.** Any member holding that epoch key could compute it, so it
+  proves "made by someone holding the zone key". With the publisher signature,
+  that restores the v1 property. It does not tell members apart. A searcher
+  without the newest epoch key cannot check it, so cannot use the manifest.
+- **Implementation.** RustCrypto `hkdf`, `hmac` and `sha2`, private to this
+  project.
+- **Bounds.** A browser accepts a version jump of at most 16,384 (44 years of
+  nightly runs) and at most 16,384 excluded ids, applied as a set lookup.
+- **Tie-break.** Equal versions resolve to the first publisher in
+  `SEARCH_PUBLISHERS`, in both the client and the builder.
+
 Updates and compactions always sign `v: 2`. A browser built before this change
 refuses a v2 manifest as unsupported. It then keeps using the newest v1 manifest
 it can find, the archivist's base, so it still works with stale results. It
 never raises its rollback mark to a version it could not load later.
+
+The high-water mark of the relay read moves only on verified events of this
+zone, never past the job's clock. That is stricter than the relay's own bound
+of now + `MAX_CREATED_AT_DRIFT_SECS`: a post dated ahead is read again each run
+until the clock passes it. A second the relay cannot page completely (more than
+1,000 events) holds the mark below it.
 
 A full build (`--manifest-format auto`, the default) signs v1 while no trusted
 publisher holds a v2 manifest for the zone, and v2 once one does. The import
@@ -130,33 +168,37 @@ a time the operator chooses.
 
 ### Deletions and edits (review M5)
 
-- **Deleted on the relay.** A post deleted with a kind-5 by a moderator, or
-  through the admin HTTP API, is removed from the relay. The browser resolves
-  every hit through the relay, so the post stops showing **immediately**.
-- **Excluded in the manifest.** Posts that stay on the relay are listed in the
-  next manifest's `excluded`:
-  - an edited post's original;
-  - a sealed post deleted by its inner (original) id: the relay stores only
-    the envelope, so the kind-5 deletes nothing;
-  - an author's own deletion, if the relay kept the row.
+The relay is untrusted here. Only positive evidence the builder checks itself
+removes a row.
 
-  The worker never returns or uses an excluded row as a decoy, and the main
-  thread drops one too. This takes effect at the **next nightly run**.
-- **Physically removed.** A compaction drops excluded rows, and rows the relay
-  no longer serves, from the shards it folds. `compact --all` does this for
-  every shard.
-
-  With `NBSS_FULL_COMPACT_EXCLUDED_AT=0` (the default), the embeddings of
-  deleted or edited posts that sit in the archivist's full base shards stay in
-  those shards indefinitely. Members cannot see them as hits, but they are in
-  the sealed bytes every member downloads, until an operator runs
-  `compact --all`, which re-uploads the whole index once. Set the threshold to
-  make that automatic.
-
-The builder honours every kind-5 the relay stored. The relay refuses a kind-5
-below trust level 3 unless every target is the signer's own, so a stored kind-5
-is an authorised deletion. Edits count only when the edit's author is the
-target's author; for an imported post, that is the original's author.
+- **Deletions.** A verified kind-5 deletes a row only when its signer is the
+  post's author, or a key in `NBSS_MODERATORS` (admins and moderators,
+  supplied in config). For an imported post, the author is the original's
+  author. The target may be a live post id, an envelope id or an original id.
+  - The author comes from the post itself if it was read this run, else from
+    the job's **author book**, else from the relay. The book records every row
+    id's author and every envelope's original id when the job first opens the
+    post; the first run reads the whole zone, so it covers the base too.
+  - The book matters because the relay removes a post at once on its author's
+    kind-5. Without it, an ordinary author deletion could never be verified
+    afterwards.
+  - A target none of them establishes is skipped this run, never assumed.
+- **Edits.** A post is superseded by a kind-42 tagged `["e", <target>, "",
+  "edit"]` only when the editor is the target's author. A target the relay
+  does not return, and the book does not know, is skipped.
+- **When it shows.** A post the relay no longer serves stops showing
+  **immediately**, because every hit resolves through the relay. Excluded posts
+  are listed in the next manifest's `excluded`, so they take effect at the
+  **next nightly run**. The worker never returns them or uses them as decoys,
+  and the main thread drops them too.
+- **Physical removal.** A compaction drops only excluded rows from the shards it
+  folds. A row the relay merely does not serve, such as one deleted through the
+  admin HTTP API with no kind-5, is kept and counted (`missing_rows`).
+  Withholding must never become a signed, permanent exclusion.
+- **Base shards.** The archivist's full base shards are re-packed only by
+  `compact --all`. By default it runs once 4,096 ids are excluded. Until then,
+  the embeddings of excluded posts in those shards are hidden from members but
+  still sit in the sealed bytes they download.
 
 ### Disclosure
 
@@ -168,8 +210,9 @@ reaches Cloudflare or non-members.
 ### Object lifecycle
 
 - An object that a new manifest stops listing is deleted from the indexer's
-  pod **one run later** (the state's `retired` list). A browser that read the
-  previous manifest can still finish loading it.
+  pod **48 hours later** (`--retire-after-secs`; the state's `retired` list
+  records when). A browser that read the previous manifest can still finish
+  loading it, even if the job is rerun by hand.
 - Browsers cache objects in IndexedDB by SHA-256. An object listed unchanged is
   never fetched again.
 - On a new version the worker re-reads the bin layers from that cache, about
@@ -183,7 +226,9 @@ reaches Cloudflare or non-members.
 | Base objects (`b-5-N-v1.age`, `q-5-N-v1.age`) and the archivist's `m.json` (v1) | `pods/<archivist>/media/zones/zone2/search/` | Zone members (pod zone read gate) |
 | Update and compacted objects, the indexer's `m.json` (v2) | `pods/<indexer>/media/zones/zone2/search/` | Zone members |
 | Indexer key | `NBSS_KEY_FILE` (0600) on the job machine | The job user |
-| State file (`<zone>.state.json`): high-water mark, last version, retired names | `NBSS_STATE_DIR` (0600) | The job user |
+| State file (`<zone>.state.json`): high-water mark, last version, retired names with times | `NBSS_STATE_DIR` (0600) | The job user |
+| Author book (`<zone>.state.authors.json`): row id → author, envelope id → original id; no text | `NBSS_STATE_DIR` (0600) | The job user |
+| Zone-key file, if used instead of grants (`NBSS_KEYS_FILE`) | 0600, checked by the job and the builder | The job user |
 | Object cache (`<zone>.cache/<sha256>`): sealed bytes only | `NBSS_STATE_DIR` | The job user |
 | Log (`<zone>.log`): JSON counts | `NBSS_STATE_DIR` | The job user |
 

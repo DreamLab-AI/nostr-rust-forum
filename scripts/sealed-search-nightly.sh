@@ -27,19 +27,23 @@
 #   NBSS_ORIGIN         Origin header for the relay (default http://localhost)
 #   NBSS_COMPACT_AT     compact when this many partial shard pairs exist (default 14)
 #   NBSS_FULL_COMPACT_EXCLUDED_AT
-#                       compact --all when this many ids are excluded (default 0: never)
+#                       compact --all when this many ids are excluded (default 4096, a
+#                       quarter of the manifest's cap of 16384; 0 disables it)
 #   NBSS_TIMEOUT        seconds the whole job may take (default 3600)
+#   NBSS_MODERATORS     comma-separated admin/moderator pubkeys whose kind-5 deletes
+#                       any post (default: none; authors still delete their own)
 #   NBSS_WORKERS        embedding threads (default: the builder's, half the CPUs)
 #
 # Exit codes:
 #   0  done (published, or nothing new)
 #   3  published, but posts under an epoch the indexer holds no key for were
 #      held back (grant the epoch; the next run picks them up)
-#   1, 4, 5, 6, 7  the builder's: error; relay not NIP-42 authenticated;
-#      compaction found too many rows missing from the relay; the pods show an
-#      older index than the state recorded (rollback or withholding); the relay
-#      serves none of the zone's indexed posts to the indexer (not admitted to
-#      the zone's cohorts)
+#   1, 4, 6, 7, 8  the builder's: error; relay not NIP-42 authenticated; the
+#      pods show an older index than the state recorded (rollback or
+#      withholding); the relay serves none of the zone's indexed posts to the
+#      indexer (not admitted to the zone's cohorts); the exclusion list would
+#      pass its cap (run compact --all)
+#   (5 is retired: compaction no longer refuses on rows the relay does not serve)
 #   10 another run holds the lock
 #   11 timed out
 #   12 configuration error
@@ -61,6 +65,12 @@ mode="$(stat -c %a "$config")"
 case "$mode" in
   *[2367]? | *[2367]) die_config "$config is writable by group or others (mode $mode)" ;;
 esac
+# Nor may anyone else replace it: its directory must not be group/other writable.
+config_dir="$(dirname "$config")"
+dir_mode="$(stat -c %a "$config_dir")"
+case "$dir_mode" in
+  *[2367]? | *[2367]) die_config "$config_dir is writable by group or others (mode $dir_mode)" ;;
+esac
 # shellcheck source=/dev/null
 . "$config"
 
@@ -72,12 +82,19 @@ for v in NBSS_ZONE NBSS_PUBLISHERS NBSS_KEY_FILE NBSS_STATE_DIR NBSS_MODEL_DIR N
 done
 [ -n "${NBSS_POD:-}${NBSS_POD_DIR:-}" ] || die_config "NBSS_POD (or NBSS_POD_DIR) is not set"
 [ -f "$NBSS_KEY_FILE" ] || die_config "no key file $NBSS_KEY_FILE"
-case "$(stat -c %a "$NBSS_KEY_FILE")" in
-  ?00 | 400 | 600) ;;
-  *) die_config "$NBSS_KEY_FILE must be mode 0600" ;;
-esac
+owner_only() {
+  case "$(stat -c %a "$1")" in
+    ?00) ;;
+    *) die_config "$1 must be mode 0600 (it holds secrets)" ;;
+  esac
+}
+owner_only "$NBSS_KEY_FILE"
+if [ -n "${NBSS_KEYS_FILE:-}" ]; then
+  [ -f "$NBSS_KEYS_FILE" ] || die_config "no zone-key file $NBSS_KEYS_FILE"
+  owner_only "$NBSS_KEYS_FILE"
+fi
 compact_at="${NBSS_COMPACT_AT:-14}"
-full_at="${NBSS_FULL_COMPACT_EXCLUDED_AT:-0}"
+full_at="${NBSS_FULL_COMPACT_EXCLUDED_AT:-4096}"
 budget="${NBSS_TIMEOUT:-3600}"
 for n in "$compact_at" "$full_at" "$budget"; do
   [[ "$n" =~ ^[0-9]+$ ]] || die_config "NBSS_COMPACT_AT, NBSS_FULL_COMPACT_EXCLUDED_AT and NBSS_TIMEOUT must be whole numbers"
@@ -122,6 +139,9 @@ if [ -n "${NBSS_KEYS_FILE:-}" ]; then
   common+=(--keys-file "$NBSS_KEYS_FILE")
 else
   common+=(--fetch-grants)
+fi
+if [ -n "${NBSS_MODERATORS:-}" ]; then
+  common+=(--moderators "$NBSS_MODERATORS")
 fi
 if [ -n "${NBSS_WORKERS:-}" ]; then
   common+=(--workers "$NBSS_WORKERS")

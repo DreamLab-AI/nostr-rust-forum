@@ -22,7 +22,7 @@ use nostr_bbs_search_build::harvest::harvest;
 use nostr_bbs_search_build::memrelay::MemRelay;
 use nostr_bbs_search_build::pipeline::{
     run_compact, run_full, run_update, status, Fold, Format, Job, JobError, Pins, Report,
-    DEFAULT_MAX_MISSING, DEFAULT_OVERLAP_SECS,
+    DEFAULT_OVERLAP_SECS,
 };
 use nostr_bbs_search_build::pod::DirPod;
 use nostr_bbs_search_build::state::State;
@@ -178,6 +178,8 @@ fn pins() -> Pins {
 
 struct Fixture {
     root: PathBuf,
+    /// The indexer's author book (kept with its state between runs).
+    book: nostr_bbs_search_build::harvest::AuthorBook,
     relay: MemRelay,
     publishers: Vec<String>,
     /// Imported originals by text, and live posts by text.
@@ -216,6 +218,7 @@ fn fixture(name: &str) -> Fixture {
     }
     let publishers = vec![pk(ARCHIVIST), pk(INDEXER)];
     let mut f = Fixture {
+        book: Default::default(),
         root,
         relay,
         publishers,
@@ -235,6 +238,7 @@ fn fixture(name: &str) -> Fixture {
         None,
         &HashSet::new(),
         &rules(),
+        &mut Default::default(),
     ))
     .unwrap();
     assert_eq!(h.rows.len(), 115);
@@ -312,6 +316,7 @@ fn update_with(f: &mut Fixture, state: &mut State, o: &Opts) -> Result<Report, J
         &mut j,
         &mut f.relay,
         state,
+        &mut f.book,
         &mut HashEmbedder { calls: 0 },
         None,
         DEFAULT_OVERLAP_SECS,
@@ -334,21 +339,12 @@ fn indexer<T>(
 }
 
 fn update(f: &mut Fixture, state: &mut State) -> Result<Report, JobError> {
-    indexer(f, state, |j, r, s| {
-        block_on(run_update(
-            j,
-            r,
-            s,
-            &mut HashEmbedder { calls: 0 },
-            None,
-            DEFAULT_OVERLAP_SECS,
-        ))
-    })
+    update_with(f, state, &Opts::default())
 }
 
 fn compact_partial(f: &mut Fixture, state: &mut State) -> Result<Report, JobError> {
     indexer(f, state, |j, r, s| {
-        block_on(run_compact(j, r, s, Fold::Partial, DEFAULT_MAX_MISSING))
+        block_on(run_compact(j, r, s, Fold::Partial))
     })
 }
 
@@ -362,7 +358,10 @@ fn browser_manifest(f: &Fixture, hw: Option<&HighWater>) -> Manifest {
             continue;
         };
         let ev: NostrEvent = serde_json::from_slice(&bytes).unwrap();
-        if let Ok(m) = Manifest::verify(ev, ZONE, RELAY, &f.publishers, hw) {
+        let secret = |e: u32, p: &str| {
+            (e == 1 && p == pk(ZONE_E1)).then(|| zeroize::Zeroizing::new(ZONE_E1))
+        };
+        if let Ok(m) = Manifest::accept(ev, ZONE, RELAY, &f.publishers, hw, secret) {
             if best
                 .as_ref()
                 .is_none_or(|b| m.content.index_version > b.content.index_version)
@@ -501,7 +500,7 @@ fn an_update_by_the_indexer_shares_the_archivists_base_and_finds_new_posts_not_d
     // removes the envelope), imported post 5 by its inner id (the envelope
     // stays on the relay), live post 105 by its own id.
     let (orig3, env3) = f.originals[&base_text(3)].clone();
-    f.relay.insert(kind5(ALICE, t1 + 60, &env3.id));
+    f.relay.insert(kind5(STRANGER, t1 + 60, &env3.id));
     f.relay.remove(&env3.id);
     let (orig5, _) = f.originals[&base_text(5)].clone();
     f.relay.insert(kind5(BOB, t1 + 61, &orig5.id));
@@ -513,7 +512,12 @@ fn an_update_by_the_indexer_shares_the_archivists_base_and_finds_new_posts_not_d
     f.relay.insert(doomed.clone());
     f.relay.insert(kind5(BOB, t1 + 71, &doomed.id));
 
-    let r = update(&mut f, &mut state).unwrap();
+    // STRANGER is a configured moderator (it deleted post 3's envelope).
+    let mods = Opts {
+        moderators: vec![pk(STRANGER)],
+        ..Opts::default()
+    };
+    let r = update_with(&mut f, &mut state, &mods).unwrap();
     assert!(r.published);
     assert_eq!(r.index_version, Some(2));
     assert_eq!(
@@ -521,12 +525,14 @@ fn an_update_by_the_indexer_shares_the_archivists_base_and_finds_new_posts_not_d
         30 + 2,
         "30 fresh posts, the edit, and Bob's ignored edit post itself"
     );
-    // Post 3's kind-5 names an envelope the relay has removed, so it cannot
-    // be mapped to the original; the relay no longer serves it, so no
-    // browser shows it (and the next compaction drops its row).
-    assert_eq!(r.excluded_added, 3, "posts 5, 10 (superseded) and 105");
+    // Post 3's kind-5 names an envelope the relay has removed, and post 105
+    // is gone from the relay too: the job's author book (filled when it
+    // opened them) still establishes their authors, so the authors'
+    // deletions count.
+    assert_eq!(r.excluded_added, 4, "posts 3, 5, 10 (superseded) and 105");
     assert_eq!(state.index_version, Some(2));
-    assert_eq!(state.high_water, Some(t1 + 71));
+    // Kind-5s do not move the mark; the newest zone post does.
+    assert_eq!(state.high_water, Some(t1 + 70));
 
     // The archivist's pod was not touched.
     assert_eq!(files(&f, ARCHIVIST), archivist_files);
@@ -578,16 +584,14 @@ fn an_update_by_the_indexer_shares_the_archivists_base_and_finds_new_posts_not_d
         assert!(new_ids.contains_key(&top), "{text}");
     }
     let top = |text: &str| search(&l, text)[0].clone();
-    // Excluded posts are never returned by the index; post 3 is still in the
-    // index but the relay no longer serves it, so it is never shown.
+    // Excluded posts are never returned by the index, nor shown.
     for text in [base_text(3), base_text(5), base_text(10), base_text(105)] {
         let hits = search(&l, &text);
-        for gone in [&orig5.id, &orig10.id, &live105.id] {
+        for gone in [&orig3.id, &orig5.id, &orig10.id, &live105.id] {
             assert!(!hits.contains(gone), "{text}");
         }
         assert!(!shown(&mut f, &l, &text).contains(&orig3.id));
     }
-    assert!(search(&l, &base_text(3)).contains(&orig3.id));
     // The edit is found under its own id; post 12 is still Alice's original.
     let corrected = top("base post number 10, corrected");
     assert_ne!(corrected, orig10.id);
@@ -683,7 +687,7 @@ fn compaction_folds_update_shards_drops_gone_rows_and_retires_objects_a_run_late
     // version 4 can still load it.
     assert_eq!(state.retired.len(), 4);
     let own = files(&f, INDEXER);
-    assert!(state.retired.iter().all(|n| own.contains_key(n)));
+    assert!(state.retired.iter().all(|r| own.contains_key(&r.name)));
     // A run straight after (a manual rerun) keeps them: the grace period is
     // a duration, not a number of runs.
     let r = update(&mut f, &mut state).unwrap();
@@ -708,7 +712,7 @@ fn compaction_folds_update_shards_drops_gone_rows_and_retires_objects_a_run_late
 
     // compact --all re-homes everything: no archivist object is referenced.
     let r = indexer(&mut f, &mut state, |j, rl, s| {
-        block_on(run_compact(j, rl, s, Fold::All, DEFAULT_MAX_MISSING))
+        block_on(run_compact(j, rl, s, Fold::All))
     })
     .unwrap();
     assert!(r.published);
@@ -743,6 +747,7 @@ fn refusals_keep_the_index_and_the_high_water_mark() {
             j,
             &mut anon,
             s,
+            &mut Default::default(),
             &mut HashEmbedder { calls: 0 },
             None,
             0,
@@ -810,6 +815,7 @@ fn a_zone_the_relay_withholds_is_refused_not_read_as_empty() {
             j,
             &mut gated,
             s,
+            &mut Default::default(),
             &mut HashEmbedder { calls: 0 },
             None,
             0,
@@ -819,13 +825,7 @@ fn a_zone_the_relay_withholds_is_refused_not_read_as_empty() {
     assert_eq!(e.exit_code(), 7, "{e}");
     assert_eq!(state.high_water, None);
     let e = indexer(&mut f, &mut state, |j, _, s| {
-        block_on(run_compact(
-            j,
-            &mut gated,
-            s,
-            Fold::All,
-            DEFAULT_MAX_MISSING,
-        ))
+        block_on(run_compact(j, &mut gated, s, Fold::All))
     })
     .unwrap_err();
     assert_eq!(e.exit_code(), 7, "{e}");
@@ -870,6 +870,7 @@ fn a_full_build_after_a_v2_manifest_is_v2_and_small_folds_tolerate_a_few_gone_ro
         None,
         &HashSet::new(),
         &rules(),
+        &mut Default::default(),
     ))
     .unwrap();
     let rows = std::mem::take(&mut h.rows);
@@ -906,6 +907,7 @@ fn an_update_with_another_local_model_is_refused() {
         &mut j,
         &mut f.relay,
         &mut state,
+        &mut f.book,
         &mut HashEmbedder { calls: 0 },
         None,
         0,
@@ -974,6 +976,7 @@ fn a_second_the_relay_cannot_page_holds_the_mark_below_it() {
         Some(T0),
         &HashSet::new(),
         &rules(),
+        &mut Default::default(),
     ))
     .unwrap();
     assert_eq!(h.ambiguous_seconds, vec![s]);
@@ -1041,6 +1044,7 @@ fn equal_versions_resolve_to_the_first_listed_publisher_in_the_builder_too() {
             None,
             &HashSet::new(),
             &rules(),
+            &mut Default::default(),
         ))
         .unwrap();
         let rows = std::mem::take(&mut h.rows);

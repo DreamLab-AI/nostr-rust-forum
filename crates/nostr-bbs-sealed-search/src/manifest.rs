@@ -31,6 +31,22 @@
 //! `(epoch, zone_pk, shard, kind)`; every excluded id is 64 lowercase hex, and
 //! there are at most [`MAX_EXCLUDED`] of them. A v1 manifest carrying any v2
 //! field is refused, so an older browser can never misread one.
+//!
+//! # The v2 zone-key MAC
+//!
+//! In v1, a manifest at a higher version must list objects sealed at that
+//! version, which takes the zone key: a listed publisher key alone cannot
+//! move browsers forward. v2 lets a manifest list existing objects at any
+//! version, so it also carries `["mac", "hmac-sha256-v1", <epoch>, <zone_pk>,
+//! <hex>]`: an HMAC over the signed content string, keyed by HKDF from the
+//! zone key of the newest epoch listed, with the zone, epoch, zone key and
+//! `index_version` bound in ([`crate::kdf::manifest_mac`]).
+//! [`Manifest::accept`] checks it before a searcher uses the manifest or
+//! moves its high-water mark; [`Manifest::verify`] checks only that the tag
+//! is there and names that epoch. Every member holding that epoch key could
+//! compute it, so it proves "made by someone holding the zone key", and with
+//! the publisher signature that restores the v1 property. A searcher without
+//! that epoch key cannot check it and so cannot use the manifest.
 
 use nostr_bbs_core::event::{verify_event_strict, NostrEvent};
 use serde::{Deserialize, Serialize};
@@ -57,10 +73,14 @@ pub const KIND: u64 = 30078;
 pub const V1: u32 = 1;
 /// Content version with per-object `owner` and `version`, and `excluded`.
 pub const V2: u32 = 2;
-/// Most excluded ids one manifest may list.
-pub const MAX_EXCLUDED: usize = 1 << 17;
-/// Largest accepted version jump (M2).
-pub const MAX_VERSION_JUMP: u64 = 1 << 20;
+/// Most excluded ids one manifest may list (about 1.1 MB of JSON; checked as a
+/// set). The builder empties the list by compaction long before it.
+pub const MAX_EXCLUDED: usize = 1 << 14;
+/// Largest accepted version jump (M2): 16,384 versions, 44 years of nightly
+/// runs (a compaction is one version). With the v2 MAC a higher version needs
+/// the zone key, as in v1; the bound limits how far even that can move a
+/// browser's rollback mark at once.
+pub const MAX_VERSION_JUMP: u64 = 1 << 14;
 
 /// `d` tag value for a zone.
 pub fn d_tag(zone: &str) -> String {
@@ -225,6 +245,12 @@ impl Manifest {
             return Err("unsupported manifest content".into());
         }
         check_version_rules(&content, publishers)?;
+        if content.v == V2 {
+            if content.objects.is_empty() {
+                return Err("a v2 manifest lists at least one object".into());
+            }
+            mac_tag(&ev, &content)?;
+        }
         let pks: Vec<(u32, String)> = tag(&ev, "zone_pk")
             .filter_map(|t| Some((t.get(1)?.parse().ok()?, t.get(2)?.to_lowercase())))
             .collect();
@@ -264,8 +290,67 @@ impl Manifest {
         high_water: Option<&HighWater>,
         secret_for: impl Fn(u32, &str) -> Option<zeroize::Zeroizing<[u8; 32]>>,
     ) -> Result<Self, String> {
-        let _ = &secret_for;
-        Self::verify(ev, zone, relay_url, publishers, high_water)
+        let m = Self::verify(ev, zone, relay_url, publishers, high_water)?;
+        if m.content.v == V2 {
+            let (epoch, pk, mac) = mac_tag(&m.event, &m.content)?;
+            let secret = secret_for(epoch, &pk).ok_or_else(|| {
+                format!("no zone key for epoch {epoch} to check the manifest MAC")
+            })?;
+            let pkb: [u8; 32] = hex::decode(&pk)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or("bad zone_pk in the mac tag")?;
+            if !crate::kdf::verify_manifest_mac(
+                &secret,
+                zone,
+                epoch,
+                &pkb,
+                m.content.index_version,
+                m.event.content.as_bytes(),
+                &mac,
+            ) {
+                return Err("manifest MAC does not verify with the zone key".into());
+            }
+        }
+        Ok(m)
+    }
+
+    /// The tags of a v2 manifest whose content string is `content_json`
+    /// (exactly as it will be signed): [`Manifest::tags`] plus the zone-key
+    /// MAC, keyed from `zone_secret`, the secret of the newest epoch the
+    /// content lists ([`mac_slot`]).
+    ///
+    /// # Errors
+    ///
+    /// When the content lists no object.
+    pub fn tags_v2(
+        content: &Content,
+        content_json: &str,
+        relay_url: &str,
+        zone_secret: &[u8; 32],
+    ) -> Result<Vec<Vec<String>>, String> {
+        let (epoch, pk) = mac_slot(content).ok_or("a v2 manifest lists at least one object")?;
+        let pkb: [u8; 32] = hex::decode(&pk)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or("bad zone_pk")?;
+        let mac = crate::kdf::manifest_mac(
+            zone_secret,
+            &content.zone,
+            epoch,
+            &pkb,
+            content.index_version,
+            content_json.as_bytes(),
+        );
+        let mut t = Self::tags(content, relay_url);
+        t.push(vec![
+            "mac".into(),
+            crate::kdf::MAC_ALG.into(),
+            epoch.to_string(),
+            pk,
+            hex::encode(mac),
+        ]);
+        Ok(t)
     }
 
     /// The newest of `candidates` (given in trusted-publisher order): the
@@ -296,6 +381,41 @@ impl Manifest {
             event_id: self.event.id.clone(),
         }
     }
+}
+
+/// The `(epoch, lowercase zone_pk)` whose zone key keys a v2 manifest's MAC:
+/// the newest epoch the content lists (the highest zone_pk among equals).
+pub fn mac_slot(content: &Content) -> Option<(u32, String)> {
+    content
+        .objects
+        .iter()
+        .map(|o| (o.epoch, o.zone_pk.to_lowercase()))
+        .max()
+}
+
+/// The single well-formed `["mac", alg, epoch, zone_pk, hex]` tag of a v2
+/// manifest, naming [`mac_slot`]: `(epoch, zone_pk, mac bytes)`.
+fn mac_tag(ev: &NostrEvent, content: &Content) -> Result<(u32, String, Vec<u8>), String> {
+    let tags: Vec<&Vec<String>> = tag(ev, "mac").collect();
+    let [t] = tags.as_slice() else {
+        return Err("a v2 manifest carries exactly one mac tag".into());
+    };
+    let (Some(alg), Some(epoch), Some(pk), Some(mac)) = (t.get(1), t.get(2), t.get(3), t.get(4))
+    else {
+        return Err("malformed mac tag".into());
+    };
+    let epoch: u32 = epoch.parse().map_err(|_| "malformed mac tag")?;
+    if alg != crate::kdf::MAC_ALG || !is_hex64_lower(pk) || !is_hex64_lower(mac) {
+        return Err("malformed mac tag".into());
+    }
+    if mac_slot(content) != Some((epoch, pk.clone())) {
+        return Err("the mac tag does not name the newest epoch listed".into());
+    }
+    Ok((
+        epoch,
+        pk.clone(),
+        hex::decode(mac).map_err(|_| "malformed mac tag")?,
+    ))
 }
 
 fn is_hex64_lower(s: &str) -> bool {
@@ -395,15 +515,23 @@ mod tests {
         k256::schnorr::SigningKey::from_bytes((&[b; 32]).into()).unwrap()
     }
 
+    /// Signed by test key `key`; a v2 content also carries the MAC made with
+    /// the test zone secret.
     fn signed(key: u8, content: &Content, relay: &str) -> NostrEvent {
         let k = sk(key);
         let pk = hex::encode(k.verifying_key().to_bytes());
+        let json = serde_json::to_string(content).unwrap();
+        let tags = if content.v == V2 {
+            Manifest::tags_v2(content, &json, relay, &ZSECRET).unwrap()
+        } else {
+            Manifest::tags(content, relay)
+        };
         let ev = UnsignedEvent {
             pubkey: pk,
             created_at: 1,
             kind: KIND,
-            tags: Manifest::tags(content, relay),
-            content: serde_json::to_string(content).unwrap(),
+            tags,
+            content: json,
         };
         sign_event_deterministic(ev, &k).unwrap()
     }

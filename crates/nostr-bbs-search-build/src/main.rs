@@ -62,7 +62,7 @@ mod native {
     use nostr_bbs_search_build::memrelay::MemRelay;
     use nostr_bbs_search_build::pipeline::{
         run_compact, run_full, run_update, status, Fold, Format, Job, JobError, Pins,
-        DEFAULT_MAX_MISSING, DEFAULT_OVERLAP_SECS,
+        DEFAULT_OVERLAP_SECS,
     };
     use nostr_bbs_search_build::pod::{DirPod, DryRun, HttpPod, ObjectCache, Pod};
     use nostr_bbs_search_build::secrets::load_identity;
@@ -139,9 +139,6 @@ mod native {
         /// Update: seconds re-read before the high-water mark.
         #[arg(long, global = true, default_value_t = DEFAULT_OVERLAP_SECS)]
         overlap_secs: u64,
-        /// Compact: largest share of folded rows that may be missing from the relay.
-        #[arg(long, global = true, default_value_t = DEFAULT_MAX_MISSING)]
-        max_missing: f64,
         /// Full build: manifest content version. `auto` signs v1 while no
         /// trusted publisher holds a v2 manifest for the zone, v2 once one does.
         #[arg(long, global = true, value_enum, default_value_t = ManifestFormat::Auto)]
@@ -357,6 +354,8 @@ mod native {
     async fn load_keys(cli: &Cli, me: &SecretKey) -> Result<KeyRing, Fail> {
         let mut ring = KeyRing::new();
         if let Some(path) = &cli.keys_file {
+            nostr_bbs_search_build::secrets::ensure_owner_only(path, "keys file")
+                .map_err(|e| Fail(e, 2))?;
             let text = Zeroizing::new(io(std::fs::read_to_string(path))?);
             for key in io(parse_key_file(&text))?.keys {
                 io(ring.insert(key))?;
@@ -445,6 +444,13 @@ mod native {
         if cli.dump_vectors.is_some() && !cli.dry_run {
             return Err(Fail("--dump-vectors requires --dry-run".into(), 2));
         }
+        if cli.dump_vectors.is_some() && (cli.input.is_none() || cli.cmd.is_some()) {
+            return Err(Fail(
+                "--dump-vectors is only for a full build from --input: rows read from a relay or an export are never written"
+                    .into(),
+                2,
+            ));
+        }
         let inner = match (&cli.pod_dir, &cli.pod) {
             (Some(dir), _) => AnyPod::Dir(DirPod::new(dir, &zone, &publisher)),
             (None, Some(url)) => AnyPod::Http(HttpPod::new(url, &zone, &me)?),
@@ -478,6 +484,11 @@ mod native {
         let cache = cli.cache_dir.as_deref().map(ObjectCache::new);
         let now = io(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))?.as_secs();
         let state_path: Option<&Path> = cli.state.as_deref();
+        let book_path = state_path.map(|p| p.with_extension("authors.json"));
+        let mut book = match &book_path {
+            Some(p) => nostr_bbs_search_build::harvest::AuthorBook::load(p)?,
+            None => Default::default(),
+        };
         let mut state = match state_path {
             Some(p) => Some(State::load_or_new(p, zone, relay_url, &publisher)?),
             None => None,
@@ -539,6 +550,7 @@ mod native {
                     &mut job,
                     &mut relay,
                     st,
+                    &mut book,
                     &mut emb,
                     cli.since,
                     cli.overlap_secs,
@@ -553,7 +565,7 @@ mod native {
                     .as_mut()
                     .ok_or_else(|| Fail("compact needs --state".into(), 2))?;
                 let fold = if *all { Fold::All } else { Fold::Partial };
-                run_compact(&mut job, &mut relay, st, fold, cli.max_missing).await?
+                run_compact(&mut job, &mut relay, st, fold).await?
             }
             Some(Cmd::ModelQ8) => unreachable!("handled before the job is set up"),
             None => {
@@ -609,9 +621,17 @@ mod native {
                         now,
                         moderators: &moderators,
                     };
-                    let mut h = harvest(&mut relay, zone, &ring, None, &HashSet::new(), &rules)
-                        .await
-                        .map_err(JobError::from)?;
+                    let mut h = harvest(
+                        &mut relay,
+                        zone,
+                        &ring,
+                        None,
+                        &HashSet::new(),
+                        &rules,
+                        &mut book,
+                    )
+                    .await
+                    .map_err(JobError::from)?;
                     let rows = std::mem::take(&mut h.rows);
                     run_full(
                         &mut job,
@@ -630,7 +650,7 @@ mod native {
                         .iter()
                         .flat_map(|v| v.iter().flat_map(|x| x.to_le_bytes()))
                         .collect();
-                    io(std::fs::write(p, bytes))?;
+                    nostr_bbs_search_build::secrets::write_owner_only(p, &bytes)?;
                 }
                 report
             }
@@ -640,6 +660,9 @@ mod native {
             if let (Some(p), Some(s)) = (state_path, state.as_mut()) {
                 s.updated_at = now;
                 s.save(p)?;
+            }
+            if let Some(p) = &book_path {
+                book.save(p)?;
             }
         }
         print_json(&report)?;

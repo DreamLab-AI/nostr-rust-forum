@@ -30,8 +30,8 @@ steps: [`docs/runbooks/sealed-search-incremental.md`](docs/runbooks/sealed-searc
 - **Builder.** `nostr-bbs-search-build` is now a library plus binary. `--from-relay` (or `--from-events`, a NIP-01
   export) reads and opens a zone's posts in memory: live posts by their own id, sealed originals by the original id;
   deleted (kind-5) and superseded (edited) posts left out. New `update` (seal only new rows, list earlier objects
-  unchanged, exclude deleted or edited indexed posts), `compact [--all]` (re-pack shards verbatim, drop excluded rows and
-  rows the relay no longer serves, refuse when more than 5% are missing), and `status`. State file with the high-water
+  unchanged, exclude deleted or edited indexed posts), `compact [--all]` (re-pack shards verbatim, drop excluded rows
+  only), and `status`. State file with the high-water
   mark, rollback check against the last version published, and a one-run grace period before superseded objects are
   deleted. An update refuses (exit 7) when the relay serves none of the zone's indexed posts to the indexer (the zone
   read gate withholds silently). Full builds sign v1 while no trusted publisher holds a v2 manifest for the zone, v2
@@ -42,6 +42,20 @@ steps: [`docs/runbooks/sealed-search-incremental.md`](docs/runbooks/sealed-searc
   are dropped (the worker's `Index` already skips them). The IndexedDB cache was already keyed by SHA-256, so objects a
   new manifest lists unchanged are not fetched again.
 - **zone-migrate.** `Filter` gains `since` and `#sealed`.
+- **Security review of #126.**
+  - v2 manifests carry a zone-key MAC (HKDF-SHA256 then HMAC-SHA256 over the signed content, keyed from the newest
+    epoch listed), checked by `Manifest::accept` in the client and the builder before a manifest is used.
+  - Version jumps are bounded at 16,384 and exclusion lists at 16,384 ids (a set lookup).
+  - Deletions need the post's author (from the post, the job's author book or the relay) or a configured moderator
+    (`--moderators`). Edits of posts whose author is unknown are skipped. Compaction drops only excluded rows.
+  - The high-water mark moves only on verified in-zone events, never past the job's clock, and stays below seconds
+    the relay cannot page.
+  - Exit 8 for a full exclusion list; `compact --all` runs by default at 4,096 exclusions.
+  - The grace period before deleting superseded objects is 48 hours (state v2). The state file is written through an
+    exclusive 0600 temporary file.
+  - `--keys-file` and `NBSS_KEYS_FILE` must be 0600, and the nightly config's directory must not be writable by
+    others. `--dump-vectors` works only with `--input` and writes 0600.
+  - Equal-version manifests resolve to the first listed publisher everywhere.
 - **Job.** `scripts/sealed-search-nightly.sh`: update, then compact when enough partial shard pairs exist; lock,
   time budget, distinct exit codes, no secrets in argv.
 

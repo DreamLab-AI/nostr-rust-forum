@@ -17,17 +17,27 @@
 //! and a held key whose pubkey matches, and it must open. Rows are left out
 //! when the post is:
 //!
-//! - **deleted**: named by a kind-5 the relay stored. The relay refuses a
-//!   kind-5 below trust level 3 unless every target is the signer's own, so
-//!   a stored kind-5 is an authorised deletion. A target may be a live post's
-//!   id, an envelope's id, or an original's (inner) id; all three map to the
-//!   row. (Moderator deletes physically remove the event as well; deletes
-//!   through the admin HTTP API leave no kind-5 and are caught when a
-//!   compaction finds the post gone.)
+//! - **deleted**: named by a verified kind-5 whose signer wrote the post (for
+//!   an imported post, the original's author) or is a configured moderator
+//!   ([`Rules::moderators`]). The relay is not trusted to have gated it. A
+//!   target may be a live post's id, an envelope's id, or an original's
+//!   (inner) id; all three map to the row. The author comes from the post
+//!   itself when read this run, else from the job's [`AuthorBook`] (what it
+//!   saw when it opened the post earlier), else from the relay; a target whose
+//!   author none of them establishes is skipped. (Deletes through the admin HTTP
+//!   API leave no kind-5: the relay stops serving the post, so no member sees
+//!   it, but its row stays until positive evidence arrives.)
 //! - **superseded**: the target of an edit, a kind-42 tagged
 //!   `["e", <target>, "", "edit"]` by the target's own author (for an
 //!   envelope, the original's author). Chains resolve edge by edge: each
-//!   edit supersedes the post it names.
+//!   edit supersedes the post it names. A target the relay does not return
+//!   this run is skipped.
+//!
+//! Only verified events of this zone move the high-water mark, never past
+//! [`Rules::now`] (stricter than the relay's own bound of now +
+//! `MAX_CREATED_AT_DRIFT_SECS`, so a post dated ahead is read again every run
+//! until the clock passes it); a second the relay cannot page completely
+//! ([`Harvest::ambiguous_seconds`]) holds the mark below it.
 //! - **already indexed** (the overlap between runs).
 //!
 //! A post under an epoch whose key the indexer does not hold is not an
@@ -96,6 +106,47 @@ pub struct Rules<'a> {
     pub moderators: &'a [String],
 }
 
+/// What the job has seen of posts it opened: each row id's author and each
+/// envelope id's original id. It holds no text: the relay already serves the
+/// same facts (the event's `pubkey`, the envelope's `sealed` tag). It lets a
+/// deletion's authority be checked after the relay has removed the post
+/// (which it does at once for an author's own kind-5).
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuthorBook {
+    /// Row id → author pubkey (an original's author for an imported post).
+    pub authors: HashMap<String, String>,
+    /// Envelope id → original (row) id.
+    pub envelopes: HashMap<String, String>,
+}
+
+impl AuthorBook {
+    /// Read `path`, or an empty book when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// When the file exists but cannot be read or parsed.
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        match std::fs::read(path) {
+            Ok(b) => serde_json::from_slice(&b)
+                .map_err(|e| format!("author book {} is malformed: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("author book {}: {e}", path.display())),
+        }
+    }
+
+    /// Write the book to `path` (mode 0600, through a fresh temporary file).
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be written.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        crate::secrets::write_owner_only(&tmp, &json)?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
 /// What a harvest found. Counts only: no text.
 #[derive(Debug, Default)]
 pub struct Harvest {
@@ -136,12 +187,17 @@ pub struct Harvest {
 }
 
 impl Harvest {
-    /// The high-water mark this harvest supports: the newest event read (and
-    /// never below `prior`), unless an event was held back for want of a key:
-    /// then just below it, even if that is below `prior`, so the next run reads
-    /// it again however old it is (a reconcile can find old ones).
+    /// The high-water mark this harvest supports: the newest verified event
+    /// of the zone read (capped at the job's clock, and never below `prior`),
+    /// unless an event was held back for want of a key, or a second could not
+    /// be paged completely: then just below the oldest such, even if that is
+    /// below `prior`, so the next run reads it again however old it is.
     pub fn high_water(&self, prior: Option<u64>) -> Option<u64> {
-        if let Some(h) = self.hold_back {
+        let hold = [self.hold_back, self.ambiguous_seconds.first().copied()]
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some(h) = hold {
             return Some(h.saturating_sub(1));
         }
         match (self.newest, prior) {
@@ -355,8 +411,8 @@ pub async fn harvest<R: Relay>(
     since: Option<u64>,
     indexed: &HashSet<String>,
     rules: &Rules<'_>,
+    book: &mut AuthorBook,
 ) -> Result<Harvest, HarvestError> {
-    let _ = rules;
     if !relay.session_authenticated() {
         return Err(HarvestError::Unauthenticated);
     }
@@ -369,8 +425,7 @@ pub async fn harvest<R: Relay>(
             ..Filter::default()
         },
     )
-    .await?
-    .events;
+    .await?;
     let dels = fetch_all(
         relay,
         &Filter {
@@ -379,11 +434,20 @@ pub async fn harvest<R: Relay>(
             ..Filter::default()
         },
     )
-    .await?
-    .events;
+    .await?;
+    let mut ambiguous: Vec<u64> = posts
+        .ambiguous_seconds
+        .iter()
+        .chain(dels.ambiguous_seconds.iter())
+        .copied()
+        .collect();
+    ambiguous.sort_unstable();
+    ambiguous.dedup();
+    let (posts, dels) = (posts.events, dels.events);
     let mut h = Harvest {
         events: posts.len(),
         deletions: dels.len(),
+        ambiguous_seconds: ambiguous,
         ..Harvest::default()
     };
     let mut opener = Opener {
@@ -391,20 +455,30 @@ pub async fn harvest<R: Relay>(
         ring,
         conv: HashMap::new(),
     };
+    // Only a verified event of this zone moves the mark, and never past the
+    // job's clock: a relay cannot push it beyond the posts it still owes.
+    let seen = |h: &mut Harvest, at: u64| {
+        h.newest = Some(h.newest.unwrap_or(0).max(at.min(rules.now)));
+    };
     let mut recs: HashMap<String, Rec> = HashMap::new();
     let mut env_to_inner: HashMap<String, String> = HashMap::new();
     for ev in &posts {
-        h.newest = Some(h.newest.unwrap_or(0).max(ev.created_at));
         if verify_event_strict(ev).is_err() {
             h.invalid += 1;
             continue;
         }
         match opener.open(ev) {
             Opened::Post(id, author, text, edit_of) => {
+                seen(&mut h, ev.created_at);
                 if id != ev.id.to_ascii_lowercase() {
                     env_to_inner.insert(ev.id.to_ascii_lowercase(), id.clone());
                 }
                 let (_, epoch, zone_pk) = zk(ev).expect("opened events carry a zk tag");
+                book.authors.insert(id.clone(), author.clone());
+                if id != ev.id.to_ascii_lowercase() {
+                    book.envelopes
+                        .insert(ev.id.to_ascii_lowercase(), id.clone());
+                }
                 recs.entry(id).or_insert(Rec {
                     author,
                     created_at: ev.created_at,
@@ -415,6 +489,7 @@ pub async fn harvest<R: Relay>(
                 });
             }
             Opened::MissingKey => {
+                seen(&mut h, ev.created_at);
                 h.missing_key += 1;
                 if let Some((_, e, _)) = zk(ev) {
                     h.missing_epochs.insert(e);
@@ -422,48 +497,98 @@ pub async fn harvest<R: Relay>(
                 h.hold_back = Some(h.hold_back.unwrap_or(u64::MAX).min(ev.created_at));
             }
             Opened::Foreign => h.foreign += 1,
-            Opened::Undecryptable => h.undecryptable += 1,
+            Opened::Undecryptable => {
+                seen(&mut h, ev.created_at);
+                h.undecryptable += 1;
+            }
         }
     }
 
-    // Deletions: every `e` target of a stored kind-5, mapped to a row id.
+    // Deletions: a verified kind-5 deletes a row when its signer wrote the
+    // post (the original's author for an imported post) or is a configured
+    // moderator. The relay's own write gate is not relied on. A target whose
+    // author cannot be established this run is skipped, never assumed.
     let mut deleted: HashSet<String> = HashSet::new();
-    let mut unknown: Vec<String> = Vec::new();
+    let mut authors: HashMap<String, Option<(String, String)>> = HashMap::new();
+    // Targets neither read this run nor indexed may be envelopes of indexed
+    // originals: one batched lookup for all of them.
+    let mut unknown: Vec<String> = dels
+        .iter()
+        .flat_map(|d| d.tags.iter())
+        .filter(|t| t.len() >= 2 && t[0] == "e" && is_hex64(&t[1]))
+        .map(|t| t[1].to_ascii_lowercase())
+        .filter(|t| {
+            !env_to_inner.contains_key(t)
+                && !recs.contains_key(t)
+                && !indexed.contains(t)
+                && !book.envelopes.contains_key(t)
+        })
+        .collect();
+    unknown.sort();
+    unknown.dedup();
+    let envelopes = if unknown.is_empty() {
+        HashMap::new()
+    } else {
+        fetch_by_ids(relay, &unknown).await?
+    };
+    for t in &unknown {
+        let found = envelopes.get(t).and_then(|env| {
+            if verify_event_strict(env).is_err() || parse_sealed(&env.tags).is_none() {
+                return None;
+            }
+            match opener.open(env) {
+                Opened::Post(inner, author, _, _) if indexed.contains(&inner) => {
+                    Some((inner, author))
+                }
+                _ => None,
+            }
+        });
+        authors.insert(t.clone(), found);
+    }
     for d in &dels {
-        h.newest = Some(h.newest.unwrap_or(0).max(d.created_at));
         if verify_event_strict(d).is_err() {
             continue;
         }
+        let signer = d.pubkey.to_ascii_lowercase();
+        let moderator = rules
+            .moderators
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(&signer));
         for t in d
             .tags
             .iter()
             .filter(|t| t.len() >= 2 && t[0] == "e" && is_hex64(&t[1]))
         {
             let t = t[1].to_ascii_lowercase();
-            if let Some(inner) = env_to_inner.get(&t) {
-                deleted.insert(inner.clone());
-            } else if recs.contains_key(&t) || indexed.contains(&t) {
-                deleted.insert(t);
+            // (row id, author) the target stands for.
+            let target = if let Some(inner) = env_to_inner.get(&t) {
+                recs.get(inner).map(|r| (inner.clone(), r.author.clone()))
+            } else if let Some(r) = recs.get(&t) {
+                Some((t.clone(), r.author.clone()))
+            } else if let Some(row) = book.envelopes.get(&t).filter(|r| indexed.contains(*r)) {
+                book.authors.get(row).map(|a| (row.clone(), a.clone()))
+            } else if let Some(a) = book.authors.get(&t).filter(|_| indexed.contains(&t)) {
+                Some((t.clone(), a.clone()))
             } else {
-                unknown.push(t);
-            }
-        }
-    }
-    // A target may be the envelope of an indexed original read in an earlier
-    // run: ask the relay what it is.
-    unknown.sort();
-    unknown.dedup();
-    if !unknown.is_empty() {
-        for ev in fetch_by_ids(relay, &unknown).await?.into_values() {
-            if let Some(r) = parse_sealed(&ev.tags) {
-                if indexed.contains(&r.inner_id) {
-                    deleted.insert(r.inner_id);
+                if !authors.contains_key(&t) {
+                    // An indexed post named by its own id.
+                    let found = author_of(relay, &mut opener, &t)
+                        .await?
+                        .map(|a| (t.clone(), a));
+                    authors.insert(t.clone(), found);
+                }
+                authors.get(&t).cloned().flatten()
+            };
+            if let Some((row, author)) = target {
+                if moderator || author == signer {
+                    deleted.insert(row);
                 }
             }
         }
     }
 
-    // Edits: the target is superseded when the edit's author wrote it.
+    // Edits: the target is superseded when the edit's author wrote it. A
+    // target the relay does not return this run is skipped.
     let mut superseded: HashSet<String> = HashSet::new();
     let edits: Vec<(String, String)> = recs
         .values()
@@ -472,12 +597,14 @@ pub async fn harvest<R: Relay>(
     for (target, editor) in edits {
         let author = if let Some(r) = recs.get(&target) {
             Some(r.author.clone())
+        } else if let Some(a) = book
+            .authors
+            .get(&target)
+            .filter(|_| indexed.contains(&target))
+        {
+            Some(a.clone())
         } else if indexed.contains(&target) {
-            match author_of(relay, &mut opener, &target).await? {
-                Some(a) => Some(a),
-                // Gone from the relay: nothing left to show; exclude it.
-                None => Some(editor.clone()),
-            }
+            author_of(relay, &mut opener, &target).await?
         } else {
             None
         };

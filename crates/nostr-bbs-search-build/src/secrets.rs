@@ -47,6 +47,47 @@ pub fn load_identity(file: Option<&Path>) -> Result<SecretKey, KeyLoadError> {
     parse_identity(&raw).map_err(|_| KeyLoadError::Malformed)
 }
 
+/// Refuse a file holding secrets (a zone-key file, say) that anyone but its
+/// owner could read. `what` names it in the message.
+///
+/// # Errors
+///
+/// When the file cannot be inspected or its mode lets group or others read it.
+pub fn ensure_owner_only(path: &Path, what: &str) -> Result<(), String> {
+    check_owner_only(path).map_err(|()| {
+        format!(
+            "{what} {} must exist and not be readable by group or others (chmod 600)",
+            path.display()
+        )
+    })
+}
+
+/// Write `bytes` to a fresh file at `path` with mode 0600 (any existing file
+/// is replaced, never reused with its old mode).
+///
+/// # Errors
+///
+/// When the file cannot be written.
+pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("{}: {e}", path.display()))
+        }
+        _ => {}
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .and_then(|mut f| f.write_all(bytes))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 #[cfg(unix)]
 fn check_owner_only(path: &Path) -> Result<(), ()> {
     use std::os::unix::fs::PermissionsExt;

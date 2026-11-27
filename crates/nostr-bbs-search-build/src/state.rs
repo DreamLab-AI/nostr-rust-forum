@@ -7,8 +7,19 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// State file format version.
-pub const STATE_VERSION: u32 = 1;
+/// State file format version (2: retired objects carry the time they were
+/// retired).
+pub const STATE_VERSION: u32 = 2;
+
+/// An object of this publisher a manifest stopped listing, kept until its
+/// grace period has passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retired {
+    /// Object name.
+    pub name: String,
+    /// When it was retired (Unix seconds).
+    pub since: u64,
+}
 
 /// The state of one zone's index job.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,10 +40,10 @@ pub struct State {
     pub index_version: Option<u64>,
     /// Event id of that manifest.
     pub event_id: Option<String>,
-    /// This publisher's objects that its last manifest stopped listing. They
-    /// are deleted by the next run, so a browser that read the previous
-    /// manifest can still finish loading it.
-    pub retired: Vec<String>,
+    /// This publisher's objects its manifests stopped listing. Each is
+    /// deleted by the first run after its grace period, so a browser that read
+    /// an earlier manifest can still finish loading it.
+    pub retired: Vec<Retired>,
     /// When the state was last written (Unix seconds).
     pub updated_at: u64,
 }
@@ -100,14 +111,22 @@ impl State {
     }
 }
 
+/// Write a fresh file with mode 0600: any file left at `path` is removed
+/// first and the new one is created exclusively (`O_EXCL`), so a leftover's
+/// wider mode never carries over.
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("{}: {e}", path.display()))
+        }
+        _ => {}
+    }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -132,7 +151,10 @@ mod tests {
         assert_eq!(s.high_water, None);
         s.high_water = Some(1_700_000_000);
         s.index_version = Some(4);
-        s.retired = vec!["b-1-3-v3.age".into()];
+        s.retired = vec![Retired {
+            name: "b-1-3-v3.age".into(),
+            since: 5,
+        }];
         s.save(&p).unwrap();
         #[cfg(unix)]
         {

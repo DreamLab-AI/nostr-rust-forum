@@ -724,22 +724,26 @@ fn choose_manifest(
     hw: Option<&HighWater>,
     held: &[ZoneKey],
 ) -> (Option<Manifest>, Vec<(String, String)>) {
-    let _ = held;
-    let mut best: Option<Manifest> = None;
+    // A v2 manifest is used only if its zone-key MAC verifies with a key this
+    // member holds (`Manifest::accept`), before it is chosen or its version
+    // can move the high-water mark.
+    let secret_for = |epoch: u32, zone_pk: &str| {
+        let k = held.iter().find(|k| {
+            !k.pending_delivery && k.epoch == epoch && k.pubkey.eq_ignore_ascii_case(zone_pk)
+        })?;
+        let mut out = zeroize::Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(&k.secret, out.as_mut()).ok()?;
+        Some(out)
+    };
+    let mut accepted = Vec::new();
     let mut refused = Vec::new();
     for (p, ev) in answers {
-        match Manifest::verify(ev, zone, relay_url, pubs, hw) {
-            Ok(m)
-                if best
-                    .as_ref()
-                    .is_none_or(|b| m.content.index_version > b.content.index_version) =>
-            {
-                best = Some(m);
-            }
-            Ok(_) => {}
+        match Manifest::accept(ev, zone, relay_url, pubs, hw, secret_for) {
+            Ok(m) => accepted.push(m),
             Err(e) => refused.push((p, e)),
         }
     }
+    let best = Manifest::newest(accepted);
     (best, refused)
 }
 
@@ -759,7 +763,14 @@ fn object_url(pod: &str, zone: &str, manifest: &Manifest, o: &ObjectRef) -> Stri
 /// skips them; this keeps the rule even if a worker answers from an index
 /// built before the manifest it was loaded with).
 fn drop_excluded(want: &mut HashMap<String, HitSource>, kept: &HashMap<String, Content>) {
-    want.retain(|id, (zone, ..)| kept.get(zone).is_none_or(|c| !c.excluded.contains(id)));
+    let sets: HashMap<&str, HashSet<&str>> = kept
+        .iter()
+        .map(|(z, c)| (z.as_str(), c.excluded.iter().map(String::as_str).collect()))
+        .collect();
+    want.retain(|id, (zone, ..)| {
+        sets.get(zone.as_str())
+            .is_none_or(|set| !set.contains(id.as_str()))
+    });
 }
 
 /// A manifest event from one publisher: `Ok(None)` when it answered that it
