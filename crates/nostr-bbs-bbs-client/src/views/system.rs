@@ -201,6 +201,7 @@ pub fn NotificationsView() -> impl IntoView {
 #[component]
 pub fn SettingsView() -> impl IntoView {
     let router = use_router();
+    let channels = use_channel_store();
     let cfg = expect_context::<BbsConfig>();
     let auth = use_auth();
     let prefs = use_bbs_prefs();
@@ -368,7 +369,7 @@ pub fn SettingsView() -> impl IntoView {
                                 </div>
 
                                 <div class="bbs-row-wrap">
-                                    <a href=move || crate::router::forum_href(&router.route.get()) class="bbs-btn bbs-btn-sm">"OPEN MAIN FORUM ↗"</a>
+                                    <a href=move || crate::router::forum_href(&router.route.get(), channels) class="bbs-btn bbs-btn-sm">"OPEN MAIN FORUM ↗"</a>
                                     {pwa_enabled.then(move || {
                                         let zb = z_bake.clone();
                                         view! {

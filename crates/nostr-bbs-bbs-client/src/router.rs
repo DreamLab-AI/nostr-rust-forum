@@ -7,9 +7,11 @@
 
 use leptos::prelude::*;
 use nostr_bbs_client_core::base_href;
+use nostr_bbs_client_core::stores::channels::{ChannelMeta, ChannelStore};
 use nostr_bbs_client_core::stores::zones::{load_zones, resolve_zone_param, zone_slug, Zone};
 use nostr_bbs_client_core::utils::post_link::jump_link;
-use nostr_bbs_client_core::utils::slug_hash::{section_slug, topic_slug};
+use nostr_bbs_client_core::utils::section_url::{canonical_section_path, section_path};
+use nostr_bbs_client_core::utils::slug_hash::topic_slug;
 
 /// Every navigable location in the re-imagined BBS workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -285,37 +287,44 @@ impl Route {
     /// its topic page (at the focused post when there is one), a post link
     /// the forum's own resolver, and the other views their forum
     /// counterparts. The forum's front page where there is none.
-    pub fn forum_path(&self, zones: &[Zone]) -> String {
+    ///
+    /// Section and topic paths are the forum's canonical ones
+    /// (client-core `utils::section_url`): `/<zone-slug>/<channel-id hash>`
+    /// and `…/<topic hash>`. The zone comes from the channel's own section
+    /// tag when `channels` holds its metadata, exactly as the forum derives
+    /// it, so the forum never has to replace the address; otherwise from
+    /// the route's zone.
+    pub fn forum_path(&self, zones: &[Zone], channels: &[ChannelMeta]) -> String {
         // The forum accepts a zone's slug or id; links carry the slug.
         let zone_path = |z: &str| {
             resolve_zone_param(z, zones)
                 .map(|z| zone_slug(z).to_string())
                 .unwrap_or_else(|| z.to_string())
         };
+        let section = |zone: &str, channel_id: &str| {
+            channels
+                .iter()
+                .find(|c| c.id == channel_id)
+                .and_then(|c| canonical_section_path(c, zones))
+                .unwrap_or_else(|| section_path(&zone_path(zone), channel_id))
+        };
         match self {
-            Route::Zone { slug } => format!("/forums/{}", zone_path(slug)),
-            Route::Board { zone, channel_id } => {
-                format!("/forums/{}/{}", zone_path(zone), section_slug(channel_id))
-            }
+            Route::Zone { slug } => format!("/{}", zone_path(slug)),
+            Route::Board { zone, channel_id } => section(zone, channel_id),
             Route::Thread {
                 zone,
                 channel_id,
                 root_id,
                 focus,
             } => {
-                let topic = format!(
-                    "/forums/{}/{}/{}",
-                    zone_path(zone),
-                    section_slug(channel_id),
-                    topic_slug(root_id)
-                );
+                let topic = format!("{}/{}", section(zone, channel_id), topic_slug(root_id));
                 match focus {
                     Some(f) => format!("{topic}?focus={f}"),
                     None => topic,
                 }
             }
             Route::Go { event_id, channel } => jump_link(event_id, channel.as_deref()),
-            Route::Kanban { zone } => format!("/forums/{}/board", zone_path(zone)),
+            Route::Kanban { zone } => format!("/{}/board", zone_path(zone)),
             Route::Zones | Route::LiveFeed => "/forums".into(),
             Route::DmList => "/dm".into(),
             Route::DmChat { pubkey } => format!("/dm/{pubkey}"),
@@ -339,9 +348,13 @@ impl Route {
 }
 
 /// The href of `route`'s equivalent page in the modern forum
-/// ([`Route::forum_path`] under the forum's base path).
-pub fn forum_href(route: &Route) -> String {
-    base_href(&route.forum_path(&load_zones()))
+/// ([`Route::forum_path`] under the forum's base path), with the channel
+/// metadata `channels` holds. Tracks the channel list when read reactively.
+pub fn forum_href(route: &Route, channels: ChannelStore) -> String {
+    let zones = load_zones();
+    channels
+        .channels
+        .with(|cs| base_href(&route.forum_path(&zones, cs)))
 }
 
 /// Parse a `/command` string into a [`CommandAction`].
@@ -705,6 +718,7 @@ mod tests {
 
     #[test]
     fn forum_path_opens_the_equivalent_page() {
+        use nostr_bbs_client_core::utils::slug_hash::section_slug;
         let cid = "a".repeat(64);
         let root = "b".repeat(64);
         let board = Route::Board {
@@ -712,8 +726,8 @@ mod tests {
             channel_id: cid.clone(),
         };
         assert_eq!(
-            board.forum_path(&[]),
-            format!("/forums/zone-x/{}", section_slug(&cid))
+            board.forum_path(&[], &[]),
+            format!("/zone-x/{}", section_slug(&cid))
         );
         let thread = Route::Thread {
             zone: "zone-x".into(),
@@ -722,12 +736,8 @@ mod tests {
             focus: None,
         };
         assert_eq!(
-            thread.forum_path(&[]),
-            format!(
-                "/forums/zone-x/{}/{}",
-                section_slug(&cid),
-                topic_slug(&root)
-            )
+            thread.forum_path(&[], &[]),
+            format!("/zone-x/{}/{}", section_slug(&cid), topic_slug(&root))
         );
         let focused = Route::Thread {
             zone: "zone-x".into(),
@@ -735,16 +745,73 @@ mod tests {
             root_id: root.clone(),
             focus: Some("p1".into()),
         };
-        assert!(focused.forum_path(&[]).ends_with("?focus=p1"));
+        assert!(focused.forum_path(&[], &[]).ends_with("?focus=p1"));
         assert_eq!(
             Route::Go {
                 event_id: "e1".into(),
                 channel: Some("chan".into())
             }
-            .forum_path(&[]),
+            .forum_path(&[], &[]),
             "/go/e1?c=chan"
         );
-        assert_eq!(Route::Zones.forum_path(&[]), "/forums");
-        assert_eq!(Route::Help.forum_path(&[]), "/");
+        assert_eq!(
+            Route::Zone {
+                slug: "zone-x".into()
+            }
+            .forum_path(&[], &[]),
+            "/zone-x"
+        );
+        assert_eq!(Route::Zones.forum_path(&[], &[]), "/forums");
+        assert_eq!(Route::Help.forum_path(&[], &[]), "/");
+    }
+
+    /// The live Rants section: the forum's canonical URL for it (and its
+    /// topics) is what the BBS links to, whichever form of the zone the BBS
+    /// route carries and even when the route names another zone.
+    #[test]
+    fn forum_path_is_the_forums_canonical_section_url() {
+        use nostr_bbs_client_core::utils::section_url::canonical_topic_path;
+        let zones: Vec<Zone> = serde_json::from_str(
+            r#"[
+                {"id":"zone1","slug":"welcome","display_name":"Welcome"},
+                {"id":"zone2","slug":"minimoonoir","display_name":"Minimoonoir"}
+            ]"#,
+        )
+        .expect("zone config parses");
+        let rants = ChannelMeta {
+            id: "62e1c0f409f0e35bacefb701e49ba85a8b6168ee48cc4a55eb70df8b8638e1bd".into(),
+            name: "Rants".into(),
+            description: String::new(),
+            section: "zone2-rants".into(),
+            picture: String::new(),
+            created_at: 0,
+        };
+        let channels = vec![rants.clone()];
+        let canonical = canonical_section_path(&rants, &zones).expect("canonical");
+        assert_eq!(canonical, "/minimoonoir/s00405652f2bf");
+        for zone in ["zone2", "minimoonoir", "zone1"] {
+            let board = Route::Board {
+                zone: zone.into(),
+                channel_id: rants.id.clone(),
+            };
+            assert_eq!(board.forum_path(&zones, &channels), canonical, "{zone}");
+        }
+        let root = "c".repeat(64);
+        let thread = Route::Thread {
+            zone: "zone2".into(),
+            channel_id: rants.id.clone(),
+            root_id: root.clone(),
+            focus: None,
+        };
+        assert_eq!(
+            Some(thread.forum_path(&zones, &channels)),
+            canonical_topic_path(&rants, "", Some(&root), &zones)
+        );
+        // Without the channel's metadata: the route's zone, as its slug.
+        let board = Route::Board {
+            zone: "zone2".into(),
+            channel_id: rants.id.clone(),
+        };
+        assert_eq!(board.forum_path(&zones, &[]), canonical);
     }
 }

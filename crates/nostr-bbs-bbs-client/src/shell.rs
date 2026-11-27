@@ -537,7 +537,7 @@ fn Sidebar() -> impl IntoView {
                 </button>
                 // The same place in the modern forum: a board's section page,
                 // a thread's topic page.
-                <a class="tui-side-item" href=move || forum_href(&router.route.get()) rel="noopener">
+                <a class="tui-side-item" href=move || forum_href(&router.route.get(), channels) rel="noopener">
                     <span class="tui-side-glyph">"↗"</span>
                     <span class="tui-side-label">"Modern Forum"</span>
                 </a>
@@ -551,6 +551,9 @@ fn Sidebar() -> impl IntoView {
 fn CommandBar() -> impl IntoView {
     let prefs = use_bbs_prefs();
     let router = use_router();
+    // Looked up here: `/forum` runs in a handler, which has no reactive owner.
+    #[cfg(target_arch = "wasm32")]
+    let channels = use_channel_store();
     let search = use_search_palette();
     let toasts = use_toasts();
     let text = RwSignal::new(String::new());
@@ -581,7 +584,7 @@ fn CommandBar() -> impl IntoView {
                 if let Some(win) = web_sys::window() {
                     let _ = win
                         .location()
-                        .set_href(&forum_href(&router.route.get_untracked()));
+                        .set_href(&forum_href(&router.route.get_untracked(), channels));
                 }
             }
             CommandAction::Back => router.back(),
