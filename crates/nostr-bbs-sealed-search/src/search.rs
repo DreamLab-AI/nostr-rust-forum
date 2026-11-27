@@ -6,7 +6,7 @@
 //! which byte ranges of which `q-` objects are needed, the caller fetches
 //! them (blob slices), then [`Index::rescore`] decrypts just those chunks.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
@@ -41,7 +41,11 @@ pub fn sha256_hex(b: &[u8]) -> String {
     hex::encode(Sha256::digest(b))
 }
 
-fn check_header(h: &Header, o: &ObjectRef, c: &Content) -> Result<(), String> {
+/// Check an object's authenticated header against its manifest entry: kind,
+/// base scope, zone, epoch, zone key, shard, row count, and the index version
+/// it was built at (the manifest's, or the entry's own `version` for an object
+/// carried over unchanged by a v2 update).
+pub fn check_header(h: &Header, o: &ObjectRef, c: &Content) -> Result<(), String> {
     let pk = hex::encode(h.zone_pk);
     if h.kind != o.kind
         || h.scope != Scope::Base
@@ -49,7 +53,7 @@ fn check_header(h: &Header, o: &ObjectRef, c: &Content) -> Result<(), String> {
         || h.epoch != o.epoch
         || pk != o.zone_pk.to_lowercase()
         || h.shard != o.shard
-        || h.index_version != c.index_version
+        || h.index_version != o.effective_version(c)
         || h.count != o.count
     {
         return Err(format!(
@@ -85,6 +89,8 @@ struct Shard {
     /// Name of the bin object it was read from.
     bin_name: String,
     bin: BinLayer,
+    /// Rows whose id the manifest excludes (never returned, never decoys).
+    dead: HashSet<usize>,
     q: ObjectRef,
     /// age header length of the q object and its NBSS header length.
     q_geom: Option<(usize, usize)>,
@@ -120,16 +126,24 @@ pub struct Index {
     content: Content,
     keys: HashMap<(u32, String), SearchKey>,
     shards: Vec<Shard>,
+    /// The manifest's excluded ids (v2), applied to every shard added.
+    excluded: HashSet<[u8; 32]>,
 }
 
 impl Index {
     /// Start an index for a verified manifest with the keys the member holds
     /// (keyed by `(epoch, hex zone_pk)`).
+    ///
+    /// Rows whose id the manifest lists in `excluded` stay resident (the
+    /// shard is authenticated whole) but are never returned or used as
+    /// decoys.
     pub fn new(content: Content, keys: HashMap<(u32, String), SearchKey>) -> Self {
+        let excluded = content.excluded_ids();
         Self {
             content,
             keys,
             shards: Vec::new(),
+            excluded,
         }
     }
 
@@ -172,9 +186,17 @@ impl Index {
         let q = self
             .q_for(o)
             .ok_or_else(|| format!("no int8 layer for {}", o.name))?;
+        let dead = if self.excluded.is_empty() {
+            HashSet::new()
+        } else {
+            (0..bin.header.count as usize)
+                .filter(|&r| self.excluded.contains(&bin.id(r)))
+                .collect()
+        };
         self.shards.push(Shard {
             bin_name: o.name.clone(),
             bin,
+            dead,
             q,
             q_geom: None,
         });
@@ -229,6 +251,14 @@ impl Index {
         self.shards
             .iter()
             .map(|s| s.bin.header.count as usize)
+            .sum()
+    }
+
+    /// Rows resident that a search may return (excluded rows left out).
+    pub fn live_rows(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.bin.header.count as usize - s.dead.len())
             .sum()
     }
 
@@ -300,6 +330,7 @@ impl Index {
             self.shards.iter().enumerate().flat_map(|(si, s)| {
                 let lut = &lut;
                 (0..s.bin.header.count as usize)
+                    .filter(move |row| !s.dead.contains(row))
                     .map(move |row| (si, row, lut.score(s.bin.code(row))))
             }),
             r,
@@ -409,7 +440,7 @@ impl Index {
                 let c = s.bin.header.count as usize;
                 if r < c {
                     let id = hex::encode(s.bin.id(r));
-                    if !exclude.contains(&id) && !out.contains(&id) {
+                    if !s.dead.contains(&r) && !exclude.contains(&id) && !out.contains(&id) {
                         out.push(id);
                     }
                     break;

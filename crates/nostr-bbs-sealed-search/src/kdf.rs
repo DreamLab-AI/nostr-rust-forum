@@ -9,12 +9,93 @@
 //! The browser's main thread derives `okm` here (this module needs no age)
 //! and transfers only `okm` to the search worker; [`crate::seal`] turns it
 //! into an age X25519 identity.
+//!
+//! # Manifest MAC (content v2)
+//!
+//! ```text
+//! key = HKDF-SHA256(salt = "nostr-bbs/sealed-search/manifest-mac/v1",
+//!                   ikm  = zone epoch secret (32 bytes),
+//!                   info = "manifest-mac\0" || zone || "\0" || be32(epoch)
+//!                          || zone_pk (32) || be64(index_version))
+//! mac = HMAC-SHA256(key, the manifest event's content string, as signed)
+//! ```
+//!
+//! The epoch is the newest one the manifest lists. Any holder of that zone
+//! key can compute it: it proves "made by someone holding the zone key", which
+//! together with the publisher's signature gives a v2 manifest what building
+//! sealed objects at a new version gave v1 (see [`crate::manifest`]).
 
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
 const SALT: &[u8] = b"nostr-bbs/sealed-search/v1";
+const MAC_SALT: &[u8] = b"nostr-bbs/sealed-search/manifest-mac/v1";
+
+/// Algorithm label of the manifest MAC tag.
+pub const MAC_ALG: &str = "hmac-sha256-v1";
+
+type HmacSha256 = hmac::Hmac<Sha256>;
+
+fn manifest_mac_state(
+    zone_secret: &[u8; 32],
+    zone: &str,
+    epoch: u32,
+    zone_pk: &[u8; 32],
+    index_version: u64,
+    content: &[u8],
+) -> HmacSha256 {
+    use hmac::Mac;
+    let mut info = Vec::with_capacity(64 + zone.len());
+    info.extend_from_slice(b"manifest-mac\0");
+    info.extend_from_slice(zone.as_bytes());
+    info.push(0);
+    info.extend_from_slice(&epoch.to_be_bytes());
+    info.extend_from_slice(zone_pk);
+    info.extend_from_slice(&index_version.to_be_bytes());
+    let mut key = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(MAC_SALT), zone_secret)
+        .expand(&info, key.as_mut())
+        .expect("32 bytes is a valid HKDF-SHA256 length");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(key.as_ref()).expect("HMAC takes any key length");
+    mac.update(content);
+    mac
+}
+
+/// The manifest MAC (see the module docs) of `content`, the manifest event's
+/// content string as signed.
+pub fn manifest_mac(
+    zone_secret: &[u8; 32],
+    zone: &str,
+    epoch: u32,
+    zone_pk: &[u8; 32],
+    index_version: u64,
+    content: &[u8],
+) -> [u8; 32] {
+    use hmac::Mac;
+    manifest_mac_state(zone_secret, zone, epoch, zone_pk, index_version, content)
+        .finalize()
+        .into_bytes()
+        .into()
+}
+
+/// Whether `tag` is the manifest MAC of `content` (constant-time comparison,
+/// `hmac`'s `verify_slice`).
+pub fn verify_manifest_mac(
+    zone_secret: &[u8; 32],
+    zone: &str,
+    epoch: u32,
+    zone_pk: &[u8; 32],
+    index_version: u64,
+    content: &[u8],
+    tag: &[u8],
+) -> bool {
+    use hmac::Mac;
+    manifest_mac_state(zone_secret, zone, epoch, zone_pk, index_version, content)
+        .verify_slice(tag)
+        .is_ok()
+}
 
 /// The derived per-(zone, epoch) search key (`okm`). Zeroised on drop.
 #[derive(Clone)]

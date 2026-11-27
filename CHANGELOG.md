@@ -18,6 +18,57 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Sealed search: incremental nightly updates (2026-11-27)
+
+Sealed-search crate, builder, client core and search worker. Nothing is deployed or scheduled by this change; operator
+steps: [`docs/runbooks/sealed-search-incremental.md`](docs/runbooks/sealed-search-incremental.md).
+
+- **Manifest content v2** (versioned, backward compatible). Objects may carry the `version` their header was built at
+  and the trusted publisher (`owner`) whose pod holds them; the content may list `excluded` row ids. Defaults read as
+  v1, so a v1 manifest verifies and opens unchanged; a v1 manifest carrying v2 fields is refused. Browsers built before
+  this refuse v2 manifests as unsupported and keep using the newest v1 one (the archivist's base).
+- **Builder.** `nostr-bbs-search-build` is now a library plus binary. `--from-relay` (or `--from-events`, a NIP-01
+  export) reads and opens a zone's posts in memory: live posts by their own id, sealed originals by the original id;
+  deleted (kind-5) and superseded (edited) posts left out. New `update` (seal only new rows, list earlier objects
+  unchanged, exclude deleted or edited indexed posts), `compact [--all]` (re-pack shards verbatim, drop excluded rows
+  only), and `status`. State file with the high-water
+  mark, rollback check against the last version published, and a one-run grace period before superseded objects are
+  deleted. An update refuses (exit 7) when the relay serves none of the zone's indexed posts to the indexer (the zone
+  read gate withholds silently). Full builds sign v1 while no trusted publisher holds a v2 manifest for the zone, v2
+  once one does (`--manifest-format auto|v1|v2`); the import hand-off (`--input … --dry-run --out DIR`, no pod) still
+  yields a v1 base at version 1. Publisher key from `NOSTR_BBS_MIGRATE_KEY` or `--key-file` (0600). The explicit
+  `--version` flag is gone: a run always publishes the newest verified version + 1.
+- **Client.** Each object is fetched from the pod of the publisher that holds it; hits whose id the manifest excludes
+  are dropped (the worker's `Index` already skips them). The IndexedDB cache was already keyed by SHA-256, so objects a
+  new manifest lists unchanged are not fetched again.
+- **zone-migrate.** `Filter` gains `since` and `#sealed`.
+- **Security review of #126.**
+  - v2 manifests carry a zone-key MAC (HKDF-SHA256 then HMAC-SHA256 over the signed content, keyed from the newest
+    epoch listed), checked by `Manifest::accept` in the client and the builder before a manifest is used.
+  - Version jumps are bounded at 16,384 and exclusion lists at 16,384 ids (a set lookup).
+  - Deletions need the post's author (from the post, the job's author book or the relay) or a configured moderator
+    (`--moderators`). Edits of posts whose author is unknown are skipped. Compaction drops only excluded rows.
+  - The high-water mark moves only on verified in-zone events, never past the job's clock, and stays below seconds
+    the relay cannot page.
+  - Exit 8 for a full exclusion list; `compact --all` runs by default at 4,096 exclusions.
+  - The grace period before deleting superseded objects is 48 hours (state v2). The state file is written through an
+    exclusive 0600 temporary file.
+  - `--keys-file` and `NBSS_KEYS_FILE` must be 0600, and the nightly config's directory must not be writable by
+    others. `--dump-vectors` works only with `--input` and writes 0600.
+  - Equal-version manifests resolve to the first listed publisher everywhere.
+- **Second security review of #126.**
+  - Moderator deletions count without a known author.
+  - The author book is seeded once (`seed-book`). The first update refuses an unseeded book (exit 9). The book is
+    written before the state and pruned to the index's rows.
+  - Operator takedown: `takedown --ids FILE --reason …` excludes indexed posts in the next manifest.
+  - Unpaged seconds hold the mark only with a relevant verified event of the same query, and for at most 3 days.
+  - `--moderators` and `--publishers` refuse malformed entries.
+  - Browsers fall back to the next verified manifest when one fails to load, and record the newest epoch accepted;
+    a later v2 MAC must use at least that epoch.
+  - The nightly script checks the state directory (owner, 0700) and the config directory's owner.
+- **Job.** `scripts/sealed-search-nightly.sh`: update, then compact when enough partial shard pairs exist; lock,
+  time budget, distinct exit codes, no secrets in argv.
+
 ### Inter self-hosted; BBS page gets the baseline CSP (2026-11-26)
 
 Forum client and BBS client shells only.

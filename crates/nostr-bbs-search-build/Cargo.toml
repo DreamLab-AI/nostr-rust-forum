@@ -3,10 +3,15 @@ name = "nostr-bbs-search-build"
 version = "0.1.0"
 publish = false           # operator tool: builds and uploads a zone's sealed search index
 edition = "2021"
-description = "Offline builder for sealed per-zone search indexes (local bge-small embeddings, age-sealed shards)"
+description = "Builder for sealed per-zone search indexes: full, incremental and compacting runs (local bge-small embeddings, age-sealed shards)"
 license = "AGPL-3.0-only"
 repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
 rust-version = "1.85"
+
+[lib]
+# The relay harvest, pod access, state file and update/compact pipeline:
+# native only (the wasm32 workspace check sees an empty library).
+path = "src/lib.rs"
 
 [[bin]]
 name = "nostr-bbs-search-build"
@@ -21,6 +26,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+thiserror = { workspace = true }
 zeroize = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net"] }

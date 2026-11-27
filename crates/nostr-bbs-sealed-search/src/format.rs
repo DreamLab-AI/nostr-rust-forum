@@ -223,6 +223,23 @@ impl BinLayer {
     }
 }
 
+/// Parse an int8 object's plaintext into its header and rows (the builder's
+/// compaction re-packs rows verbatim; the browser reads them by chunk).
+pub fn parse_int8(plain: &[u8]) -> Result<(Header, Vec<[u8; I8_ROW_BYTES]>), String> {
+    let (header, off) = Header::decode(plain)?;
+    if header.kind != Kind::Int8 {
+        return Err("not an int8 object".into());
+    }
+    if plain.len() != off + header.body_len() {
+        return Err("int8 length mismatch".into());
+    }
+    let rows = plain[off..]
+        .chunks_exact(I8_ROW_BYTES)
+        .map(|r| <[u8; I8_ROW_BYTES]>::try_from(r).expect("chunks_exact yields full rows"))
+        .collect();
+    Ok((header, rows))
+}
+
 /// Plaintext byte offset of int8 row `r` in an object whose header encodes to
 /// `header_len` bytes.
 pub fn int8_row_offset(header_len: usize, r: usize) -> usize {
@@ -276,5 +293,29 @@ mod tests {
         assert_eq!(l.id(1), [2u8; 32]);
         assert_eq!(l.code(0), &[3u8; CODE_BYTES]);
         assert!(BinLayer::parse(&p[..p.len() - 1]).is_err());
+        assert!(
+            parse_int8(&p).is_err(),
+            "a bin object is not an int8 object"
+        );
+    }
+
+    #[test]
+    fn int8_rows_roundtrip() {
+        let h = Header {
+            kind: Kind::Int8,
+            scope: Scope::Base,
+            zone: "z".into(),
+            epoch: 1,
+            zone_pk: [5u8; 32],
+            shard: 0,
+            index_version: 1,
+            count: 2,
+        };
+        let rows = [[1u8; I8_ROW_BYTES], [2u8; I8_ROW_BYTES]];
+        let p = encode_int8(&h, &rows);
+        let (got_h, got) = parse_int8(&p).unwrap();
+        assert_eq!(got_h, h);
+        assert_eq!(got, rows);
+        assert!(parse_int8(&p[..p.len() - 1]).is_err());
     }
 }

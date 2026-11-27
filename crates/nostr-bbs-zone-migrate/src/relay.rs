@@ -42,6 +42,13 @@ pub struct Filter {
     /// `#zk` tag values (zone ids): every zone-encrypted event of a zone.
     #[serde(rename = "#zk", skip_serializing_if = "Option::is_none")]
     pub zk_tags: Option<Vec<String>>,
+    /// `#sealed` tag values: sealed envelopes (ADR-2017) by the id of the
+    /// original they wrap.
+    #[serde(rename = "#sealed", skip_serializing_if = "Option::is_none")]
+    pub sealed_tags: Option<Vec<String>>,
+    /// Inclusive lower bound on `created_at` (the relay uses `created_at >= since`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
     /// Inclusive upper bound on `created_at` (the relay uses `created_at <= until`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until: Option<u64>,
@@ -250,6 +257,16 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&f).unwrap(),
             r##"{"kinds":[42],"#e":["c"],"until":5,"limit":1000}"##
+        );
+        let f = Filter {
+            kinds: Some(vec![42]),
+            sealed_tags: Some(vec!["a".into()]),
+            since: Some(9),
+            ..Filter::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&f).unwrap(),
+            r##"{"kinds":[42],"#sealed":["a"],"since":9}"##
         );
     }
 

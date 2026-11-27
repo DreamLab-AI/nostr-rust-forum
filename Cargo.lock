@@ -3589,6 +3589,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hkdf 0.12.4",
+ "hmac 0.12.1",
  "k256",
  "nostr-bbs-core",
  "serde",
@@ -3628,6 +3629,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.21",
  "tokio",
  "zeroize",
 ]

@@ -375,6 +375,14 @@ bound into the manifest); `upload-plan` adds the built objects to `r2-objects.js
 under the archivist's `media/zones/<zone>/search/` folder. The publisher is the
 archivist. Delete `docs.jsonl` after the build.
 
+Posts written after the import are added by a nightly incremental job under a
+separate indexer identity (`nostr-bbs-search-build update` / `compact`, and
+`scripts/sealed-search-nightly.sh`). Its manifests (content v2) list the
+archivist's base objects unchanged, where they are, and add only new shards; see
+`docs/runbooks/sealed-search-incremental.md`. After a later import or migration
+run, whose envelopes keep their original `created_at`, run `update --since 0`
+once.
+
 ## 10. Upload and cutover
 
 `upload-plan` writes `upload/` (never executed by the tool):

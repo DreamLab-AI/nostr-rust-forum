@@ -12,8 +12,12 @@
 //! - [`format`](mod@format): authenticated object header and layers.
 //! - [`kdf`]: HKDF derivation of the per-(zone, epoch) search key (no age; the main thread links only this).
 //! - [`seal`]: age X25519 identity from that key, seal/open, chunk random access.
-//! - [`manifest`]: the signed (NIP-01) index manifest and its acceptance rules.
-//! - [`search`]: the resident index (first stage, chunked rescoring, decoys).
+//! - [`manifest`]: the signed (NIP-01) index manifest and its acceptance rules
+//!   (content v1, and v2 for incremental updates).
+//! - [`search`]: the resident index (first stage, chunked rescoring, decoys,
+//!   excluded rows).
+//! - [`build`]: sealing a full index, an incremental update that lists earlier
+//!   objects unchanged, and a compaction that re-packs shards.
 
 #[cfg(feature = "seal")]
 pub mod build;

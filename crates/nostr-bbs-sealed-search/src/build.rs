@@ -1,18 +1,27 @@
-//! Building a sealed index from embedded rows (used by the builder CLI).
+//! Building sealed index versions from embedded rows (used by the builder):
+//!
+//! - [`build`]: a whole index, every object at one version (a base);
+//! - [`update`]: seal only new rows into additional shards and list every
+//!   earlier object unchanged (same name, bytes and hash), so a browser that
+//!   has them cached downloads only the new ones (manifest v2);
+//! - [`compact`]: re-pack chosen shard pairs (rows opened with
+//!   [`open_pair`]) into fresh shards, dropping rows no longer wanted, without
+//!   re-embedding: sign codes and int8 rows are carried verbatim.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::format::{encode_bin, encode_int8, Header, Kind, Scope, MAX_ROWS};
-use crate::manifest::{object_name, Content, ObjectRef};
-use crate::quant::{encode_i8, sign_code};
-use crate::seal::{seal, SearchKey};
-use crate::search::sha256_hex;
+use crate::format::{encode_bin, encode_int8, parse_int8, BinLayer, Header, Kind, Scope, MAX_ROWS};
+use crate::manifest::{object_name, Content, ObjectRef, V1, V2};
+use crate::quant::{encode_i8, sign_code, CODE_BYTES, I8_ROW_BYTES};
+use crate::seal::{open, seal, SearchKey};
+use crate::search::{check_header, check_sealed, sha256_hex};
 use crate::DIM;
 
 /// One document to index.
 #[derive(Clone)]
 pub struct DocRow {
-    /// Event id the client will fetch (the outer envelope id for sealed history).
+    /// Event id the client resolves a hit to: a live post's own id, or a
+    /// sealed original's ORIGINAL id (the envelope's `sealed` tag value).
     pub id: [u8; 32],
     /// Zone key epoch the event is encrypted under.
     pub epoch: u32,
@@ -26,7 +35,8 @@ pub struct DocRow {
 pub struct Built {
     /// Manifest content (to sign and publish as `m.json`).
     pub content: Content,
-    /// `(object name, sealed bytes)`.
+    /// `(object name, sealed bytes)` of the objects this version adds (an
+    /// update or compaction lists earlier objects without re-sealing them).
     pub objects: Vec<(String, Vec<u8>)>,
 }
 
@@ -49,77 +59,394 @@ pub struct BuildSpec<'a> {
     pub shard_rows: usize,
 }
 
-/// Build an index version. Rows are grouped by their own `(epoch, zone_pk)`
-/// and sealed under that epoch's key only (review M4): a row never lands in
-/// another epoch's shard.
-pub fn build(spec: &BuildSpec<'_>, rows: &[DocRow], keys: &KeyMap) -> Result<Built, String> {
-    let BuildSpec {
-        zone,
-        version,
-        model,
-        model_sha256,
-        vocab_sha256,
-        shard_rows,
-    } = *spec;
-    let shard_rows = shard_rows.clamp(1, MAX_ROWS);
-    let mut groups: BTreeMap<(u32, [u8; 32]), Vec<&DocRow>> = BTreeMap::new();
-    for r in rows {
-        groups.entry((r.epoch, r.zone_pk)).or_default().push(r);
-    }
-    let mut objects = Vec::new();
-    let mut refs = Vec::new();
-    for ((epoch, zone_pk), g) in groups {
-        let key = keys
-            .get(&(epoch, zone_pk))
-            .ok_or_else(|| format!("no key for epoch {epoch}"))?;
-        for (shard, chunk) in g.chunks(shard_rows).enumerate() {
-            let shard = shard as u32;
-            let count = chunk.len() as u32;
-            let head = |kind| Header {
+/// The verified manifest an update or compaction starts from.
+#[derive(Clone, Copy)]
+pub struct Previous<'a> {
+    /// Its content.
+    pub content: &'a Content,
+    /// Hex pubkey of its signer (the pod of objects without an `owner`).
+    pub signer: &'a str,
+}
+
+/// The rows of one opened shard pair (or of new rows, quantised), in row
+/// order: ids, sign codes and int8 rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairRows {
+    /// Zone key epoch.
+    pub epoch: u32,
+    /// That epoch's x-only zone key pubkey.
+    pub zone_pk: [u8; 32],
+    /// Event ids.
+    pub ids: Vec<[u8; 32]>,
+    /// Sign codes.
+    pub codes: Vec<[u8; CODE_BYTES]>,
+    /// int8 rescoring rows.
+    pub rows: Vec<[u8; I8_ROW_BYTES]>,
+}
+
+/// Sealed objects and manifest entries produced for some shards.
+#[derive(Default)]
+struct Sealed {
+    refs: Vec<ObjectRef>,
+    objects: Vec<(String, Vec<u8>)>,
+}
+
+/// Seal `rows` (one `(epoch, zone_pk)` group) into shard pairs numbered from
+/// `first_shard`, at `version`, under `key`.
+#[allow(clippy::too_many_arguments)]
+fn seal_group(
+    zone: &str,
+    version: u64,
+    rows: &PairRows,
+    first_shard: u32,
+    shard_rows: usize,
+    key: &SearchKey,
+    out: &mut Sealed,
+) -> Result<(), String> {
+    let (epoch, zone_pk) = (rows.epoch, rows.zone_pk);
+    for (i, start) in (0..rows.ids.len()).step_by(shard_rows).enumerate() {
+        let end = (start + shard_rows).min(rows.ids.len());
+        let shard = first_shard
+            .checked_add(u32::try_from(i).map_err(|_| "too many shards")?)
+            .ok_or("shard number overflow")?;
+        let count = (end - start) as u32;
+        let head = |kind| Header {
+            kind,
+            scope: Scope::Base,
+            zone: zone.into(),
+            epoch,
+            zone_pk,
+            shard,
+            index_version: version,
+            count,
+        };
+        for (kind, plain) in [
+            (
+                Kind::Bin,
+                encode_bin(
+                    &head(Kind::Bin),
+                    &rows.ids[start..end],
+                    &rows.codes[start..end],
+                ),
+            ),
+            (
+                Kind::Int8,
+                encode_int8(&head(Kind::Int8), &rows.rows[start..end]),
+            ),
+        ] {
+            let sealed = seal(key, &plain)?;
+            let name = object_name(kind, epoch, shard, version);
+            out.refs.push(ObjectRef {
+                name: name.clone(),
                 kind,
-                scope: Scope::Base,
-                zone: zone.into(),
                 epoch,
-                zone_pk,
+                zone_pk: hex::encode(zone_pk),
                 shard,
-                index_version: version,
                 count,
-            };
-            let ids: Vec<[u8; 32]> = chunk.iter().map(|r| r.id).collect();
-            let codes: Vec<_> = chunk.iter().map(|r| sign_code(&r.vec)).collect();
-            let i8s: Vec<_> = chunk.iter().map(|r| encode_i8(&r.vec)).collect();
-            for (kind, plain) in [
-                (Kind::Bin, encode_bin(&head(Kind::Bin), &ids, &codes)),
-                (Kind::Int8, encode_int8(&head(Kind::Int8), &i8s)),
-            ] {
-                let sealed = seal(key, &plain)?;
-                let name = object_name(kind, epoch, shard, version);
-                refs.push(ObjectRef {
-                    name: name.clone(),
-                    kind,
-                    epoch,
-                    zone_pk: hex::encode(zone_pk),
-                    shard,
-                    count,
-                    size: sealed.len() as u64,
-                    sha256: sha256_hex(&sealed),
-                });
-                objects.push((name, sealed));
+                size: sealed.len() as u64,
+                sha256: sha256_hex(&sealed),
+                owner: None,
+                version: None,
+            });
+            out.objects.push((name, sealed));
+        }
+    }
+    Ok(())
+}
+
+/// Quantise embedded rows, grouped by their own `(epoch, zone_pk)` (review
+/// M4: a row is only ever sealed under its own epoch's key), in input order.
+fn quantise(rows: &[DocRow]) -> BTreeMap<(u32, [u8; 32]), PairRows> {
+    let mut groups: BTreeMap<(u32, [u8; 32]), PairRows> = BTreeMap::new();
+    for r in rows {
+        let g = groups
+            .entry((r.epoch, r.zone_pk))
+            .or_insert_with(|| PairRows {
+                epoch: r.epoch,
+                zone_pk: r.zone_pk,
+                ids: Vec::new(),
+                codes: Vec::new(),
+                rows: Vec::new(),
+            });
+        g.ids.push(r.id);
+        g.codes.push(sign_code(&r.vec));
+        g.rows.push(encode_i8(&r.vec));
+    }
+    groups
+}
+
+fn key_for<'k>(keys: &'k KeyMap, epoch: u32, zone_pk: &[u8; 32]) -> Result<&'k SearchKey, String> {
+    keys.get(&(epoch, *zone_pk))
+        .ok_or_else(|| format!("no key for epoch {epoch}"))
+}
+
+fn content(
+    spec: &BuildSpec<'_>,
+    v: u32,
+    objects: Vec<ObjectRef>,
+    excluded: Vec<String>,
+) -> Content {
+    Content {
+        v,
+        zone: spec.zone.into(),
+        index_version: spec.version,
+        dim: DIM as u32,
+        model: spec.model.into(),
+        model_sha256: spec.model_sha256.into(),
+        vocab_sha256: spec.vocab_sha256.into(),
+        objects,
+        excluded,
+    }
+}
+
+/// Build a whole index version (every object at `spec.version`, shards
+/// numbered from 0 per epoch). The content is v1; a publisher that must keep
+/// older browsers off its manifests sets `v` to [`V2`] before signing (a v1
+/// content is a valid v2 content).
+pub fn build(spec: &BuildSpec<'_>, rows: &[DocRow], keys: &KeyMap) -> Result<Built, String> {
+    let shard_rows = spec.shard_rows.clamp(1, MAX_ROWS);
+    let mut out = Sealed::default();
+    for ((epoch, zone_pk), g) in quantise(rows) {
+        let key = key_for(keys, epoch, &zone_pk)?;
+        seal_group(spec.zone, spec.version, &g, 0, shard_rows, key, &mut out)?;
+    }
+    Ok(Built {
+        content: content(spec, V1, out.refs, Vec::new()),
+        objects: out.objects,
+    })
+}
+
+/// An earlier object listed unchanged in a newer version signed by `signer`:
+/// same name, kind, slot, size and hash, with its `owner` (when not `signer`)
+/// and the `version` its header was built at made explicit.
+fn carry(o: &ObjectRef, prev: Previous<'_>, signer: &str, version: u64) -> ObjectRef {
+    let owner = o.owner_or(prev.signer).to_lowercase();
+    let built_at = o.effective_version(prev.content);
+    ObjectRef {
+        owner: (!owner.eq_ignore_ascii_case(signer)).then_some(owner),
+        version: (built_at != version).then_some(built_at),
+        ..o.clone()
+    }
+}
+
+/// Next free shard number per `(epoch, lowercase zone_pk)` in `objects`.
+fn next_shards<'a>(
+    objects: impl IntoIterator<Item = &'a ObjectRef>,
+) -> HashMap<(u32, String), u32> {
+    let mut next: HashMap<(u32, String), u32> = HashMap::new();
+    for o in objects {
+        let n = next.entry((o.epoch, o.zone_pk.to_lowercase())).or_insert(0);
+        *n = (*n).max(o.shard.saturating_add(1));
+    }
+    next
+}
+
+fn check_newer(spec: &BuildSpec<'_>, prev: Previous<'_>) -> Result<(), String> {
+    if spec.version <= prev.content.index_version {
+        return Err(format!(
+            "version {} is not above the previous {}",
+            spec.version, prev.content.index_version
+        ));
+    }
+    if spec.zone != prev.content.zone {
+        return Err("previous manifest is for another zone".into());
+    }
+    Ok(())
+}
+
+/// An incremental update: seal only `rows` (new posts) into additional
+/// shards, numbered after each epoch's highest existing shard, and list every
+/// object of `prev` unchanged. `exclude` adds ids (deleted or superseded posts
+/// already in `prev`'s objects) to the manifest's exclusion list. The content
+/// is v2, signed by `signer`.
+pub fn update(
+    spec: &BuildSpec<'_>,
+    prev: Previous<'_>,
+    signer: &str,
+    rows: &[DocRow],
+    exclude: &[String],
+    keys: &KeyMap,
+) -> Result<Built, String> {
+    check_newer(spec, prev)?;
+    let shard_rows = spec.shard_rows.clamp(1, MAX_ROWS);
+    let mut objects: Vec<ObjectRef> = prev
+        .content
+        .objects
+        .iter()
+        .map(|o| carry(o, prev, signer, spec.version))
+        .collect();
+    let next = next_shards(&prev.content.objects);
+    let mut out = Sealed::default();
+    for ((epoch, zone_pk), g) in quantise(rows) {
+        let key = key_for(keys, epoch, &zone_pk)?;
+        let first = next
+            .get(&(epoch, hex::encode(zone_pk)))
+            .copied()
+            .unwrap_or(0);
+        seal_group(
+            spec.zone,
+            spec.version,
+            &g,
+            first,
+            shard_rows,
+            key,
+            &mut out,
+        )?;
+    }
+    objects.extend(out.refs);
+    let excluded: BTreeSet<String> = prev
+        .content
+        .excluded
+        .iter()
+        .cloned()
+        .chain(exclude.iter().map(|e| e.to_lowercase()))
+        .collect();
+    Ok(Built {
+        content: content(spec, V2, objects, excluded.into_iter().collect()),
+        objects: out.objects,
+    })
+}
+
+/// The int8 partner of a bin object in `content`.
+pub fn q_partner<'c>(content: &'c Content, bin: &ObjectRef) -> Option<&'c ObjectRef> {
+    content.objects.iter().find(|o| {
+        o.kind == Kind::Int8
+            && o.epoch == bin.epoch
+            && o.shard == bin.shard
+            && o.zone_pk.eq_ignore_ascii_case(&bin.zone_pk)
+    })
+}
+
+/// Open one shard pair of `content` (both objects whole), checking each
+/// against its manifest entry (size, hash, single X25519 stanza) and its
+/// authenticated header, and return its rows.
+pub fn open_pair(
+    content: &Content,
+    bin: &ObjectRef,
+    bin_sealed: &[u8],
+    q: &ObjectRef,
+    q_sealed: &[u8],
+    key: &SearchKey,
+) -> Result<PairRows, String> {
+    if bin.kind != Kind::Bin || q.kind != Kind::Int8 {
+        return Err("not a bin + int8 pair".into());
+    }
+    check_sealed(
+        bin,
+        bin_sealed,
+        bin_sealed.len(),
+        Some(&sha256_hex(bin_sealed)),
+    )?;
+    check_sealed(q, q_sealed, q_sealed.len(), Some(&sha256_hex(q_sealed)))?;
+    let layer = BinLayer::parse(&open(key, bin_sealed)?)?;
+    check_header(&layer.header, bin, content)?;
+    let (qh, rows) = parse_int8(&open(key, q_sealed)?)?;
+    check_header(&qh, q, content)?;
+    if qh.shard != layer.header.shard || qh.count != layer.header.count {
+        return Err(format!("{} and {} are not one shard", bin.name, q.name));
+    }
+    let n = layer.header.count as usize;
+    Ok(PairRows {
+        epoch: layer.header.epoch,
+        zone_pk: layer.header.zone_pk,
+        ids: (0..n).map(|r| layer.id(r)).collect(),
+        codes: (0..n)
+            .map(|r| <[u8; CODE_BYTES]>::try_from(layer.code(r)).expect("code width"))
+            .collect(),
+        rows,
+    })
+}
+
+/// A compaction: replace the shard pairs whose bin objects are named in
+/// `fold` by fresh shards holding their rows (from [`open_pair`], in
+/// `opened`) minus the ids in `dropped`, and list every other object of
+/// `prev` unchanged. Dropped ids leave the exclusion list (they are gone);
+/// the rest of it stays. Rows are re-packed verbatim, so no embedding is
+/// needed. The content is v2, signed by `signer`.
+pub fn compact(
+    spec: &BuildSpec<'_>,
+    prev: Previous<'_>,
+    signer: &str,
+    fold: &[String],
+    opened: &[PairRows],
+    dropped: &HashSet<String>,
+    keys: &KeyMap,
+) -> Result<Built, String> {
+    check_newer(spec, prev)?;
+    let shard_rows = spec.shard_rows.clamp(1, MAX_ROWS);
+    let folded_slots: HashSet<(u32, String, u32)> = prev
+        .content
+        .objects
+        .iter()
+        .filter(|o| o.kind == Kind::Bin && fold.contains(&o.name))
+        .map(|o| (o.epoch, o.zone_pk.to_lowercase(), o.shard))
+        .collect();
+    if folded_slots.len() != fold.len() {
+        return Err("a folded object is not a bin object of the previous manifest".into());
+    }
+    let kept: Vec<&ObjectRef> = prev
+        .content
+        .objects
+        .iter()
+        .filter(|o| !folded_slots.contains(&(o.epoch, o.zone_pk.to_lowercase(), o.shard)))
+        .collect();
+    let mut objects: Vec<ObjectRef> = kept
+        .iter()
+        .map(|o| carry(o, prev, signer, spec.version))
+        .collect();
+    // New shards are numbered after every shard of the previous version, so
+    // no name or slot of a folded pair is reused.
+    let next = next_shards(&prev.content.objects);
+    let mut merged: BTreeMap<(u32, [u8; 32]), PairRows> = BTreeMap::new();
+    for p in opened {
+        let g = merged
+            .entry((p.epoch, p.zone_pk))
+            .or_insert_with(|| PairRows {
+                epoch: p.epoch,
+                zone_pk: p.zone_pk,
+                ids: Vec::new(),
+                codes: Vec::new(),
+                rows: Vec::new(),
+            });
+        for i in 0..p.ids.len() {
+            if !dropped.contains(&hex::encode(p.ids[i])) {
+                g.ids.push(p.ids[i]);
+                g.codes.push(p.codes[i]);
+                g.rows.push(p.rows[i]);
             }
         }
     }
+    let mut out = Sealed::default();
+    for ((epoch, zone_pk), g) in merged {
+        if g.ids.is_empty() {
+            continue;
+        }
+        let key = key_for(keys, epoch, &zone_pk)?;
+        let first = next
+            .get(&(epoch, hex::encode(zone_pk)))
+            .copied()
+            .unwrap_or(0);
+        seal_group(
+            spec.zone,
+            spec.version,
+            &g,
+            first,
+            shard_rows,
+            key,
+            &mut out,
+        )?;
+    }
+    objects.extend(out.refs);
+    let excluded: Vec<String> = prev
+        .content
+        .excluded
+        .iter()
+        .filter(|e| !dropped.contains(*e))
+        .cloned()
+        .collect();
     Ok(Built {
-        content: Content {
-            v: 1,
-            zone: zone.into(),
-            index_version: version,
-            dim: DIM as u32,
-            model: model.into(),
-            model_sha256: model_sha256.into(),
-            vocab_sha256: vocab_sha256.into(),
-            objects: refs,
-        },
-        objects,
+        content: content(spec, V2, objects, excluded),
+        objects: out.objects,
     })
 }
 

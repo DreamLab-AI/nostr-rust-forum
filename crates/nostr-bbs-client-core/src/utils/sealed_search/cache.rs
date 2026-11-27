@@ -128,6 +128,8 @@ mod tests {
             count: 1,
             size: 1,
             sha256: sha.into(),
+            owner: None,
+            version: None,
         }
     }
 
@@ -141,6 +143,7 @@ mod tests {
             model_sha256: "m0".into(),
             vocab_sha256: "v0".into(),
             objects,
+            excluded: Vec::new(),
         }
     }
 
