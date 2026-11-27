@@ -714,6 +714,35 @@ async fn ensure_model(
     r
 }
 
+/// The manifest to load from the publishers' answers `(publisher, event)`,
+/// given in trusted-publisher order, and the refusals `(publisher, reason)`.
+fn choose_manifest(
+    answers: Vec<(String, NostrEvent)>,
+    zone: &str,
+    relay_url: &str,
+    pubs: &[String],
+    hw: Option<&HighWater>,
+    held: &[ZoneKey],
+) -> (Option<Manifest>, Vec<(String, String)>) {
+    let _ = held;
+    let mut best: Option<Manifest> = None;
+    let mut refused = Vec::new();
+    for (p, ev) in answers {
+        match Manifest::verify(ev, zone, relay_url, pubs, hw) {
+            Ok(m)
+                if best
+                    .as_ref()
+                    .is_none_or(|b| m.content.index_version > b.content.index_version) =>
+            {
+                best = Some(m);
+            }
+            Ok(_) => {}
+            Err(e) => refused.push((p, e)),
+        }
+    }
+    (best, refused)
+}
+
 /// Where `o` is fetched from: the pod of the publisher holding it (the
 /// manifest's signer, or the object's v2 `owner`, which
 /// [`Manifest::verify`] has checked is a listed publisher). The manifest's
@@ -842,30 +871,27 @@ async fn load_zone(
     }))
     .await;
     alive(gen, None)?;
-    let mut best: Option<Manifest> = None;
     let mut unreachable: Option<String> = None;
+    let mut events: Vec<(String, NostrEvent)> = Vec::new();
     for (p, answer) in answers {
-        let ev = match answer {
-            Ok(Some(ev)) => ev,
-            Ok(None) => continue,
+        match answer {
+            Ok(Some(ev)) => events.push((p.clone(), ev)),
+            Ok(None) => {}
             Err(e) => {
                 unreachable.get_or_insert(format!("publisher {}: {e}", &p[..8.min(p.len())]));
-                continue;
             }
-        };
-        match Manifest::verify(ev, zone, &relay_url, &pubs, hw.as_ref()) {
-            Ok(m)
-                if best
-                    .as_ref()
-                    .is_none_or(|b| m.content.index_version > b.content.index_version) =>
-            {
-                best = Some(m);
-            }
-            Ok(_) => {}
-            Err(e) => web_sys::console::warn_1(
-                &format!("[sealed-search] {zone}: manifest from {p} refused: {e}").into(),
-            ),
         }
+    }
+    let held_keys: Vec<ZoneKey> = store
+        .all_for_zone(zone)
+        .into_iter()
+        .filter(|k| !k.pending_delivery)
+        .collect();
+    let (best, refused) = choose_manifest(events, zone, &relay_url, &pubs, hw.as_ref(), &held_keys);
+    for (p, e) in refused {
+        web_sys::console::warn_1(
+            &format!("[sealed-search] {zone}: manifest from {p} refused: {e}").into(),
+        );
     }
     debug(&format!("{zone}: manifest read in {:.0} ms", now_ms() - t0));
     let Some(manifest) = best else {
