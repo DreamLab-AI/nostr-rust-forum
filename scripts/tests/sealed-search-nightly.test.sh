@@ -145,6 +145,13 @@ set -e
 check "config in a world-writable directory: exit 12" 12 "$rc"
 chmod 700 "$tmp/shared"
 
+# The state directory (state, author book, cache) must be private to the job.
+mkdir -p "$tmp/state"
+chmod 777 "$tmp/state"
+run_job
+check "state directory writable by others: exit 12" 12 "$rc"
+chmod 700 "$tmp/state"
+
 # By default the exclusion list is emptied by compact --all well before its cap.
 STUB_PARTIAL=0 STUB_EXCLUDED=4096 run_job
 check "default: compact --all at 4096 exclusions" 1 "$(grep -c '^compact.*--all' "$tmp/calls" || true)"

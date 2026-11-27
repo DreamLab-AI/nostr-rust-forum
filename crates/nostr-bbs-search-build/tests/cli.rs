@@ -73,3 +73,28 @@ fn dump_vectors_is_refused_for_rows_read_from_a_relay_or_export() {
     assert!(err.contains("--dump-vectors"), "{err}");
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+#[test]
+fn a_malformed_moderator_or_publisher_entry_is_an_error() {
+    let d = dir("mods");
+    let good = "ab".repeat(32);
+    for (flag, value) in [
+        ("--moderators", format!("{good},abc")),
+        ("--publishers", format!("{good},not-a-key")),
+    ] {
+        let (code, err) = run(&[
+            "status",
+            "--zone",
+            "zone2",
+            "--relay-url",
+            "wss://r",
+            "--pod-dir",
+            d.to_str().unwrap(),
+            flag,
+            &value,
+        ]);
+        assert_eq!(code, 2, "{flag}: {err}");
+        assert!(err.contains(flag), "{flag}: {err}");
+    }
+    std::fs::remove_dir_all(&d).unwrap();
+}

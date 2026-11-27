@@ -1009,4 +1009,37 @@ mod tests {
         );
         assert_eq!(Manifest::newest([b, a, c]).unwrap().event.pubkey, pk(2));
     }
+
+    #[test]
+    fn the_mac_epoch_never_goes_back_on_a_device() {
+        // A v2 manifest listing epoch 2: accepted, and its mark records it.
+        let mut c2 = update_content(7);
+        for o in c2.objects.iter_mut() {
+            o.epoch = 2;
+        }
+        let m = accept(signed(2, &c2, "ws://r"), None).unwrap();
+        assert_eq!(m.high_water().mac_epoch, Some(2));
+        // Later, one listing only epoch-1 objects (a former member holding
+        // epoch 1 and a publisher key could MAC it): refused on that device.
+        let c1 = update_content(8);
+        let refused = accept(signed(2, &c1, "ws://r"), Some(&m.high_water()));
+        assert!(refused.is_err(), "MAC epoch below the device's mark");
+        // A mark stored before the epoch was recorded does not block it.
+        let old = HighWater {
+            mac_epoch: None,
+            ..m.high_water()
+        };
+        assert!(accept(signed(2, &c1, "ws://r"), Some(&old)).is_ok());
+    }
+
+    #[test]
+    fn strict_pubkey_lists_refuse_typos() {
+        let a = "ab".repeat(32);
+        assert_eq!(
+            parse_pubkey_list(&format!(" {a} ,{a}")).unwrap(),
+            vec![a.clone()]
+        );
+        assert!(parse_pubkey_list(&format!("{a},abc")).is_err());
+        assert!(parse_pubkey_list("").unwrap().is_empty());
+    }
 }

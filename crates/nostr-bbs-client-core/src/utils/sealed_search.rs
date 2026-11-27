@@ -1790,6 +1790,84 @@ mod tests {
     }
 
     #[test]
+    fn every_accepted_manifest_is_a_candidate_newest_first() {
+        let pubs = vec![pk_hex(MIGRATOR), pk_hex(ALICE)];
+        let base = signed_manifest(
+            MIGRATOR,
+            &manifest_content(1, 1, vec![zone_object(1, 0, None)]),
+        );
+        // A higher v1 signed with a publisher key alone: valid on its face
+        // (its objects fail only when loaded).
+        let higher = signed_manifest(
+            ALICE,
+            &manifest_content(1, 5, vec![zone_object(5, 0, None)]),
+        );
+        let (cands, refused) = choose_manifests(
+            vec![(pk_hex(MIGRATOR), base), (pk_hex(ALICE), higher)],
+            "zone2",
+            "wss://relay.test",
+            &pubs,
+            None,
+            &[zone_key()],
+        );
+        assert!(refused.is_empty());
+        let versions: Vec<u64> = cands.iter().map(|m| m.content.index_version).collect();
+        assert_eq!(versions, [5, 1]);
+    }
+
+    fn poll_ready<T>(f: impl std::future::Future<Output = T>) -> T {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    #[test]
+    fn a_candidate_that_fails_to_load_falls_back_to_the_next() {
+        let c = |v| {
+            Manifest::verify(
+                signed_manifest(
+                    MIGRATOR,
+                    &manifest_content(1, v, vec![zone_object(v, 0, None)]),
+                ),
+                "zone2",
+                "wss://relay.test",
+                &[pk_hex(MIGRATOR)],
+                None,
+            )
+            .unwrap()
+        };
+        let tried = std::cell::RefCell::new(Vec::new());
+        let got = poll_ready(first_loadable(
+            vec![c(5), c(1)],
+            |m| {
+                tried.borrow_mut().push(m.content.index_version);
+                let v = m.content.index_version;
+                async move {
+                    if v == 5 {
+                        Err("object does not match the manifest".to_string())
+                    } else {
+                        Ok(v)
+                    }
+                }
+            },
+            || false,
+        ));
+        assert_eq!(got, Ok(1));
+        assert_eq!(*tried.borrow(), [5, 1]);
+        // A session that ended stops trying.
+        let got = poll_ready(first_loadable(
+            vec![c(5), c(1)],
+            |_| async { Err::<u64, _>("failed".to_string()) },
+            || true,
+        ));
+        assert!(got.is_err());
+    }
+
+    #[test]
     fn equal_versions_choose_the_first_listed_publisher() {
         let pubs = vec![pk_hex(MIGRATOR), pk_hex(ALICE)];
         let c = manifest_content(1, 4, vec![zone_object(4, 0, None)]);

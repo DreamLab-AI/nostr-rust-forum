@@ -257,6 +257,14 @@ fn fixture(name: &str) -> Fixture {
     assert_eq!(r.rows_added, 115);
     // A first base, with no v2 manifest anywhere, is v1: every browser reads it.
     assert_eq!(browser_manifest(&f, None).content.v, 1);
+    // The indexer seeds its author book from the zone before its first update.
+    block_on(nostr_bbs_search_build::harvest::seed_book(
+        &mut f.relay,
+        ZONE,
+        &ring(&[(1, ZONE_E1)]),
+        &mut f.book,
+    ))
+    .unwrap();
     f
 }
 
@@ -980,18 +988,27 @@ fn a_second_the_relay_cannot_page_holds_the_mark_below_it() {
         f.relay
             .insert(native(BOB, s, &format!("same second {i}"), vec![]));
     }
+    // A recent second (the job runs an hour later) holds the mark.
+    let soon = nostr_bbs_search_build::harvest::Rules {
+        now: s + 3_600,
+        moderators: &[],
+    };
     let h = block_on(harvest(
         &mut f.relay,
         ZONE,
         &ring(&[(1, ZONE_E1)]),
         Some(T0),
         &HashSet::new(),
-        &rules(),
+        &soon,
         &mut Default::default(),
     ))
     .unwrap();
     assert_eq!(h.ambiguous_seconds, vec![s]);
-    update(&mut f, &mut state).unwrap();
+    let o = Opts {
+        now: s + 3_600,
+        ..Opts::default()
+    };
+    update_with(&mut f, &mut state, &o).unwrap();
     assert!(state.high_water.unwrap() < s, "{:?}", state.high_water);
 }
 
@@ -1103,4 +1120,157 @@ fn a_full_exclusion_list_stops_with_its_own_exit_code() {
     let e = update_with(&mut f, &mut state, &o).unwrap_err();
     assert_eq!(e.exit_code(), 8, "{e}");
     assert!(e.to_string().contains("compact --all"), "{e}");
+}
+
+// ── Second security review ─────────────────────────────────────────────────
+
+#[test]
+fn a_moderator_deletion_needs_no_author() {
+    let mut f = fixture("mod-no-author");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    // A live post and an imported one, removed by the relay at once on a
+    // moderator's kind-5, whose authors the book does not hold.
+    let live = f.natives[&base_text(107)].clone();
+    f.relay.remove(&live.id);
+    f.book.authors.remove(&live.id);
+    let (o30, e30) = f.originals[&base_text(30)].clone();
+    f.relay.remove(&e30.id);
+    f.book.authors.remove(&o30.id);
+    f.relay.insert(kind5(STRANGER, T0 + 6_000, &live.id));
+    f.relay.insert(kind5(STRANGER, T0 + 6_001, &e30.id));
+    let o = Opts {
+        moderators: vec![pk(STRANGER)],
+        ..Opts::default()
+    };
+    let r = update_with(&mut f, &mut state, &o).unwrap();
+    assert_eq!(
+        r.excluded_added, 2,
+        "a moderator's deletion counts without an author"
+    );
+}
+
+#[test]
+fn an_unseeded_author_book_stops_the_first_update() {
+    let mut f = fixture("unseeded");
+    assert!(f.book.seeded, "seed_book marks the book");
+    assert_eq!(f.book.authors.len(), 115);
+    assert_eq!(f.book.envelopes.len(), 100);
+    f.book = Default::default();
+    let mut state = new_state();
+    let e = update(&mut f, &mut state).unwrap_err();
+    assert_eq!(e.exit_code(), 9, "{e}");
+    assert_eq!(state.high_water, None);
+}
+
+#[test]
+fn the_book_is_written_before_the_state() {
+    let dir = std::env::temp_dir().join(format!("nbss-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("not-a-dir"), "x").unwrap();
+    let state_path = dir.join("zone2.state.json");
+    let book_path = dir.join("not-a-dir").join("zone2.authors.json");
+    let mut st = new_state();
+    st.high_water = Some(42);
+    let r = nostr_bbs_search_build::pipeline::persist(
+        Some((&st, &state_path)),
+        Some((
+            &nostr_bbs_search_build::harvest::AuthorBook::default(),
+            &book_path,
+        )),
+    );
+    assert!(r.is_err());
+    assert!(
+        !state_path.exists(),
+        "the mark must not move when the book was not written"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_operator_takedown_excludes_indexed_posts_in_the_next_manifest() {
+    let mut f = fixture("takedown");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    let (o40, _) = f.originals[&base_text(40)].clone();
+    let r = indexer(&mut f, &mut state, |j, _, s| {
+        block_on(nostr_bbs_search_build::pipeline::run_takedown(
+            j,
+            s,
+            &[o40.id.clone(), "ff".repeat(32)],
+            "moderated through the admin API",
+        ))
+    })
+    .unwrap();
+    assert!(r.published);
+    assert_eq!(r.excluded_added, 1, "only the indexed id");
+    assert!(r.warnings.iter().any(|w| w.contains("not in the index")));
+    let m = browser_manifest(&f, None);
+    assert_eq!(m.event.pubkey, pk(INDEXER));
+    assert!(m.content.excluded.contains(&o40.id));
+    let l = load(&f, &m);
+    assert!(!search(&l, &base_text(40)).contains(&o40.id));
+}
+
+#[test]
+fn a_flood_of_irrelevant_or_old_events_cannot_pin_the_mark() {
+    let mut f = fixture("stall");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    // 1,001 valid kind-5s at one second, each naming a random id of the
+    // signer's own: nothing in this zone.
+    let s = T0 + 50;
+    for i in 0..1_001u32 {
+        let target = hex::encode(sha2::Sha256::digest(i.to_be_bytes()));
+        f.relay.insert(kind5(BOB, s, &target));
+    }
+    let o = Opts {
+        now: T0 + 3_600,
+        ..Opts::default()
+    };
+    update_with(&mut f, &mut state, &o).unwrap();
+    assert_eq!(
+        state.high_water,
+        Some(T0 + 114),
+        "irrelevant events hold nothing"
+    );
+    // 1,001 real posts in one second, long ago: released after the hold
+    // period, loudly.
+    let s2 = T0 + 500;
+    for i in 0..1_001 {
+        f.relay
+            .insert(native(BOB, s2, &format!("old flood {i}"), vec![]));
+    }
+    let r = update(&mut f, &mut state).unwrap();
+    assert!(state.high_water.unwrap() >= s2, "{:?}", state.high_water);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("could not be read completely")),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn the_author_book_keeps_only_indexed_posts() {
+    let mut f = fixture("prune");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    // Deleted before it was ever indexed: not kept.
+    let doomed = native(BOB, T0 + 7_000, "short-lived", vec![]);
+    f.relay.insert(doomed.clone());
+    f.relay.insert(kind5(BOB, T0 + 7_001, &doomed.id));
+    f.relay.insert(native(BOB, T0 + 7_002, "kept post", vec![]));
+    update(&mut f, &mut state).unwrap();
+    assert!(!f.book.authors.contains_key(&doomed.id));
+    // Dropped by compaction: forgotten.
+    let live113 = f.natives[&base_text(113)].clone();
+    f.relay.insert(kind5(ALICE, T0 + 7_100, &live113.id));
+    update(&mut f, &mut state).unwrap();
+    let r = compact_partial(&mut f, &mut state).unwrap();
+    assert!(r.dropped_rows >= 1);
+    assert!(!f.book.authors.contains_key(&live113.id));
+    assert!(f.book.authors.len() < 120);
 }
