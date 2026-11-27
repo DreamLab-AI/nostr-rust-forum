@@ -563,16 +563,18 @@ impl NotificationStoreV2 {
                 state.notified_ids.iter().cloned(),
                 MAX_SEEN_IDS,
             ));
-            store.announced_channels.set(SeenIds::from_ids(
-                state.announced_channels.iter().cloned(),
-                MAX_ANNOUNCED_IDS,
-            ));
-            store.announced_members.set(SeenIds::from_ids(
-                state.announced_members.iter().cloned(),
-                MAX_ANNOUNCED_IDS,
-            ));
             // The visible list is per-account too: swap in this owner's own.
-            store.items.set(load_from_storage(&owner_for_items));
+            let items = load_from_storage(&owner_for_items);
+            let mut channels =
+                SeenIds::from_ids(state.announced_channels.iter().cloned(), MAX_ANNOUNCED_IDS);
+            let mut members =
+                SeenIds::from_ids(state.announced_members.iter().cloned(), MAX_ANNOUNCED_IDS);
+            // State stored before the announced lists existed knows nothing of
+            // notices already in the list; adopt them so clearing them sticks.
+            let adopted = adopt_listed_notices(&items, &mut channels, &mut members);
+            store.announced_channels.set(channels);
+            store.announced_members.set(members);
+            store.items.set(items);
             known_profiles.set(HashSet::new());
             join_seeded.set(false);
             if state.baseline == 0 {
@@ -582,6 +584,9 @@ impl NotificationStoreV2 {
                 store.persist_sync_state();
             } else {
                 store.baseline.set(state.baseline);
+                if adopted {
+                    store.persist_sync_state();
+                }
             }
         });
 
@@ -1153,6 +1158,28 @@ fn notice_due(items: &[Notification], announced: &SeenIds, subject: &str, prefix
     }
     let id = format!("{prefix}{subject}");
     !items.iter().any(|n| n.id == id)
+}
+
+/// Record the section and member notices already in `items` as announced.
+///
+/// Sync state written before the announced lists existed is empty, yet its
+/// owner's visible list may hold `topic:` and `join:` notices; without this
+/// they would be announced once more after being cleared. Returns whether any
+/// id was newly recorded, so the caller knows to persist.
+fn adopt_listed_notices(
+    items: &[Notification],
+    channels: &mut SeenIds,
+    members: &mut SeenIds,
+) -> bool {
+    let mut adopted = false;
+    for n in items {
+        if let Some(id) = n.id.strip_prefix(TOPIC_NOTICE_PREFIX) {
+            adopted |= channels.insert(id.to_string());
+        } else if let Some(id) = n.id.strip_prefix(JOIN_NOTICE_PREFIX) {
+            adopted |= members.insert(id.to_string());
+        }
+    }
+    adopted
 }
 
 /// Compute the per-pubkey localStorage key for the producer sync state.
@@ -1977,6 +2004,43 @@ mod tests {
         // A different section / member is still announced.
         assert!(notice_due(&items, &channels, "chan-2", "topic:"));
         assert!(notice_due(&items, &members, "member-2", "join:"));
+    }
+
+    #[test]
+    fn notices_listed_before_the_upgrade_stay_cleared_too() {
+        // State stored by an older build: no announced lists at all.
+        let state: SyncState = serde_json::from_str(r#"{"baseline":5,"notified_ids":[]}"#).unwrap();
+        let mut items = vec![notice("topic:chan-1"), notice("join:member-1")];
+        let mut channels = SeenIds::from_ids(state.announced_channels, MAX_ANNOUNCED_IDS);
+        let mut members = SeenIds::from_ids(state.announced_members, MAX_ANNOUNCED_IDS);
+        assert!(adopt_listed_notices(&items, &mut channels, &mut members));
+        // Adopting again records nothing new.
+        assert!(!adopt_listed_notices(&items, &mut channels, &mut members));
+
+        // Persist, clear, reload.
+        let stored = serde_json::to_string(&SyncState {
+            baseline: 5,
+            notified_ids: Vec::new(),
+            announced_channels: channels.ids(),
+            announced_members: members.ids(),
+        })
+        .unwrap();
+        items.clear();
+        let state: SyncState = serde_json::from_str(&stored).unwrap();
+        let channels = SeenIds::from_ids(state.announced_channels, MAX_ANNOUNCED_IDS);
+        let members = SeenIds::from_ids(state.announced_members, MAX_ANNOUNCED_IDS);
+        assert!(!notice_due(
+            &items,
+            &channels,
+            "chan-1",
+            TOPIC_NOTICE_PREFIX
+        ));
+        assert!(!notice_due(
+            &items,
+            &members,
+            "member-1",
+            JOIN_NOTICE_PREFIX
+        ));
     }
 
     #[test]
