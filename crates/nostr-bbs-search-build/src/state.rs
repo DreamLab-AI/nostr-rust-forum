@@ -147,4 +147,22 @@ mod tests {
         assert!(State::load_or_new(&p, "zone2", "wss://r", &"cd".repeat(32)).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_temp_file_cannot_widen_the_state_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nbss-state-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("zone2.json");
+        let tmp = p.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&tmp, "stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        State::new("zone2", "wss://r", &"ab".repeat(32))
+            .save(&p)
+            .unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

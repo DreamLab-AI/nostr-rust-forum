@@ -119,5 +119,36 @@ chmod 600 "$tmp/key"
 sed -i '/^NBSS_ZONE=/d' "$tmp/zone.env"
 run_job
 check "missing zone: exit 12" 12 "$rc"
+write_config
+
+# The zone-key file holds zone secrets: owner-only too.
+printf '{}' >"$tmp/zonekeys.json"
+chmod 644 "$tmp/zonekeys.json"
+printf 'NBSS_KEYS_FILE=%s\n' "$tmp/zonekeys.json" >>"$tmp/zone.env"
+run_job
+check "zone-key file readable by others: exit 12" 12 "$rc"
+chmod 600 "$tmp/zonekeys.json"
+run_job
+check "zone-key file 0600: runs" 0 "$rc"
+write_config
+
+# A config in a directory others can write could be swapped for theirs.
+mkdir -p "$tmp/shared"
+cp "$tmp/zone.env" "$tmp/shared/zone.env"
+chmod 600 "$tmp/shared/zone.env"
+chmod 777 "$tmp/shared"
+export STUB_LOG="$tmp/calls"
+set +e
+"$job" "$tmp/shared/zone.env" 2>/dev/null
+rc=$?
+set -e
+check "config in a world-writable directory: exit 12" 12 "$rc"
+chmod 700 "$tmp/shared"
+
+# By default the exclusion list is emptied by compact --all well before its cap.
+STUB_PARTIAL=0 STUB_EXCLUDED=4096 run_job
+check "default: compact --all at 4096 exclusions" 1 "$(grep -c '^compact.*--all' "$tmp/calls" || true)"
+STUB_PARTIAL=0 STUB_EXCLUDED=4095 run_job
+check "default: no compaction below it" 0 "$(grep -c '^compact' "$tmp/calls" || true)"
 
 [ "$fails" -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

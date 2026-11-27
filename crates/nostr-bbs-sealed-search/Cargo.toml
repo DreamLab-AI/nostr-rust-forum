@@ -20,6 +20,7 @@ candle-core = { version = "0.9", default-features = false, optional = true }
 candle-nn = { version = "0.9", default-features = false, optional = true }
 age = { version = "0.11", default-features = false, optional = true }
 hkdf = { workspace = true }
+hmac = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
 serde = { workspace = true }

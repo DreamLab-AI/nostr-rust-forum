@@ -228,7 +228,15 @@ fn fixture(name: &str) -> Fixture {
     let mut pod = DirPod::new(&f.root, ZONE, &pk(ARCHIVIST));
     let p = pins();
     let mut job = job(&me, &keys, &mut pod, &f.publishers, &p);
-    let mut h = block_on(harvest(&mut f.relay, ZONE, &keys, None, &HashSet::new(), &rules())).unwrap();
+    let mut h = block_on(harvest(
+        &mut f.relay,
+        ZONE,
+        &keys,
+        None,
+        &HashSet::new(),
+        &rules(),
+    ))
+    .unwrap();
     assert_eq!(h.rows.len(), 115);
     let rows = std::mem::take(&mut h.rows);
     let r = block_on(run_full(
@@ -269,8 +277,45 @@ fn job<'a>(
         warnings: Vec::new(),
         moderators: &[],
         max_excluded: nostr_bbs_sealed_search::manifest::MAX_EXCLUDED,
-        retire_after_secs: 0,
+        retire_after_secs: nostr_bbs_search_build::pipeline::DEFAULT_RETIRE_AFTER_SECS,
     }
+}
+
+/// Indexer settings a test may change.
+struct Opts {
+    moderators: Vec<String>,
+    now: u64,
+    max_excluded: usize,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            moderators: Vec::new(),
+            now: 1_900_000_000,
+            max_excluded: nostr_bbs_sealed_search::manifest::MAX_EXCLUDED,
+        }
+    }
+}
+
+fn update_with(f: &mut Fixture, state: &mut State, o: &Opts) -> Result<Report, JobError> {
+    let me = sk(INDEXER);
+    let keys = ring(&[(1, ZONE_E1)]);
+    let mut pod = DirPod::new(&f.root, ZONE, &pk(INDEXER));
+    let p = pins();
+    let publishers = f.publishers.clone();
+    let mut j = job(&me, &keys, &mut pod, &publishers, &p);
+    j.moderators = &o.moderators;
+    j.now = o.now;
+    j.max_excluded = o.max_excluded;
+    block_on(run_update(
+        &mut j,
+        &mut f.relay,
+        state,
+        &mut HashEmbedder { calls: 0 },
+        None,
+        DEFAULT_OVERLAP_SECS,
+    ))
 }
 
 /// Run one indexer step against the fixture.
@@ -611,12 +656,15 @@ fn compaction_folds_update_shards_drops_gone_rows_and_retires_objects_a_run_late
     let r = compact_partial(&mut f, &mut state).unwrap();
     assert!(r.published);
     assert_eq!(r.folded_pairs, 3);
-    assert_eq!(r.missing_rows, 1, "post 110: gone from the relay");
-    assert_eq!(r.dropped_rows, 2, "posts 110 and 113");
+    assert_eq!(r.missing_rows, 1, "post 110: not served by the relay now");
+    // Only positive evidence drops a row: 113 has an authorised kind-5; 110
+    // is merely not served (withholding must never become a signed,
+    // permanent exclusion), so its row is kept.
+    assert_eq!(r.dropped_rows, 1, "post 113 only");
     assert_eq!(r.excluded_total, 0, "113 left the list with its row");
     let after = indexer(&mut f, &mut state, |j, _, _| block_on(status(j)).unwrap());
     assert_eq!(after.index_version, 5);
-    assert_eq!(after.rows, before.rows - 2);
+    assert_eq!(after.rows, before.rows - 1);
     assert_eq!(after.partial_pairs, 1);
     assert!(
         after.foreign_objects > 0,
@@ -626,17 +674,28 @@ fn compaction_folds_update_shards_drops_gone_rows_and_retires_objects_a_run_late
     let m = browser_manifest(&f, None);
     let l = load(&f, &m);
     assert_eq!(search(&l, "night 1 post 4")[0].len(), 64);
-    for text in [base_text(110), base_text(113)] {
-        let hits = search(&l, &text);
-        assert!(!hits.contains(&live110.id) && !hits.contains(&live118.id));
-    }
+    assert!(!search(&l, &base_text(113)).contains(&live118.id));
+    assert!(
+        search(&l, &base_text(110)).contains(&live110.id),
+        "kept, not shown by the relay"
+    );
     // The folded update objects are retired, not yet deleted: a browser on
     // version 4 can still load it.
     assert_eq!(state.retired.len(), 4);
     let own = files(&f, INDEXER);
     assert!(state.retired.iter().all(|n| own.contains_key(n)));
-    // The next run deletes them.
+    // A run straight after (a manual rerun) keeps them: the grace period is
+    // a duration, not a number of runs.
     let r = update(&mut f, &mut state).unwrap();
+    assert!(!r.published);
+    assert_eq!(r.objects_deleted, 0);
+    assert_eq!(state.retired.len(), 4);
+    // 48 hours later they go.
+    let later = Opts {
+        now: 1_900_000_000 + 48 * 3600,
+        ..Opts::default()
+    };
+    let r = update_with(&mut f, &mut state, &later).unwrap();
     assert!(!r.published);
     assert_eq!(r.objects_deleted, 4);
     let own = files(&f, INDEXER);
@@ -722,8 +781,12 @@ fn refusals_keep_the_index_and_the_high_water_mark() {
     }
     f.relay.insert(native(BOB, t1 + 10, "another", vec![]));
     update(&mut f, &mut state).unwrap();
-    let e = compact_partial(&mut f, &mut state).unwrap_err();
-    assert_eq!(e.exit_code(), 5, "{e}");
+    let before = indexer(&mut f, &mut state, |j, _, _| block_on(status(j)).unwrap());
+    let r = compact_partial(&mut f, &mut state).unwrap();
+    assert_eq!(r.missing_rows, 15, "reported");
+    assert_eq!(r.dropped_rows, 0, "but kept: no evidence of deletion");
+    let after = indexer(&mut f, &mut state, |j, _, _| block_on(status(j)).unwrap());
+    assert_eq!(after.rows, before.rows);
 
     // The pods show an older index than the state recorded (exit 6).
     let mut ahead = state.clone();
@@ -849,4 +912,180 @@ fn an_update_with_another_local_model_is_refused() {
     ))
     .unwrap_err();
     assert!(e.to_string().contains("model"), "{e}");
+}
+
+// ── Security review fixes ──────────────────────────────────────────────────
+
+const DRIFT: u64 = nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS;
+
+#[test]
+fn bogus_foreign_or_future_events_cannot_move_the_high_water_mark() {
+    let mut f = fixture("future");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    assert_eq!(state.high_water, Some(T0 + 114));
+    // A far-future event whose signature does not verify.
+    let mut bad = native(BOB, T0 + 200, "tampered", vec![]);
+    bad.created_at = 4_000_000_000;
+    f.relay.insert(bad);
+    // A valid event of another zone.
+    f.relay.insert(sign(
+        BOB,
+        42,
+        4_000_000_001,
+        vec![
+            t(&["e", CHANNEL, "", "root"]),
+            t(&["zk", "zone9", "1", &pk(ZONE_E1)]),
+        ],
+        "x",
+    ));
+    // A valid kind-5 naming nothing in this zone.
+    f.relay.insert(kind5(BOB, 4_000_000_002, &"ab".repeat(32)));
+    update(&mut f, &mut state).unwrap();
+    assert_eq!(
+        state.high_water,
+        Some(T0 + 114),
+        "none of them moves the mark"
+    );
+    // A valid post of this zone dated far ahead is indexed, but the mark
+    // never goes past the job's clock.
+    f.relay
+        .insert(native(BOB, 4_000_000_003, "post from the future", vec![]));
+    let r = update(&mut f, &mut state).unwrap();
+    assert!(r.published);
+    assert!(state.high_water.unwrap() <= 1_900_000_000 + DRIFT);
+    assert_eq!(state.high_water, Some(1_900_000_000));
+}
+
+#[test]
+fn a_second_the_relay_cannot_page_holds_the_mark_below_it() {
+    let mut f = fixture("ambiguous");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    let s = T0 + 500;
+    for i in 0..1_001 {
+        f.relay
+            .insert(native(BOB, s, &format!("same second {i}"), vec![]));
+    }
+    let h = block_on(harvest(
+        &mut f.relay,
+        ZONE,
+        &ring(&[(1, ZONE_E1)]),
+        Some(T0),
+        &HashSet::new(),
+        &rules(),
+    ))
+    .unwrap();
+    assert_eq!(h.ambiguous_seconds, vec![s]);
+    update(&mut f, &mut state).unwrap();
+    assert!(state.high_water.unwrap() < s, "{:?}", state.high_water);
+}
+
+#[test]
+fn only_authors_and_configured_moderators_delete_posts() {
+    let mut f = fixture("authority");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    // A stranger's kind-5 of Alice's imported post 20 (its original id).
+    let (o20, _) = f.originals[&base_text(20)].clone();
+    f.relay.insert(kind5(STRANGER, T0 + 3_000, &o20.id));
+    let r = update(&mut f, &mut state).unwrap();
+    assert_eq!(r.excluded_added, 0, "not the author, not a moderator");
+    // Alice deleting her own imported post 22.
+    let (o22, _) = f.originals[&base_text(22)].clone();
+    f.relay.insert(kind5(ALICE, T0 + 3_001, &o22.id));
+    let r = update(&mut f, &mut state).unwrap();
+    assert_eq!(r.excluded_added, 1, "the original's author");
+    // Once the stranger is a configured moderator, the earlier kind-5 counts.
+    let o = Opts {
+        moderators: vec![pk(STRANGER)],
+        ..Opts::default()
+    };
+    let r = update_with(&mut f, &mut state, &o).unwrap();
+    assert_eq!(r.excluded_added, 1, "a moderator deletes anyone's post");
+}
+
+#[test]
+fn an_edit_of_a_post_the_relay_does_not_return_is_not_authority() {
+    let mut f = fixture("edit-gone");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    let live105 = f.natives[&base_text(105)].clone();
+    f.relay.remove(&live105.id);
+    f.relay.insert(native(
+        BOB,
+        T0 + 4_000,
+        "bob claims post 105",
+        edit_of(&live105.id),
+    ));
+    let r = update(&mut f, &mut state).unwrap();
+    assert_eq!(r.excluded_added, 0, "authorship unknown this run: skipped");
+}
+
+#[test]
+fn equal_versions_resolve_to_the_first_listed_publisher_in_the_builder_too() {
+    let mut f = fixture("tie");
+    // The indexer's own version-1 index, built elsewhere and placed in its pod.
+    let other = f.root.join("elsewhere");
+    let me = sk(INDEXER);
+    let keys = ring(&[(1, ZONE_E1)]);
+    let p = pins();
+    let publishers = f.publishers.clone();
+    {
+        let mut pod = DirPod::new(&other, ZONE, &pk(INDEXER));
+        let mut j = job(&me, &keys, &mut pod, &publishers, &p);
+        let mut h = block_on(harvest(
+            &mut f.relay,
+            ZONE,
+            &keys,
+            None,
+            &HashSet::new(),
+            &rules(),
+        ))
+        .unwrap();
+        let rows = std::mem::take(&mut h.rows);
+        let r = block_on(run_full(
+            &mut j,
+            None,
+            rows,
+            &HashSet::new(),
+            Some(&h),
+            &mut HashEmbedder { calls: 0 },
+            Format::Auto,
+        ))
+        .unwrap();
+        assert_eq!(r.index_version, Some(1));
+    }
+    let from = DirPod::new(&other, ZONE, &pk(INDEXER)).path(&pk(INDEXER), "m.json");
+    let to = DirPod::new(&f.root, ZONE, &pk(INDEXER)).path(&pk(INDEXER), "m.json");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    for e in std::fs::read_dir(from.parent().unwrap()).unwrap().flatten() {
+        std::fs::copy(e.path(), to.parent().unwrap().join(e.file_name())).unwrap();
+    }
+    let mut state = new_state();
+    let st = indexer(&mut f, &mut state, |j, _, _| block_on(status(j)).unwrap());
+    assert_eq!(st.index_version, 1);
+    assert_eq!(
+        st.signer,
+        pk(ARCHIVIST),
+        "publishers are [archivist, indexer]"
+    );
+}
+
+#[test]
+fn a_full_exclusion_list_stops_with_its_own_exit_code() {
+    let mut f = fixture("cap");
+    let mut state = new_state();
+    update(&mut f, &mut state).unwrap();
+    for (i, n) in [100usize, 102, 104].iter().enumerate() {
+        let ev = f.natives[&base_text(*n)].clone();
+        f.relay.insert(kind5(ALICE, T0 + 5_000 + i as u64, &ev.id));
+    }
+    let o = Opts {
+        max_excluded: 2,
+        ..Opts::default()
+    };
+    let e = update_with(&mut f, &mut state, &o).unwrap_err();
+    assert_eq!(e.exit_code(), 8, "{e}");
+    assert!(e.to_string().contains("compact --all"), "{e}");
 }

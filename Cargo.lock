@@ -3589,6 +3589,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hkdf 0.12.4",
+ "hmac 0.12.1",
  "k256",
  "nostr-bbs-core",
  "serde",

@@ -1665,6 +1665,96 @@ mod tests {
         }
     }
 
+    fn signed_manifest(signer: [u8; 32], content: &Content) -> NostrEvent {
+        sign_event_deterministic(
+            UnsignedEvent {
+                pubkey: pk_hex(signer),
+                created_at: 1,
+                kind: nostr_bbs_sealed_search::manifest::KIND,
+                tags: Manifest::tags(content, "wss://relay.test"),
+                content: serde_json::to_string(content).unwrap(),
+            },
+            &SigningKey::from_bytes((&signer).into()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn manifest_content(v: u32, version: u64, objects: Vec<ObjectRef>) -> Content {
+        Content {
+            v,
+            zone: "zone2".into(),
+            index_version: version,
+            dim: 384,
+            model: "bge".into(),
+            model_sha256: "m".into(),
+            vocab_sha256: "v".into(),
+            objects,
+            excluded: Vec::new(),
+        }
+    }
+
+    fn zone_object(version: u64, shard: u32, built_at: Option<u64>) -> ObjectRef {
+        ObjectRef {
+            name: format!("b-5-{shard}-v{}.age", built_at.unwrap_or(version)),
+            kind: Kind::Bin,
+            epoch: 5,
+            zone_pk: pk_hex(ZONE),
+            shard,
+            count: 1,
+            size: 1,
+            sha256: "00".repeat(32),
+            owner: None,
+            version: built_at,
+        }
+    }
+
+    #[test]
+    fn a_v2_manifest_whose_zone_key_mac_is_missing_is_not_chosen() {
+        let pubs = vec![pk_hex(MIGRATOR), pk_hex(ALICE)];
+        let base = signed_manifest(
+            MIGRATOR,
+            &manifest_content(1, 1, vec![zone_object(1, 0, None)]),
+        );
+        // A listed publisher's v2 at a higher version, without the MAC only a
+        // zone-key holder can make.
+        let forged = signed_manifest(
+            ALICE,
+            &manifest_content(
+                2,
+                9,
+                vec![zone_object(9, 0, Some(1)), zone_object(9, 1, None)],
+            ),
+        );
+        let (best, refused) = choose_manifest(
+            vec![(pk_hex(MIGRATOR), base), (pk_hex(ALICE), forged)],
+            "zone2",
+            "wss://relay.test",
+            &pubs,
+            None,
+            &[zone_key()],
+        );
+        assert_eq!(best.expect("the v1 base").content.index_version, 1);
+        assert_eq!(refused.len(), 1);
+    }
+
+    #[test]
+    fn equal_versions_choose_the_first_listed_publisher() {
+        let pubs = vec![pk_hex(MIGRATOR), pk_hex(ALICE)];
+        let c = manifest_content(1, 4, vec![zone_object(4, 0, None)]);
+        let (best, _) = choose_manifest(
+            vec![
+                (pk_hex(MIGRATOR), signed_manifest(MIGRATOR, &c)),
+                (pk_hex(ALICE), signed_manifest(ALICE, &c)),
+            ],
+            "zone2",
+            "wss://relay.test",
+            &pubs,
+            None,
+            &[zone_key()],
+        );
+        assert_eq!(best.unwrap().event.pubkey, pk_hex(MIGRATOR));
+    }
+
     #[test]
     fn objects_are_fetched_from_the_pod_that_holds_them() {
         let indexer = "1".repeat(64);

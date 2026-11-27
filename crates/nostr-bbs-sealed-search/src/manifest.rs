@@ -670,4 +670,197 @@ mod tests {
         assert_eq!(object_name_version("m.json"), None);
         assert_eq!(object_name_version("b-1-0-v07.age"), None);
     }
+
+    // ── Security review fixes (M3): zone-key MAC, version jump, exclusions ──
+
+    const ZSECRET: [u8; 32] = [0x77; 32];
+
+    /// The manifest MAC computed independently of the crate, from the
+    /// construction as documented (HKDF-SHA256 then HMAC-SHA256 over the
+    /// signed content string).
+    fn reference_mac(
+        content_json: &str,
+        zone: &str,
+        epoch: u32,
+        pk_hex: &str,
+        version: u64,
+        secret: &[u8; 32],
+    ) -> String {
+        use hkdf::Hkdf;
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut info = b"manifest-mac\0".to_vec();
+        info.extend_from_slice(zone.as_bytes());
+        info.push(0);
+        info.extend_from_slice(&epoch.to_be_bytes());
+        info.extend_from_slice(&hex::decode(pk_hex).unwrap());
+        info.extend_from_slice(&version.to_be_bytes());
+        let mut k = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(b"nostr-bbs/sealed-search/manifest-mac/v1"), secret)
+            .expand(&info, &mut k)
+            .unwrap();
+        let mut m = <Hmac<Sha256> as Mac>::new_from_slice(&k).unwrap();
+        m.update(content_json.as_bytes());
+        hex::encode(m.finalize().into_bytes())
+    }
+
+    fn signed_mac(key: u8, content: &Content, mac: Option<(u32, String)>) -> NostrEvent {
+        let k = sk(key);
+        let json = serde_json::to_string(content).unwrap();
+        let mut tags = Manifest::tags(content, "ws://r");
+        if let Some((epoch, m)) = mac {
+            tags.push(vec![
+                "mac".into(),
+                "hmac-sha256-v1".into(),
+                epoch.to_string(),
+                "11".repeat(32),
+                m,
+            ]);
+        }
+        let ev = UnsignedEvent {
+            pubkey: hex::encode(k.verifying_key().to_bytes()),
+            created_at: 1,
+            kind: KIND,
+            tags,
+            content: json,
+        };
+        sign_event_deterministic(ev, &k).unwrap()
+    }
+
+    fn held(_: u32, pk: &str) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+        (pk == "11".repeat(32)).then(|| zeroize::Zeroizing::new(ZSECRET))
+    }
+
+    fn accept(ev: NostrEvent, hw: Option<&HighWater>) -> Result<Manifest, String> {
+        Manifest::accept(ev, "zone2", "ws://r", &[pk(1), pk(2)], hw, held)
+    }
+
+    #[test]
+    fn a_v2_manifest_without_a_zone_key_mac_is_refused() {
+        let c = update_content(7);
+        assert!(accept(signed_mac(2, &c, None), None).is_err(), "no mac tag");
+    }
+
+    #[test]
+    fn only_the_mac_made_with_the_zone_key_for_this_content_is_accepted() {
+        let c = update_content(7);
+        let json = serde_json::to_string(&c).unwrap();
+        let pkh = "11".repeat(32);
+        let good = reference_mac(&json, "zone2", 1, &pkh, 7, &ZSECRET);
+        assert!(accept(signed_mac(2, &c, Some((1, good.clone()))), None).is_ok());
+        // Made with another key (a publisher without the zone key).
+        let other = reference_mac(&json, "zone2", 1, &pkh, 7, &[0x78; 32]);
+        assert!(accept(signed_mac(2, &c, Some((1, other))), None).is_err());
+        // Bound to another index version or zone.
+        let v6 = reference_mac(&json, "zone2", 1, &pkh, 6, &ZSECRET);
+        assert!(accept(signed_mac(2, &c, Some((1, v6))), None).is_err());
+        let z3 = reference_mac(&json, "zone3", 1, &pkh, 7, &ZSECRET);
+        assert!(accept(signed_mac(2, &c, Some((1, z3))), None).is_err());
+        // Over other content: the same MAC on a manifest with one more exclusion.
+        let mut c2 = c.clone();
+        c2.excluded.push("cd".repeat(32));
+        assert!(accept(signed_mac(2, &c2, Some((1, good))), None).is_err());
+        // A searcher without the epoch key cannot check it, so cannot use it.
+        let none = |_: u32, _: &str| None;
+        let json = serde_json::to_string(&c).unwrap();
+        let mac = reference_mac(&json, "zone2", 1, &pkh, 7, &ZSECRET);
+        assert!(Manifest::accept(
+            signed_mac(2, &c, Some((1, mac))),
+            "zone2",
+            "ws://r",
+            &[pk(1), pk(2)],
+            None,
+            none
+        )
+        .is_err());
+        // v1 needs no MAC (built objects already prove the zone key).
+        assert!(accept(signed(1, &content(5), "ws://r"), None).is_ok());
+    }
+
+    #[test]
+    fn version_jumps_and_exclusion_lists_are_bounded() {
+        let pubs = vec![pk(1)];
+        let hw = HighWater {
+            version: 5,
+            event_id: "x".into(),
+        };
+        let ok = Manifest::verify(
+            signed(1, &content(5 + 16_384), "ws://r"),
+            "zone2",
+            "ws://r",
+            &pubs,
+            Some(&hw),
+        );
+        assert!(ok.is_ok());
+        let far = Manifest::verify(
+            signed(1, &content(5 + 16_385), "ws://r"),
+            "zone2",
+            "ws://r",
+            &pubs,
+            Some(&hw),
+        );
+        assert!(far.is_err(), "jump bound");
+        let mut c = update_content(7);
+        c.excluded = (0..16_384u32)
+            .map(|i| {
+                hex::encode(
+                    [
+                        i.to_be_bytes(),
+                        [0; 4],
+                        [0; 4],
+                        [0; 4],
+                        [0; 4],
+                        [0; 4],
+                        [0; 4],
+                        [0; 4],
+                    ]
+                    .concat(),
+                )
+            })
+            .collect();
+        c.excluded.sort();
+        let pubs2 = vec![pk(1), pk(2)];
+        assert!(Manifest::verify(signed(2, &c, "ws://r"), "zone2", "ws://r", &pubs2, None).is_ok());
+        c.excluded.push("ff".repeat(32));
+        assert!(
+            Manifest::verify(signed(2, &c, "ws://r"), "zone2", "ws://r", &pubs2, None).is_err(),
+            "exclusion cap"
+        );
+    }
+
+    #[test]
+    fn equal_versions_resolve_to_the_first_listed_publisher() {
+        let a = Manifest::verify(
+            signed(1, &content(4), "ws://r"),
+            "zone2",
+            "ws://r",
+            &[pk(1), pk(2)],
+            None,
+        )
+        .unwrap();
+        let b = Manifest::verify(
+            signed(2, &content(4), "ws://r"),
+            "zone2",
+            "ws://r",
+            &[pk(1), pk(2)],
+            None,
+        )
+        .unwrap();
+        let c = Manifest::verify(
+            signed(2, &content(3), "ws://r"),
+            "zone2",
+            "ws://r",
+            &[pk(1), pk(2)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            Manifest::newest([a.clone(), b.clone(), c.clone()])
+                .unwrap()
+                .event
+                .pubkey,
+            pk(1)
+        );
+        assert_eq!(Manifest::newest([b, a, c]).unwrap().event.pubkey, pk(2));
+    }
 }
