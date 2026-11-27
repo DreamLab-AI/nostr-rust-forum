@@ -352,7 +352,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
 
                 // Sealed per-zone search over the encrypted zones this member
                 // holds keys for: verified, decrypted events only.
-                if let Some(store) = zone_store.filter(|_| crate::utils::sealed_search::ready()) {
+                if let Some(store) = zone_store {
                     match crate::utils::sealed_search::search(&relay, &store, &q, SEMANTIC_K).await
                     {
                         Ok(hits) => {

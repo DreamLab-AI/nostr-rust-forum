@@ -188,8 +188,6 @@ struct Service {
     rows: RefCell<HashMap<String, usize>>,
     /// Zones with at least one shard in the worker (searchable, maybe partly).
     searchable: RefCell<HashSet<String>>,
-    /// Zone → when (ms) its loaded manifest was last confirmed current.
-    checked: RefCell<HashMap<String, f64>>,
     /// Zone → its loaded manifest content (what the cache must keep).
     kept: RefCell<HashMap<String, Content>>,
 }
@@ -206,12 +204,17 @@ thread_local! {
     static ZONES: RefCell<BTreeMap<String, ZoneLoad>> = const { RefCell::new(BTreeMap::new()) };
     /// The aggregate of `ZONES` (or the state before any load), for search UIs.
     static READINESS: ArcRwSignal<Readiness> = ArcRwSignal::new(Readiness::Idle);
+    /// Zone → when (ms) its manifest was last read: a loaded or index-less
+    /// zone is not asked again within [`RECHECK_MS`].
+    static CHECKED: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
     /// What [`autoload`] last started for: `pubkey|generation|zones held`.
     static AUTOLOADED: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Shard pairs (bin + int8) fetched and loaded at once.
-const PARALLEL_SHARDS: usize = 3;
+/// Shard pairs (bin + int8) fetched and loaded at once: enough to hide
+/// request latency, few enough that the first pairs arrive early on a link
+/// the downloads saturate (measured ~5–6 MB/s, shared by every stream).
+const PARALLEL_SHARDS: usize = 2;
 /// A loaded zone's manifest is re-read at most this often (ms).
 const RECHECK_MS: f64 = 5.0 * 60.0 * 1000.0;
 /// [`autoload`] waits this long (ms) after sign-in, so the page paints first.
@@ -476,10 +479,12 @@ async fn idb_clear(db: &web_sys::IdbDatabase) -> Result<(), String> {
 async fn ensure_scope(db: &web_sys::IdbDatabase, pubkey: &str) -> Result<(), String> {
     let cur = cache::scope_fingerprint(pubkey, &crate::utils::relay_url::relay_url());
     if cache::must_reset(stored_scope().as_deref(), &cur) {
-        idb_clear(db).await?;
+        // Recorded before the await, so a second zone load starting now does
+        // not empty the cache again under the first one's writes.
         if let Some(ls) = local_storage() {
             let _ = ls.set_item(SCOPE_KEY, &cur);
         }
+        idb_clear(db).await?;
         debug("object cache emptied: it was not recorded for this identity and relay");
     }
     Ok(())
@@ -625,7 +630,6 @@ async fn service() -> Result<Rc<Service>, String> {
         loaded: RefCell::new(HashMap::new()),
         rows: RefCell::new(HashMap::new()),
         searchable: RefCell::new(HashSet::new()),
-        checked: RefCell::new(HashMap::new()),
         kept: RefCell::new(HashMap::new()),
     });
     SVC.with(|s| *s.borrow_mut() = Some(svc.clone()));
@@ -768,15 +772,22 @@ async fn load_zone(
     gen: u64,
 ) -> Result<usize, String> {
     let t0 = now_ms();
-    let was_ready = zone_state(zone) == Some(ZoneLoad::Ready);
-    if let Some(svc) = SVC.with(|s| s.borrow().clone()) {
-        let fresh = svc
-            .checked
-            .borrow()
-            .get(zone)
-            .is_some_and(|t| t0 - t < RECHECK_MS);
-        if fresh && svc.loaded.borrow().contains_key(zone) {
-            return Ok(svc.rows.borrow().get(zone).copied().unwrap_or(1));
+    // No usable key for the zone: nothing to load, and nothing to report
+    // (a search UI asks for every sealed zone).
+    if store.all_for_zone(zone).iter().all(|k| k.pending_delivery) {
+        return Ok(0);
+    }
+    let prior = zone_state(zone);
+    let was_ready = prior == Some(ZoneLoad::Ready);
+    let fresh = CHECKED.with(|c| c.borrow().get(zone).is_some_and(|t| t0 - t < RECHECK_MS));
+    if fresh && prior == Some(ZoneLoad::NoIndex) {
+        return Ok(0);
+    }
+    if fresh && was_ready {
+        if let Some(svc) = SVC.with(|s| s.borrow().clone()) {
+            if svc.loaded.borrow().contains_key(zone) {
+                return Ok(svc.rows.borrow().get(zone).copied().unwrap_or(1));
+            }
         }
     }
     let pubs = publishers();
@@ -784,7 +795,8 @@ async fn load_zone(
         set_zone(zone, ZoneLoad::NoIndex);
         return Ok(0);
     }
-    if !was_ready {
+    // A re-check of a settled zone stays quiet unless it finds work to do.
+    if !matches!(prior, Some(ZoneLoad::Ready | ZoneLoad::NoIndex)) {
         set_zone(zone, ZoneLoad::Pending);
     }
     let relay_url = crate::utils::relay_url::relay_url();
@@ -840,6 +852,7 @@ async fn load_zone(
                 Err(e)
             }
             None => {
+                CHECKED.with(|c| c.borrow_mut().insert(zone.to_string(), now_ms()));
                 set_zone(zone, ZoneLoad::NoIndex);
                 Ok(0)
             }
@@ -849,7 +862,7 @@ async fn load_zone(
     alive(gen, Some(&svc))?;
     let version = manifest.content.index_version;
     if svc.loaded.borrow().get(zone) == Some(&version) {
-        svc.checked.borrow_mut().insert(zone.to_string(), now_ms());
+        CHECKED.with(|c| c.borrow_mut().insert(zone.to_string(), now_ms()));
         set_zone(zone, ZoneLoad::Ready);
         return Ok(svc.rows.borrow().get(zone).copied().unwrap_or(1));
     }
@@ -916,7 +929,7 @@ async fn load_zone(
     store_hw(zone, &manifest.high_water());
     svc.loaded.borrow_mut().insert(zone.to_string(), version);
     svc.rows.borrow_mut().insert(zone.to_string(), rows);
-    svc.checked.borrow_mut().insert(zone.to_string(), now_ms());
+    CHECKED.with(|c| c.borrow_mut().insert(zone.to_string(), now_ms()));
     svc.kept
         .borrow_mut()
         .insert(zone.to_string(), manifest.content.clone());
@@ -1042,9 +1055,22 @@ async fn load_shards(
     let shards = futures_util::stream::iter(units)
         .buffer_unordered(PARALLEL_SHARDS)
         .collect::<Vec<_>>();
-    let (model, results) =
-        futures_util::future::join(ensure_model(svc, db, content, gen), shards).await;
-    model?;
+    // Nothing answers before the model is in, so on a device without it the
+    // model is fetched first, with the whole link to itself; the shards then
+    // follow. With the model cached, both run at once.
+    let model_cached = svc.model_ready.get()
+        || idb_get(db, &cache::static_key(&content.model_sha256))
+            .await?
+            .is_some();
+    let results = if model_cached {
+        let (model, results) =
+            futures_util::future::join(ensure_model(svc, db, content, gen), shards).await;
+        model?;
+        results
+    } else {
+        ensure_model(svc, db, content, gen).await?;
+        shards.await
+    };
     if let Some(e) = results.into_iter().find_map(Result::err) {
         return Err(e);
     }
@@ -1058,7 +1084,7 @@ pub async fn load_all(store: &ZoneKeyStore, signer: &dyn nostr_bbs_core::signer:
     let t = now_ms();
     let zones: Vec<String> = sealed_zones()
         .into_iter()
-        .filter(|z| !store.all_for_zone(z).is_empty())
+        .filter(|z| store.all_for_zone(z).iter().any(|k| !k.pending_delivery))
         .collect();
     debug(&format!("loading {} sealed zone(s)", zones.len()));
     futures_util::future::join_all(zones.iter().map(|z| async move {
@@ -1315,6 +1341,7 @@ pub fn wipe() {
     }
     INFLIGHT.with(|m| m.borrow_mut().clear());
     ZONES.with(|m| m.borrow_mut().clear());
+    CHECKED.with(|c| c.borrow_mut().clear());
     AUTOLOADED.with(|a| a.borrow_mut().take());
     publish(Readiness::Idle);
     let stored = stored_scope();
