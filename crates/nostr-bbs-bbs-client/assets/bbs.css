@@ -96,14 +96,42 @@ body {
   background: var(--bg);
   color: var(--fg);
   font-family: var(--font);
-  font-size: 15px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   overflow-x: clip;
 }
 
+/* ── Text size: one root ladder ─────────────────────────────────────────────
+ * Every size in this sheet is in rem (or em), so the root font-size alone
+ * scales the whole BBS. It is a percentage of the browser's own default,
+ * which respects the member's browser text-size setting, times three factors:
+ *   --fs-pref   the shared client preference (`data-font-size`, also used by
+ *               the forum: small 14px, medium 16px, large 18px at default);
+ *   --fs-bbs    the BBS's own TEXT SIZE setting (large = 17/16);
+ *   --fs-mobile 2 on phones (see the media query below), else 1.
+ * `html:root` (0,1,1) outranks the `:root{font-size:…px}` that client-core
+ * injects at runtime (`nostrbbs-prefs-style`), which would otherwise pin the
+ * root in px and silently disable all three. */
+html {
+  --fs-pref: 1;
+  --fs-bbs: 1;
+  --fs-mobile: 1;
+}
+html[data-font-size="small"] {
+  --fs-pref: 0.875;
+}
+html[data-font-size="large"] {
+  --fs-pref: 1.125;
+}
 html.bbs-text-large {
-  font-size: 17px;
+  --fs-bbs: 1.0625;
+}
+html:root {
+  font-size: calc(100% * var(--fs-pref) * var(--fs-bbs) * var(--fs-mobile));
+}
+body {
+  /* 15px at the default 16px root. */
+  font-size: 0.9375rem;
 }
 
 a {
@@ -443,7 +471,7 @@ html.bbs-crt-off .bbs-crt::after {
   outline: none;
   color: var(--fg-bright);
   font: inherit;
-  font-size: 16px;
+  font-size: max(16px, 1rem);
 }
 
 /* Mobile bottom nav & drawer backdrop (hidden on desktop) */
@@ -701,7 +729,7 @@ html.bbs-crt-off .bbs-crt::after {
   border-radius: var(--radius);
   color: var(--fg-bright);
   font: inherit;
-  font-size: 16px; /* prevents iOS focus-zoom */
+  font-size: max(16px, 1rem); /* never below 16px: prevents iOS focus-zoom */
 }
 .bbs-input:focus,
 .bbs-textarea:focus,
@@ -947,13 +975,114 @@ html.bbs-crt-off .bbs-crt::after {
   margin: 0;
   font-family: var(--font);
   font-size: 0.58rem;
+  /* Fit the grid to its container rather than scaling glyphs with the text:
+   * `--cols` (set by the component) characters of ~0.62em each fill 100cqi.
+   * Never larger than the desktop size; browsers without container queries
+   * keep the line above. */
+  font-size: min(0.58rem, calc(100cqi / (var(--cols, 80) * 0.62)));
   line-height: 1;
   white-space: pre;
   text-shadow: 0 0 2px currentColor;
 }
+/* Status lines and placeholders share the class for its colours but are
+ * text, sized and wrapped as text (never at glyph size). */
+.ascii-img.ascii-img-status,
 .ascii-img-status {
   font-size: 0.8rem;
+  line-height: 1.45;
   color: var(--fg-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-shadow: none;
+}
+
+/* ── Tap-to-see-original image toggle ───────────────────────────────────── */
+.bbs-img {
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 0;
+  max-width: 100%;
+}
+.bbs-img-toggle {
+  /* The art fits inside the toggle's padding, so it is the container. */
+  container-type: inline-size;
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 0.15rem;
+  border: 1px dashed transparent;
+  border-radius: var(--radius);
+  color: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+.bbs-img-toggle:hover {
+  border-color: var(--border-bright);
+}
+.bbs-img-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.bbs-img-cue {
+  display: block;
+  margin-top: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--accent);
+}
+.bbs-img-orig {
+  display: block;
+  max-width: 100%;
+  max-height: min(70vh, 40rem);
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.bbs-img-hint,
+.bbs-img-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  font-size: 0.78rem;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+
+/* A reply's quote line: a long word or link wraps rather than widening the
+ * thread. */
+.bbs-quote {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Settings / Help helpers that keep long values inside the pane. */
+.bbs-truncate {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bbs-mono-xs {
+  font-size: 0.75rem;
+}
+.bbs-pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Key/value rows (Help commands, Settings diagnostics): a gap between the
+ * two, wrapping when narrow. */
+.bbs-kv-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.75rem;
+  min-width: 0;
 }
 .ascii-img .p0 { color: color-mix(in srgb, var(--fg-bright) 6%, var(--bg)); }
 .ascii-img .p1 { color: color-mix(in srgb, var(--fg-bright) 13%, var(--bg)); }
@@ -1410,6 +1539,7 @@ html.bbs-crt-off .bbs-crt::after {
 
   .ascii-img {
     font-size: clamp(6.5px, 2.15vw, 9.5px);
+    font-size: min(0.58rem, calc(100cqi / (var(--cols, 80) * 0.62)));
   }
 
   .sentry { padding: 0.55rem; }
@@ -1432,4 +1562,191 @@ html.bbs-reduced-motion .sentry-radar::before {
 .bbs-post.bbs-post-focus {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* ── Phones: every piece of text at twice the size ──────────────────────────
+ * Phone-width screens, and touch devices in portrait inside the drawer
+ * layout (<900px). Doubling the root doubles every rem size in the sheet;
+ * what follows keeps the layout working at 2x: gutters that would otherwise
+ * double too are pulled back so a 360px screen still holds ~20 columns of
+ * text, fixed px heights become text-relative, and the top bar keeps only
+ * what fits (the rest is in the drawer and Settings). Art glyphs are
+ * container-sized (above), not doubled. */
+@media (max-width: 640px),
+  (pointer: coarse) and (orientation: portrait) and (max-width: 899px) {
+  html {
+    --fs-mobile: 2;
+    --topbar-h: calc(2.25rem + env(safe-area-inset-top, 0px));
+    --bottomnav-h: calc(1.9rem + 7.5vw + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Top bar: menu, brand glyph, search, notifications, profile. */
+  .tui-topbar {
+    gap: 0.25rem;
+    padding: env(safe-area-inset-top, 0px) 0.25rem 0;
+  }
+  .tui-topbar-left,
+  .tui-topbar-right {
+    gap: 0.2rem;
+  }
+  .tui-topbar-right {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  .tui-topbar-left {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .tui-route-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 0.8rem;
+  }
+  .tui-brand,
+  .tui-crumb-sep,
+  .tui-status-pill.ok,
+  .tui-status-pill.warn,
+  .tui-theme-btn {
+    display: none;
+  }
+  .bbs-icon-btn {
+    min-width: 44px;
+    padding: 0 0.2rem;
+  }
+  .bbs-btn.tui-signin-btn {
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+  input[type="checkbox"],
+  input[type="radio"] {
+    width: 1.4rem;
+    height: 1.4rem;
+  }
+  .bbs-btn.tui-profile-btn {
+    white-space: nowrap;
+    max-width: 4.5em;
+    min-width: 44px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: block;
+  }
+  .tui-bnav-badge {
+    font-size: 0.6rem;
+  }
+
+  /* Drawer wide enough for doubled labels. */
+  .tui-sidebar,
+  .tui-body.sidebar-collapsed .tui-sidebar {
+    width: min(92vw, 30rem);
+  }
+
+  /* Bottom nav: icons double; the five labels are fitted to their column
+   * (a 6-letter label at 2x would not fit 72px), still larger than before. */
+  .tui-bnav-btn {
+    font-size: min(0.72rem, 5vw);
+    padding: 0.15rem 0.05rem;
+  }
+  .tui-bnav-btn .ico {
+    font-size: 1.15rem;
+  }
+
+  /* Gutters: keep roughly the 1x pixel spacing. */
+  .tui-main {
+    padding: 0.4rem 0.3rem 0.8rem;
+  }
+  .tui-container,
+  .tui-stack,
+  .bbs-composer {
+    gap: 0.4rem;
+  }
+  .tui-card {
+    padding: 0.4rem 0.4rem;
+  }
+  .bbs-post {
+    padding: 0.35rem 0.4rem;
+    gap: 0.3rem;
+  }
+  .bbs-post-reply-indent {
+    margin-left: 0.25rem;
+  }
+  .bbs-composer {
+    padding: 0.35rem;
+  }
+  .bbs-ascii-card {
+    padding: 0.25rem 0.3rem;
+  }
+  .bbs-md pre {
+    padding: 0.3rem 0.35rem;
+  }
+  .bbs-md ul,
+  .bbs-md ol {
+    padding-left: 0.8rem;
+  }
+  .bbs-md blockquote {
+    padding: 0.1rem 0.35rem;
+  }
+  .bbs-input,
+  .bbs-textarea,
+  .bbs-select {
+    padding: 0.25rem 0.35rem;
+  }
+  .bbs-textarea {
+    min-height: 4.5rem;
+  }
+  .bbs-modal-head,
+  .bbs-modal-body {
+    padding: 0.3rem 0.4rem;
+  }
+  .bbs-toast {
+    padding: 0.3rem 0.4rem;
+  }
+
+  /* Controls wrap instead of running off the edge. */
+  .bbs-btn,
+  .tui-tab,
+  .bbs-pill,
+  .bbs-badge {
+    white-space: normal;
+    max-width: 100%;
+    text-align: center;
+    /* Break only a word too long for the line (never "al|l"). */
+    overflow-wrap: break-word;
+  }
+  .bbs-btn {
+    padding: 0.2rem 0.4rem;
+  }
+  .tui-tab {
+    padding: 0.15rem 0.4rem;
+  }
+  .bbs-pill,
+  .bbs-copy-btn,
+  .bbs-react-pill,
+  .bbs-author-btn {
+    min-height: 44px;
+  }
+  .bbs-img-links a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  .tui-page-title,
+  .tui-empty-title,
+  .bbs-post-header,
+  .tui-crumb {
+    overflow-wrap: anywhere;
+  }
+  .bbs-dm-bubble {
+    max-width: 96%;
+    padding: 0.3rem 0.4rem;
+  }
+  .bbs-kanban-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .bbs-playing-card {
+    width: 2.6rem;
+    height: 3.6rem;
+  }
+  .sentry-rounds {
+    font-size: 1.6rem;
+  }
 }

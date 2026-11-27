@@ -38,6 +38,13 @@ pub struct BbsConfig {
     pub relay_url: String,
     /// Solid pod API base URL (WebID, pod-git, storage).
     pub pod_api: String,
+    /// Earlier origins of the same pod storage (`POD_API_ALIASES`, comma or
+    /// space separated), e.g. the host a migrated deployment used before:
+    /// posts written then still link there. Images on these hosts are the
+    /// forum's own storage: rendered by the pod itself (`?format=ascii`) and,
+    /// for the original picture, fetched from [`Self::pod_api`] with the
+    /// member's credentials first. Only `http(s)` origins are kept.
+    pub pod_aliases: Vec<String>,
     /// Preview-worker base URL — serves `GET /ascii?url=…&cols=…&ramp=…`
     /// image→ASCII fragments for the on-theme image renderer.
     pub preview_api: String,
@@ -79,6 +86,7 @@ impl Default for BbsConfig {
             logo_url: None,
             relay_url: String::new(),
             pod_api: String::new(),
+            pod_aliases: Vec::new(),
             preview_api: String::new(),
             search_api: String::new(),
             viewer_pubkey: None,
@@ -120,6 +128,29 @@ fn env_flag(env: &Value, key: &str) -> bool {
     }
 }
 
+/// Parse a comma/space separated list of `http(s)` origins (anything with a
+/// path, query or credentials is dropped; trailing slashes are trimmed).
+fn parse_origins(list: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in list.split([',', ' ', '\n', '\t']).map(str::trim) {
+        let Ok(u) = url::Url::parse(raw) else {
+            continue;
+        };
+        let plain = matches!(u.scheme(), "http" | "https")
+            && u.host_str().is_some()
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.path() == "/"
+            && u.query().is_none()
+            && u.fragment().is_none();
+        let origin = raw.trim_end_matches('/').to_string();
+        if plain && !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    out
+}
+
 /// Parse `ZONE_CONFIG` (a JSON string or an already-parsed array) into zones.
 fn parse_zones(env: &Value) -> Vec<Zone> {
     match env.get("ZONE_CONFIG") {
@@ -147,6 +178,7 @@ impl BbsConfig {
             logo_url: first_key(env, &["LOGO_URL", "LOGO"]),
             relay_url: first_key(env, &["RELAY_URL", "RELAY"]).unwrap_or_default(),
             pod_api: first_key(env, &["POD_API", "POD_URL", "POD_BASE_URL"]).unwrap_or_default(),
+            pod_aliases: parse_origins(str_key(env, "POD_API_ALIASES").as_deref().unwrap_or("")),
             preview_api: first_key(env, &["PREVIEW_API", "PREVIEW_URL", "PREVIEW_BASE_URL"])
                 .unwrap_or_default(),
             search_api: first_key(env, &["SEARCH_API", "SEARCH_URL", "SEARCH_BASE_URL"])
@@ -409,6 +441,22 @@ mod tests {
         assert!(!boot_is_pwa(false, &None));
         // An invalid BootProfile is not enough on its own.
         assert!(!boot_is_pwa(false, &Some(invalid)));
+    }
+
+    #[test]
+    fn pod_aliases_keep_plain_origins_only() {
+        let cfg = BbsConfig::from_env_value(&json!({
+            "POD_API": "https://pods-v2.example.workers.dev",
+            "POD_API_ALIASES": "https://pods.example.workers.dev/, http://old.example  https://pods.example.workers.dev,https://x.example/path, https://u@p.example, ftp://f.example, junk"
+        }));
+        assert_eq!(
+            cfg.pod_aliases,
+            vec![
+                "https://pods.example.workers.dev".to_string(),
+                "http://old.example".to_string()
+            ]
+        );
+        assert!(BbsConfig::from_env_value(&json!({})).pod_aliases.is_empty());
     }
 
     #[test]

@@ -216,7 +216,11 @@ fn current_policy() -> EgressPolicy {
 /// Build a request with manual redirect handling so we can re-run the SSRF
 /// policy on each `Location` target rather than letting the runtime follow
 /// 3xx silently to a private address.
-fn build_request(url: &str, headers: &Headers, method: Method) -> worker::Result<Request> {
+pub(crate) fn build_request(
+    url: &str,
+    headers: &Headers,
+    method: Method,
+) -> worker::Result<Request> {
     let mut init = RequestInit::new();
     init.with_method(method);
     init.with_headers(headers.clone());

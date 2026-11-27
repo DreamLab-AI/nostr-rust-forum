@@ -36,12 +36,31 @@
 //! forum, which can show it) without making a request. Each outcome is kept
 //! for the session (`ascii_slot`), so a re-rendered post never repeats a
 //! request, failed or not.
+//!
+//! **Tap for the original.** Each image is also a toggle (a `role="button"`,
+//! reachable by keyboard, Enter/Space): it swaps in place for the original
+//! picture and back. Nothing is requested until the member asks.
+//! [`original_route`] decides how:
+//!
+//! * the forum's own pod storage ([`PodHosts`]: the pod API and any earlier
+//!   origins of it) is fetched from the pod API with the member's own NIP-98
+//!   credentials (`fetch_restricted_blob`), shown from a `blob:` URL that is
+//!   revoked when toggled back or unmounted; a public file falls back to the
+//!   URL as written. Credentials never go in a URL, and nothing protected is
+//!   ever sent to the preview service;
+//! * any other public image loads directly in an `<img>` (no referrer, lazy,
+//!   async decode). That reveals the member's IP address to its host, so the
+//!   first time for each host a line says where it loads from;
+//! * protected media anywhere else (a lookalike host) has no original route:
+//!   only its placeholder.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 
 use leptos::prelude::*;
 use url::Url;
+
+use nostr_bbs_client_core::auth::AuthStore;
 
 use crate::config::BbsConfig;
 
@@ -120,11 +139,63 @@ pub enum AsciiRoute {
     Unavailable,
 }
 
+/// The forum's own pod storage: the pod API origin, and earlier origins of
+/// the same storage that old posts still link to
+/// ([`BbsConfig::pod_aliases`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PodHosts {
+    primary: String,
+    aliases: Vec<String>,
+}
+
+impl PodHosts {
+    /// The pod API base and its aliases.
+    pub fn new(primary: &str, aliases: &[String]) -> Self {
+        Self {
+            primary: primary.trim().trim_end_matches('/').to_string(),
+            aliases: aliases
+                .iter()
+                .map(|a| a.trim().trim_end_matches('/').to_string())
+                .filter(|a| !a.is_empty())
+                .collect(),
+        }
+    }
+
+    /// The pod API base (no trailing slash; empty when unconfigured).
+    pub fn primary(&self) -> &str {
+        &self.primary
+    }
+
+    /// The base (primary or alias) `src` is hosted under, by exact authority
+    /// ([`is_pod_url`]).
+    pub fn base_of(&self, src: &str) -> Option<&str> {
+        std::iter::once(&self.primary)
+            .chain(self.aliases.iter())
+            .map(String::as_str)
+            .find(|base| is_pod_url(base, src))
+    }
+
+    /// `src` on the primary pod API: an alias origin swapped for the
+    /// primary's, the path kept byte for byte. `None` off the pod hosts.
+    pub fn on_primary(&self, src: &str) -> Option<String> {
+        let base = self.base_of(src)?;
+        let src_origin = Url::parse(src).ok()?.origin().ascii_serialization();
+        let base_origin = Url::parse(base).ok()?.origin().ascii_serialization();
+        debug_assert_eq!(src_origin, base_origin);
+        let rest = src.trim().get(src_origin.len()..)?;
+        let primary_origin = Url::parse(&self.primary)
+            .ok()?
+            .origin()
+            .ascii_serialization();
+        Some(format!("{primary_origin}{rest}"))
+    }
+}
+
 /// Decide how to render `src`: protected media first, so its URL never
 /// reaches the preview worker or an unauthenticated pod request.
 pub fn ascii_route(
     preview_api: &str,
-    pod_api: &str,
+    pods: &PodHosts,
     src: &str,
     cols: u32,
     ramp: &str,
@@ -132,7 +203,7 @@ pub fn ascii_route(
     if is_protected_media(src) {
         return AsciiRoute::Protected;
     }
-    let urls = ascii_fetch_urls(preview_api, pod_api, src, cols, ramp);
+    let urls = ascii_fetch_urls(preview_api, pods, src, cols, ramp);
     if urls.is_empty() {
         AsciiRoute::Unavailable
     } else {
@@ -140,14 +211,18 @@ pub fn ascii_route(
     }
 }
 
-/// Render an image as on-theme ASCII art.
+/// Render an image as on-theme ASCII art, with a tap-to-see-original toggle.
 ///
 /// On mount it fetches the server-rendered phosphor fragment for `src` and
 /// injects it, once per session (see `ascii_slot`). While loading it shows
-/// `[ loading ascii … ]`. Protected media is never fetched, and it and any
-/// failure show a placeholder naming the file, with an "Open in forum" link
-/// when `forum_href` is given. Endpoints come from [`BbsConfig`] in context
-/// (`preview_api` for arbitrary URLs, `pod_api` for pod-hosted images).
+/// `[ loading ascii … ]`. Protected media is never sent for rendering, and it
+/// and any failure show a placeholder naming the file, with an "Open in
+/// forum" link when `forum_href` is given. Endpoints come from [`BbsConfig`]
+/// in context (`preview_api` for arbitrary URLs, `pod_api` and
+/// `pod_aliases` for pod-hosted images).
+///
+/// When [`original_route`] finds a way to show the original picture, the art
+/// (or placeholder) is a toggle button that swaps it in place, and back.
 #[component]
 pub fn AsciiImg(
     /// Image URL to render.
@@ -164,7 +239,12 @@ pub fn AsciiImg(
     forum_href: Option<String>,
 ) -> impl IntoView {
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("config");
-    let (preview_api, pod_api) = cfg.with_value(|c| (c.preview_api.clone(), c.pod_api.clone()));
+    let (preview_api, pods) = cfg.with_value(|c| {
+        (
+            c.preview_api.clone(),
+            PodHosts::new(&c.pod_api, &c.pod_aliases),
+        )
+    });
     // Resolve a root-relative src (e.g. a zone banner "/images/heroes/x.webp")
     // to an absolute URL — the /ascii endpoint fetches server-side and cannot
     // resolve a client-relative path.
@@ -172,7 +252,7 @@ pub fn AsciiImg(
     let src = make_absolute(&current_origin(), &src);
     let name = media_file_name(&src);
     let protected_why = protected_reason(&src);
-    let route = ascii_route(&preview_api, &pod_api, &src, cols, &ramp);
+    let route = ascii_route(&preview_api, &pods, &src, cols, &ramp);
     let initial = match &route {
         AsciiRoute::Protected => AsciiState::Protected,
         AsciiRoute::Fetch(_) => AsciiState::Loading,
@@ -203,24 +283,53 @@ pub fn AsciiImg(
         let _ = fetch_urls;
     }
 
-    move || match state.get() {
+    let cols_style = format!("--cols:{cols}");
+    let original = original_route(&pods, &src);
+    if original == OriginalRoute::None {
+        let name = name.clone();
+        return view! {
+            <div class="bbs-img" style=cols_style>
+                {move || art_body(state.get(), &name, protected_why, forum_href.clone())}
+            </div>
+        }
+        .into_any();
+    }
+    view! {
+        <ImageToggle
+            src=src
+            name=name
+            protected_why=protected_why
+            original=original
+            art=state
+            cols_style=cols_style
+            forum_href=forum_href
+        />
+    }
+    .into_any()
+}
+
+/// The art face of an image: the injected fragment, a loading line, or a
+/// placeholder (with the forum link when `forum_href` is given).
+fn art_body(
+    state: AsciiState,
+    name: &str,
+    protected_why: &'static str,
+    forum_href: Option<String>,
+) -> AnyView {
+    match state {
         AsciiState::Loading => view! {
             <pre class="ascii-img ascii-img-status">"[ loading ascii … ]"</pre>
         }
         .into_any(),
         AsciiState::Protected => view! {
-            <MediaPlaceholder
-                name=name.clone()
-                reason=protected_why
-                forum_href=forum_href.clone()
-            />
+            <MediaPlaceholder name=name.to_string() reason=protected_why forum_href=forum_href />
         }
         .into_any(),
         AsciiState::Error => view! {
             <MediaPlaceholder
-                name=name.clone()
+                name=name.to_string()
                 reason="image unavailable"
-                forum_href=forum_href.clone()
+                forum_href=forum_href
             />
         }
         .into_any(),
@@ -231,6 +340,341 @@ pub fn AsciiImg(
         }
         .into_any(),
     }
+}
+
+/// Load state of the original picture behind a toggle.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OriginalState {
+    /// Not asked for (or toggled back).
+    Idle,
+    /// Signing and fetching.
+    Loading,
+    /// An `<img src>`: the public URL, or this component's own `blob:` URL.
+    Ready(String),
+    /// Shown instead of the picture.
+    Failed(String),
+}
+
+/// An image that swaps between its art face and its original picture.
+#[component]
+fn ImageToggle(
+    src: String,
+    name: String,
+    protected_why: &'static str,
+    original: OriginalRoute,
+    art: ArcRwSignal<AsciiState>,
+    cols_style: String,
+    forum_href: Option<String>,
+) -> impl IntoView {
+    // Captured during setup: the click handler has no reactive owner, so a
+    // context lookup there would find nothing.
+    let auth = use_context::<AuthStore>();
+    let face = RwSignal::new(Face::Art);
+    let orig = RwSignal::new(OriginalState::Idle);
+    let loaded = RwSignal::new(false);
+    let reserve = RwSignal::new(None::<String>);
+    let toggle_ref = NodeRef::<leptos::html::Div>::new();
+    // Each swap gets a generation; a fetch that lands after a later swap (or
+    // after unmount) is dropped.
+    let generation = StoredValue::new(0u32);
+    let direct_host = match &original {
+        OriginalRoute::Direct { host, .. } => Some(host.clone()),
+        _ => None,
+    };
+    let hint_needed = RwSignal::new(
+        direct_host
+            .as_deref()
+            .is_some_and(|h| load_host_memory().needs_hint(h)),
+    );
+
+    // This component's object URL: revoked when toggled back, replaced or
+    // unmounted, so a picture fetched with credentials never outlives it.
+    let object_url =
+        send_wrapper::SendWrapper::new(std::rc::Rc::new(std::cell::RefCell::new(None::<String>)));
+    let alive = send_wrapper::SendWrapper::new(std::rc::Rc::new(std::cell::Cell::new(true)));
+    {
+        let object_url = object_url.clone();
+        let alive = alive.clone();
+        on_cleanup(move || {
+            alive.set(false);
+            release_object_url(&object_url);
+        });
+    }
+
+    let art_ok = {
+        let art = art.clone();
+        Signal::derive(move || !matches!(art.get(), AsciiState::Protected | AsciiState::Error))
+    };
+    let label = move || toggle_label(face.get(), art_ok.get());
+
+    let activate = {
+        let object_url = object_url.clone();
+        let alive = alive.clone();
+        let src = src.clone();
+        let original = original.clone();
+        move || {
+            generation.update_value(|g| *g = g.wrapping_add(1));
+            let gen = generation.get_value();
+            match face.get_untracked() {
+                Face::Art => {
+                    let current = toggle_ref
+                        .get_untracked()
+                        .map(|el| f64::from(el.offset_height()));
+                    reserve.set(reserve_style(known_height(&src), current));
+                    loaded.set(false);
+                    face.set(Face::Original);
+                    if let Some(host) = &direct_host {
+                        let mut memory = load_host_memory();
+                        memory.remember(host);
+                        save_host_memory(&memory);
+                        hint_needed.set(false);
+                    }
+                    start_original(&original, auth, orig, gen, generation, &object_url, &alive);
+                }
+                Face::Original => {
+                    face.set(Face::Art);
+                    reserve.set(None);
+                    orig.set(OriginalState::Idle);
+                    release_object_url(&object_url);
+                }
+            }
+        }
+    };
+    let on_click = {
+        let activate = activate.clone();
+        move |_| activate()
+    };
+    let on_key = move |ev: leptos::ev::KeyboardEvent| {
+        if matches!(ev.key().as_str(), "Enter" | " " | "Spacebar") {
+            ev.prevent_default();
+            activate();
+        }
+    };
+
+    let on_load = {
+        let src = src.clone();
+        move |ev: leptos::ev::Event| {
+            #[cfg(target_arch = "wasm32")]
+            {
+                use wasm_bindgen::JsCast;
+                if let Some(img) = ev
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
+                {
+                    remember_height(&src, f64::from(img.offset_height()));
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = (&ev, &src);
+            loaded.set(true);
+            reserve.set(None);
+        }
+    };
+    let fail_host = match &original {
+        OriginalRoute::Direct { host, .. } => host.clone(),
+        OriginalRoute::Pod { .. } | OriginalRoute::None => String::new(),
+    };
+    let on_error = move |_| {
+        orig.set(OriginalState::Failed(original_failure_text(
+            OriginalFailure::LoadFailed,
+            &fail_host,
+        )));
+        reserve.set(None);
+    };
+
+    let face_name = name.clone();
+    let alt = name.clone();
+    let body_name = name.clone();
+    let art_for_body = art.clone();
+    let art_for_links = art.clone();
+    let hint_host = match &original {
+        OriginalRoute::Direct { host, .. } => host.clone(),
+        _ => String::new(),
+    };
+
+    view! {
+        <div class="bbs-img" style=cols_style>
+            <div
+                class="bbs-img-toggle"
+                role="button"
+                tabindex="0"
+                node_ref=toggle_ref
+                aria-label=move || toggle_name(face.get(), art_ok.get(), &face_name)
+                style=move || reserve.get().unwrap_or_default()
+                on:click=on_click
+                on:keydown=on_key
+            >
+                {move || match face.get() {
+                    Face::Art => art_body(art_for_body.get(), &body_name, protected_why, None),
+                    Face::Original => match orig.get() {
+                        OriginalState::Idle | OriginalState::Loading => view! {
+                            <p class="ascii-img-status" role="status">"[ loading picture … ]"</p>
+                        }
+                        .into_any(),
+                        OriginalState::Ready(url) => {
+                            let on_load = on_load.clone();
+                            let on_error = on_error.clone();
+                            view! {
+                                <img
+                                    class="bbs-img-orig"
+                                    src=url
+                                    alt=alt.clone()
+                                    referrerpolicy="no-referrer"
+                                    loading="lazy"
+                                    decoding="async"
+                                    on:load=on_load
+                                    on:error=on_error
+                                />
+                                {move || (!loaded.get()).then(|| view! {
+                                    <p class="ascii-img-status" role="status">"[ loading picture … ]"</p>
+                                })}
+                            }
+                            .into_any()
+                        }
+                        OriginalState::Failed(text) => view! {
+                            <p class="ascii-img-status" role="status">{text}</p>
+                        }
+                        .into_any(),
+                    },
+                }}
+                <span class="bbs-img-cue" aria-hidden="true">
+                    {move || format!("{} {}", if face.get() == Face::Art { "▸" } else { "◂" }, label())}
+                </span>
+            </div>
+            {move || (face.get() == Face::Art && hint_needed.get()).then(|| view! {
+                <p class="bbs-img-hint">{origin_hint(&hint_host)}</p>
+            })}
+            {
+                let forum_href = forum_href.clone();
+                move || {
+                    let placeholder = matches!(
+                        art_for_links.get(),
+                        AsciiState::Protected | AsciiState::Error
+                    );
+                    let forum = forum_href.clone().filter(|_| placeholder && face.get() == Face::Art);
+                    let full = match (face.get(), orig.get()) {
+                        (Face::Original, OriginalState::Ready(u)) => Some(u),
+                        _ => None,
+                    };
+                    (forum.is_some() || full.is_some()).then(|| view! {
+                        <div class="bbs-img-links">
+                            {forum.map(|href| view! { <a href=href rel="noopener">"Open in forum ↗"</a> })}
+                            {full.map(|href| view! {
+                                <a href=href target="_blank" rel="noopener noreferrer">
+                                    "Open full size ↗"
+                                </a>
+                            })}
+                        </div>
+                    })
+                }
+            }
+        </div>
+    }
+}
+
+/// Begin loading the original for `route` into `orig` (generation `gen`).
+#[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
+fn start_original(
+    route: &OriginalRoute,
+    auth: Option<AuthStore>,
+    orig: RwSignal<OriginalState>,
+    gen: u32,
+    generation: StoredValue<u32>,
+    object_url: &send_wrapper::SendWrapper<std::rc::Rc<std::cell::RefCell<Option<String>>>>,
+    alive: &send_wrapper::SendWrapper<std::rc::Rc<std::cell::Cell<bool>>>,
+) {
+    match route {
+        OriginalRoute::None => {}
+        OriginalRoute::Direct { url, .. } => orig.set(OriginalState::Ready(url.clone())),
+        OriginalRoute::Pod { signed, fallback } => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                use nostr_bbs_client_core::utils::restricted_media::{
+                    cache_blob, cached_blob, fetch_restricted_blob, RestrictedFetchError,
+                };
+                let owner = auth.and_then(|a| a.state().with_untracked(|st| st.pubkey.clone()));
+                let signer = auth.and_then(|a| a.get_signer());
+                let fallback_or = |why: OriginalFailure| match fallback {
+                    Some(u) => OriginalState::Ready(u.clone()),
+                    None => OriginalState::Failed(original_failure_text(why, "")),
+                };
+                let (Some(owner), Some(signer)) = (owner, signer) else {
+                    orig.set(fallback_or(OriginalFailure::SignedOut));
+                    return;
+                };
+                let show = {
+                    let object_url = (*object_url).clone();
+                    let alive = (*alive).clone();
+                    move |blob: &web_sys::Blob| {
+                        if !alive.get() || generation.try_get_value() != Some(gen) {
+                            return;
+                        }
+                        match web_sys::Url::create_object_url_with_blob(blob) {
+                            Ok(u) => {
+                                if let Some(old) = object_url.borrow_mut().replace(u.clone()) {
+                                    let _ = web_sys::Url::revoke_object_url(&old);
+                                }
+                                orig.try_set(OriginalState::Ready(u));
+                            }
+                            Err(_) => {
+                                orig.try_set(OriginalState::Failed(original_failure_text(
+                                    OriginalFailure::Unavailable,
+                                    "",
+                                )));
+                            }
+                        }
+                    }
+                };
+                if let Some(blob) = cached_blob(&owner, signed) {
+                    show(&blob);
+                    return;
+                }
+                orig.set(OriginalState::Loading);
+                let signed = signed.clone();
+                let fallback = fallback.clone();
+                let alive = (*alive).clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let result = fetch_restricted_blob(&signed, signer.as_ref()).await;
+                    if !alive.get() || generation.try_get_value() != Some(gen) {
+                        return;
+                    }
+                    let failed = |why: OriginalFailure| match &fallback {
+                        Some(u) => OriginalState::Ready(u.clone()),
+                        None => OriginalState::Failed(original_failure_text(why, "")),
+                    };
+                    match result {
+                        Ok(blob) => {
+                            cache_blob(&owner, &signed, &blob);
+                            show(&blob);
+                        }
+                        Err(RestrictedFetchError::Locked) => {
+                            orig.try_set(failed(OriginalFailure::Locked));
+                        }
+                        Err(RestrictedFetchError::Failed(e)) => {
+                            web_sys::console::warn_1(&format!("[bbs image] {e}").into());
+                            orig.try_set(failed(OriginalFailure::Unavailable));
+                        }
+                    }
+                });
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = (signed, fallback, auth);
+        }
+    }
+}
+
+/// Revoke and forget this component's object URL, if it has one.
+fn release_object_url(
+    object_url: &send_wrapper::SendWrapper<std::rc::Rc<std::cell::RefCell<Option<String>>>>,
+) {
+    let taken = object_url.borrow_mut().take();
+    #[cfg(target_arch = "wasm32")]
+    if let Some(u) = taken {
+        let _ = web_sys::Url::revoke_object_url(&u);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = taken;
 }
 
 /// The inline stand-in for an image the BBS cannot render: its file name,
@@ -253,6 +697,275 @@ pub fn MediaPlaceholder(
             })}
         </div>
     }
+}
+
+/// How the original picture behind an image is shown, if at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OriginalRoute {
+    /// A public image elsewhere: an `<img>` straight from `url`, which tells
+    /// `host` the member's IP address (hence the hint).
+    Direct {
+        /// The image URL as written.
+        url: String,
+        /// Its host, named in [`origin_hint`].
+        host: String,
+    },
+    /// The forum's own pod storage: `signed` (on the pod API) fetched with
+    /// the member's credentials and shown from a `blob:` URL; for a public
+    /// file, `fallback` (the URL as written) when that fails or nobody is
+    /// signed in.
+    Pod {
+        /// The URL to fetch with NIP-98 ([`signable_pod_url`] holds).
+        signed: String,
+        /// The URL as written, for a public file only.
+        fallback: Option<String>,
+    },
+    /// No safe way to show it: only the art or placeholder.
+    None,
+}
+
+/// Decide how the original of `src` is shown ([`OriginalRoute`]).
+///
+/// Protected media is only ever fetched with credentials, from the pod API,
+/// and only when its URL is on one of the forum's own pod hosts; on any other
+/// host (a lookalike) there is no route at all.
+pub fn original_route(pods: &PodHosts, src: &str) -> OriginalRoute {
+    let src = src.trim();
+    let Ok(parsed) = Url::parse(src) else {
+        return OriginalRoute::None;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return OriginalRoute::None;
+    }
+    let Some(host) = parsed.host_str().map(str::to_string) else {
+        return OriginalRoute::None;
+    };
+    let protected = is_protected_media(src);
+    if let Some(signed) = pods
+        .on_primary(src)
+        .filter(|u| signable_pod_url(u, pods.primary()))
+    {
+        return OriginalRoute::Pod {
+            signed,
+            fallback: (!protected).then(|| src.to_string()),
+        };
+    }
+    if protected {
+        OriginalRoute::None
+    } else {
+        OriginalRoute::Direct {
+            url: src.to_string(),
+            host,
+        }
+    }
+}
+
+/// Whether `url` may be fetched with a NIP-98 token for the pod at
+/// `pod_base`: exactly `{pod_base}/pods/<64-hex owner>/<path>` naming a file,
+/// with nothing the browser could rewrite between signing and sending (no
+/// query, fragment, userinfo, escapes, backslashes or dot segments). The same
+/// rules as client-core's `is_restricted_media_url_for`, for any file in the
+/// pod rather than zone media only.
+pub fn signable_pod_url(url: &str, pod_base: &str) -> bool {
+    let base = pod_base.trim().trim_end_matches('/');
+    if base.is_empty() || !is_pod_url(base, url) {
+        return false;
+    }
+    let Some(path) = url
+        .strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix("/pods/"))
+    else {
+        return false;
+    };
+    if path.contains(['?', '#', '@', '%', '\\']) {
+        return false;
+    }
+    if path.split('/').any(|seg| seg == "." || seg == "..") {
+        return false;
+    }
+    let Some((owner, tail)) = path.split_once('/') else {
+        return false;
+    };
+    owner.len() == 64
+        && owner.bytes().all(|b| b.is_ascii_hexdigit())
+        && !tail.is_empty()
+        && !tail.ends_with('/')
+        && !tail.split('/').any(str::is_empty)
+}
+
+/// Which face of an image toggle is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Face {
+    /// The ASCII art, or the placeholder.
+    Art,
+    /// The original picture.
+    Original,
+}
+
+impl Face {
+    /// The other face.
+    pub fn flipped(self) -> Self {
+        match self {
+            Face::Art => Face::Original,
+            Face::Original => Face::Art,
+        }
+    }
+}
+
+/// What activating the toggle does, given the face showing and whether the
+/// art face is ASCII art (`true`) or a placeholder (`false`).
+pub fn toggle_label(face: Face, has_art: bool) -> &'static str {
+    match (face, has_art) {
+        (Face::Art, true) => "Show original image",
+        (Face::Art, false) => "Show image",
+        (Face::Original, true) => "Show as text art",
+        (Face::Original, false) => "Hide image",
+    }
+}
+
+/// The toggle's accessible name: [`toggle_label`] and the file name.
+pub fn toggle_name(face: Face, has_art: bool, file: &str) -> String {
+    format!("{}: {file}", toggle_label(face, has_art))
+}
+
+/// The one-line notice under a third-party image before its first load.
+pub fn origin_hint(host: &str) -> String {
+    format!("Loads the picture from {host}")
+}
+
+/// Why an original picture is not shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginalFailure {
+    /// The `<img>` failed (`host` is named).
+    LoadFailed,
+    /// 401/403: the pod refused this member.
+    Locked,
+    /// Nobody is signed in to fetch it with.
+    SignedOut,
+    /// Anything else.
+    Unavailable,
+}
+
+/// The status line shown in place of a picture that failed.
+pub fn original_failure_text(why: OriginalFailure, host: &str) -> String {
+    match why {
+        OriginalFailure::LoadFailed if !host.is_empty() => {
+            format!("[ could not load the picture from {host} ]")
+        }
+        OriginalFailure::LoadFailed | OriginalFailure::Unavailable => {
+            "[ picture unavailable ]".to_string()
+        }
+        OriginalFailure::Locked => "[ this picture is for members of its zone ]".to_string(),
+        OriginalFailure::SignedOut => "[ sign in to see this picture ]".to_string(),
+    }
+}
+
+/// Hosts the member has already loaded a picture from (so the hint is shown
+/// once per host), most recent last, at most [`HOST_MEMORY_MAX`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostMemory {
+    hosts: Vec<String>,
+}
+
+/// Most hosts [`HostMemory`] keeps.
+pub const HOST_MEMORY_MAX: usize = 64;
+
+impl HostMemory {
+    /// Parse the stored form (one host per line).
+    pub fn parse(stored: &str) -> Self {
+        let mut memory = Self::default();
+        for host in stored.lines() {
+            memory.remember(host);
+        }
+        memory
+    }
+
+    /// The stored form.
+    pub fn serialise(&self) -> String {
+        self.hosts.join("\n")
+    }
+
+    /// Whether the hint should still be shown for `host`.
+    pub fn needs_hint(&self, host: &str) -> bool {
+        let host = host.trim().to_ascii_lowercase();
+        !host.is_empty() && !self.hosts.contains(&host)
+    }
+
+    /// Record that a picture was loaded from `host`.
+    pub fn remember(&mut self, host: &str) {
+        let host = host.trim().to_ascii_lowercase();
+        if host.is_empty() {
+            return;
+        }
+        self.hosts.retain(|h| *h != host);
+        self.hosts.push(host);
+        if self.hosts.len() > HOST_MEMORY_MAX {
+            let excess = self.hosts.len() - HOST_MEMORY_MAX;
+            self.hosts.drain(..excess);
+        }
+    }
+}
+
+/// `localStorage` key of the [`HostMemory`].
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const HOST_MEMORY_KEY: &str = "bbs_img_hosts_seen";
+
+fn load_host_memory() -> HostMemory {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let stored = web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|s| s.get_item(HOST_MEMORY_KEY).ok().flatten())
+            .unwrap_or_default();
+        HostMemory::parse(&stored)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    HostMemory::default()
+}
+
+fn save_host_memory(memory: &HostMemory) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(HOST_MEMORY_KEY, &memory.serialise());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = memory;
+}
+
+/// The `min-height` that holds an image's place while its original loads:
+/// its last shown height when known (no jump on a second look), else the
+/// height of the art it replaces. `None` when neither is known.
+pub fn reserve_style(known: Option<f64>, current: Option<f64>) -> Option<String> {
+    known
+        .or(current)
+        .filter(|h| h.is_finite() && *h > 0.0)
+        .map(|h| format!("min-height:{}px", h.round()))
+}
+
+thread_local! {
+    /// Last shown height of each original this session, by URL.
+    static SHOWN_HEIGHTS: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
+}
+
+/// Most heights [`SHOWN_HEIGHTS`] keeps.
+const SHOWN_HEIGHTS_MAX: usize = 256;
+
+fn known_height(src: &str) -> Option<f64> {
+    SHOWN_HEIGHTS.with(|m| m.borrow().get(src).copied())
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn remember_height(src: &str, height: f64) {
+    if !(height.is_finite() && height > 0.0) {
+        return;
+    }
+    SHOWN_HEIGHTS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= SHOWN_HEIGHTS_MAX && !m.contains_key(src) {
+            m.clear();
+        }
+        m.insert(src.to_string(), height);
+    });
 }
 
 /// Whether `src` is media only the member's own credentials can read, which
@@ -386,8 +1099,9 @@ fn current_origin() -> String {
 /// `src`. [`AsciiImg`] tries them in order and injects the first that returns a
 /// `text/html` fragment, so position encodes priority:
 ///
-/// 1. **Pod-hosted images** are fetched directly with `?format=ascii` (plus
-///    `cols`/`ramp`) — the DreamLab pod-worker renders them itself, saving a hop.
+/// 1. **Pod-hosted images** (the pod API or one of its [`PodHosts`] aliases)
+///    are fetched directly with `?format=ascii` (plus `cols`/`ramp`) — the
+///    pod-worker renders them itself, saving a hop.
 /// 2. **Fallback for pod images**, and the sole route for everything else, is the
 ///    preview-worker's `/ascii` endpoint with the image URL percent-encoded. For
 ///    a pod image this fallback is what keeps the signature ASCII render working
@@ -400,7 +1114,7 @@ fn current_origin() -> String {
 /// `[ image unavailable ]` placeholder.
 pub fn ascii_fetch_urls(
     preview_api: &str,
-    pod_api: &str,
+    pods: &PodHosts,
     src: &str,
     cols: u32,
     ramp: &str,
@@ -419,7 +1133,7 @@ pub fn ascii_fetch_urls(
         })
     };
     let mut urls = Vec::new();
-    if is_pod_url(pod_api, src) {
+    if pods.base_of(src).is_some() {
         let sep = if src.contains('?') { '&' } else { '?' };
         urls.push(format!("{src}{sep}format=ascii&cols={cols}&ramp={ramp}"));
         urls.extend(preview_route);
@@ -435,12 +1149,12 @@ pub fn ascii_fetch_urls(
 /// [`ascii_fetch_urls`] when the fallback chain matters (as [`AsciiImg`] does).
 pub fn ascii_fetch_url(
     preview_api: &str,
-    pod_api: &str,
+    pods: &PodHosts,
     src: &str,
     cols: u32,
     ramp: &str,
 ) -> Option<String> {
-    ascii_fetch_urls(preview_api, pod_api, src, cols, ramp)
+    ascii_fetch_urls(preview_api, pods, src, cols, ramp)
         .into_iter()
         .next()
 }
@@ -565,6 +1279,10 @@ async fn fetch_ascii(url: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    fn pods(primary: &str) -> PodHosts {
+        PodHosts::new(primary, &[])
+    }
+
     #[test]
     fn pod_url_detection() {
         assert!(is_pod_url(
@@ -611,7 +1329,7 @@ mod tests {
     fn pod_image_fetches_with_format_ascii() {
         let url = ascii_fetch_url(
             "https://preview.example.com",
-            "https://pods.example.com",
+            &pods("https://pods.example.com"),
             "https://pods.example.com/pods/ab/cat.png",
             72,
             "standard",
@@ -627,7 +1345,7 @@ mod tests {
     fn pod_image_with_query_uses_ampersand() {
         let url = ascii_fetch_url(
             "https://preview.example.com",
-            "https://pods.example.com",
+            &pods("https://pods.example.com"),
             "https://pods.example.com/pods/ab/cat.png?v=2",
             64,
             "blocks",
@@ -643,7 +1361,7 @@ mod tests {
     fn external_image_routes_through_preview_and_is_encoded() {
         let url = ascii_fetch_url(
             "https://preview.example.com/",
-            "https://pods.example.com",
+            &pods("https://pods.example.com"),
             "https://cdn.other.com/a b.png?x=1&y=2",
             80,
             "standard",
@@ -659,13 +1377,13 @@ mod tests {
     fn no_endpoint_for_external_image_is_none() {
         assert!(ascii_fetch_url(
             "",
-            "https://pods.example.com",
+            &pods("https://pods.example.com"),
             "https://cdn.other.com/x.png",
             80,
             "standard"
         )
         .is_none());
-        assert!(ascii_fetch_url("", "", "  ", 80, "standard").is_none());
+        assert!(ascii_fetch_url("", &pods(""), "  ", 80, "standard").is_none());
     }
 
     #[test]
@@ -676,7 +1394,7 @@ mod tests {
         // server-side) so the ASCII still renders. Ordering is pod-direct first.
         let urls = ascii_fetch_urls(
             "https://preview.example.com",
-            "https://pods.example.com",
+            &pods("https://pods.example.com"),
             "https://pods.example.com/pods/ab/media/public/cat.jpg",
             64,
             "standard",
@@ -697,7 +1415,7 @@ mod tests {
         // unavailable ]`).
         let urls = ascii_fetch_urls(
             "",
-            "https://pods.example.com",
+            &pods("https://pods.example.com"),
             "https://pods.example.com/pods/ab/cat.png",
             72,
             "standard",
@@ -717,7 +1435,7 @@ mod tests {
         // there is exactly one candidate and no spurious pod-direct fetch.
         let urls = ascii_fetch_urls(
             "https://preview.example.com",
-            "https://pods.example.com",
+            &pods("https://pods.example.com"),
             "https://cdn.other.com/x.png",
             80,
             "standard",
@@ -735,13 +1453,13 @@ mod tests {
     fn no_route_yields_empty_candidate_list() {
         assert!(ascii_fetch_urls(
             "",
-            "https://pods.example.com",
+            &pods("https://pods.example.com"),
             "https://cdn.other.com/x.png",
             80,
             "standard"
         )
         .is_empty());
-        assert!(ascii_fetch_urls("", "", "  ", 80, "standard").is_empty());
+        assert!(ascii_fetch_urls("", &pods(""), "  ", 80, "standard").is_empty());
     }
 
     const OWNER: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -766,7 +1484,7 @@ mod tests {
             assert_eq!(
                 ascii_route(
                     "https://preview.example.com",
-                    pod,
+                    &pods(pod),
                     &zone_img,
                     64,
                     "standard"
@@ -790,7 +1508,7 @@ mod tests {
         assert_eq!(
             ascii_route(
                 "https://preview.example.com",
-                "",
+                &pods(""),
                 &pod("media/public/cat.jpg"),
                 64,
                 "standard"
@@ -801,7 +1519,7 @@ mod tests {
             )])
         );
         assert_eq!(
-            ascii_route("", "", "https://cdn.other.com/x.png", 64, "standard"),
+            ascii_route("", &pods(""), "https://cdn.other.com/x.png", 64, "standard"),
             AsciiRoute::Unavailable
         );
     }
@@ -919,5 +1637,237 @@ mod tests {
     fn extract_urls_ignores_non_images() {
         let urls = extract_image_urls("hello https://x.com/page and a.png without scheme");
         assert!(urls.is_empty());
+    }
+
+    const V2: &str = "https://pods-v2.example.workers.dev";
+    const V1: &str = "https://pods.example.workers.dev";
+
+    fn hosts() -> PodHosts {
+        PodHosts::new(V2, &[format!("{V1}/")])
+    }
+
+    #[test]
+    fn pod_hosts_know_aliases_and_move_paths_to_the_primary() {
+        let h = hosts();
+        let old = format!("{V1}/pods/{OWNER}/media/public/13337.jpg");
+        assert_eq!(h.base_of(&old), Some(V1));
+        assert_eq!(
+            h.on_primary(&old).as_deref(),
+            Some(format!("{V2}/pods/{OWNER}/media/public/13337.jpg").as_str())
+        );
+        let new = format!("{V2}/pods/{OWNER}/media/zones/zone2/a.webp");
+        assert_eq!(h.on_primary(&new).as_deref(), Some(new.as_str()));
+        // Lookalikes are not pod hosts.
+        assert_eq!(
+            h.base_of("https://pods.example.workers.dev.evil.com/x.png"),
+            None
+        );
+        assert_eq!(h.on_primary("https://cdn.other.com/x.png"), None);
+    }
+
+    #[test]
+    fn alias_images_render_through_the_pod_itself() {
+        let old = format!("{V1}/pods/{OWNER}/media/public/13337.jpg");
+        let urls = ascii_fetch_urls(
+            "https://preview.example.com",
+            &hosts(),
+            &old,
+            68,
+            "standard",
+        );
+        assert_eq!(urls[0], format!("{old}?format=ascii&cols=68&ramp=standard"));
+        assert!(urls[1].starts_with("https://preview.example.com/ascii?url="));
+        // A zone image on the old host is still never routed anywhere.
+        let zone = format!("{V1}/pods/{OWNER}/media/zones/zone2/a.webp");
+        assert_eq!(
+            ascii_route(
+                "https://preview.example.com",
+                &hosts(),
+                &zone,
+                68,
+                "standard"
+            ),
+            AsciiRoute::Protected
+        );
+    }
+
+    #[test]
+    fn third_party_public_images_load_directly() {
+        assert_eq!(
+            original_route(&hosts(), "https://cdn.other.com/cat.png?w=1"),
+            OriginalRoute::Direct {
+                url: "https://cdn.other.com/cat.png?w=1".into(),
+                host: "cdn.other.com".into()
+            }
+        );
+    }
+
+    #[test]
+    fn own_pod_media_is_fetched_signed_from_the_primary() {
+        // Zone media: signed only, no fallback (an <img> could not read it).
+        let zone = format!("{V2}/pods/{OWNER}/media/zones/zone2/a.webp");
+        assert_eq!(
+            original_route(&hosts(), &zone),
+            OriginalRoute::Pod {
+                signed: zone.clone(),
+                fallback: None
+            }
+        );
+        // A private pod file likewise.
+        let private = format!("{V2}/pods/{OWNER}/private/me.png");
+        assert_eq!(
+            original_route(&hosts(), &private),
+            OriginalRoute::Pod {
+                signed: private.clone(),
+                fallback: None
+            }
+        );
+        // A public file on the old host: signed on the primary first, then
+        // the URL as written.
+        let old = format!("{V1}/pods/{OWNER}/media/public/13337.jpg");
+        assert_eq!(
+            original_route(&hosts(), &old),
+            OriginalRoute::Pod {
+                signed: format!("{V2}/pods/{OWNER}/media/public/13337.jpg"),
+                fallback: Some(old.clone())
+            }
+        );
+        // A zone image on the old host: signed on the primary, no fallback.
+        let old_zone = format!("{V1}/pods/{OWNER}/media/zones/zone2/b.webp");
+        assert_eq!(
+            original_route(&hosts(), &old_zone),
+            OriginalRoute::Pod {
+                signed: format!("{V2}/pods/{OWNER}/media/zones/zone2/b.webp"),
+                fallback: None
+            }
+        );
+    }
+
+    #[test]
+    fn protected_media_elsewhere_has_no_original_route() {
+        for src in [
+            format!(
+                "https://pods-v2.example.workers.dev.evil.com/pods/{OWNER}/media/zones/z/a.png"
+            ),
+            format!("https://other.example/pods/{OWNER}/media/zones/z/a.png"),
+            format!(
+                "https://pods-v2.example.workers.dev@evil.com/pods/{OWNER}/media/zones/z/a.png"
+            ),
+            // On our host, but not signable exactly as written.
+            format!("{V2}/pods/{OWNER}/media/zones/z/a.png?x=1"),
+            format!("{V2}/pods/{OWNER}/media%2Fzones/z/a.png"),
+            format!("{V2}/pods/{OWNER}/media/zones/../zones/z/a.png"),
+            "data:image/png;base64,AAAA".to_string(),
+            "/media/zones/z/a.png".to_string(),
+        ] {
+            assert_eq!(original_route(&hosts(), &src), OriginalRoute::None, "{src}");
+        }
+        // No pod configured: zone media has nowhere to be signed.
+        let zone = format!("{V2}/pods/{OWNER}/media/zones/z/a.png");
+        assert_eq!(
+            original_route(&PodHosts::default(), &zone),
+            OriginalRoute::None
+        );
+    }
+
+    #[test]
+    fn signable_urls_follow_client_core_rules_for_zone_media() {
+        use nostr_bbs_client_core::utils::restricted_media::is_restricted_media_url_for;
+        let cases = [
+            format!("{V2}/pods/{OWNER}/media/zones/zone2/a.webp"),
+            format!("{V2}/pods/{OWNER}/media/zones/zone2/a.webp?x"),
+            format!("{V2}/pods/{OWNER}/media/zones/zone2/a%20b.webp"),
+            format!("{V2}/pods/{OWNER}/media/zones/./a.webp"),
+            format!("{V2}/pods/short/media/zones/zone2/a.webp"),
+            format!("{V2}.evil.com/pods/{OWNER}/media/zones/zone2/a.webp"),
+            format!("{V2}@evil.com/pods/{OWNER}/media/zones/zone2/a.webp"),
+        ];
+        for url in &cases {
+            assert_eq!(
+                signable_pod_url(url, V2),
+                is_restricted_media_url_for(url, V2),
+                "{url}"
+            );
+        }
+        // Wider than zone media: any named file in a pod, never a container.
+        assert!(signable_pod_url(
+            &format!("{V2}/pods/{OWNER}/private/a.png"),
+            V2
+        ));
+        assert!(!signable_pod_url(
+            &format!("{V2}/pods/{OWNER}/private/"),
+            V2
+        ));
+        assert!(!signable_pod_url(
+            &format!("{V2}/pods/{OWNER}/a//b.png"),
+            V2
+        ));
+        assert!(!signable_pod_url(&format!("{V2}/pods/{OWNER}/a.png"), ""));
+    }
+
+    #[test]
+    fn toggle_labels_and_names() {
+        assert_eq!(toggle_label(Face::Art, true), "Show original image");
+        assert_eq!(toggle_label(Face::Original, true), "Show as text art");
+        assert_eq!(toggle_label(Face::Art, false), "Show image");
+        assert_eq!(toggle_label(Face::Original, false), "Hide image");
+        assert_eq!(Face::Art.flipped(), Face::Original);
+        assert_eq!(Face::Art.flipped().flipped(), Face::Art);
+        assert_eq!(
+            toggle_name(Face::Art, true, "cat.png"),
+            "Show original image: cat.png"
+        );
+        assert_eq!(
+            origin_hint("cdn.other.com"),
+            "Loads the picture from cdn.other.com"
+        );
+        assert_eq!(
+            original_failure_text(OriginalFailure::LoadFailed, "cdn.other.com"),
+            "[ could not load the picture from cdn.other.com ]"
+        );
+        assert_eq!(
+            original_failure_text(OriginalFailure::Locked, ""),
+            "[ this picture is for members of its zone ]"
+        );
+        assert_eq!(
+            original_failure_text(OriginalFailure::SignedOut, ""),
+            "[ sign in to see this picture ]"
+        );
+    }
+
+    #[test]
+    fn the_hint_is_shown_once_per_host() {
+        let mut m = HostMemory::parse("");
+        assert!(m.needs_hint("cdn.other.com"));
+        m.remember("CDN.other.com");
+        assert!(!m.needs_hint("cdn.other.com"));
+        assert!(m.needs_hint("img.else.org"));
+        let round = HostMemory::parse(&m.serialise());
+        assert_eq!(round, m);
+        for i in 0..(HOST_MEMORY_MAX + 5) {
+            m.remember(&format!("h{i}.example"));
+        }
+        assert_eq!(m.hosts.len(), HOST_MEMORY_MAX);
+        assert!(m.needs_hint("cdn.other.com"), "oldest dropped first");
+        assert!(!m.needs_hint(&format!("h{}.example", HOST_MEMORY_MAX + 4)));
+        assert!(!m.needs_hint(""), "no host, no hint");
+    }
+
+    #[test]
+    fn height_is_reserved_from_the_last_look_or_the_art() {
+        assert_eq!(
+            reserve_style(Some(412.4), Some(200.0)).as_deref(),
+            Some("min-height:412px")
+        );
+        assert_eq!(
+            reserve_style(None, Some(199.6)).as_deref(),
+            Some("min-height:200px")
+        );
+        assert_eq!(reserve_style(None, None), None);
+        assert_eq!(reserve_style(Some(f64::NAN), Some(0.0)), None);
+        remember_height("https://cdn.other.com/h.png", 300.0);
+        assert_eq!(known_height("https://cdn.other.com/h.png"), Some(300.0));
+        remember_height("https://cdn.other.com/h.png", -1.0);
+        assert_eq!(known_height("https://cdn.other.com/h.png"), Some(300.0));
     }
 }
