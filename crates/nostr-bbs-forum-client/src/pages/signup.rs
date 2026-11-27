@@ -672,8 +672,9 @@ pub fn SignupPage() -> impl IntoView {
                                 <button
                                     data-testid="signup-finish"
                                     prop:disabled=move || {
-                                        !(sheet_ready.get() || advanced_override.get())
+                                        finish_blocker(sheet_ready.get(), advanced_override.get()).is_some()
                                     }
+                                    aria-describedby="signup-finish-hint"
                                     on:click=move |_: web_sys::MouseEvent| finish_signup.run(())
                                     class="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-40 \
                                            disabled:cursor-not-allowed text-gray-900 font-semibold \
@@ -681,6 +682,12 @@ pub fn SignupPage() -> impl IntoView {
                                 >
                                     "Done — take me to the forum"
                                 </button>
+                                // Say what the disabled button is waiting for.
+                                {move || finish_blocker(sheet_ready.get(), advanced_override.get()).map(|why| view! {
+                                    <p id="signup-finish-hint" class="text-xs text-gray-400 text-center" data-testid="signup-finish-hint">
+                                        {why}
+                                    </p>
+                                })}
                                 <Show
                                     when=move || !(sheet_ready.get() || advanced_override.get())
                                 >
@@ -719,4 +726,30 @@ fn event_target_checked(ev: &leptos::ev::Event) -> bool {
         .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
         .map(|el| el.checked())
         .unwrap_or(false)
+}
+
+/// Why the Backup phase's finish button is still disabled, or `None` once it
+/// may be used: a copy of the recovery sheet made (downloaded or printed) and
+/// the "saved" box ticked (`sheet_ready`, ADR-095), or the explicit skip.
+fn finish_blocker(sheet_ready: bool, advanced_override: bool) -> Option<&'static str> {
+    (!(sheet_ready || advanced_override)).then_some(
+        "To finish, use \u{201c}Download recovery file\u{201d} or \u{201c}Print a paper copy \
+         instead\u{201d}, and tick \u{201c}I\u{2019}ve saved this somewhere safe\u{201d}.",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_is_blocked_with_a_reason_until_a_copy_is_made_and_ticked() {
+        let why = finish_blocker(false, false).expect("blocked");
+        assert!(why.contains("Download recovery file"), "{why}");
+        assert!(why.contains("Print a paper copy"), "{why}");
+        assert!(why.contains("saved this somewhere safe"), "{why}");
+        assert_eq!(finish_blocker(true, false), None);
+        assert_eq!(finish_blocker(false, true), None, "the explicit skip");
+        assert_eq!(finish_blocker(true, true), None);
+    }
 }
