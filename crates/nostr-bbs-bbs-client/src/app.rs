@@ -105,6 +105,8 @@ pub fn App() -> impl IntoView {
     provide_context(relay.clone());
     provide_channel_store();
     zone_crypto::store::provide_zone_key_store(use_channel_store());
+    // Encrypted-zone search loads at sign-in, not at the first search.
+    nostr_bbs_client_core::utils::sealed_search::autoload();
     provide_reaction_store();
     provide_dm_store();
 

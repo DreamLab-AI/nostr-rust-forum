@@ -269,6 +269,119 @@ mod tests {
         assert!(ix2.add_bin(&bins[0], &t).is_err());
     }
 
+    fn string_keys(keys: &KeyMap) -> HashMap<(u32, String), SearchKey> {
+        keys.iter()
+            .map(|((e, pk), k)| ((*e, hex::encode(pk)), k.clone()))
+            .collect()
+    }
+
+    fn top_hits(ix: &Index, objs: &HashMap<&str, &Vec<u8>>, q: &[f32; DIM]) -> Vec<String> {
+        let cands = ix.first_stage(q, 200);
+        let plan = ix.plan_rescore(&cands).unwrap();
+        let fetched: Fetched = plan
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.ranges
+                        .iter()
+                        .map(|&(a, b)| (a, objs[p.name.as_str()][a..b].to_vec()))
+                        .collect(),
+                )
+            })
+            .collect();
+        ix.rescore(q, &cands, &fetched, 3)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect()
+    }
+
+    #[test]
+    fn shards_added_one_at_a_time_answer_from_what_is_loaded() {
+        let (rows, keys, built) = setup(1500);
+        let objs: HashMap<&str, &Vec<u8>> =
+            built.objects.iter().map(|(n, b)| (n.as_str(), b)).collect();
+        let mut ix = Index::new(built.content.clone(), string_keys(&keys));
+        let bins = ix.wanted_bins();
+        assert_eq!(bins.len(), 5);
+        assert!(!ix.is_complete());
+
+        // One shard in: its own rows are found, others are simply absent.
+        let q0 = ix.add_shard(&bins[0], objs[bins[0].name.as_str()], &[], 0);
+        assert!(
+            q0.is_err(),
+            "an int8 prefix that does not verify is refused"
+        );
+        assert_eq!(ix.shard_count(), 0, "a refused shard is not kept");
+        let qref = built
+            .content
+            .objects
+            .iter()
+            .find(|o| o.kind == Kind::Int8 && o.shard == bins[0].shard && o.epoch == bins[0].epoch)
+            .unwrap()
+            .clone();
+        let qb = objs[qref.name.as_str()];
+        let got = ix
+            .add_shard(
+                &bins[0],
+                objs[bins[0].name.as_str()],
+                &qb[..qb.len().min(70_000)],
+                qb.len(),
+            )
+            .unwrap();
+        assert_eq!(got.name, qref.name);
+        assert_eq!(ix.shard_count(), 1);
+        assert_eq!(ix.rows(), bins[0].count as usize);
+        // Adding the same shard again changes nothing.
+        ix.add_shard(
+            &bins[0],
+            objs[bins[0].name.as_str()],
+            &qb[..qb.len().min(70_000)],
+            qb.len(),
+        )
+        .unwrap();
+        assert_eq!(ix.shard_count(), 1);
+
+        // A row in the loaded shard is found while the rest is still to come.
+        let in_first: Vec<usize> = (0..rows.len())
+            .filter(|&i| rows[i].epoch == bins[0].epoch)
+            .take(bins[0].count as usize)
+            .collect();
+        let probe = in_first[7];
+        assert_eq!(
+            top_hits(&ix, &objs, &rows[probe].vec)[0],
+            hex::encode(rows[probe].id)
+        );
+
+        // The rest, in any order: the index ends up complete and whole.
+        for b in bins.iter().skip(1).rev() {
+            let q = built
+                .content
+                .objects
+                .iter()
+                .find(|o| o.kind == Kind::Int8 && o.shard == b.shard && o.epoch == b.epoch)
+                .unwrap();
+            let qb = objs[q.name.as_str()];
+            ix.add_shard(
+                b,
+                objs[b.name.as_str()],
+                &qb[..qb.len().min(70_000)],
+                qb.len(),
+            )
+            .unwrap();
+        }
+        assert!(ix.is_complete());
+        assert_eq!(ix.rows(), 1500);
+        assert_eq!(ix.index_version(), 3);
+        for qi in [0usize, 701, 1499] {
+            assert_eq!(
+                top_hits(&ix, &objs, &rows[qi].vec)[0],
+                hex::encode(rows[qi].id)
+            );
+        }
+    }
+
     #[test]
     fn decoys_are_drawn_from_the_index_and_exclude_hits() {
         let (rows, keys, built) = setup(300);
