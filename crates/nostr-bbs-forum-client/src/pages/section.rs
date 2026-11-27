@@ -43,6 +43,7 @@ use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::access_denied::AccessDenied;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
+use crate::components::canonical_address::keep_address_canonical;
 use crate::components::message_input::MessageInput;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::topic_list::{classify_topics, with_topic_stats, TopicList, TopicSummary};
@@ -56,9 +57,7 @@ use crate::utils::capitalize;
 use crate::utils::lookup::{
     deadline_for, key_state_memo, zone_is_encrypted, zone_is_gated, Lookup,
 };
-use crate::utils::section_url::{
-    canonical_section_path, find_by_section_slug, keep_address_canonical,
-};
+use crate::utils::section_url::{canonical_section_path, find_by_section_slug};
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
 /// Map a zone slug to its display name. Config-driven: resolves against the
@@ -281,19 +280,7 @@ pub fn SectionPage() -> impl IntoView {
         store.channel_messages.with(|m| {
             let roots = m.get(&roots_key).map(Vec::as_slice).unwrap_or(&[]);
             let window = m.get(&cid).map(Vec::as_slice).unwrap_or(&[]);
-            if roots.is_empty() {
-                return classify_topics(&cid, window);
-            }
-            let held: std::collections::HashSet<&str> =
-                window.iter().map(|e| e.id.as_str()).collect();
-            let mut all: Vec<nostr_bbs_core::NostrEvent> = window.to_vec();
-            all.extend(
-                roots
-                    .iter()
-                    .filter(|r| !held.contains(r.id.as_str()))
-                    .cloned(),
-            );
-            classify_topics(&cid, &all)
+            classify_topics(&cid, &crate::topics::board_events(window, roots))
         })
     });
     // The window holds a fraction of a long topic: take the relay's exact
@@ -362,17 +349,8 @@ pub fn SectionPage() -> impl IntoView {
             // Latest kind-42 message in the channel (max created_at, tie-broken by
             // id for determinism — matches the index's `created_at >` semantics).
             let latest = store.channel_messages.with(|m| {
-                m.get(&cid).and_then(|events| {
-                    events
-                        .iter()
-                        .filter(|e| e.kind == 42)
-                        .max_by(|a, b| {
-                            a.created_at
-                                .cmp(&b.created_at)
-                                .then_with(|| a.id.cmp(&b.id))
-                        })
-                        .map(|e| (e.id.clone(), e.created_at))
-                })
+                m.get(&cid)
+                    .and_then(|events| crate::topics::latest_post(events))
             });
             if let Some((last_id, last_ts)) = latest {
                 if last_marked.get_untracked() != last_id {
@@ -784,18 +762,7 @@ async fn publish_topic_root(
     // The topic marker lists the root in the section's root list
     // (`#t:["topic"]`), as sealed roots are, so it is never only reachable
     // by paging the channel's history.
-    let mut tags = vec![
-        vec![
-            "e".to_string(),
-            section_channel_id.to_string(),
-            String::new(),
-            "root".to_string(),
-        ],
-        vec![
-            "t".to_string(),
-            nostr_bbs_core::sealed::TOPIC_MARKER.to_string(),
-        ],
-    ];
+    let mut tags = crate::topics::topic_root_tags(section_channel_id);
     // @handles get ["p", pubkey] tags so mentioned users / agents (e.g.
     // @junkiejarvis) are addressable and reachable via the relay's #p-filtered
     // subscriptions. Two sources, de-duped: the pubkeys the user picked from the

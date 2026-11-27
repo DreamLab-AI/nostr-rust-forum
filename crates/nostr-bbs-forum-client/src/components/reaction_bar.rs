@@ -130,13 +130,8 @@ const REACTION_EMOJIS: &[&str] = &[
     "\u{1F64C}",
 ];
 
-/// A single emoji reaction on a message, aggregated across all reactors.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Reaction {
-    pub emoji: String,
-    pub count: u32,
-    pub reacted_by_me: bool,
-}
+#[allow(unused_imports)]
+pub(crate) use nostr_bbs_client_core::types::Reaction;
 
 /// Display and toggle emoji reactions on a message.
 ///

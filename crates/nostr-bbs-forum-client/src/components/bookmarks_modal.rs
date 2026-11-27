@@ -197,7 +197,7 @@ impl BookmarkStore {
 /// The signed-in identity, if the session is authenticated.
 fn current_owner() -> Option<String> {
     let auth = use_context::<crate::auth::AuthStore>()?;
-    auth.state.with_untracked(owner_of)
+    auth.state().with_untracked(owner_of)
 }
 
 fn owner_of(s: &crate::auth::AuthState) -> Option<String> {
@@ -216,7 +216,7 @@ pub fn provide_bookmarks() {
     provide_context(store);
     if let Some(auth) = use_context::<crate::auth::AuthStore>() {
         Effect::new(move |_| {
-            let owner = auth.state.with(owner_of);
+            let owner = auth.state().with(owner_of);
             store.follow(owner);
         });
     }

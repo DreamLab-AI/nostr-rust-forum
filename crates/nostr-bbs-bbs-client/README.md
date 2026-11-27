@@ -1,54 +1,50 @@
 # nostr-bbs-bbs-client
 
-A retro **ASCII/BBS terminal** face for the nostr-rust-forum kit — a Leptos
-CSR/WASM app served at `/community/bbs/` and driven entirely by `forum.toml`.
+A modern **retro ASCII/BBS TUI** face for the `nostr-rust-forum` kit — a
+responsive Leptos CSR/WASM application served at `/community/bbs/` and driven
+by `forum.toml` (`window.__ENV__`).
 
-It is a *face* over the kit's real infrastructure, not a separate app:
+Rather than maintaining a parallel reimplementation, `nostr-bbs-bbs-client`
+consumes the shared headless [`nostr-bbs-client-core`](../nostr-bbs-client-core)
+engine alongside `nostr-bbs-forum-client`. Auth, relay sync, NIP-42 AUTH,
+encrypted zones (ADR-2016/2017), reactions, NIP-09 tombstones, governance,
+NIP-59/17 DMs, Kanban, Calendar, Colloquy Knowledge, Poker, and Sidestr wallets
+all run on the exact same stores and crypto primitives.
 
-| BBS screen | Kit capability |
+## Surfaces & Feature Parity
+
+| View / Hash Route | Kit Capability |
 |---|---|
-| Message Base | config-driven **zones/boards** (`[[zones]]`), kind-40/42, deny-by-default relay reads |
-| File Base | **Solid pod** browser — WebID-owned storage (`solid_pod_rs::webid`) |
-| Node List | **relay** + federation **mesh** peers |
-| User List | members as **`did:nostr` WebID** profiles (`nostr_bbs_core::did`) |
-| Chat | live channel + encrypted **DMs** (NIP-44/59) |
-| Door Games | **agent control panels** — the human-in-the-loop governance plane (`nostr_bbs_core::governance::PanelDefinition`) |
-| Code Exchange | shared snippets / pod files |
-| System Info | node / relay / pod / **identity** status |
-| Settings | theme · identity · node |
-| Help | about |
+| `#/zones`, `#/zone/<slug>` | Config-driven zones & boards (`[[zones]]`), kind-40/42, encrypted zone badges |
+| `#/board/<id>`, `#/thread/<ch>/<post>` | NIP-28 / NIP-22 threads, Markdown, reactions + custom emoji, edits, NIP-09 delete, NIP-56 report, encrypted `ZoneWriter`, image upload + ASCII/Raw toggle |
+| `#/live` | Cross-board live post feed |
+| `#/kanban/<zone>` | Per-zone Kanban (`30301`/`30302`), approval gates (`31402`), `38000` agent dispatch |
+| `#/events/<zone>` | NIP-52 Calendar & Events (`31923`/`31925`), live RSVPs, free/busy, poker deep links |
+| `#/knowledge/<zone>` | Colloquy Knowledge Board (`colloquy-core`/`colloquy-nostr`), principal-counted attestations, gap signals |
+| `#/agents` | Governance control plane (`31400–31405`), relay-authoritative risk tiers, calibration samples, receipts, Approve/Reject/Promote/Demote/Delegate |
+| `#/dm`, `#/dm/<pubkey>` | Encrypted NIP-59/17 DMs with reactions, deletions, delivery reports, foreign-relay consent |
+| `#/games`, `#/games/poker[/<chain>]` | Door Games Hub: UA 571-C Sentry Gun (with Opus audio) + Practice & Live Sidestr Hold'em Poker (`nostr-bbs-poker`) + AI Coach |
+| `#/wallet` | Multi-chain Sidestr Wallet (`DREAM`, `BLAKES7`, `kind:23500`, receive QR, faucet, tab unlock) |
+| `#/pod` | NIP-98 authenticated Solid Pod browser (`solid-pod-rs`) + Pod Git status/commit/log |
+| `#/members`, `#/u/<pubkey>` | Member directory, `did:nostr` / WebID profiles, NIP-58 badges, non-clobbering kind-0 editor |
+| `#/bookmarks`, `#/notifications`, `#/settings`, `#/help` | Per-identity bookmarks, live notification center, 4 phosphor themes + CRT toggle + auth + device keys + ADR-109 PWA |
+
+## Desktop & Mobile Phone UX
+
+- **Desktop (`>= 900px`)**: Collapsible left sidebar with unread badges, main scrollable viewport, `/` slash command bar, `Ctrl/Cmd+K` global + sealed search, `g <key>` chord navigation.
+- **Mobile (`< 900px`)**: Native vertical scrolling (zero scroll-hijack JS), slide-over navigation drawer, sticky 5-tab thumb bar (`Zones`, `Live`, `DMs`, `Agents`, `More`), `>= 44px` tap targets, `16px` inputs (no iOS auto-zoom), safe-area inset support, and zero horizontal overflow.
 
 ## Configuration (`forum.toml` → `window.__ENV__`)
 
-```toml
-[branding]
-theme      = "amber"        # amber | green | purple | sky  (BBS palette)
-node_name  = "DREAMLAB BBS" # masthead + status bar
-location   = "Manchester, UK"
-banner_url = ""             # optional ASCII-art / image
-logo_url   = "…"
+Projected globals: `THEME`, `NODE_NAME`, `TAGLINE`, `LOCATION`, `BANNER_URL`,
+`LOGO_URL`, `RELAY_URL`, `POD_API`, `PREVIEW_API`, `SEARCH_API`, `ZONE_CONFIG`,
+`ENCRYPTION_ENABLED`, `BBS_PWA_ENABLED`, `SIDESTR_WALLET`, `SIDESTR_CHAINS`,
+`POKER`, `POKER_CONFIG`, `DEVICE_KEYS_ENABLED` — identical to `nostr-bbs-forum-client`.
 
-[[zones]]
-id         = "public"
-accent_hex = "#3b82f6"      # per-board accent colour
-```
-
-Projected globals: `THEME`, `NODE_NAME`, `LOCATION`, `BANNER_URL`, `LOGO_URL`,
-`RELAY_URL`, `POD_API`, `ZONE_CONFIG`, and optionally `VIEWER_PUBKEY` — the same
-`__ENV__` channel the main forum client already uses.
-
-## Keyboard model
-
-`1`–`9`,`0` open a board · `/` command line · `ESC` back · `↑↓`/`j`/`k` move ·
-`ENTER` select · `T` cycle theme · `?` help.
-
-## Build (host site integration)
+## Build & Test
 
 ```bash
-trunk build --release --public-url /community/bbs/
-# → dist/community/bbs/ ; copy into the branded site's deploy and inject the
-#   branding keys into window.__ENV__ alongside the existing set.
+cargo test -p nostr-bbs-bbs-client
+cargo check --target wasm32-unknown-unknown -p nostr-bbs-bbs-client
+cd crates/nostr-bbs-bbs-client && trunk build --release --public-url /community/bbs/
 ```
-
-Pure logic (`config`, `theme`, `menu`, `agent`, `identity`) is unit-tested on the
-native target; `cargo test -p nostr-bbs-bbs-client`.

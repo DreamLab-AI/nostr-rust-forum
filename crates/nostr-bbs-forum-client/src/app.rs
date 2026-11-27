@@ -495,7 +495,7 @@ pub fn App() -> impl IntoView {
         if is_authed.get() {
             let r = expect_context::<RelayConnection>();
             let a = auth_conn;
-            if a.state.get_untracked().is_nip07 {
+            if a.state().get_untracked().is_nip07 {
                 let a2 = a;
                 let async_signer: crate::relay::AuthSignAsyncCallback =
                     std::rc::Rc::new(move |event| {
@@ -849,7 +849,7 @@ pub fn App() -> impl IntoView {
             }
             // A NIP-07 extension can refuse a decrypt (a denied prompt), so its
             // failures are retried rather than taken as unreadable wraps.
-            let can_refuse = auth_for_keys.state.with_untracked(|s| s.is_nip07);
+            let can_refuse = auth_for_keys.state().with_untracked(|s| s.is_nip07);
             store.start_grant_sync(&relay_for_keys, signer, me, can_refuse);
         });
     }

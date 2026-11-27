@@ -205,8 +205,8 @@ const FORUM_SESSION_KEY: &str = "nostr_bbs_keys";
 ///
 /// Returns `None` when the session is absent or logged out (`publicKey` missing
 /// or empty). Only ever reads the PUBLIC key — never any private-key material.
-/// Consumed by the wasm `read_forum_session_pubkey`, the signer's NIP-07 adopt
-/// path ([`crate::signer::BbsSigner::adopt_forum_session`]), and the unit tests.
+/// Consumed by the wasm `read_forum_session_pubkey` and the unit tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn pubkey_from_session(json: &str) -> Option<String> {
     serde_json::from_str::<Value>(json)
         .ok()?
@@ -222,6 +222,7 @@ pub(crate) fn pubkey_from_session(json: &str) -> Option<String> {
 /// `nostr_bbs_sk`, so the BBS adopts them by re-attaching a `Nip07Signer` to the
 /// same same-origin `window.nostr` provider rather than importing a raw key.
 /// Missing/false/malformed all read as `false` (fail-closed).
+#[allow(dead_code)]
 pub(crate) fn session_is_nip07(json: &str) -> bool {
     serde_json::from_str::<Value>(json)
         .ok()

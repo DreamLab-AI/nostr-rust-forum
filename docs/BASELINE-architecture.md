@@ -1,24 +1,26 @@
 ---
 title: Architecture Baseline — nostr-rust-forum
 doc_id: NRF-BASELINE
-version: 0.3.1
+version: 0.3.2
 status: draft-for-ratification
-verified_commit: fd31193 (kit-version, solid-pod-rs and relay-admission paragraphs, and the invariant 6 note); 4a73a7a (ADR-2034 section, re-read 2026-11-23 for the zone-key wait); 3c48e26 (ADR-2033 section, invariants 7 and 8, and the deletion citations in the encrypted-zones section; ADR-2030 to ADR-2032 sections keep 0065dd9; older sections keep their earlier stamp)
+verified_commit: 3d6d557 (ADR-2036 shared nostr-bbs-client-core and retro BBS TUI redesign); fd31193 (kit-version, solid-pod-rs and relay-admission paragraphs, and the invariant 6 note); 4a73a7a (ADR-2034 section, re-read 2026-11-23 for the zone-key wait); 3c48e26 (ADR-2033 section, invariants 7 and 8, and the deletion citations in the encrypted-zones section; ADR-2030 to ADR-2032 sections keep 0065dd9; older sections keep their earlier stamp)
 sources:
   - Cargo.toml
   - crates/nostr-bbs-upstream-canary/src/lib.rs
   - crates/nostr-bbs-core/src/lib.rs
+  - crates/nostr-bbs-client-core/src/lib.rs
+  - crates/nostr-bbs-client-core/src/auth/mod.rs
   - crates/nostr-bbs-pod-worker/src/acl.rs
   - crates/nostr-bbs-auth-worker/src/schema.rs
   - crates/nostr-bbs-forum-client/src/main.rs
   - crates/nostr-bbs-bbs-client/src/app.rs
-  - crates/nostr-bbs-bbs-client/src/signer.rs
+  - crates/nostr-bbs-bbs-client/src/router.rs
   - crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs
   - crates/nostr-bbs-relay-worker/src/lib.rs
-  - crates/nostr-bbs-forum-client/src/stores/deletion_sync.rs
-  - crates/nostr-bbs-forum-client/src/stores/tombstones.rs
-  - crates/nostr-bbs-forum-client/src/relay/receipt.rs
-  - crates/nostr-bbs-forum-client/src/utils/lookup.rs
+  - crates/nostr-bbs-client-core/src/stores/deletion_sync.rs
+  - crates/nostr-bbs-client-core/src/stores/tombstones.rs
+  - crates/nostr-bbs-client-core/src/relay/receipt.rs
+  - crates/nostr-bbs-client-core/src/utils/lookup.rs
 date: 2026-08-31
 ---
 
@@ -52,8 +54,11 @@ proposed by ADR-2030 and is not a member (see "NIP-29 spaces" below):
 - **Cloudflare Worker reference implementations** — `nostr-bbs-auth-worker`,
   `nostr-bbs-pod-worker`, `nostr-bbs-preview-worker`, `nostr-bbs-relay-worker`,
   `nostr-bbs-search-worker`.
-- **Clients (Leptos CSR)** — `nostr-bbs-forum-client` (modern forum) and
-  `nostr-bbs-bbs-client` (retro ASCII/BBS terminal, served at `/community/bbs/`).
+- **Clients (Leptos CSR)** — `nostr-bbs-client-core` (shared headless browser
+  engine: auth, relay, zone crypto, DMs, stores, governance, poker, wallets;
+  `publish = false`, `AGPL-3.0-only`, ADR-2036), consumed by both
+  `nostr-bbs-forum-client` (modern forum) and `nostr-bbs-bbs-client` (re-imagined
+  responsive desktop + mobile retro ASCII/BBS TUI, served at `/community/bbs/`).
 - **Validation** — `nostr-bbs-upstream-canary` (build canary; not linked into any
   binary).
 
@@ -149,12 +154,16 @@ build resolves, so a newer alpha arrives only through a reviewed `cargo update`.
   unset, the client renders as before. `window.__ENV__.SIDESTR_CHAINS` chooses which
   of the two pinned chains are offered (`src/wallet/profile.rs`); absent, only
   `sidestr:dreamlab`.
-- **Retro BBS client** (`nostr-bbs-bbs-client`, served at `/community/bbs/`) — the
-  M2 write-path is implemented via an in-client signer (`BbsSigner`) that adopts
-  the forum session key when same-origin (`crates/nostr-bbs-bbs-client/src/app.rs:20-26`,
-  `crates/nostr-bbs-bbs-client/src/signer.rs:64,224,250`). Mobile-first redesign
-  (legacy ADR-108) is T1-shipped, T2/T3 in progress; the zone-bound one-shot PWA
-  install (legacy ADR-109) shipped in release `1.0.0-beta.5`.
+- **Retro BBS client** (`nostr-bbs-bbs-client`, served at `/community/bbs/`) —
+  re-imagined under [ADR-2036](adr/ADR-2036-shared-client-core-and-retro-tui-redesign.md)
+  (superseding ADR-2008) as a modern responsive desktop + mobile TUI over the
+  shared `nostr-bbs-client-core` headless engine (`crates/nostr-bbs-bbs-client/src/app.rs`,
+  `src/router.rs`, `src/shell.rs`, `assets/bbs.css`). Uses hash routing (`#/...`)
+  while preserving the zone-bound one-shot PWA install (`?pwa=1`, `src/pwa.rs`,
+  legacy ADR-109), removes legacy scroll-hijack and 60fps DOM-ghost scripts, and
+  achieves member feature parity with `nostr-bbs-forum-client` across encrypted
+  zones, governance, DMs, Kanban, Calendar, Colloquy Knowledge, Door Games
+  (UA 571-C Sentry + Hold'em Poker), Sidestr wallets, and Solid pods.
 
 ### Relay admission
 
@@ -188,11 +197,12 @@ bounds them (`nip_handlers.rs:71-77`).
   "implementation pending" while the ADR file header states it shipped in
   `1.0.0-beta.5` (`docs/archive/adr/ADR-109-zone-bound-bbs-pwa-install.md:3`). The file is
   correct; the index is stale.
-- **BBS write-path key custody.** Legacy ADR-105 §2.3 decided the BBS client would
-  delegate signing to a forum `sign()` seam; the shipped code holds key material
-  directly in `BbsSigner` (`crates/nostr-bbs-bbs-client/src/app.rs:25`,
-  `signer.rs:64`). ADR-105 was amended (2026-07-03) to acknowledge this; the
-  decision-as-originally-stated diverges from code.
+- **BBS write-path key custody (resolved via ADR-2036).** Legacy ADR-105 §2.3
+  decided the BBS client would delegate signing to a forum `sign()` seam; the
+  earlier M2 code diverged into a separate `BbsSigner` (ADR-2008). Under
+  [ADR-2036](adr/ADR-2036-shared-client-core-and-retro-tui-redesign.md),
+  `BbsSigner` is deleted and both clients share `nostr_bbs_client_core::auth::AuthStore`
+  (`crates/nostr-bbs-client-core/src/auth/mod.rs`).
 - **CF-Workers pod federation degenerate.** ADR-086's pod fallback returns only
   data D1 already holds because ADR-087's portable-cores decision is unresolved.
 - **NIP-29 group semantics are not implemented, and are no longer advertised.** The
@@ -486,3 +496,7 @@ ADR names it. Add a row in the same change as any ADR that introduces or reuses 
 
 Obelisk's private kinds (20390, 31313, 31314, 25050-25052) and its 30078 d-tags are not
 adopted (ADR-2030).
+
+## Shared client engine & re-imagined retro TUI — ADR-2036
+
+[ADR-2036](adr/ADR-2036-shared-client-core-and-retro-tui-redesign.md) extracts the headless browser-client layer into `crates/nostr-bbs-client-core` (`publish = false`, `AGPL-3.0-only`), consumed by both `nostr-bbs-forum-client` and `nostr-bbs-bbs-client`. It deletes the diverged `BbsSigner` (`signer.rs`) and duplicated BBS transport/store modules, superseding [ADR-2008](adr/ADR-2008-bbs-signer-holds-key-directly.md) so key custody, NIP-42 AUTH, encrypted zones (ADR-2016/2017), NIP-09 tombstones (ADR-2033), authenticated absence receipts (ADR-2034), governance control panels (ADR-2010/2011/2013), NIP-59/17 DMs, Poker (ADR-2020), and Sidestr wallets (ADR-2015/2021) share one implementation. `nostr-bbs-bbs-client` is rebuilt as a responsive desktop + mobile phone TUI (`src/shell.rs`, `src/router.rs`, `assets/bbs.css`) using hash routing (`#/...`), preserving ADR-109 `?pwa=1` zone-bound boot (`src/pwa.rs`), four phosphor palettes, pure-CSS CRT scanlines, `AsciiImg`, and the UA 571-C Sentry Gun door game without legacy scroll-hijack or 60fps DOM-ghost scripts. No new Nostr event kinds are introduced.

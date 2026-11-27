@@ -3,15 +3,15 @@ name = "nostr-bbs-bbs-client"
 version = "1.0.0-beta.10"
 publish = false           # deployable application (built from source at KIT_REF), not a crates.io dependency
 edition = "2021"
-description = "nostr-bbs community forum — retro ASCII/BBS terminal client (Leptos CSR/WASM)"
+description = "nostr-bbs community forum — re-imagined retro TUI/BBS terminal client (Leptos CSR/WASM)"
 license = "AGPL-3.0-only"
 repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
-keywords = ["nostr", "bbs", "ascii", "leptos", "wasm"]
+keywords = ["nostr", "bbs", "ascii", "tui", "leptos", "wasm"]
 categories = ["web-programming", "wasm"]
 rust-version = "1.85"
 
-# Pure logic (config/theme/menu) lives in the lib so it is unit-testable on the
-# native target; `main.rs` mounts the Leptos app from it for the wasm build.
+# Pure logic (config/theme/router/prefs/pod/pwa/ascii) lives in the lib so it is
+# unit-testable on the native target; `main.rs` mounts the Leptos app for wasm.
 [lib]
 name = "nostr_bbs_bbs_client"
 path = "src/lib.rs"
@@ -21,18 +21,21 @@ name = "nostr-bbs-bbs-client"
 path = "src/main.rs"
 
 [dependencies]
-# Shared config schema (Branding, Zone, ZoneVisibility) — single source of truth
-# with the rest of the kit so the BBS chrome is driven by the same forum.toml.
+# Shared headless client engine (relay, auth, encrypted zones, DMs, stores,
+# poker, wallet, sealed search, pod client) — prevents drift with forum-client.
+nostr-bbs-client-core = { workspace = true }
+# Shared config schema (Branding, Zone, ZoneVisibility).
 nostr-bbs-config = { workspace = true }
-# Kit core: event types + verify_event_strict, did:nostr identity, and the
-# agent-governance control-panel schema (PanelDefinition / ActionDef / FieldDef /
-# ActionRequest+Response). The BBS renders the SAME human-in-the-loop panels the
-# main client does, in ASCII — no reimplementation of the governance model.
+# Kit core: event types, governance, kanban, calendar, sealed originals, signer.
 nostr-bbs-core = { workspace = true, features = ["did"] }
-# Solid pod / WebID / did:nostr URL formatting (pure `core` feature, wasm-safe) —
-# powers the File Base (pod browser), User List (WebID profiles), and System Info
-# screens against the same infrastructure the forum client uses.
+# Poker engine types & rules (shared with poker-citizen and forum-client).
+nostr-bbs-poker = { workspace = true }
+# Solid pod / WebID / did:nostr URL formatting.
 solid-pod-rs = { workspace = true }
+# Colloquy shared-agent-learning knowledge board (ADR-2085/2086).
+colloquy-core = "0.1"
+colloquy-nostr = "0.2"
+colloquy-view = "0.1"
 
 leptos = { workspace = true }
 wasm-bindgen = { workspace = true }
@@ -40,6 +43,8 @@ wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+comrak = { workspace = true }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 web-sys = { workspace = true, features = [
     "Window",
     "console",
@@ -47,11 +52,19 @@ web-sys = { workspace = true, features = [
     "Element",
     "HtmlElement",
     "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "HtmlSelectElement",
     "Event",
     "CustomEvent",
     "EventTarget",
+    "HashChangeEvent",
     "KeyboardEvent",
+    "ClipboardEvent",
+    "DataTransfer",
+    "DataTransferItemList",
+    "DataTransferItem",
     "Location",
+    "History",
     "WebSocket",
     "MessageEvent",
     "BinaryType",
@@ -63,14 +76,13 @@ web-sys = { workspace = true, features = [
     "Response",
     "Headers",
     "Storage",
-    # Cross-tab notification read-state sync (see notifications.rs): the `storage`
-    # event fires in OTHER same-origin tabs on a localStorage write, carrying the key.
     "StorageEvent",
     "MediaQueryList",
     "DomTokenList",
-    # Zone-bound one-shot PWA (ADR-109): baked-key unwrap (WebCrypto AES-GCM over
-    # a non-extractable CryptoKey in IndexedDB), the `?pwa=1` boot read, and the
-    # scoped service-worker registration for installability.
+    "DomRect",
+    "ResizeObserver",
+    "ScrollIntoViewOptions",
+    "ScrollLogicalPosition",
     "Crypto",
     "SubtleCrypto",
     "CryptoKey",
@@ -89,17 +101,12 @@ web-sys = { workspace = true, features = [
     "Url",
     "ServiceWorkerContainer",
     "ServiceWorkerRegistration",
-    # Composer image upload (F10): file pick + canvas compression.
     "File",
     "FileList",
     "Blob",
     "HtmlCanvasElement",
     "CanvasRenderingContext2d",
     "ImageBitmap",
-    # F9 native passkey sign-in (WebAuthn PRF → derived key). navigator.credentials
-    # + the credential option wrappers the ceremony casts into; the remaining
-    # PublicKeyCredential*/Authenticator*/AuthenticationExtensions* bindings mirror
-    # the forum client's WebAuthn surface.
     "Navigator",
     "CredentialsContainer",
     "CredentialCreationOptions",
@@ -114,29 +121,11 @@ web-sys = { workspace = true, features = [
     "AuthenticationExtensionsClientOutputs",
 ] }
 console_error_panic_hook = "0.1"
-# Write path: reuse the kit's audited signer (PrfSigner) + key parsing. `hex`
-# decodes the forum's persisted secret and generated keys; `zeroize` scrubs the
-# transient key buffers; `send_wrapper` carries the non-Send `Rc<dyn Signer>`
-# through Leptos context on the single-threaded wasm main thread (same pattern as
-# the forum client's AuthStore).
 hex = { workspace = true }
 zeroize = { workspace = true }
-# Zone-bound PWA (ADR-109): `gloo::storage::LocalStorage` reads/writes the
-# non-secret BootProfile record (`nostr_bbs_bootprofile`) that drives the
-# one-shot boot, matching the forum client's bake-side storage layer.
 gloo = { workspace = true }
-# Composer image upload (F10): base64-encode the signed NIP-98 event and
-# SHA-256 the payload for the `payload` tag — the same primitives the forum
-# client's pod_client uses, built here on the shared `Signer` trait.
 base64 = { workspace = true }
 sha2 = { workspace = true }
 send_wrapper = "0.6"
-# URL parsing for authority-exact first-party (pod) checks — a bare string
-# prefix cannot distinguish `pods.example.com` from `pods.example.com.evil.com`,
-# and the pod ASCII fragment is injected as trusted HTML, so the pod-host match
-# must compare parsed scheme/host/port, not a substring.
 url = { workspace = true }
-# NIP-07 signer: implements the kit's async `Signer` trait for `window.nostr`
-# extension sessions (PodKey / nos2x / Alby), matching how the forum client's
-# `Nip07Signer` is defined — same `async_trait(?Send)` erasure as core's PrfSigner.
 async-trait = { workspace = true }

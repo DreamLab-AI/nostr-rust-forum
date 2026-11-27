@@ -25,6 +25,20 @@
 //! when every route fails does it degrade to `[ image unavailable ]` — never a
 //! raw `JsValue` and never a panic. The pure URL/parsing helpers are unit-tested
 //! on the native target; the `fetch` itself is wasm-only.
+//!
+//! **Protected media is never sent anywhere.** A zone image
+//! (`…/media/zones/…`) or any other non-public pod resource needs the
+//! member's own credentials, which neither the preview worker nor an
+//! unauthenticated pod request has: the preview worker answered such URLs
+//! with 400 after the pod refused it. [`ascii_route`] classifies them first
+//! ([`is_protected_media`]) and [`AsciiImg`] shows a placeholder with the
+//! file name (and, where the caller passes one, a link to the post in the
+//! forum, which can show it) without making a request. Each outcome is kept
+//! for the session (`ascii_slot`), so a re-rendered post never repeats a
+//! request, failed or not.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 
 use leptos::prelude::*;
 use url::Url;
@@ -45,15 +59,94 @@ enum AsciiState {
     Loading,
     /// Server-rendered HTML fragment ready to inject.
     Loaded(String),
+    /// Media only the member's own credentials can read: never fetched.
+    Protected,
     /// Fetch failed / no endpoint / wrong content-type.
     Error,
+}
+
+/// Most outcomes kept for the session (oldest dropped first).
+const ASCII_CACHE_MAX: usize = 256;
+
+/// Session outcomes of ASCII renders: each key's slot, and the keys oldest
+/// first (for eviction past [`ASCII_CACHE_MAX`]).
+#[derive(Default)]
+struct AsciiCache {
+    slots: HashMap<String, ArcRwSignal<AsciiState>>,
+    order: VecDeque<String>,
+}
+
+thread_local! {
+    /// Outcome of each ASCII render this session, keyed by
+    /// [`ascii_cache_key`]: a remounted image (a post re-rendered by a store
+    /// update, a revisited thread) reuses it instead of fetching again, and a
+    /// request in flight is shared rather than repeated.
+    static ASCII_CACHE: RefCell<AsciiCache> = RefCell::new(AsciiCache::default());
+}
+
+/// The session slot for `key`, and whether it is new (the caller then
+/// fetches into it). A new slot starts as `initial`.
+fn ascii_slot(key: &str, initial: AsciiState) -> (ArcRwSignal<AsciiState>, bool) {
+    ASCII_CACHE.with(|cache| {
+        let AsciiCache { slots: map, order } = &mut *cache.borrow_mut();
+        if let Some(slot) = map.get(key) {
+            return (slot.clone(), false);
+        }
+        if order.len() >= ASCII_CACHE_MAX {
+            if let Some(oldest) = order.pop_front() {
+                map.remove(&oldest);
+            }
+        }
+        let slot = ArcRwSignal::new(initial);
+        map.insert(key.to_string(), slot.clone());
+        order.push_back(key.to_string());
+        (slot, true)
+    })
+}
+
+/// The session cache key of an image render.
+fn ascii_cache_key(src: &str, cols: u32, ramp: &str) -> String {
+    format!("{cols}|{ramp}|{src}")
+}
+
+/// How [`AsciiImg`] renders an image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AsciiRoute {
+    /// Protected media ([`is_protected_media`]): a placeholder, no request.
+    Protected,
+    /// Try these fragment URLs in order ([`ascii_fetch_urls`]).
+    Fetch(Vec<String>),
+    /// No endpoint can serve it (blank `src`, no preview API).
+    Unavailable,
+}
+
+/// Decide how to render `src`: protected media first, so its URL never
+/// reaches the preview worker or an unauthenticated pod request.
+pub fn ascii_route(
+    preview_api: &str,
+    pod_api: &str,
+    src: &str,
+    cols: u32,
+    ramp: &str,
+) -> AsciiRoute {
+    if is_protected_media(src) {
+        return AsciiRoute::Protected;
+    }
+    let urls = ascii_fetch_urls(preview_api, pod_api, src, cols, ramp);
+    if urls.is_empty() {
+        AsciiRoute::Unavailable
+    } else {
+        AsciiRoute::Fetch(urls)
+    }
 }
 
 /// Render an image as on-theme ASCII art.
 ///
 /// On mount it fetches the server-rendered phosphor fragment for `src` and
-/// injects it. While loading it shows `[ loading ascii … ]`; on any error it
-/// shows `[ image unavailable ]`. Endpoints come from [`BbsConfig`] in context
+/// injects it, once per session (see `ascii_slot`). While loading it shows
+/// `[ loading ascii … ]`. Protected media is never fetched, and it and any
+/// failure show a placeholder naming the file, with an "Open in forum" link
+/// when `forum_href` is given. Endpoints come from [`BbsConfig`] in context
 /// (`preview_api` for arbitrary URLs, `pod_api` for pod-hosted images).
 #[component]
 pub fn AsciiImg(
@@ -65,6 +158,10 @@ pub fn AsciiImg(
     /// Phosphor ramp: `standard`, `blocks`, or `dense`.
     #[prop(default = String::from("standard"))]
     ramp: String,
+    /// Where the forum shows the post this image belongs to, for media the
+    /// BBS cannot render.
+    #[prop(optional)]
+    forum_href: Option<String>,
 ) -> impl IntoView {
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("config");
     let (preview_api, pod_api) = cfg.with_value(|c| (c.preview_api.clone(), c.pod_api.clone()));
@@ -73,31 +170,35 @@ pub fn AsciiImg(
     // resolve a client-relative path.
     #[cfg(target_arch = "wasm32")]
     let src = make_absolute(&current_origin(), &src);
-    let fetch_urls = ascii_fetch_urls(&preview_api, &pod_api, &src, cols, &ramp);
+    let name = media_file_name(&src);
+    let protected_why = protected_reason(&src);
+    let route = ascii_route(&preview_api, &pod_api, &src, cols, &ramp);
+    let initial = match &route {
+        AsciiRoute::Protected => AsciiState::Protected,
+        AsciiRoute::Fetch(_) => AsciiState::Loading,
+        AsciiRoute::Unavailable => AsciiState::Error,
+    };
+    let (state, fresh) = ascii_slot(&ascii_cache_key(&src, cols, &ramp), initial);
 
-    let state = RwSignal::new(if fetch_urls.is_empty() {
-        AsciiState::Error
-    } else {
-        AsciiState::Loading
-    });
-
-    if !fetch_urls.is_empty() {
+    if let (true, AsciiRoute::Fetch(fetch_urls)) = (fresh, route) {
         #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(async move {
-            // Try each candidate in priority order (pod-direct, then preview
-            // fallback); the first `text/html` fragment wins. A pod that ignores
-            // `?format=ascii` (raw image / wrong content-type) or 401s simply
-            // falls through to the next route. When every candidate fails we
-            // degrade to `[ image unavailable ]` — never a raw `JsValue`, never
-            // a panic.
-            for url in &fetch_urls {
-                if let Ok(html) = fetch_ascii(url).await {
-                    state.set(AsciiState::Loaded(html));
-                    return;
+        {
+            let state = state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                // Try each candidate in priority order (pod-direct, then
+                // preview fallback); the first `text/html` fragment wins. When
+                // every candidate fails the slot records it, so no later mount
+                // asks again. The slot is not owned by this component, so it
+                // outlives an unmounted post.
+                for url in &fetch_urls {
+                    if let Ok(html) = fetch_ascii(url).await {
+                        state.set(AsciiState::Loaded(html));
+                        return;
+                    }
                 }
-            }
-            state.set(AsciiState::Error);
-        });
+                state.set(AsciiState::Error);
+            });
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let _ = fetch_urls;
     }
@@ -107,8 +208,20 @@ pub fn AsciiImg(
             <pre class="ascii-img ascii-img-status">"[ loading ascii … ]"</pre>
         }
         .into_any(),
+        AsciiState::Protected => view! {
+            <MediaPlaceholder
+                name=name.clone()
+                reason=protected_why
+                forum_href=forum_href.clone()
+            />
+        }
+        .into_any(),
         AsciiState::Error => view! {
-            <pre class="ascii-img ascii-img-status">"[ image unavailable ]"</pre>
+            <MediaPlaceholder
+                name=name.clone()
+                reason="image unavailable"
+                forum_href=forum_href.clone()
+            />
         }
         .into_any(),
         // The fragment is server-generated by our own workers and already
@@ -118,6 +231,106 @@ pub fn AsciiImg(
         }
         .into_any(),
     }
+}
+
+/// The inline stand-in for an image the BBS cannot render: its file name,
+/// why, and a link to the post in the forum when there is one.
+#[component]
+pub fn MediaPlaceholder(
+    /// The image's file name ([`media_file_name`]).
+    name: String,
+    /// Why it is not shown, e.g. "protected zone media".
+    reason: &'static str,
+    /// The post in the forum, which can show the image.
+    forum_href: Option<String>,
+) -> impl IntoView {
+    view! {
+        <div class="ascii-img ascii-img-status" role="note">
+            <span>{format!("[ {name} · {reason} ]")}</span>
+            {forum_href.map(|href| view! {
+                " "
+                <a href=href rel="noopener">"Open in forum ↗"</a>
+            })}
+        </div>
+    }
+}
+
+/// Whether `src` is media only the member's own credentials can read, which
+/// must never be sent to the preview worker (or fetched without credentials):
+/// a zone image (a `media/zones/` path on any host), or any pod resource
+/// (`/pods/<owner>/…` on any host) outside its `public/` and `media/public/`
+/// containers. Decided on the path alone and failing closed: a lookalike host
+/// is still treated as protected, since the cost is a placeholder rather than
+/// a leaked URL. The path is percent-decoded first.
+pub fn is_protected_media(src: &str) -> bool {
+    let raw = src.trim();
+    let path = match Url::parse(raw) {
+        Ok(u) => u.path().to_string(),
+        Err(_) => raw.split(['?', '#']).next().unwrap_or_default().to_string(),
+    };
+    let path = percent_decode(&path).to_ascii_lowercase();
+    if path.contains("/media/zones/") || path.starts_with("media/zones/") {
+        return true;
+    }
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.iter().position(|s| *s == "pods") {
+        Some(i) if segs.len() > i + 2 => {
+            let rest = &segs[i + 2..];
+            !(rest[0] == "public" || (rest[0] == "media" && rest.get(1) == Some(&"public")))
+        }
+        _ => false,
+    }
+}
+
+/// How a placeholder names protected media: a zone image, or a member's own
+/// non-public pod file (the File Base).
+pub fn protected_reason(src: &str) -> &'static str {
+    if percent_decode(src)
+        .to_ascii_lowercase()
+        .contains("/media/zones/")
+    {
+        "protected zone media"
+    } else {
+        "private pod file"
+    }
+}
+
+/// The file name of an image URL for a placeholder: the last path segment,
+/// percent-decoded, without query or fragment; "image" when there is none.
+pub fn media_file_name(src: &str) -> String {
+    let path = src.trim().split(['?', '#']).next().unwrap_or_default();
+    let path = path.split_once("://").map_or(path, |(_, rest)| {
+        rest.split_once('/').map_or("", |(_, p)| p)
+    });
+    let last = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or_default();
+    let name = percent_decode(last);
+    let name = name.trim();
+    if name.is_empty() {
+        "image".to_string()
+    } else {
+        name.chars().take(80).collect()
+    }
+}
+
+/// Decode `%XX` escapes (invalid escapes and non-UTF-8 results are kept as
+/// they were).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// Is `src` a resource hosted under the configured pod API base?
@@ -529,6 +742,110 @@ mod tests {
         )
         .is_empty());
         assert!(ascii_fetch_urls("", "", "  ", 80, "standard").is_empty());
+    }
+
+    const OWNER: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn zone_media_is_protected_on_any_host_and_never_routed() {
+        let zone_img = format!("https://pods.example.com/pods/{OWNER}/media/zones/zone2/cat.png");
+        assert!(is_protected_media(&zone_img));
+        // Lookalike or unconfigured host: still protected (fail closed).
+        assert!(is_protected_media(&format!(
+            "https://pods.example.com.evil.com/pods/{OWNER}/media/zones/z/x.jpg"
+        )));
+        assert!(is_protected_media(&format!(
+            "https://other.example/pods/{OWNER}/media/zones/z/x.jpg?v=1"
+        )));
+        // An escaped path is decoded before it is judged.
+        assert!(is_protected_media(&format!(
+            "https://p.example/pods/{OWNER}/media%2Fzones%2Fz/x.png"
+        )));
+        // With and without a configured pod API, no URL is built for it.
+        for pod in ["", "https://pods.example.com"] {
+            assert_eq!(
+                ascii_route(
+                    "https://preview.example.com",
+                    pod,
+                    &zone_img,
+                    64,
+                    "standard"
+                ),
+                AsciiRoute::Protected,
+                "pod api {pod:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_pod_resources_are_protected_and_public_ones_are_not() {
+        let pod = |path: &str| format!("https://pods.example.com/pods/{OWNER}/{path}");
+        assert!(is_protected_media(&pod("private/me.png")));
+        assert!(is_protected_media(&pod("media/other/x.png")));
+        assert!(is_protected_media(&pod("inbox/x.png")));
+        assert!(!is_protected_media(&pod("public/x.png")));
+        assert!(!is_protected_media(&pod("media/public/x.png")));
+        assert!(!is_protected_media("https://cdn.other.com/media/x.png"));
+        assert!(!is_protected_media("/images/heroes/lake.webp"));
+        assert_eq!(
+            ascii_route(
+                "https://preview.example.com",
+                "",
+                &pod("media/public/cat.jpg"),
+                64,
+                "standard"
+            ),
+            AsciiRoute::Fetch(vec![format!(
+                "https://preview.example.com/ascii?url={}&cols=64&ramp=standard",
+                encode_uri_component(&pod("media/public/cat.jpg"))
+            )])
+        );
+        assert_eq!(
+            ascii_route("", "", "https://cdn.other.com/x.png", 64, "standard"),
+            AsciiRoute::Unavailable
+        );
+    }
+
+    #[test]
+    fn placeholder_names_the_file() {
+        assert_eq!(
+            media_file_name(&format!(
+                "https://p.example/pods/{OWNER}/media/zones/z/My%20Cat.png?v=2#x"
+            )),
+            "My Cat.png"
+        );
+        assert_eq!(media_file_name("https://p.example/"), "image");
+        assert_eq!(media_file_name("https://p.example"), "image");
+        assert_eq!(media_file_name("/images/a.webp"), "a.webp");
+        assert_eq!(
+            protected_reason(&format!(
+                "https://p.example/pods/{OWNER}/media/zones/z/a.png"
+            )),
+            "protected zone media"
+        );
+        assert_eq!(
+            protected_reason(&format!("https://p.example/pods/{OWNER}/private/a.png")),
+            "private pod file"
+        );
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%zz%41"), "%zzA");
+    }
+
+    #[test]
+    fn an_outcome_is_kept_for_the_session() {
+        let key = ascii_cache_key("https://cdn.other.com/kept.png", 64, "standard");
+        let (slot, fresh) = ascii_slot(&key, AsciiState::Loading);
+        assert!(fresh, "the first mount fetches");
+        slot.set(AsciiState::Error);
+        let (again, fresh) = ascii_slot(&key, AsciiState::Loading);
+        assert!(!fresh, "a remount does not fetch again");
+        assert_eq!(again.get_untracked(), AsciiState::Error);
+        // Another width is another render.
+        let (_, fresh) = ascii_slot(
+            &ascii_cache_key("https://cdn.other.com/kept.png", 40, "standard"),
+            AsciiState::Loading,
+        );
+        assert!(fresh);
     }
 
     #[test]

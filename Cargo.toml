@@ -39,6 +39,10 @@ members = [
     # sends, replayed under either header family. Pure library + native bin.
     "crates/nostr-bbs-sidestr-admin",
 
+    # Shared headless client engine (protocol, relay, zone crypto, DM, stores,
+    # poker, wallet, pod/search utilities) consumed by both browser clients.
+    "crates/nostr-bbs-client-core",
+
     # Leptos CSR forum client.
     "crates/nostr-bbs-forum-client",
 
@@ -205,6 +209,7 @@ nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-
 nostr-bbs-jev = { path = "crates/nostr-bbs-jev", version = "1.0.0-beta.16" }
 nostr-bbs-ascii = { path = "crates/nostr-bbs-ascii", version = "1.0.0-beta.10" }
 nostr-bbs-poker = { path = "crates/nostr-bbs-poker", version = "1.0.0-beta.15" }
+nostr-bbs-client-core = { path = "crates/nostr-bbs-client-core", version = "1.0.0-beta.10" }
 
 # Image decoders for server-side ASCII rendering (nostr-bbs-ascii `decode`
 # feature, enabled by the preview/pod workers). default-features off so no

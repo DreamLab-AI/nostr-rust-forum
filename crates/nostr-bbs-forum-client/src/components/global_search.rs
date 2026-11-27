@@ -16,6 +16,7 @@
 
 use crate::components::copy_key::KeyGlyph;
 use crate::relay::{Filter, RelayConnection};
+use crate::utils::sealed_search::IndexState;
 use gloo::events::EventListener;
 use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
@@ -191,9 +192,9 @@ impl Hit {
                 event_id,
                 channel_id,
                 ..
-            } => crate::pages::jump_link(event_id, Some(channel_id)),
+            } => crate::utils::post_link::jump_link(event_id, Some(channel_id)),
             Self::SemanticMessage { event_id, id, .. } => {
-                crate::pages::jump_link(event_id, Some(id))
+                crate::utils::post_link::jump_link(event_id, Some(id))
             }
             Self::User { pubkey, .. } => format!("/profile/{pubkey}"),
         }
@@ -206,58 +207,21 @@ impl Hit {
     }
 }
 
-/// Where the on-device index for encrypted zones stands, as the panel sees it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SealedIndex {
-    /// Nothing to wait for: no encrypted zone this member can search, or its
-    /// load finished without anything to search.
-    Idle,
-    /// The member's zone keys or the index are still on their way.
-    Loading,
-    /// At least one encrypted zone is searchable in the worker.
-    Ready,
-}
-
-/// The index state when the panel opens. `searchable` is "an encrypted zone
-/// and an index publisher are configured"; `keys_ready` is "this member's
-/// stored zone keys are read"; `holds_key` is "a key for one of those zones is
-/// held"; `ready_now` is [`sealed_search::ready`](crate::utils::sealed_search::ready).
-fn sealed_state_on_open(
-    searchable: bool,
-    keys_ready: bool,
-    holds_key: bool,
-    ready_now: bool,
-) -> SealedIndex {
-    if ready_now {
-        SealedIndex::Ready
-    } else if !searchable || (keys_ready && !holds_key) {
-        SealedIndex::Idle
-    } else {
-        SealedIndex::Loading
-    }
-}
-
 /// Whether `tab` searches message bodies (and so encrypted zones).
 fn searches_messages(tab: &Tab) -> bool {
     matches!(tab, Tab::All | Tab::Messages)
 }
 
 /// Whether to tell the member that encrypted zones were not searched yet.
-fn sealed_notice(state: SealedIndex, tab: &Tab, query: &str) -> bool {
-    state == SealedIndex::Loading && searches_messages(tab) && !query.trim().is_empty()
+fn sealed_notice(state: IndexState, tab: &Tab, query: &str) -> bool {
+    state == IndexState::Loading && searches_messages(tab) && !query.trim().is_empty()
 }
 
 /// Whether the index load that moved `prev` to `next` should re-run the
 /// query in the open panel, so results appear without retyping.
-fn rerun_on_ready(
-    prev: SealedIndex,
-    next: SealedIndex,
-    open: bool,
-    query: &str,
-    tab: &Tab,
-) -> bool {
-    prev == SealedIndex::Loading
-        && next == SealedIndex::Ready
+fn rerun_on_ready(prev: IndexState, next: IndexState, open: bool, query: &str, tab: &Tab) -> bool {
+    prev == IndexState::Loading
+        && next == IndexState::Ready
         && open
         && searches_messages(tab)
         && !query.trim().is_empty()
@@ -310,7 +274,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     // and re-runs the query when it completes (effect below `do_search`).
     let zone_store = crate::zone_crypto::store::try_use_zone_key_store();
     let auth = crate::auth::use_auth();
-    let sealed = RwSignal::new(SealedIndex::Idle);
+    let sealed = RwSignal::new(IndexState::Idle);
     let sealed_in_flight = StoredValue::new(false);
     let navigate = StoredValue::new(use_navigate());
 
@@ -546,7 +510,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
             return;
         }
         let (Some(store), Some(signer)) = (zone_store, auth.get_signer()) else {
-            sealed.set(SealedIndex::Idle);
+            sealed.set(IndexState::Idle);
             return;
         };
         let zones = crate::utils::sealed_search::sealed_zones();
@@ -554,7 +518,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
         let keys_ready = store.ready_for(auth.pubkey().get().as_deref());
         let holds_key = keys_ready && zones.iter().any(|z| !store.all_for_zone(z).is_empty());
         let ready_now = crate::utils::sealed_search::ready();
-        sealed.set(sealed_state_on_open(
+        sealed.set(crate::utils::sealed_search::state_on_open(
             searchable, keys_ready, holds_key, ready_now,
         ));
         if !searchable || !holds_key || sealed_in_flight.get_value() {
@@ -571,15 +535,15 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
             }
             let _ = sealed_in_flight.try_set_value(false);
             let next = if crate::utils::sealed_search::ready() {
-                SealedIndex::Ready
+                IndexState::Ready
             } else {
-                SealedIndex::Idle
+                IndexState::Idle
             };
             let Some(prev) = sealed.try_get_untracked() else {
                 return;
             };
             sealed.set(next);
-            api_online.set(next == SealedIndex::Ready);
+            api_online.set(next == IndexState::Ready);
             if rerun_on_ready(
                 prev,
                 next,
@@ -930,47 +894,8 @@ mod tests {
     // ── Encrypted-zone index readiness ──────────────────────────────────────
 
     #[test]
-    fn nothing_to_load_means_no_loading_state() {
-        // No sealed zone or no publisher: there is nothing to wait for.
-        assert_eq!(
-            sealed_state_on_open(false, true, true, false),
-            SealedIndex::Idle
-        );
-        // Keys loaded, none held for a sealed zone: never "still loading".
-        assert_eq!(
-            sealed_state_on_open(true, true, false, false),
-            SealedIndex::Idle
-        );
-    }
-
-    #[test]
-    fn loading_while_keys_or_index_are_on_their_way() {
-        // Stored keys not yet read: the zones cannot be searched yet.
-        assert_eq!(
-            sealed_state_on_open(true, false, false, false),
-            SealedIndex::Loading
-        );
-        assert_eq!(
-            sealed_state_on_open(true, true, true, false),
-            SealedIndex::Loading
-        );
-    }
-
-    #[test]
-    fn an_index_already_in_the_worker_is_ready() {
-        assert_eq!(
-            sealed_state_on_open(true, true, true, true),
-            SealedIndex::Ready
-        );
-        assert_eq!(
-            sealed_state_on_open(false, false, false, true),
-            SealedIndex::Ready
-        );
-    }
-
-    #[test]
     fn the_notice_shows_only_for_a_pending_message_search() {
-        let l = SealedIndex::Loading;
+        let l = IndexState::Loading;
         assert!(sealed_notice(l, &Tab::All, "Glastonbury"));
         assert!(sealed_notice(l, &Tab::Messages, "Glastonbury"));
         assert!(
@@ -979,13 +904,13 @@ mod tests {
         );
         assert!(!sealed_notice(l, &Tab::Users, "Glastonbury"));
         assert!(!sealed_notice(l, &Tab::All, "  "), "no query yet");
-        assert!(!sealed_notice(SealedIndex::Idle, &Tab::All, "Glastonbury"));
-        assert!(!sealed_notice(SealedIndex::Ready, &Tab::All, "Glastonbury"));
+        assert!(!sealed_notice(IndexState::Idle, &Tab::All, "Glastonbury"));
+        assert!(!sealed_notice(IndexState::Ready, &Tab::All, "Glastonbury"));
     }
 
     #[test]
     fn the_query_reruns_once_the_index_becomes_ready() {
-        let (l, r, i) = (SealedIndex::Loading, SealedIndex::Ready, SealedIndex::Idle);
+        let (l, r, i) = (IndexState::Loading, IndexState::Ready, IndexState::Idle);
         assert!(rerun_on_ready(l, r, true, "Glastonbury", &Tab::All));
         assert!(rerun_on_ready(l, r, true, "Glastonbury", &Tab::Messages));
         assert!(
