@@ -297,7 +297,13 @@ fn zone_state(zone: &str) -> Option<ZoneLoad> {
     ZONES.with(|m| m.borrow().get(zone).cloned())
 }
 
-fn set_zone(zone: &str, z: ZoneLoad) {
+/// Record where `zone`'s load stands, for a load started in `gen`: a load
+/// that outlived a [`wipe`] publishes nothing (a signed-out member must not
+/// be told the index is still loading).
+fn set_zone(gen: u64, zone: &str, z: ZoneLoad) {
+    if generation() != gen {
+        return;
+    }
     let r = ZONES.with(|m| {
         let mut m = m.borrow_mut();
         m.insert(zone.to_string(), z);
@@ -792,12 +798,12 @@ async fn load_zone(
     }
     let pubs = publishers();
     if pubs.is_empty() {
-        set_zone(zone, ZoneLoad::NoIndex);
+        set_zone(gen, zone, ZoneLoad::NoIndex);
         return Ok(0);
     }
     // A re-check of a settled zone stays quiet unless it finds work to do.
     if !matches!(prior, Some(ZoneLoad::Ready | ZoneLoad::NoIndex)) {
-        set_zone(zone, ZoneLoad::Pending);
+        set_zone(gen, zone, ZoneLoad::Pending);
     }
     let relay_url = crate::utils::relay_url::relay_url();
     let pod = crate::utils::relay_url::pod_api_base();
@@ -848,12 +854,12 @@ async fn load_zone(
         }
         return match unreachable {
             Some(e) => {
-                set_zone(zone, ZoneLoad::Failed(e.clone()));
+                set_zone(gen, zone, ZoneLoad::Failed(e.clone()));
                 Err(e)
             }
             None => {
                 CHECKED.with(|c| c.borrow_mut().insert(zone.to_string(), now_ms()));
-                set_zone(zone, ZoneLoad::NoIndex);
+                set_zone(gen, zone, ZoneLoad::NoIndex);
                 Ok(0)
             }
         };
@@ -863,7 +869,7 @@ async fn load_zone(
     let version = manifest.content.index_version;
     if svc.loaded.borrow().get(zone) == Some(&version) {
         CHECKED.with(|c| c.borrow_mut().insert(zone.to_string(), now_ms()));
-        set_zone(zone, ZoneLoad::Ready);
+        set_zone(gen, zone, ZoneLoad::Ready);
         return Ok(svc.rows.borrow().get(zone).copied().unwrap_or(1));
     }
     let content: &Content = &manifest.content;
@@ -902,12 +908,13 @@ async fn load_zone(
     }
     if okms.is_empty() {
         if !was_ready {
-            set_zone(zone, ZoneLoad::NoIndex);
+            set_zone(gen, zone, ZoneLoad::NoIndex);
         }
         return Ok(0);
     }
 
     let db = open_db().await?;
+    alive(gen, Some(&svc))?;
     let result = load_shards(
         &svc, &db, zone, &manifest, &publisher, pod, &okms, signer, gen, was_ready,
     )
@@ -920,7 +927,7 @@ async fn load_zone(
         Ok(rows) => rows,
         Err(e) => {
             if !was_ready && generation() == gen {
-                set_zone(zone, ZoneLoad::Failed(e.clone()));
+                set_zone(gen, zone, ZoneLoad::Failed(e.clone()));
             }
             return Err(e);
         }
@@ -933,7 +940,7 @@ async fn load_zone(
     svc.kept
         .borrow_mut()
         .insert(zone.to_string(), manifest.content.clone());
-    set_zone(zone, ZoneLoad::Ready);
+    set_zone(gen, zone, ZoneLoad::Ready);
     debug(&format!(
         "{zone}: ready, {rows} rows, index version {version}, {:.0} ms in all",
         now_ms() - t0
@@ -985,7 +992,7 @@ async fn load_shards(
     let loaded = Cell::new(0u32);
     let rows = Cell::new(0usize);
     if !was_ready {
-        set_zone(zone, ZoneLoad::Loading { loaded: 0, total });
+        set_zone(gen, zone, ZoneLoad::Loading { loaded: 0, total });
     }
     let url = |o: &ObjectRef| {
         format!(
@@ -1034,6 +1041,7 @@ async fn load_shards(
             svc.searchable.borrow_mut().insert(zone.to_string());
             if !was_ready {
                 set_zone(
+                    gen,
                     zone,
                     ZoneLoad::Loading {
                         loaded: loaded.get(),
