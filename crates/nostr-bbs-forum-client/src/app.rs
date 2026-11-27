@@ -156,6 +156,28 @@ fn brand_icon() -> impl IntoView {
     }
 }
 
+/// The header's home control: a 44 px hit area that never shrinks, so the
+/// Back button and the nav cannot squeeze it down to nothing.
+const HOME_LINK_CLASS: &str =
+    "shrink-0 inline-flex items-center gap-2 min-w-11 h-11 px-1 rounded-lg \
+     text-amber-400 hover:text-amber-300 hover:bg-gray-800 transition-colors focus:outline-none \
+     focus-visible:ring-2 focus-visible:ring-amber-400";
+/// The home mark: the brand hexagon, filled orange, 32 px.
+const HOME_MARK_CLASS: &str = "w-8 h-8 shrink-0 text-amber-400";
+/// The wordmark beside the mark, from `sm` up, whole (never truncated).
+const HOME_WORDMARK_CLASS: &str = "hidden sm:inline whitespace-nowrap text-xl font-bold";
+
+/// The header's home mark (orange, so it is never confused with the grey Back).
+fn home_mark() -> impl IntoView {
+    view! {
+        <svg class=HOME_MARK_CLASS viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 2L21.5 7.5V16.5L12 22L2.5 16.5V7.5L12 2Z"
+                fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <circle cx="12" cy="12" r="3.25" fill="#111827"/>
+        </svg>
+    }
+}
+
 fn dm_icon() -> impl IntoView {
     view! {
         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1235,13 +1257,20 @@ fn Layout(children: Children) -> impl IntoView {
                         // Back (members' request: the installed app has no
                         // browser back button). Hidden on the front page.
                         <BackButton />
-                        // Brand — links to the forum's own home, not the host
-                        // site root (issue #21: the wordmark must stay inside the
-                        // SPA when the forum is mounted under a base path).
-                        <a href=base_href("/") class="flex items-center gap-2 min-w-0 text-xl sm:text-2xl font-bold text-amber-400 hover:text-amber-300 transition-colors">
-                            {brand_icon()}
-                            <span class="truncate">{crate::utils::relay_url::brand_label()}</span>
-                        </a>
+                        // Home — the top of the forum, in-app: `/` sends a member
+                        // to the Forums index, or straight to their only zone,
+                        // and a visitor to the landing. Never the host site root
+                        // (issue #21). Orange and never shrunk, beside the grey
+                        // Back, so it cannot read as gone.
+                        <A
+                            href=base_href("/")
+                            attr:class=HOME_LINK_CLASS
+                            attr:aria-label="Community home"
+                            attr:title="Community home"
+                        >
+                            {home_mark()}
+                            <span class=HOME_WORDMARK_CLASS>{crate::utils::relay_url::brand_label()}</span>
+                        </A>
                     </div>
 
                     // Desktop nav
@@ -1780,5 +1809,44 @@ fn AdminGatedGovernance() -> impl IntoView {
                 </Show>
             </Show>
         </Show>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classes(s: &str) -> Vec<&str> {
+        s.split_whitespace().collect()
+    }
+
+    #[test]
+    fn the_home_control_is_never_squeezed_and_has_a_full_hit_area() {
+        let c = classes(HOME_LINK_CLASS);
+        for want in ["shrink-0", "min-w-11", "h-11", "text-amber-400"] {
+            assert!(c.contains(&want), "{want} missing from {HOME_LINK_CLASS}");
+        }
+        assert!(!c.contains(&"min-w-0"), "min-w-0 lets the nav squeeze it");
+        assert!(!c.contains(&"truncate"));
+    }
+
+    #[test]
+    fn the_home_mark_is_filled_orange_at_32px() {
+        let c = classes(HOME_MARK_CLASS);
+        for want in ["w-8", "h-8", "shrink-0", "text-amber-400"] {
+            assert!(c.contains(&want), "{want} missing from {HOME_MARK_CLASS}");
+        }
+    }
+
+    #[test]
+    fn the_wordmark_shows_from_sm_up_without_truncating() {
+        let c = classes(HOME_WORDMARK_CLASS);
+        for want in ["hidden", "sm:inline", "whitespace-nowrap"] {
+            assert!(
+                c.contains(&want),
+                "{want} missing from {HOME_WORDMARK_CLASS}"
+            );
+        }
+        assert!(!c.contains(&"truncate"));
     }
 }

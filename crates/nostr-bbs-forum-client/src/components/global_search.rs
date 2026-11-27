@@ -1273,7 +1273,7 @@ mod tests {
             name: name.map(Into::into),
             ..Default::default()
         };
-        let people = vec![
+        let people = [
             entry("p1", Some("RedDread"), None),
             entry("p2", None, Some("technologikal")),
             entry("p3", Some("Beema"), Some("beema")),
