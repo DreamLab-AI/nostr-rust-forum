@@ -1,6 +1,7 @@
 //! Message deep-link resolver.
 //!
-//! Route: `/go/:event_id`, optionally `?c=<channel id>` ([`jump_link`]).
+//! Route: `/go/:event_id`, optionally `?c=<channel id>`
+//! ([`jump_link`](crate::utils::post_link::jump_link)).
 //!
 //! Search results and other "take me to this message" links carry only an
 //! event id. The forum renders messages inside a TOPIC page
@@ -33,6 +34,8 @@ use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::channels::{use_channel_store, ChannelStore};
 use crate::stores::zones::{load_zones, section_to_zone, zone_path_for_id};
 use crate::utils::lookup::zone_is_gated;
+// The link helpers live in client-core: the notification store builds them too.
+use crate::utils::post_link::{channel_of, CHANNEL_HINT_PARAM};
 use crate::utils::set_timeout_once;
 use crate::utils::slug_hash::{section_slug, topic_slug};
 
@@ -45,38 +48,6 @@ const HINTED_RESOLVE_CEILING_MS: f64 = 20_000.0;
 
 /// How often the give-up check re-runs after [`RESOLVE_TIMEOUT_MS`].
 const GIVE_UP_POLL_MS: i32 = 1_000;
-
-/// Query parameter carrying the post's channel id: `/go/<id>?c=<channel>`.
-pub(crate) const CHANNEL_HINT_PARAM: &str = "c";
-
-/// The deep link to post `event_id`, carrying its channel as a hint when
-/// known. In an encrypted zone the relay holds only the sealed envelope,
-/// whose id is not the post's id, so the jump page resolves from the
-/// channel's own (decrypted) history.
-///
-/// A hint that is not URL-safe as it stands (a legacy slug-style channel
-/// tag) is left off rather than escaped: the page still resolves without it.
-pub(crate) fn jump_link(event_id: &str, channel_id: Option<&str>) -> String {
-    let url_safe = |c: &str| {
-        !c.is_empty()
-            && c.chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-    };
-    match channel_id.filter(|c| url_safe(c)) {
-        Some(c) => format!("/go/{event_id}?{CHANNEL_HINT_PARAM}={c}"),
-        None => format!("/go/{event_id}"),
-    }
-}
-
-/// The deep link for a post held in store list `list_key`. The hint is the
-/// post's own channel tag: the store's list keys include `topic:<root>` and
-/// `roots:<channel>`, which are not channels. A bare list key stands in only
-/// for a post with no channel tag.
-pub(crate) fn post_link(ev: &NostrEvent, list_key: &str) -> String {
-    let channel =
-        channel_of(ev).or_else(|| (!list_key.contains(':')).then(|| list_key.to_string()));
-    jump_link(&ev.id, channel.as_deref())
-}
 
 /// The event with id `id` in any list of the channel store (channel lists,
 /// `topic:` and `roots:` lists), case-insensitively.
@@ -162,15 +133,6 @@ pub(crate) fn edit_target_of(ev: &NostrEvent) -> Option<String> {
     ev.tags
         .iter()
         .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "edit")
-        .map(|t| t[1].clone())
-}
-
-/// Channel id of a kind-42: the `root`-marked `e` tag, else the first `e`.
-pub(crate) fn channel_of(ev: &NostrEvent) -> Option<String> {
-    ev.tags
-        .iter()
-        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
-        .or_else(|| ev.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
         .map(|t| t[1].clone())
 }
 
@@ -522,32 +484,6 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect()
-    }
-
-    #[test]
-    fn jump_link_carries_the_channel_hint() {
-        assert_eq!(jump_link("abc", Some("chan")), "/go/abc?c=chan");
-        assert_eq!(jump_link("abc", None), "/go/abc");
-        assert_eq!(jump_link("abc", Some("")), "/go/abc");
-        // Old persisted links stay recognisable as post links.
-        assert!(jump_link("abc", Some("chan")).starts_with("/go/"));
-    }
-
-    #[test]
-    fn post_link_hints_the_posts_own_channel() {
-        let reply = ev(
-            "r1",
-            vec![
-                vec!["e", "root", "", "reply"],
-                vec!["e", "chan", "", "root"],
-            ],
-        );
-        // Held in its topic's list: the hint is still the channel.
-        assert_eq!(post_link(&reply, "topic:root"), "/go/r1?c=chan");
-        assert_eq!(post_link(&reply, "chan"), "/go/r1?c=chan");
-        let untagged = ev("u", vec![]);
-        assert_eq!(post_link(&untagged, "chan"), "/go/u?c=chan");
-        assert_eq!(post_link(&untagged, "topic:root"), "/go/u");
     }
 
     #[test]

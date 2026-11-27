@@ -737,7 +737,7 @@ impl NotificationStoreV2 {
                         kind,
                         &title,
                         &post_body(&author, &event.content, &channel_name, encrypted),
-                        Some(&crate::pages::post_link(event, cid)),
+                        Some(&crate::utils::post_link::post_link(event, cid)),
                         Origin {
                             timestamp: event.created_at,
                             dedup_id: Some(format!("post:{}", event.id)),

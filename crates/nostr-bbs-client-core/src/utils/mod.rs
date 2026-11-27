@@ -11,6 +11,7 @@ pub mod image_compress;
 pub mod lookup;
 pub mod paths;
 pub mod pod_client;
+pub mod post_link;
 pub mod push;
 pub mod pwa_install;
 pub mod qr_scan;
