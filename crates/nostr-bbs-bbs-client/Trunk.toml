@@ -11,6 +11,18 @@ target = "index.html"
 dist = "../../dist/community/bbs"
 public_url = "/community/bbs/"
 
+# Public-URL links: the manifest and touch-icon <link>s are not Trunk assets,
+# so the browser resolves their relative hrefs against the page address.
+# Routes are `#/` hashes, so that is /community/bbs/ almost always, but
+# /community/bbs (no trailing slash) resolves them under /community/. The
+# forum's hook prefixes the links marked `data-public-url` with
+# $TRUNK_PUBLIC_URL; it is shared, not copied
+# (../nostr-bbs-forum-client/tools/public-url-links.sh).
+[[hooks]]
+stage = "post_build"
+command = "bash"
+command_arguments = ["../nostr-bbs-forum-client/tools/public-url-links.sh"]
+
 [serve]
 address = "127.0.0.1"
 port = 8081

@@ -1,0 +1,158 @@
+[package]
+name = "nostr-bbs-client-core"
+version = "1.0.0-beta.10"
+publish = false           # internal workspace library shared by forum-client and bbs-client
+edition = "2021"
+description = "Shared headless client engine for nostr-rust-forum browser clients (relay, auth, zone crypto, DMs, stores, poker, wallet)"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+keywords = ["nostr", "bbs", "leptos", "wasm"]
+categories = ["web-programming", "wasm"]
+rust-version = "1.85"
+
+[features]
+default = []
+dev-auth = []
+alloc-stats = []
+
+[dependencies]
+nostr-bbs-core = { workspace = true }
+nostr-bbs-sealed-search = { path = "../nostr-bbs-sealed-search", version = "0.1.0", default-features = false }
+nostr = { workspace = true }
+nostr-bbs-poker = { workspace = true }
+solid-pod-rs = { workspace = true }
+leptos = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = [
+    "WebSocket",
+    "MessageEvent",
+    "Worker",
+    "CloseEvent",
+    "ErrorEvent",
+    "BinaryType",
+    "Window",
+    "Document",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "Element",
+    "Node",
+    "NodeList",
+    "ScrollBehavior",
+    "ScrollLogicalPosition",
+    "DomTokenList",
+    "ScrollIntoViewOptions",
+    "EventTarget",
+    "Location",
+    "Navigator",
+    "CredentialsContainer",
+    "PublicKeyCredential",
+    "PublicKeyCredentialCreationOptions",
+    "PublicKeyCredentialRequestOptions",
+    "AuthenticatorResponse",
+    "AuthenticatorAttestationResponse",
+    "AuthenticatorAssertionResponse",
+    "CredentialCreationOptions",
+    "CredentialRequestOptions",
+    "AuthenticationExtensionsClientInputs",
+    "AuthenticationExtensionsClientOutputs",
+    "Storage",
+    "StorageEvent",
+    "HtmlDocument",
+    "Headers",
+    "RequestInit",
+    "RequestCache",
+    "RequestMode",
+    "RequestCredentials",
+    "RequestRedirect",
+    "Request",
+    "Response",
+    "PageTransitionEvent",
+    "DomRect",
+    "MediaQueryList",
+    "KeyboardEvent",
+    "CssStyleDeclaration",
+    "HtmlTextAreaElement",
+    "HtmlIFrameElement",
+    "IntersectionObserver",
+    "IntersectionObserverEntry",
+    "IntersectionObserverInit",
+    "ResizeObserver",
+    "FileReader",
+    "File",
+    "FileList",
+    "DataTransfer",
+    "DataTransferItemList",
+    "DataTransferItem",
+    "Blob",
+    "ScrollToOptions",
+    "Event",
+    "Clipboard",
+    "IdbFactory",
+    "IdbDatabase",
+    "IdbObjectStore",
+    "IdbObjectStoreParameters",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbIndex",
+    "IdbKeyRange",
+    "IdbCursorDirection",
+    "DomStringList",
+    "StorageManager",
+    "ServiceWorkerContainer",
+    "RegistrationOptions",
+    "ServiceWorkerUpdateViaCache",
+    "ImageBitmap",
+    "BlobPropertyBag",
+    "Crypto",
+    "SubtleCrypto",
+    "CryptoKey",
+    "Url",
+    "History",
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamTrack",
+    "MediaStreamConstraints",
+    "HtmlMediaElement",
+    "HtmlVideoElement",
+    "ImageData",
+] }
+gloo = { workspace = true }
+comrak = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+hex = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+bip39 = { workspace = true }
+hkdf = { workspace = true }
+getrandom = { workspace = true }
+unicode-normalization = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+k256 = { workspace = true }
+send_wrapper = "0.6"
+serde-wasm-bindgen = "0.6"
+bech32 = { workspace = true }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+rqrr = { version = "0.11", default-features = false }
+async-trait = { workspace = true }
+uuid = { version = "1", features = ["js"] }
+sidestr-agent = { version = "0.6", default-features = false }
+sidestr-core = "0.4.2"
+sidestr-header = "0.3.1"
+sidestr-wallet = "0.5.3"
+sidestr-nostr = "0.6"
+bitcoin = { version = "0.32", features = ["secp-lowmemory"] }
+
+[dev-dependencies]
+futures = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net", "io-util"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }

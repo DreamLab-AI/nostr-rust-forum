@@ -1,0 +1,1063 @@
+//! In-memory profile cache for kind-0 metadata, with debounced batched fetch
+//! against the relay-worker `/api/profiles/batch` endpoint.
+//!
+//! This store powers nickname rendering across the forum UI. The cache is
+//! populated from three sources:
+//!   1. IndexedDB hydration on app boot (warm start)
+//!   2. Live kind-0 EVENT messages from the relay subscription
+//!   3. On-demand HTTP batch fetch when the UI requests an unknown pubkey
+//!
+//! The relay-worker serves `/api/profiles/batch` (POST) and
+//! `/api/profiles/search` (GET) from the `profiles` projection of kind-0
+//! metadata. The fetcher remains tolerant of a non-200 response: any error or
+//! non-OK status degrades to `Ok(Vec::new())` so the UI falls back to
+//! `shorten_pubkey` without erroring. Note that the projection is only as
+//! populated as the stored kind-0 events: a deployment whose historic kind-0
+//! events predate the projection must run the one-shot
+//! `POST /api/admin/profiles/backfill` (relay worker) to seed it; the live
+//! kind-0 ingest hook keeps it current for new publishes thereafter.
+
+use std::collections::{HashMap, HashSet};
+
+use leptos::prelude::*;
+use serde::{Deserialize, Serialize};
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
+
+use crate::stores::indexed_db::{CachedProfile, ForumDb};
+
+/// Maximum pubkeys per `/api/profiles/batch` request.
+const MAX_BATCH_SIZE: usize = 200;
+
+/// Debounce window after the last `lookup` miss before flushing the queue.
+const FLUSH_DEBOUNCE_MS: i32 = 100;
+
+/// How long a pubkey the server returned no profile for is not asked again.
+/// Without it every newly mounted card re-queued its author: a thread of
+/// imported history (authors with no kind-0) sent a `/api/profiles/batch`
+/// per page of cards, each 3-16 s on a loaded relay, competing with the
+/// page requests themselves.
+const MISSING_RETRY_SECS: u64 = 600;
+
+/// Pubkeys answered "no profile" at `at`, still within `MISSING_RETRY_SECS`.
+fn recently_missing(missing: &HashMap<String, u64>, pubkey: &str, now: u64) -> bool {
+    missing
+        .get(pubkey)
+        .is_some_and(|at| now.saturating_sub(*at) < MISSING_RETRY_SECS)
+}
+
+fn now_secs() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (js_sys::Date::now() / 1000.0) as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
+
+/// One profile entry, materialised from kind-0 metadata.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProfileEntry {
+    pub pubkey: String,
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub picture: Option<String>,
+    pub nip05: Option<String>,
+    /// Free-text "about"/bio from kind-0 metadata. Populated from live kind-0
+    /// events and the IndexedDB cache; the batch projection supplies it when
+    /// the relay-worker returns it.
+    pub about: Option<String>,
+    /// Unix seconds when this entry was last fetched/refreshed.
+    pub fetched_at: u64,
+}
+
+impl ProfileEntry {
+    fn from_kind0_content(pubkey: String, content: &str, created_at: u64) -> Option<Self> {
+        let obj = serde_json::from_str::<serde_json::Value>(content).ok()?;
+        Some(Self {
+            pubkey,
+            name: obj.get("name").and_then(|v| v.as_str()).map(String::from),
+            display_name: obj
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            picture: obj
+                .get("picture")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            nip05: obj.get("nip05").and_then(|v| v.as_str()).map(String::from),
+            about: obj.get("about").and_then(|v| v.as_str()).map(String::from),
+            fetched_at: created_at,
+        })
+    }
+
+    /// Best human label for this profile, in precedence order:
+    ///   display_name -> name -> NIP-05 handle -> None.
+    pub fn best_label(&self) -> Option<String> {
+        if let Some(d) = self.display_name.as_ref() {
+            let t = d.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        if let Some(n) = self.name.as_ref() {
+            let t = n.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        if let Some(nip) = self.nip05.as_ref() {
+            return Some(format_nip05_handle(nip));
+        }
+        None
+    }
+}
+
+/// The operator-configured "own" NIP-05 root domain (without subdomain).
+///
+/// Set at build time via the `NOSTR_BBS_NIP05_DOMAIN` env var; when unset,
+/// every NIP-05 renders fully qualified. Operators of branded forks override
+/// this in their `forum-config/` package.
+fn own_nip05_root_domain() -> Option<&'static str> {
+    option_env!("NOSTR_BBS_NIP05_DOMAIN")
+}
+
+/// Internal: render a NIP-05 identifier as a forum handle, with the
+/// "own root domain" passed in explicitly so tests can exercise both paths.
+fn format_nip05_handle_with_domain(nip05: &str, own_root: Option<&str>) -> String {
+    let trimmed = nip05.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some((local, domain)) = trimmed.split_once('@') {
+        if let Some(root) = own_root {
+            let pods = format!("pods.{root}");
+            if domain.eq_ignore_ascii_case(root) || domain.eq_ignore_ascii_case(&pods) {
+                return format!("@{}", local);
+            }
+        }
+        return format!("@{}@{}", local, domain);
+    }
+    format!("@{}", trimmed)
+}
+
+/// Render a NIP-05 identifier as a forum handle.
+///
+/// `alice@<own-domain>` -> `@alice` when the domain matches the operator's
+/// configured `NOSTR_BBS_NIP05_DOMAIN` (or its `pods.<domain>` subdomain).
+/// `alice@external.com` -> `@alice@external.com` for cross-relay handles.
+pub fn format_nip05_handle(nip05: &str) -> String {
+    format_nip05_handle_with_domain(nip05, own_nip05_root_domain())
+}
+
+// --- Cache --------------------------------------------------------------------
+
+/// Reactive profile cache provided via Leptos context.
+#[derive(Clone, Copy)]
+pub struct ProfileCache {
+    /// Resolved entries keyed by hex pubkey.
+    pub entries: RwSignal<HashMap<String, ProfileEntry>>,
+    /// Pubkeys queued for the next batched fetch.
+    pending: RwSignal<Vec<String>>,
+    /// Pubkeys already requested in the current debounce window — prevents
+    /// duplicate enqueue when many components request the same pubkey.
+    in_flight: RwSignal<HashSet<String>>,
+    /// Whether a debounce flush is already scheduled.
+    flush_scheduled: RwSignal<bool>,
+    /// Replaced key -> successor key, from the relay's public alias map
+    /// (`/api/profiles/successors`). Lookups for a replaced key resolve to the
+    /// successor's profile, and pickers drop replaced keys.
+    pub successors: RwSignal<HashMap<String, String>>,
+    /// Pubkeys the server returned no profile for, and when (see
+    /// [`MISSING_RETRY_SECS`]). Not reactive: it only gates fetching.
+    missing: StoredValue<HashMap<String, u64>>,
+}
+
+impl Default for ProfileCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProfileCache {
+    pub fn new() -> Self {
+        Self {
+            entries: RwSignal::new(HashMap::new()),
+            pending: RwSignal::new(Vec::new()),
+            in_flight: RwSignal::new(HashSet::new()),
+            flush_scheduled: RwSignal::new(false),
+            successors: RwSignal::new(HashMap::new()),
+            missing: StoredValue::new(HashMap::new()),
+        }
+    }
+
+    /// Successor of a replaced key (untracked read).
+    pub fn successor_of(&self, pubkey: &str) -> Option<String> {
+        self.successors.with_untracked(|m| m.get(pubkey).cloned())
+    }
+
+    /// Successor of a replaced key (tracked: re-runs the enclosing reactive
+    /// scope once the successor map loads).
+    pub fn successor_tracked(&self, pubkey: &str) -> Option<String> {
+        self.successors.with(|m| m.get(pubkey).cloned())
+    }
+
+    /// The identity `pubkey` is shown as: its successor when the key was
+    /// replaced (an archive key linked to a live key), otherwise itself. One
+    /// hop only: a successor's own successor is not followed. Tracked, so the
+    /// enclosing reactive scope re-runs once the successor map loads. No
+    /// network: the map is fetched once per session at startup.
+    pub fn canonical_tracked(&self, pubkey: &str) -> String {
+        self.canonical(pubkey, true)
+    }
+
+    /// The key whose profile should represent `pubkey`: its successor when it
+    /// has been replaced, otherwise itself (one hop, see [`resolve_one_hop`]).
+    fn canonical(&self, pubkey: &str, tracked: bool) -> String {
+        let succ = if tracked {
+            self.successor_tracked(pubkey)
+        } else {
+            self.successor_of(pubkey)
+        };
+        resolve_one_hop(pubkey, succ)
+    }
+
+    /// Look up a profile entry. Returns immediately. If the entry is missing,
+    /// schedules a debounced batch fetch and the cache will populate
+    /// reactively once the response arrives.
+    pub fn lookup(&self, pubkey: &str) -> Option<ProfileEntry> {
+        let key = self.canonical(pubkey, false);
+        let found = self
+            .entries
+            .with_untracked(|e| display_entry(e, pubkey, &key));
+        if found.is_none() {
+            self.schedule_missing(pubkey, &key);
+        }
+        found
+    }
+
+    /// Reactive lookup — re-evaluates whenever the underlying entries change.
+    pub fn lookup_reactive(&self, pubkey: &str) -> Option<ProfileEntry> {
+        let key = self.canonical(pubkey, true);
+        let found = self.entries.with(|e| display_entry(e, pubkey, &key));
+        let successor_shown = found.as_ref().is_some_and(|f| f.pubkey == key);
+        if !successor_shown {
+            // Schedule fetch but do not subscribe to pending/in_flight signals.
+            self.schedule_missing(pubkey, &key);
+        }
+        found
+    }
+
+    /// Queue the profiles [`display_entry`] would read for `pubkey`: the
+    /// successor's and, for a replaced key, its own as the fallback. Both
+    /// ride the same debounced batch request, never one request per card.
+    fn schedule_missing(&self, pubkey: &str, key: &str) {
+        self.schedule_fetch(key);
+        if key != pubkey {
+            self.schedule_fetch(pubkey);
+        }
+    }
+
+    /// Tracked read of a profile's `picture` URL by pubkey.
+    ///
+    /// Subscribes to the entries signal (so the enclosing reactive scope
+    /// re-runs when kind-0 metadata arrives) and schedules the debounced
+    /// batch fetch on a miss. Only returns non-empty http(s) URLs — anything
+    /// else falls back to `None` so callers render the identicon disc.
+    pub fn picture_reactive(&self, pubkey: &str) -> Option<String> {
+        self.lookup_reactive(pubkey)
+            .and_then(|e| e.picture)
+            .map(|p| p.trim().to_string())
+            .filter(|p| p.starts_with("http://") || p.starts_with("https://"))
+    }
+
+    /// Tracked read of a profile's `about`/bio text by pubkey.
+    ///
+    /// Subscribes to the entries signal and schedules the debounced batch fetch
+    /// on a miss (same contract as [`picture_reactive`](Self::picture_reactive)).
+    /// Returns the trimmed bio only when non-empty.
+    pub fn about_reactive(&self, pubkey: &str) -> Option<String> {
+        self.lookup_reactive(pubkey)
+            .and_then(|e| e.about)
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+    }
+
+    /// Insert or update an entry from a kind-0 nostr event.
+    pub fn upsert_from_kind0(&self, pubkey: &str, content_json: &str, created_at: u64) {
+        if pubkey.is_empty() {
+            return;
+        }
+        if let Some(entry) =
+            ProfileEntry::from_kind0_content(pubkey.to_string(), content_json, created_at)
+        {
+            self.upsert_entry(entry);
+        }
+    }
+
+    /// Insert or update a fully-formed entry, refreshing the reactive signal.
+    pub fn upsert_entry(&self, entry: ProfileEntry) {
+        self.missing.update_value(|m| {
+            m.remove(&entry.pubkey);
+        });
+        let pubkey = entry.pubkey.clone();
+        // Skip if the existing entry is newer.
+        let mut should_persist = true;
+        self.entries.update(|map| {
+            if let Some(existing) = map.get(&pubkey) {
+                if existing.fetched_at > entry.fetched_at && entry.fetched_at != 0 {
+                    should_persist = false;
+                    return;
+                }
+            }
+            map.insert(pubkey.clone(), entry.clone());
+        });
+        // Drop from in_flight so future misses can re-fetch if needed.
+        self.in_flight.update(|set| {
+            set.remove(&pubkey);
+        });
+        if should_persist {
+            persist_one(&entry);
+        }
+    }
+
+    /// Hydrate the in-memory cache from IndexedDB. Best-effort; failures are
+    /// logged and ignored so an offline cache miss never blocks startup.
+    pub async fn hydrate(&self) {
+        let db = match ForumDb::open().await {
+            Ok(db) => db,
+            Err(e) => {
+                web_sys::console::warn_1(
+                    &format!("[profile_cache] hydrate: cannot open IDB: {:?}", e).into(),
+                );
+                return;
+            }
+        };
+        match db.get_all_profiles().await {
+            Ok(profiles) => {
+                if profiles.is_empty() {
+                    return;
+                }
+                self.entries.update(|map| {
+                    for p in profiles {
+                        let entry = ProfileEntry {
+                            pubkey: p.pubkey.clone(),
+                            name: p.name.clone(),
+                            display_name: None,
+                            picture: p.picture,
+                            nip05: None,
+                            about: p.about,
+                            fetched_at: p.updated_at,
+                        };
+                        map.entry(p.pubkey).or_insert(entry);
+                    }
+                });
+            }
+            Err(e) => {
+                web_sys::console::warn_1(
+                    &format!("[profile_cache] get_all_profiles: {:?}", e).into(),
+                );
+            }
+        }
+    }
+
+    /// Try to populate this cache from IndexedDB for a single pubkey.
+    /// Called as part of the debounced fetch flow so a warm IDB hit avoids
+    /// an HTTP round-trip.
+    async fn prime_from_idb(&self, pubkey: &str) -> bool {
+        let db = match ForumDb::open().await {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+        match db.get_profile(pubkey).await {
+            Ok(Some(cached)) => {
+                let entry = ProfileEntry {
+                    pubkey: cached.pubkey,
+                    name: cached.name,
+                    display_name: None,
+                    picture: cached.picture,
+                    nip05: None,
+                    about: cached.about,
+                    fetched_at: cached.updated_at,
+                };
+                self.entries.update(|map| {
+                    map.entry(entry.pubkey.clone()).or_insert(entry);
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Persist a slice of entries to IndexedDB. Failures are logged.
+    pub async fn persist(&self, entries: &[ProfileEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let db = match ForumDb::open().await {
+            Ok(db) => db,
+            Err(e) => {
+                web_sys::console::warn_1(
+                    &format!("[profile_cache] persist: cannot open IDB: {:?}", e).into(),
+                );
+                return;
+            }
+        };
+        let cached: Vec<CachedProfile> = entries
+            .iter()
+            .map(|entry| CachedProfile {
+                pubkey: entry.pubkey.clone(),
+                name: entry.display_name.clone().or_else(|| entry.name.clone()),
+                picture: entry.picture.clone(),
+                about: entry.about.clone(),
+                updated_at: entry.fetched_at,
+            })
+            .collect();
+        if let Err(e) = db.put_profiles(&cached).await {
+            web_sys::console::warn_1(
+                &format!("[profile_cache] put_profiles failed: {:?}", e).into(),
+            );
+        }
+    }
+
+    fn schedule_fetch(&self, pubkey: &str) {
+        if pubkey.is_empty() {
+            return;
+        }
+        if self
+            .missing
+            .with_value(|m| recently_missing(m, pubkey, now_secs()))
+        {
+            return;
+        }
+        // Skip if already queued or already known.
+        let mut already = false;
+        self.in_flight.update(|set| {
+            if !set.insert(pubkey.to_string()) {
+                already = true;
+            }
+        });
+        if already {
+            return;
+        }
+        // Skip if already cached (race-safe re-check).
+        if self.entries.with_untracked(|map| map.contains_key(pubkey)) {
+            self.in_flight.update(|set| {
+                set.remove(pubkey);
+            });
+            return;
+        }
+        self.pending.update(|q| q.push(pubkey.to_string()));
+
+        if !self.flush_scheduled.get_untracked() {
+            self.flush_scheduled.set(true);
+            let cache = *self;
+            crate::utils::set_timeout_once(
+                move || {
+                    cache.flush();
+                },
+                FLUSH_DEBOUNCE_MS,
+            );
+        }
+    }
+
+    fn flush(&self) {
+        self.flush_scheduled.set(false);
+        let pending: Vec<String> = self.pending.get_untracked();
+        if pending.is_empty() {
+            return;
+        }
+        self.pending.set(Vec::new());
+
+        // Chunk into batches no larger than MAX_BATCH_SIZE.
+        let cache = *self;
+        for chunk in pending.chunks(MAX_BATCH_SIZE) {
+            let pubkeys: Vec<String> = chunk.to_vec();
+            spawn_local(async move {
+                // Try IDB cache first for each pubkey before hitting the wire.
+                let mut still_missing = Vec::with_capacity(pubkeys.len());
+                for pk in &pubkeys {
+                    if !cache.prime_from_idb(pk).await {
+                        still_missing.push(pk.clone());
+                    } else {
+                        cache.in_flight.update(|set| {
+                            set.remove(pk);
+                        });
+                    }
+                }
+                if still_missing.is_empty() {
+                    return;
+                }
+                let fetched = fetch_batch(&still_missing).await;
+                #[cfg(target_arch = "wasm32")]
+                let now = (js_sys::Date::now() / 1000.0) as u64;
+                #[cfg(not(target_arch = "wasm32"))]
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let mut to_persist = Vec::with_capacity(fetched.len());
+                for mut entry in fetched {
+                    if entry.fetched_at == 0 {
+                        entry.fetched_at = now;
+                    }
+                    let pk = entry.pubkey.clone();
+                    cache.entries.update(|map| {
+                        map.insert(pk.clone(), entry.clone());
+                    });
+                    cache.in_flight.update(|set| {
+                        set.remove(&pk);
+                    });
+                    to_persist.push(entry);
+                }
+                if !to_persist.is_empty() {
+                    cache.persist(&to_persist).await;
+                }
+                // Pubkeys the server didn't return: release them, and remember
+                // them for MISSING_RETRY_SECS so cards mounted meanwhile do
+                // not ask again.
+                let returned: HashSet<String> =
+                    to_persist.iter().map(|e| e.pubkey.clone()).collect();
+                let at = now_secs();
+                cache.missing.update_value(|m| {
+                    for pk in still_missing.iter().filter(|pk| !returned.contains(*pk)) {
+                        m.insert(pk.clone(), at);
+                    }
+                });
+                cache.in_flight.update(|set| {
+                    for pk in &still_missing {
+                        set.remove(pk);
+                    }
+                });
+            });
+        }
+    }
+}
+
+// --- Context provider --------------------------------------------------------
+
+/// Provide the `ProfileCache` via Leptos context. Call once at app root.
+pub fn provide_profile_cache() {
+    let cache = ProfileCache::new();
+    provide_context(cache);
+    // Successor map — small and rarely changing; one fetch per session.
+    spawn_local(async move {
+        let map = fetch_successors().await;
+        if !map.is_empty() {
+            cache.successors.set(map);
+        }
+    });
+    // Hydrate from IDB in the background — non-blocking.
+    spawn_local(async move {
+        cache.hydrate().await;
+    });
+}
+
+/// Read the cache from context. Returns None if `provide_profile_cache` was
+/// not called (e.g. in tests).
+pub fn try_use_profile_cache() -> Option<ProfileCache> {
+    use_context::<ProfileCache>()
+}
+
+// --- Persistence helpers ------------------------------------------------------
+
+fn persist_one(entry: &ProfileEntry) {
+    let entry = entry.clone();
+    spawn_local(async move {
+        let db = match ForumDb::open().await {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let cached = CachedProfile {
+            pubkey: entry.pubkey.clone(),
+            name: entry.display_name.clone().or_else(|| entry.name.clone()),
+            picture: entry.picture.clone(),
+            about: entry.about.clone(),
+            updated_at: entry.fetched_at,
+        };
+        let _ = db.put_profile(&cached).await;
+    });
+}
+
+// --- Successor map ------------------------------------------------------------
+
+/// The profile shown for `pubkey`, whose displayed identity is `canonical`
+/// (its successor, one hop, or itself): the successor's profile when it has
+/// one, else, for a replaced key, the key's OWN profile (its name and
+/// picture rather than a blank). Colour, links and the copyable key still use
+/// `canonical`. Reactive callers re-run when the successor's profile arrives
+/// and switch to it.
+pub fn display_entry(
+    entries: &HashMap<String, ProfileEntry>,
+    pubkey: &str,
+    canonical: &str,
+) -> Option<ProfileEntry> {
+    entries
+        .get(canonical)
+        .or_else(|| (canonical != pubkey).then(|| entries.get(pubkey)).flatten())
+        .cloned()
+}
+
+/// `pubkey`'s displayed identity given its successor lookup: the successor
+/// (one hop, never chained further), else the key itself.
+pub fn resolve_one_hop(pubkey: &str, successor: Option<String>) -> String {
+    successor
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| pubkey.to_string())
+}
+
+/// Fetch the relay's public replaced-key map. Empty on any failure: without
+/// it every key simply renders as itself, which is the pre-alias behaviour.
+async fn fetch_successors() -> HashMap<String, String> {
+    let url = format!(
+        "{}/api/profiles/successors",
+        crate::utils::relay_url::relay_api_base()
+    );
+    let Some(win) = web_sys::window() else {
+        return HashMap::new();
+    };
+    let Ok(resp_val) = JsFuture::from(win.fetch_with_str(&url)).await else {
+        return HashMap::new();
+    };
+    let Ok(resp) = resp_val.dyn_into::<web_sys::Response>() else {
+        return HashMap::new();
+    };
+    if !resp.ok() {
+        return HashMap::new();
+    }
+    let Ok(promise) = resp.text() else {
+        return HashMap::new();
+    };
+    match JsFuture::from(promise)
+        .await
+        .ok()
+        .and_then(|v| v.as_string())
+    {
+        Some(text) => parse_successors(&text),
+        None => HashMap::new(),
+    }
+}
+
+/// Parse `{ "successors": { old: new } }`, keeping only well-formed,
+/// non-self-referential 64-hex pairs.
+pub fn parse_successors(text: &str) -> HashMap<String, String> {
+    fn hex64(s: &str) -> bool {
+        s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return HashMap::new();
+    };
+    let Some(obj) = value.get("successors").and_then(|v| v.as_object()) else {
+        return HashMap::new();
+    };
+    obj.iter()
+        .filter_map(|(old, new)| {
+            let new = new.as_str()?.to_lowercase();
+            let old = old.to_lowercase();
+            (hex64(&old) && hex64(&new) && old != new).then_some((old, new))
+        })
+        .collect()
+}
+
+// --- HTTP batch fetch --------------------------------------------------------
+
+#[derive(Serialize)]
+struct BatchRequest<'a> {
+    pubkeys: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct BatchResponseEntry {
+    pubkey: String,
+    #[serde(default)]
+    profile: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct BatchResponseFlat {
+    pubkey: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    picture: Option<String>,
+    #[serde(default)]
+    nip05: Option<String>,
+    #[serde(default)]
+    about: Option<String>,
+    #[serde(default)]
+    last_kind0_at: Option<u64>,
+    #[serde(default)]
+    fetched_at: Option<u64>,
+}
+
+/// Fetch a single profile's kind-0 metadata directly from the relay-worker
+/// projection, bypassing the debounced batch queue and the reactive cache.
+///
+/// Used by the auth layer to hydrate a restored identity's display name and
+/// avatar immediately after an nsec/local-key login (QA #11), so the header
+/// shows the real profile instead of a truncated pubkey until the user
+/// re-saves. Degrades to `None` on any error or empty projection — the caller
+/// keeps its pubkey fallback and never surfaces an error.
+pub async fn fetch_profile(pubkey: &str) -> Option<ProfileEntry> {
+    if pubkey.is_empty() {
+        return None;
+    }
+    let key = pubkey.to_string();
+    let batch = fetch_batch(std::slice::from_ref(&key)).await;
+    batch.into_iter().find(|e| e.pubkey == pubkey)
+}
+
+/// Fetch a batch of profiles from the relay-worker. Returns an empty vec
+/// (logged at debug level) on any non-200 response, including 404 — this is
+/// the deliberate graceful-degrade path that lets the UI ship before the
+/// relay-worker endpoint is deployed.
+async fn fetch_batch(pubkeys: &[String]) -> Vec<ProfileEntry> {
+    if pubkeys.is_empty() {
+        return Vec::new();
+    }
+
+    let base = crate::utils::relay_url::relay_api_base();
+    let url = format!("{}/api/profiles/batch", base);
+
+    let body = match serde_json::to_string(&BatchRequest { pubkeys }) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let win = match web_sys::window() {
+        Some(w) => w,
+        None => return Vec::new(),
+    };
+
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    let headers = match web_sys::Headers::new() {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+    let _ = headers.set("Content-Type", "application/json");
+    init.set_headers(&headers);
+    init.set_body(&wasm_bindgen::JsValue::from_str(&body));
+
+    let request = match web_sys::Request::new_with_str_and_init(&url, &init) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let resp_val = match JsFuture::from(win.fetch_with_request(&request)).await {
+        Ok(v) => v,
+        Err(e) => {
+            web_sys::console::log_1(
+                &format!(
+                    "[profile_cache] /api/profiles/batch unavailable, falling back: {:?}",
+                    e
+                )
+                .into(),
+            );
+            return Vec::new();
+        }
+    };
+
+    let resp: web_sys::Response = match resp_val.dyn_into() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    if !resp.ok() {
+        // 404, 500, etc. — degrade gracefully.
+        return Vec::new();
+    }
+
+    let text_promise = match resp.text() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let text_val = match JsFuture::from(text_promise).await {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let text = match text_val.as_string() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    parse_batch_response(&text)
+}
+
+/// Parse a `/api/profiles/batch` response, accepting either of the two
+/// shapes that the relay-worker may return:
+///
+///   1. `[{ "pubkey": "...", "profile": { "name": "...", ... } }, ...]`
+///   2. `[{ "pubkey": "...", "name": "...", ... }, ...]`  (flat)
+///   3. `{ "profiles": [...] }` (wrapped)
+fn parse_batch_response(text: &str) -> Vec<ProfileEntry> {
+    let value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let array = match &value {
+        serde_json::Value::Array(arr) => arr.clone(),
+        serde_json::Value::Object(obj) => match obj.get("profiles") {
+            Some(serde_json::Value::Array(arr)) => arr.clone(),
+            _ => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+
+    let mut out = Vec::with_capacity(array.len());
+    #[cfg(target_arch = "wasm32")]
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+    #[cfg(not(target_arch = "wasm32"))]
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for item in array {
+        // Try wrapped shape first.
+        if let Ok(wrapped) = serde_json::from_value::<BatchResponseEntry>(item.clone()) {
+            if let Some(profile) = wrapped.profile {
+                let entry = ProfileEntry {
+                    pubkey: wrapped.pubkey,
+                    name: profile
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    display_name: profile
+                        .get("display_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    picture: profile
+                        .get("picture")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    nip05: profile
+                        .get("nip05")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    about: profile
+                        .get("about")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    fetched_at: profile
+                        .get("last_kind0_at")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(now),
+                };
+                out.push(entry);
+                continue;
+            }
+        }
+        // Try flat shape.
+        if let Ok(flat) = serde_json::from_value::<BatchResponseFlat>(item) {
+            let entry = ProfileEntry {
+                pubkey: flat.pubkey,
+                name: flat.name,
+                display_name: flat.display_name,
+                picture: flat.picture,
+                nip05: flat.nip05,
+                about: flat.about,
+                fetched_at: flat.last_kind0_at.or(flat.fetched_at).unwrap_or(now),
+            };
+            out.push(entry);
+        }
+    }
+
+    out
+}
+
+// --- Tests -------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_successors_keeps_valid_pairs_only() {
+        let old = "cd".repeat(32);
+        let new = "b4".repeat(32);
+        let text = format!(
+            r#"{{"successors":{{"{old}":"{new}","{new}":"{new}","short":"{new}","{old2}":42}}}}"#,
+            old2 = "ab".repeat(32)
+        );
+        let map = parse_successors(&text);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&old), Some(&new));
+        assert!(parse_successors("nope").is_empty());
+        assert!(parse_successors(r#"{"successors":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn nip05_local_domain_is_short() {
+        assert_eq!(
+            format_nip05_handle_with_domain("alice@example.test", Some("example.test")),
+            "@alice"
+        );
+        assert_eq!(
+            format_nip05_handle_with_domain("bob@pods.example.test", Some("example.test")),
+            "@bob"
+        );
+    }
+
+    #[test]
+    fn nip05_external_domain_is_long() {
+        assert_eq!(
+            format_nip05_handle_with_domain("alice@example.com", Some("example.test")),
+            "@alice@example.com"
+        );
+    }
+
+    #[test]
+    fn nip05_no_own_domain_is_always_long() {
+        assert_eq!(
+            format_nip05_handle_with_domain("alice@example.test", None),
+            "@alice@example.test"
+        );
+    }
+
+    #[test]
+    fn nip05_no_at_falls_back() {
+        assert_eq!(format_nip05_handle("alice"), "@alice");
+        assert_eq!(format_nip05_handle(""), "");
+    }
+
+    #[test]
+    fn parse_wrapped_response() {
+        let json = r#"[{"pubkey":"abc","profile":{"name":"alice","nip05":"alice@example.test","about":"hi there"}}]"#;
+        let parsed = parse_batch_response(json);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].pubkey, "abc");
+        assert_eq!(parsed[0].name.as_deref(), Some("alice"));
+        assert_eq!(parsed[0].nip05.as_deref(), Some("alice@example.test"));
+        assert_eq!(parsed[0].about.as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn parse_flat_response() {
+        let json = r#"[{"pubkey":"abc","display_name":"Alice","name":"alice"}]"#;
+        let parsed = parse_batch_response(json);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].display_name.as_deref(), Some("Alice"));
+        assert_eq!(parsed[0].name.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn parse_object_wrapped_response() {
+        let json = r#"{"profiles":[{"pubkey":"abc","name":"alice"}]}"#;
+        let parsed = parse_batch_response(json);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].pubkey, "abc");
+    }
+
+    #[test]
+    fn parse_invalid_returns_empty() {
+        assert!(parse_batch_response("not json").is_empty());
+        assert!(parse_batch_response("\"plain string\"").is_empty());
+    }
+
+    #[test]
+    fn entry_best_label_precedence() {
+        let mut e = ProfileEntry {
+            pubkey: "abc".into(),
+            name: Some("alice".into()),
+            display_name: Some("Alice Wonderland".into()),
+            picture: None,
+            nip05: Some("alice@example.test".into()),
+            about: None,
+            fetched_at: 1,
+        };
+        assert_eq!(e.best_label().as_deref(), Some("Alice Wonderland"));
+        e.display_name = None;
+        assert_eq!(e.best_label().as_deref(), Some("alice"));
+        e.name = None;
+        // Without NOSTR_BBS_NIP05_DOMAIN env var, NIP-05 renders fully qualified
+        assert_eq!(e.best_label().as_deref(), Some("@alice@example.test"));
+        e.nip05 = None;
+        assert!(e.best_label().is_none());
+    }
+
+    #[test]
+    fn from_kind0_parses_metadata() {
+        let content = r#"{"name":"alice","display_name":"Alice","picture":"https://x/y.png","nip05":"alice@example.test","about":"builder of things"}"#;
+        let entry = ProfileEntry::from_kind0_content("abc".into(), content, 1234).expect("valid");
+        assert_eq!(entry.pubkey, "abc");
+        assert_eq!(entry.name.as_deref(), Some("alice"));
+        assert_eq!(entry.display_name.as_deref(), Some("Alice"));
+        assert_eq!(entry.about.as_deref(), Some("builder of things"));
+        assert_eq!(entry.fetched_at, 1234);
+    }
+
+    #[test]
+    fn from_kind0_invalid_json_returns_none() {
+        assert!(ProfileEntry::from_kind0_content("abc".into(), "not json", 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod missing_retry_tests {
+    use super::{recently_missing, MISSING_RETRY_SECS};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_missing_profile_is_not_asked_again_until_the_retry_window_passes() {
+        let mut m = HashMap::new();
+        m.insert("pk".to_string(), 1_000);
+        assert!(recently_missing(&m, "pk", 1_000));
+        assert!(recently_missing(&m, "pk", 1_000 + MISSING_RETRY_SECS - 1));
+        assert!(!recently_missing(&m, "pk", 1_000 + MISSING_RETRY_SECS));
+        assert!(!recently_missing(&m, "other", 1_000));
+    }
+}
+
+#[cfg(test)]
+mod successor_tests {
+    use super::{display_entry, resolve_one_hop, ProfileEntry};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_replaced_key_resolves_one_hop_only() {
+        let map: HashMap<&str, &str> = HashMap::from([("archive", "live"), ("live", "newer")]);
+        let get = |k: &str| map.get(k).map(|s| s.to_string());
+        assert_eq!(
+            resolve_one_hop("archive", get("archive")),
+            "live",
+            "never chained to 'newer'"
+        );
+        assert_eq!(resolve_one_hop("plain", get("plain")), "plain");
+        assert_eq!(resolve_one_hop("x", Some(String::new())), "x");
+    }
+
+    fn entry(pk: &str, name: &str) -> ProfileEntry {
+        ProfileEntry {
+            pubkey: pk.into(),
+            name: Some(name.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_replaced_key_falls_back_to_its_own_profile_until_the_successor_has_one() {
+        let mut e = HashMap::new();
+        e.insert("archive".to_string(), entry("archive", "Old Name"));
+        // Successor without a kind-0: the archive key's own profile.
+        assert_eq!(
+            display_entry(&e, "archive", "live").map(|p| p.pubkey),
+            Some("archive".into())
+        );
+        // The successor's profile arrives: it wins.
+        e.insert("live".to_string(), entry("live", "Live Name"));
+        assert_eq!(
+            display_entry(&e, "archive", "live").and_then(|p| p.name),
+            Some("Live Name".into())
+        );
+        // An unaliased key never borrows another's profile.
+        assert!(display_entry(&e, "solo", "solo").is_none());
+    }
+}

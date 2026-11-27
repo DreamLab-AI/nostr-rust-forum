@@ -2,11 +2,11 @@
 id: ADR-2008
 title: Let the retro BBS client hold its SecretKey directly, diverging from the ADR-105 `sign()` seam
 date: 2026-08-31
-decision_status: accepted
+decision_status: superseded
 implementation_status: complete
-activation_status: live
+activation_status: inactive
 supersedes: []
-superseded_by: []
+superseded_by: [ADR-2036]
 verified_commit: 7795af5
 owner: jjohare
 review_trigger: introduction of a shared forum `sign()` seam or hardware/remote-signer support for either client
@@ -16,6 +16,8 @@ lineage: distils legacy ADR-105 §2.3 (BBS door-games/write architecture), amend
 ---
 
 # ADR-2008 — Let the retro BBS client hold its SecretKey directly, diverging from the ADR-105 `sign()` seam
+
+> **Superseded (2026-11-26) by [ADR-2036](ADR-2036-shared-client-core-and-retro-tui-redesign.md):** `BbsSigner` (`crates/nostr-bbs-bbs-client/src/signer.rs`) has been deleted. Both `nostr-bbs-forum-client` and `nostr-bbs-bbs-client` now share the single `AuthStore` signing implementation in `crates/nostr-bbs-client-core/src/auth/mod.rs`.
 
 ## External review qualification — 2026-11-02
 

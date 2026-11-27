@@ -43,7 +43,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = JSON.parse(
   readFileSync(join(here, '../../nostr-bbs-poker/tests/fixtures/hands.json'), 'utf8'),
 );
-const testdata = (name) => JSON.parse(readFileSync(join(here, '../src/poker/testdata', name), 'utf8'));
+const testdata = (name) => JSON.parse(readFileSync(join(here, '../../nostr-bbs-client-core/src/poker/testdata', name), 'utf8'));
 
 /** Drain a director's queue the way the choreography does, checking each step. */
 function drain(d) {

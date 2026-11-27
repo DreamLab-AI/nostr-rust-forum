@@ -1,674 +1,1204 @@
-/* Retro ASCII/BBS terminal styling.
+/* ============================================================================
+ * nostr-bbs-bbs-client — Modern TUI Workspace Design System
  *
- * Theme palettes are CSS custom properties switched by a `theme-*` class on the
- * root element (see src/theme.rs). Per-zone accent colours are applied inline
- * via `--accent` from each zone's `accent_hex`.
- */
+ * Phosphor CRT aesthetics (4 themes: amber, green, purple, sky) + crisp TUI
+ * borders + ASCII image art — engineered for both wide desktop workspaces
+ * (collapsible sidebar + main pane) and mobile phones (native vertical scroll,
+ * slide-out drawer, sticky bottom nav, >=44px targets, 0px horizontal overflow).
+ * ============================================================================ */
 
 :root {
-  --bg: #0a0a0a;
-  --bg-panel: #0f0f0f;
-  --fg: #ffb000;       /* amber default */
-  --fg-bright: #ffd47a;
-  --fg-dim: #c48a2a;   /* readable dim: subtitles/handles/hints stay legible on #0a0a0a */
+  --bg: #08090a;
+  --bg-elevated: #0e1012;
+  --bg-panel: #121417;
+  --bg-hover: #191c20;
+  --bg-input: #0b0c0e;
+
+  --fg: #ffb000;
+  --fg-bright: #ffe19c;
+  --fg-dim: #c48c2c;
+  --fg-muted: #8f6b2a;
+
   --accent: #ffb000;
-  --border: #6b4a00;
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --border: #3d2c0b;
+  --border-bright: #7a5816;
   --select-bg: #ffb000;
-  --select-fg: #0a0a0a;
+  --select-fg: #08090a;
+
+  --ok: #4ade80;
+  --warn: #facc15;
+  --danger: #f87171;
+  --info: #60a5fa;
+
   --font: "Cascadia Mono", "JetBrains Mono", "Fira Code", "DejaVu Sans Mono",
-    Menlo, Consolas, monospace;
+    Menlo, Consolas, ui-monospace, monospace;
+  --radius: 4px;
+  --sidebar-w: 272px;
+  --topbar-h: 50px;
+  --footer-h: 32px;
+  --bottomnav-h: 58px;
 }
 
-/* ── Theme palettes ──────────────────────────────────────────────────────── */
+/* ── Phosphor theme palettes (all pass WCAG 2.1 AA on --bg) ─────────────── */
 .theme-amber {
-  --fg: #ffb000; --fg-bright: #ffd47a; --fg-dim: #c48a2a;
-  --accent: #ffb000; --border: #6b4a00; --select-bg: #ffb000;
+  --fg: #ffb000;
+  --fg-bright: #ffe19c;
+  --fg-dim: #c99235;
+  --fg-muted: #987131;
+  --accent: #ffb000;
+  --border: #46320c;
+  --border-bright: #8a6219;
+  --select-bg: #ffb000;
 }
 .theme-green {
-  --fg: #33ff66; --fg-bright: #b6ffc8; --fg-dim: #43b869;
-  --accent: #33ff66; --border: #1f7a3a; --select-bg: #33ff66;
+  --fg: #33ff66;
+  --fg-bright: #c2ffd1;
+  --fg-dim: #4ac96e;
+  --fg-muted: #34914f;
+  --accent: #33ff66;
+  --border: #144723;
+  --border-bright: #258742;
+  --select-bg: #33ff66;
 }
 .theme-purple {
-  --fg: #c792ea; --fg-bright: #e6ccff; --fg-dim: #a483c8;
-  --accent: #c792ea; --border: #5a3f80; --select-bg: #c792ea;
+  --fg: #d19eff;
+  --fg-bright: #eee0ff;
+  --fg-dim: #ab84cf;
+  --fg-muted: #8464a3;
+  --accent: #c792ea;
+  --border: #3c2957;
+  --border-bright: #704ca6;
+  --select-bg: #c792ea;
 }
 .theme-sky {
-  --fg: #56c2ff; --fg-bright: #b6e6ff; --fg-dim: #59a3cc;
-  --accent: #56c2ff; --border: #2a6f99; --select-bg: #56c2ff;
+  --fg: #5cc8ff;
+  --fg-bright: #c9edff;
+  --fg-dim: #5ea9d1;
+  --fg-muted: #4683a6;
+  --accent: #56c2ff;
+  --border: #17415c;
+  --border-bright: #2c78a8;
+  --select-bg: #56c2ff;
 }
 
-* { box-sizing: border-box; }
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
 
-html, body {
+html,
+body {
   margin: 0;
+  padding: 0;
   height: 100%;
-  /* Phosphor burn in the shadows: the dark areas are never dead black — they
-     carry a faint theme-tinted phosphor residue that lifts toward the centre. */
-  background:
-    radial-gradient(ellipse 120% 100% at 50% 50%,
-      color-mix(in srgb, var(--accent) 5%, var(--bg)) 0%, var(--bg) 70%);
-  background-color: var(--bg);
+  background: var(--bg);
   color: var(--fg);
   font-family: var(--font);
-  font-size: 16px;
-  line-height: 1.45;
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: clip;
 }
 
-/* CRT scanlines + subtle flicker + vignette. */
+html.bbs-text-large {
+  font-size: 17px;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+a:hover {
+  color: var(--fg-bright);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── Pure-CSS CRT scanlines + radial phosphor glow (zero JS overhead) ───── */
+.bbs-crt {
+  position: relative;
+  min-height: 100dvh;
+  background: radial-gradient(
+      ellipse 120% 90% at 50% 35%,
+      color-mix(in srgb, var(--accent) 6%, var(--bg)) 0%,
+      var(--bg) 72%
+    );
+}
+
 .bbs-crt::before {
   content: "";
   position: fixed;
   inset: 0;
   pointer-events: none;
-  z-index: 50;
+  z-index: 900;
   background: repeating-linear-gradient(
     to bottom,
-    rgba(0, 0, 0, 0) 0px,
-    rgba(0, 0, 0, 0) 2px,
-    rgba(0, 0, 0, 0.15) 3px,
-    rgba(0, 0, 0, 0.15) 4px
+    transparent 0px,
+    transparent 2px,
+    rgba(0, 0, 0, 0.13) 3px,
+    rgba(0, 0, 0, 0.13) 4px
   );
 }
+
 .bbs-crt::after {
   content: "";
   position: fixed;
   inset: 0;
   pointer-events: none;
-  z-index: 49;
-  /* Phosphor burn-in: a broad theme-tinted bloom that lights the screen from
-     within and pools in the shadows, over a darkened-edge vignette. Kept well
-     below text brightness so glyphs stay crisp. */
-  background:
-    radial-gradient(ellipse 95% 80% at 50% 48%,
-      color-mix(in srgb, var(--accent) 14%, transparent) 0%,
-      color-mix(in srgb, var(--accent) 6%, transparent) 40%,
-      rgba(0,0,0,0) 72%),
-    radial-gradient(ellipse at center, rgba(0,0,0,0) 52%, rgba(0,0,0,0.62) 100%);
+  z-index: 899;
+  background: radial-gradient(
+    ellipse at center,
+    transparent 58%,
+    rgba(0, 0, 0, 0.5) 100%
+  );
 }
 
-/* Fill the viewport so the terminal is a full-screen CRT rather than a block
-   floating in a void; the footer then pins to the bottom edge. */
-.bbs-crt { min-height: 100vh; }
-@keyframes crt-flicker { 0%,100% { opacity: 1; } 50% { opacity: 0.97; } }
+html.bbs-crt-off .bbs-crt::before,
+html.bbs-crt-off .bbs-crt::after,
+html.bbs-reduced-motion .bbs-crt::before,
+@media (prefers-reduced-motion: reduce) {
+  .bbs-crt::before {
+    display: none;
+  }
+}
+html.bbs-crt-off .bbs-crt::before,
+html.bbs-crt-off .bbs-crt::after {
+  display: none;
+}
 
-.bbs-root {
-  min-height: 100vh;
+/* ── Workspace Shell Layout (Desktop >=900px, Mobile <900px) ────────────── */
+.tui-app {
+  height: 100dvh;
+  display: grid;
+  grid-template-rows: var(--topbar-h) minmax(0, 1fr) auto;
+  overflow: hidden;
+}
+
+/* Top bar */
+.tui-topbar {
   display: flex;
-  flex-direction: column;
-  /* Body copy carries only a hairline halo so glyphs stay crisp; the strong
-     phosphor bloom is re-applied below to headings / chrome / accents where it
-     reads as glow rather than smearing the text. */
-  text-shadow: 0 0 1.5px color-mix(in srgb, var(--accent) 55%, transparent);
-  animation: crt-flicker 6s infinite;
-  padding: 0.5rem 1rem;
-  max-width: 100ch;
-  margin: 0 auto;
-}
-
-/* Strong phosphor glow, scoped to the bright/large/accent elements. */
-.bbs-banner,
-.bbs-panel .title,
-.bbs-menu-item,
-.bbs-fkeys .fk,
-.bbs-row .accent,
-.bbs-section-hero .label,
-.bbs-statusbar .ok {
-  text-shadow: 0 0 4px var(--accent);
-}
-
-/* ── Status bar ──────────────────────────────────────────────────────────── */
-.bbs-statusbar {
-  display: flex;
+  align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.6rem;
+  padding: 0 0.85rem;
+  padding-top: env(safe-area-inset-top, 0px);
+  background: var(--bg-elevated);
   border-bottom: 1px solid var(--border);
-  padding-bottom: 0.25rem;
-  color: var(--fg-dim);
-  font-size: 0.85rem;
-  flex-wrap: wrap;
+  z-index: 40;
+  min-width: 0;
 }
-.bbs-statusbar .ok { color: var(--accent); }
-.bbs-statusbar .bad { color: #ff5555; }
 
-/* ── Banner ──────────────────────────────────────────────────────────────── */
-/* Plain text masthead (node name + tagline), not box-glyph art: nothing to
-   misalign, clip, or mojibake. */
-.bbs-banner {
+.tui-topbar-left,
+.tui-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.tui-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
   color: var(--fg-bright);
-  margin: 0.5rem 0;
-  line-height: 1.3;
-}
-.bbs-banner-node {
-  font-size: 1.25rem; letter-spacing: 0.3em; text-transform: uppercase;
-}
-.bbs-banner-tag { color: var(--fg); opacity: 0.85; letter-spacing: 0.08em; }
-/* Never below the 12 px mobile type floor: 0.85rem is 11.05 px on the 13 px
-   mobile root, so clamp the hint up to 12 px (A11y). */
-.bbs-banner .tagline { color: var(--fg-dim); font-size: max(12px, 0.85rem); }
-
-/* ── Generic boxed panel ─────────────────────────────────────────────────── */
-.bbs-panel { white-space: pre-wrap; margin: 0.5rem 0; }
-/* Screen header line — the "you are here" signpost. Bright, weighted, and
-   spaced so each section reads as a distinct place rather than more body text. */
-.bbs-panel .title {
-  color: var(--fg-bright);
-  font-weight: bold;
-  letter-spacing: 0.04em;
-}
-
-/* ── Main menu ───────────────────────────────────────────────────────────── */
-.bbs-menu { display: grid; grid-template-columns: 1fr 1fr; gap: 0 2rem; }
-@media (max-width: 640px) { .bbs-menu { grid-template-columns: 1fr; } }
-/* Menu items are now real <button>s (a11y: interactive in the tree, D4). The
- * reset strips native chrome so they render IDENTICALLY to the old StaticText —
- * inheriting the terminal font/colour, left-aligned, full-width so the whole row
- * is the hit target. Selection styling still comes from `.selected` below. */
-.bbs-menu-item {
-  cursor: pointer;
-  padding: 0 0.25rem;
-  white-space: pre;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--accent) 55%, transparent);
   background: none;
   border: 0;
-  font: inherit;
-  color: inherit;
-  text-align: left;
-  width: 100%;
-  /* No `text-shadow` here: the phosphor-glow rule above (.bbs-menu-item) must
-   * keep winning, so the button reset deliberately leaves it untouched. */
+  cursor: pointer;
+  padding: 0.25rem 0.35rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.bbs-menu-item .key { color: var(--accent); }
-.bbs-menu-item.selected, .bbs-menu-item:hover {
+
+.tui-crumb-sep {
+  color: var(--fg-muted);
+}
+
+.tui-route-title {
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.9rem;
+}
+
+.tui-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  background: var(--bg-panel);
+}
+.tui-status-pill.ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+}
+.tui-status-pill.warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  cursor: pointer;
+}
+.tui-status-pill.bad {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+/* Main workspace body */
+.tui-body {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  overflow: hidden;
+  position: relative;
+}
+
+.tui-body.sidebar-collapsed {
+  grid-template-columns: minmax(0, 1fr);
+}
+.tui-body.sidebar-collapsed .tui-sidebar {
+  display: none;
+}
+
+/* Collapsible Sidebar */
+.tui-sidebar {
+  background: var(--bg-elevated);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 0.65rem 0.55rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.tui-side-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.tui-side-heading {
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  padding: 0.25rem 0.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tui-side-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 36px;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.88rem;
+}
+
+.tui-side-item:hover {
+  background: var(--bg-hover);
+  border-color: var(--border);
+  color: var(--fg-bright);
+}
+
+.tui-side-item.active {
   background: var(--select-bg);
   color: var(--select-fg);
-  text-shadow: none;
+  font-weight: 700;
 }
-.bbs-menu-item.selected .key { color: var(--select-fg); }
 
-/* ── Lists (boards, files, nodes, users) ─────────────────────────────────── */
-.bbs-list { margin: 0.25rem 0; }
-.bbs-row { white-space: pre; padding: 0 0.25rem; cursor: pointer; }
-.bbs-row.selected, .bbs-row:hover {
-  background: var(--select-bg); color: var(--select-fg); text-shadow: none;
+.tui-side-item.active .tui-side-sub,
+.tui-side-item.active .tui-side-glyph {
+  color: var(--select-fg);
 }
-.bbs-row .accent { color: var(--accent); }
-.bbs-row.selected .accent { color: var(--select-fg); }
-.bbs-dim { color: var(--fg-dim); }
 
-/* ── Command line + footer ───────────────────────────────────────────────── */
-.bbs-footer {
-  margin-top: auto;
-  border-top: 1px solid var(--border);
-  padding-top: 0.25rem;
+.tui-side-sub-item {
+  padding-left: 1.4rem;
+  min-height: 32px;
+  font-size: 0.83rem;
   color: var(--fg-dim);
-  font-size: 0.8rem;
 }
-.bbs-fkeys { display: flex; flex-wrap: wrap; gap: 0.75rem; }
-.bbs-fkeys .fk { color: var(--accent); }
-.bbs-cmdline {
+
+.tui-side-glyph {
+  flex: 0 0 auto;
+  width: 1.15rem;
+  text-align: center;
+  color: var(--accent);
+}
+
+.tui-side-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tui-side-pill {
+  flex: 0 0 auto;
+  background: var(--accent);
+  color: var(--select-fg);
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+}
+
+/* Main Workspace Content Pane */
+.tui-main {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 1.1rem 1.4rem 2.2rem;
+  min-width: 0;
+}
+
+.tui-container {
+  max-width: 960px;
+  margin: 0 auto;
   display: flex;
-  gap: 0.5rem;
-  align-items: center;
-  border-top: 1px solid var(--border);
-  padding-top: 0.25rem;
+  flex-direction: column;
+  gap: 0.9rem;
+  min-width: 0;
 }
-.bbs-cmdline { flex-wrap: wrap; }
-.bbs-cmdline .prompt { color: var(--accent); }
-.bbs-cmdline input {
-  flex: 1 1 8ch;
-  min-width: 0;                 /* allow the field to shrink instead of overflowing */
-  min-height: 44px;             /* ≥44px touch target (DM composer reuses this) */
+
+.tui-container.wide {
+  max-width: 1320px;
+}
+
+/* Desktop Footer + Command Bar */
+.tui-footer {
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border);
+  padding: 0.3rem 0.85rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.78rem;
+  color: var(--fg-dim);
+  z-index: 30;
+}
+
+.tui-fkeys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.tui-fk {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.tui-cmdline {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.85rem;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border-bright);
+}
+
+.tui-cmdline-prompt {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.tui-cmdline input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 36px;
   background: transparent;
-  border: none;
+  border: 0;
   outline: none;
   color: var(--fg-bright);
   font: inherit;
-  text-shadow: inherit;
+  font-size: 16px;
 }
-/* Composer control labels never shatter across lines at 360 px, and carry a
-   ≥44px tap box so the DM [ open ] / [ send ] actions clear the mobile target
-   minimum (they reuse .bbs-cmdline .bbs-link). */
-.bbs-cmdline .bbs-link {
+
+/* Mobile bottom nav & drawer backdrop (hidden on desktop) */
+.tui-bottomnav {
+  display: none;
+}
+
+.tui-drawer-backdrop {
+  display: none;
+}
+
+/* ── Shared TUI Components ──────────────────────────────────────────────── */
+.tui-page-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding-bottom: 0.65rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.tui-page-title {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--fg-bright);
+  letter-spacing: 0.04em;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.tui-page-sub {
+  margin: 0.2rem 0 0;
+  color: var(--fg-dim);
+  font-size: 0.86rem;
+}
+
+.tui-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.tui-crumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.86rem;
+  color: var(--fg-dim);
+}
+
+.tui-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.85rem 1rem;
+  min-width: 0;
+}
+
+.tui-card-accent {
+  border-left: 3px solid var(--accent);
+}
+
+.tui-card-interactive {
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.tui-card-interactive:hover {
+  border-color: var(--border-bright);
+  background: var(--bg-hover);
+}
+
+.tui-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 0.75rem;
+}
+
+.tui-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.tui-row {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.tui-row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.tui-muted {
+  color: var(--fg-dim);
+  margin: 0;
+}
+
+.tui-empty {
+  text-align: center;
+  padding: 1.6rem 1rem;
+}
+.tui-empty-title {
+  color: var(--fg-bright);
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+}
+
+/* Buttons */
+.bbs-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  min-height: 36px;
+  padding: 0.35rem 0.75rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius);
+  color: var(--fg);
+  cursor: pointer;
   white-space: nowrap;
-  display: inline-flex; align-items: center;
+  font-size: 0.86rem;
+  text-decoration: none;
+}
+.bbs-btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--fg-bright);
+}
+.bbs-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.bbs-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--select-fg);
+  font-weight: 700;
+}
+.bbs-btn-primary:hover:not(:disabled) {
+  background: var(--fg-bright);
+  border-color: var(--fg-bright);
+  color: var(--select-fg);
+}
+
+.bbs-btn-danger {
+  border-color: color-mix(in srgb, var(--danger) 70%, var(--border));
+  color: var(--danger);
+}
+.bbs-btn-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: #fecaca;
+}
+
+.bbs-btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--fg-dim);
+}
+.bbs-btn-ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border);
+  color: var(--fg-bright);
+}
+
+.bbs-btn-sm {
+  min-height: 30px;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.8rem;
+}
+
+.bbs-btn-block {
+  width: 100%;
   min-height: 44px;
 }
-.bbs-blink { animation: blink 1s step-end infinite; }
-@keyframes blink { 50% { opacity: 0; } }
 
-/* Motion-sensitivity: silence the full-screen CRT flicker and the cursor blink
-   for users who ask for reduced motion (the phosphor-ghost + sentry already are). */
-@media (prefers-reduced-motion: reduce) {
-  .bbs-root { animation: none; }
-  .bbs-blink { animation: none; }
-}
-
-/* Clickable text controls (governance Approve/Reject, [send], [reply], sign-in,
-   theme-cycle, sentry door) carry role="button" — give them a pointer cursor so
-   they read as interactive, not static text (verify-live: cursor was `auto`). */
-a, .bbs-link { color: var(--accent); }
-.bbs-link, [role="button"] { cursor: pointer; }
-.bbs-link:hover { color: var(--fg-bright); }
-
-/* ── ASCII image rendering ───────────────────────────────────────────────────
- * Images everywhere in the BBS are converted to ASCII server-side (preview /
- * pod workers) and injected as <pre class="ascii-img"> fragments whose cells
- * carry phosphor levels p0..p7. The levels map to a ramp from background to the
- * active theme's bright phosphor via color-mix on the EXISTING theme vars, so
- * they auto-recolour across all four themes with no per-theme duplication. */
-.bbs-ascii-row { margin: 0.4rem 0; }
-.bbs-banner-img { margin: 0.5rem 0 0; }
-/* ASCII art scrolls INSIDE this wrap only — `max-width:100%` pins it to the
- * column so wide art can never widen the document (page-level h-scroll is the
- * one invariant we never break). */
-.ascii-img-wrap { overflow-x: auto; max-width: 100%; }
-
-/* Content ASCII images (File Base, Message Base posts) read as contained
-   "files" — a subtle phosphor-framed box with a small label. The masthead
-   banner (.bbs-banner-img) is exempt so it stays edge-to-edge. */
-.bbs-ascii-row:not(.bbs-banner-img) {
-  width: max-content;
-  max-width: 100%;
+.bbs-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0 0.45rem;
+  background: transparent;
   border: 1px solid var(--border);
-  padding: 0.4rem 0.6rem;
-  background: color-mix(in srgb, var(--accent) 3%, var(--bg));
+  border-radius: var(--radius);
+  color: var(--fg);
+  cursor: pointer;
+  position: relative;
 }
-.bbs-ascii-row:not(.bbs-banner-img)::before {
-  content: "▞ IMG ▚";
-  display: inline-block;
-  margin-bottom: 0.3rem;
-  padding: 0 0.4rem;
-  background: var(--fg-dim);
-  color: var(--bg);
-  font-size: 0.7rem;
-  letter-spacing: 0.12em;
-  text-shadow: none;
+.bbs-icon-btn:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--fg-bright);
+}
+
+/* Badges */
+.bbs-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.bbs-badge-ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 55%, var(--border));
+}
+.bbs-badge-warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--border));
+}
+.bbs-badge-danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+}
+.bbs-badge-info {
+  color: var(--info);
+  border-color: color-mix(in srgb, var(--info) 55%, var(--border));
+}
+.bbs-badge-accent {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--select-fg);
+}
+
+/* Inputs & Form Controls */
+.bbs-input,
+.bbs-textarea,
+.bbs-select {
+  width: 100%;
+  min-height: 42px;
+  padding: 0.5rem 0.7rem;
+  background: var(--bg-input);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius);
+  color: var(--fg-bright);
+  font: inherit;
+  font-size: 16px; /* prevents iOS focus-zoom */
+}
+.bbs-input:focus,
+.bbs-textarea:focus,
+.bbs-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.bbs-textarea {
+  min-height: 84px;
+  resize: vertical;
+  line-height: 1.45;
+}
+.bbs-label {
+  display: block;
+  font-size: 0.82rem;
+  color: var(--fg-dim);
+  margin-bottom: 0.25rem;
+}
+
+/* Tabs */
+.tui-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.45rem;
+}
+.tui-tab {
+  min-height: 36px;
+  padding: 0.3rem 0.75rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 0.84rem;
+}
+.tui-tab:hover {
+  color: var(--fg-bright);
+  border-color: var(--border-bright);
+}
+.tui-tab.active {
+  background: var(--select-bg);
+  color: var(--select-fg);
+  border-color: var(--select-bg);
+  font-weight: 700;
+}
+
+/* Author chips & copy buttons */
+.bbs-author-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.bbs-author-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  font-weight: 700;
+  cursor: pointer;
+}
+.bbs-author-btn:hover {
+  color: var(--fg-bright);
+  text-decoration: underline;
+}
+.bbs-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.1rem 0.45rem;
+  font-size: 0.78rem;
+  color: var(--fg-dim);
+  cursor: copy;
+}
+.bbs-copy-btn:hover {
+  border-color: var(--accent);
+  color: var(--fg-bright);
+}
+
+/* ── Markdown prose inside posts/knowledge/DMs ──────────────────────────── */
+.bbs-md {
+  color: var(--fg);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.55;
+}
+.bbs-md p {
+  margin: 0.35rem 0;
+}
+.bbs-md p:first-child {
+  margin-top: 0;
+}
+.bbs-md p:last-child {
+  margin-bottom: 0;
+}
+.bbs-md h1,
+.bbs-md h2,
+.bbs-md h3 {
+  color: var(--fg-bright);
+  margin: 0.65rem 0 0.35rem;
+  font-size: 1.05rem;
+}
+.bbs-md pre {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.75rem;
+  overflow-x: auto;
+  max-width: 100%;
+  font-size: 0.86rem;
+}
+.bbs-md code {
+  background: var(--bg-input);
+  padding: 0.08rem 0.3rem;
+  border-radius: 3px;
+  color: var(--fg-bright);
+}
+.bbs-md pre code {
+  padding: 0;
+  background: none;
+}
+.bbs-md blockquote {
+  margin: 0.45rem 0;
+  padding: 0.2rem 0.7rem;
+  border-left: 2px solid var(--accent);
+  color: var(--fg-dim);
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+.bbs-md ul,
+.bbs-md ol {
+  margin: 0.35rem 0;
+  padding-left: 1.35rem;
+}
+
+/* ── Thread & Post Cards ────────────────────────────────────────────────── */
+.bbs-post {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.bbs-post-root {
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 4%, var(--bg-panel));
+}
+.bbs-post-reply-indent {
+  margin-left: 1.15rem;
+  border-left: 2px solid var(--border-bright);
+}
+.bbs-post-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  font-size: 0.84rem;
+}
+.bbs-post-meta {
+  color: var(--fg-muted);
+  font-size: 0.78rem;
+}
+.bbs-post-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  padding-top: 0.3rem;
+  border-top: 1px dashed var(--border);
+}
+
+.bbs-react-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 28px;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--fg-dim);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.bbs-react-pill:hover {
+  border-color: var(--accent);
+  color: var(--fg-bright);
+}
+.bbs-react-pill.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--fg-bright);
+}
+
+.bbs-composer {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.bbs-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  border: 0;
+}
+
+/* ── On-theme ASCII Art Images ──────────────────────────────────────────── */
+.bbs-ascii-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  padding: 0.45rem 0.6rem;
+  max-width: 100%;
+  overflow: hidden;
+}
+.bbs-ascii-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.74rem;
+  color: var(--fg-dim);
+}
+.ascii-img-wrap {
+  overflow-x: auto;
+  max-width: 100%;
 }
 .ascii-img {
   margin: 0;
   font-family: var(--font);
-  font-size: 0.6rem;
+  font-size: 0.58rem;
   line-height: 1;
-  letter-spacing: 0;
   white-space: pre;
-  overflow-x: auto;
-  text-shadow: 0 0 2px currentColor; /* per-cell phosphor glow */
+  text-shadow: 0 0 2px currentColor;
 }
 .ascii-img-status {
   font-size: 0.8rem;
-  line-height: 1.2;
   color: var(--fg-dim);
-  text-shadow: 0 0 3px var(--accent);
 }
-
-/* Phosphor ramp: background → bright phosphor, eased so midtones aren't muddy. */
-.ascii-img .p0 { color: color-mix(in srgb, var(--fg-bright)  6%, var(--bg)); }
-.ascii-img .p1 { color: color-mix(in srgb, var(--fg-bright) 12%, var(--bg)); }
-.ascii-img .p2 { color: color-mix(in srgb, var(--fg-bright) 20%, var(--bg)); }
-.ascii-img .p3 { color: color-mix(in srgb, var(--fg-bright) 31%, var(--bg)); }
-.ascii-img .p4 { color: color-mix(in srgb, var(--fg-bright) 45%, var(--bg)); }
-.ascii-img .p5 { color: color-mix(in srgb, var(--fg-bright) 62%, var(--bg)); }
-.ascii-img .p6 { color: color-mix(in srgb, var(--fg-bright) 80%, var(--bg)); }
+.ascii-img .p0 { color: color-mix(in srgb, var(--fg-bright) 6%, var(--bg)); }
+.ascii-img .p1 { color: color-mix(in srgb, var(--fg-bright) 13%, var(--bg)); }
+.ascii-img .p2 { color: color-mix(in srgb, var(--fg-bright) 22%, var(--bg)); }
+.ascii-img .p3 { color: color-mix(in srgb, var(--fg-bright) 34%, var(--bg)); }
+.ascii-img .p4 { color: color-mix(in srgb, var(--fg-bright) 48%, var(--bg)); }
+.ascii-img .p5 { color: color-mix(in srgb, var(--fg-bright) 64%, var(--bg)); }
+.ascii-img .p6 { color: color-mix(in srgb, var(--fg-bright) 82%, var(--bg)); }
 .ascii-img .p7 { color: var(--fg-bright); }
 
-/* ── Section heroes ──────────────────────────────────────────────────────────
- * Each configured zone's banner image rendered as ASCII at the top of the
- * Message Base, tinted to the zone accent. */
-.bbs-section-hero { margin: 0.3rem 0 0.6rem; }
-/* Each zone's banner gets a filled accent chip label — a strong, unmistakable
-   signpost of which zone this board belongs to (tinted to the zone accent_hex). */
-.bbs-section-hero .label {
-  display: inline-block;
-  background: color-mix(in srgb, var(--accent) 88%, var(--bg));
-  color: var(--bg);
-  padding: 0.1rem 0.55rem;
-  margin-bottom: 0.2rem;
-  font-weight: bold;
-  letter-spacing: 0.1em;
-  text-shadow: none;
-}
-
-/* ── Redesign T1: landing, sign-in stack, zone cards, breadcrumb, bottom nav ──
- * Tap-first controls that split the difference between the retro skin and the
- * forum's proven patterns. Everything interactive here is a ≥44 px target with
- * a nowrap label so nothing shatters or clips at 360/390 px. */
-
-/* Logged-out onboarding landing. */
-.bbs-landing { display: flex; flex-direction: column; gap: 0.7rem; margin: 0.5rem 0; }
-.bbs-landing-masthead {
-  color: var(--fg-bright); margin: 0;
-  font-size: 1.35rem; line-height: 1.2; letter-spacing: 0.3em;
-  text-transform: uppercase; text-shadow: 0 0 6px var(--accent);
-  overflow-wrap: anywhere;
-}
-.bbs-landing-tagline { color: var(--fg); letter-spacing: 0.08em; opacity: 0.85; }
-.bbs-landing-props { display: flex; flex-wrap: wrap; gap: 0.4rem; }
-/* Value-prop chips reuse the section-hero accent-chip look. */
-.bbs-prop {
-  display: inline-block;
-  background: color-mix(in srgb, var(--accent) 88%, var(--bg));
-  color: var(--bg); padding: 0.15rem 0.6rem;
-  font-weight: bold; letter-spacing: 0.05em; text-shadow: none;
-}
-.bbs-landing-cta { display: flex; flex-direction: column; gap: 0.5rem; }
-.bbs-landing-foot { font-size: 0.85rem; }
-
-/* Full-width ≥44 px call-to-action buttons (landing + sign-in sheet). */
-.bbs-cta {
-  display: block; width: 100%; min-height: 44px; line-height: 42px;
-  box-sizing: border-box; white-space: nowrap; text-align: center;
-  border: 1px solid var(--border); padding: 0 0.75rem;
-  text-decoration: none;
-}
-.bbs-cta:hover { background: color-mix(in srgb, var(--accent) 12%, var(--bg)); }
-
-/* Sign-in sheet: a vertical stack, never a cramped single flex row. */
-.bbs-signin { display: flex; flex-direction: column; gap: 0.5rem; margin: 0.4rem 0; }
-.bbs-signin .bbs-dim, .bbs-signin label { display: block; }
-.bbs-signin .bbs-key {
-  width: 100%; min-height: 44px; box-sizing: border-box;
-  background: transparent; border: 1px solid var(--border);
-  color: var(--fg-bright); font: inherit; text-shadow: inherit;
-  padding: 0 0.6rem; outline: none;
-}
-.bbs-signin .bbs-key:focus { border-color: var(--accent); }
-.bbs-signin-backup { white-space: pre-wrap; word-break: break-all; margin-top: 0.3rem; }
-
-/* Zone cards + board rows + thread/member rows: a fixed, always-visible left
-   accent chip and an ellipsised name — kills the 24-char pre-pad + clipped
-   right-edge @handle. Button semantics + a ≥44 px target (was 39 px, and a bare
-   `role=option` announced as static text — now `role=button`, focusable). */
-.bbs-zone-card, .bbs-board-row, .bbs-thread-row, .bbs-member-row {
-  display: flex; align-items: center; gap: 0.5rem; white-space: normal;
-  min-height: 44px;
-}
-.bbs-zone-card:focus-visible, .bbs-board-row:focus-visible,
-.bbs-thread-row:focus-visible, .bbs-member-row:focus-visible,
-[role="button"]:focus-visible {
-  outline: 2px solid var(--accent); outline-offset: -2px;
-}
-.bbs-chip { flex: 0 0 auto; }
-.bbs-zone-name, .bbs-board-name, .bbs-member-name {
-  flex: 1 1 auto; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.bbs-zone-count { flex: 0 0 auto; }
-.bbs-zone-card.selected .bbs-zone-count, .bbs-zone-card:hover .bbs-zone-count { color: var(--select-fg); }
-.bbs-member-id { flex: 0 0 auto; }
-
-/* Identity block (member profile): the resolved did:nostr and WebID are 64-char
-   unbreakable tokens. Inside a bare .bbs-panel (white-space:pre-wrap, no break
-   rule) they push the whole document wider than the viewport (scrollWidth 677 vs
-   360). Break them the same way .bbs-signin-backup does so the overflow-0
-   invariant holds at 360/390 — pre-wrap still keeps the "\n"-aligned labels. */
-.bbs-idblock { word-break: break-all; overflow-wrap: anywhere; }
-
-/* Thread rows: a snippet that ellipsises + a fixed reply-count/last-activity
-   meta column. */
-.bbs-thread-snip {
-  flex: 1 1 auto; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.bbs-thread-meta { flex: 0 0 auto; }
-.bbs-thread-row.selected .bbs-thread-meta, .bbs-thread-row:hover .bbs-thread-meta { color: var(--select-fg); }
-
-/* Thread view post card (D1). Replaces the old single-line `.bbs-post-row` — a
- * post is not a selectable row (reply is its only action), so it is an <article>
- * card, not a `.bbs-row`. On desktop it stays as compact as the old terminal
- * line: the author head and body render INLINE so each post reads like one
- * phosphor line ("<who> body text …"); mobile (below) breaks them onto their own
- * lines with card spacing. */
-.bbs-post-card { margin: 0.2rem 0; padding: 0.1rem 0; }
-.bbs-post-head { display: inline; }
-.bbs-post-head .bbs-post-author { color: var(--accent); margin-right: 0.4rem; }
-/* Body wraps and breaks unbreakable tokens (URLs / hex / long words) so a post
- * can never push the document wider than the viewport — the overflow-0 invariant.
- * `display:inline` keeps the classic single-line terminal look on desktop. */
-.bbs-post-body {
-  display: inline;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-/* Reply sits after the body on desktop; the button carries a ≥44px tap box that
- * only asserts itself on mobile (inline-flex keeps it unobtrusive on desktop). */
-.bbs-post-actions { display: inline; margin-left: 0.4rem; }
-.bbs-post-actions .bbs-post-reply {
-  background: none; border: 0; font: inherit; color: var(--accent);
-  cursor: pointer; padding: 0; text-shadow: inherit;
-  display: inline-flex; align-items: center;
-}
-.bbs-post-actions .bbs-post-reply:hover { color: var(--fg-bright); }
-/* The root post is subtly framed so it reads as the topic opener. */
-.bbs-post-card.bbs-post-root {
+.bbs-raw-img {
+  max-width: 100%;
+  max-height: 360px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
   display: block;
-  border-left: 2px solid var(--accent);
-  padding-left: 0.4rem;
-  background: color-mix(in srgb, var(--accent) 4%, var(--bg));
 }
 
-/* "open image ↗" affordance under an ASCII render — a real tappable link to the
- * original at a ≥44px box (D3). Dim so it doesn't compete with the art above. */
-.bbs-ascii-open {
-  display: inline-flex; align-items: center;
-  min-height: 44px;
-  color: var(--fg-dim);
-  font-size: 0.85rem;
-  text-decoration: none;
+/* ── Direct Messages Split Layout ───────────────────────────────────────── */
+.bbs-dm-bubbles {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
 }
-.bbs-ascii-open:hover { color: var(--fg-bright); }
-
-/* Composer image affordance: the file input is visually hidden (its own
-   `[ ▸ image ]` control triggers it) but stays focusable/operable. */
-.bbs-file-input {
-  position: absolute; width: 1px; height: 1px;
-  padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); border: 0;
+.bbs-dm-bubble {
+  max-width: min(82%, 640px);
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  align-self: flex-start;
+  overflow-wrap: anywhere;
 }
-.bbs-ascii-pending { opacity: 0.85; }
-
-/* Segmented a11y toggles (text size / motion) — inactive is dim, active is the
-   bright accent so the current choice is unmistakable. */
-.bbs-toggle { color: var(--fg-dim); cursor: pointer; white-space: nowrap; min-height: 44px; display: inline-flex; align-items: center; }
-.bbs-toggle.active { color: var(--accent); text-shadow: 0 0 4px var(--accent); }
-.bbs-toggle:hover { color: var(--fg-bright); }
-
-/* Key-backup sheet (F14): the "no reset" warning reads as a stop sign. */
-.bbs-backup { border: 1px solid var(--border); padding: 0.4rem 0.6rem; margin: 0.4rem 0; }
-.bbs-backup-warn {
-  color: var(--fg-bright); white-space: pre-wrap;
-  border-left: 2px solid #ff5555; padding-left: 0.5rem; margin-bottom: 0.4rem;
+.bbs-dm-bubble.mine {
+  align-self: flex-end;
+  border-color: var(--border-bright);
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-panel));
+  color: var(--fg-bright);
 }
 
-/* Breadcrumb / back control on board + thread views. A flex `gap` guarantees
- * segments never visually concatenate ("← BoardsWelcome") even if the Rust
- * markup omits separator whitespace (D5). */
-.bbs-crumb { display: flex; align-items: center; flex-wrap: wrap; gap: 0 0.4rem; white-space: normal; }
-.bbs-crumb .bbs-link { display: inline-flex; align-items: center; min-height: 44px; }
-
-/* Persistent, skinned bottom navigation bar. */
-.bbs-bottomnav {
-  display: flex; align-items: stretch; justify-content: space-around;
-  flex: 0 0 auto;
-  border-top: 1px solid var(--border);
-  background: color-mix(in srgb, var(--accent) 4%, var(--bg));
-  padding-bottom: env(safe-area-inset-bottom, 0px);
+/* ── Kanban Board ───────────────────────────────────────────────────────── */
+.bbs-kanban-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 0.75rem;
+  align-items: start;
 }
-.bbs-navitem {
-  flex: 1 1 0; min-height: 48px;
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 0.1rem;
-  background: transparent; border: none; color: var(--fg-dim);
-  font: inherit; text-shadow: inherit; cursor: pointer; padding: 0.3rem 0.2rem;
+.bbs-kanban-col {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  min-width: 0;
 }
-.bbs-navitem .ico { font-size: 1.1rem; line-height: 1; color: var(--accent); }
-.bbs-navitem .lab { font-size: 0.7rem; letter-spacing: 0.03em; }
-.bbs-navitem:hover:not(:disabled) { color: var(--fg-bright); }
-.bbs-navitem.active { background: var(--select-bg); color: var(--select-fg); text-shadow: none; }
-.bbs-navitem.active .ico { color: var(--select-fg); text-shadow: none; }
-.bbs-navitem:disabled, .bbs-navitem[aria-disabled="true"] { opacity: 0.5; cursor: default; }
+.bbs-kanban-col-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border);
+  font-weight: 700;
+  color: var(--fg-bright);
+}
+.bbs-kanban-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.7rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
 
-/* Status bar third state: connected-but-unauthenticated (deny-by-default reads). */
-.bbs-statusbar .warn { color: var(--fg-bright); }
+/* ── Terminal Poker Table ───────────────────────────────────────────────── */
+.bbs-felt {
+  background: radial-gradient(
+    ellipse at center,
+    color-mix(in srgb, var(--accent) 10%, var(--bg-panel)) 0%,
+    var(--bg-input) 85%
+  );
+  border: 2px solid var(--border-bright);
+  border-radius: 10px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+.bbs-cards-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+.bbs-playing-card {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 3.1rem;
+  height: 4.3rem;
+  border: 1.5px solid var(--accent);
+  border-radius: 5px;
+  background: var(--bg-elevated);
+  color: var(--fg-bright);
+  font-weight: 700;
+  font-size: 1.05rem;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+.bbs-playing-card.red {
+  color: #fb7185;
+  border-color: #fb7185;
+}
+.bbs-playing-card.back {
+  color: var(--fg-muted);
+  border-style: dashed;
+  background: repeating-linear-gradient(
+    45deg,
+    var(--bg-input),
+    var(--bg-input) 4px,
+    var(--bg-panel) 4px,
+    var(--bg-panel) 8px
+  );
+}
+.bbs-poker-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 0.5rem;
+}
 
-/* ── Accessibility prefs (F13) ─────────────────────────────────────────────────
- * Applied as classes on <html> (see app::apply_prefs) so the whole rem-based
- * layout scales and the CRT motion stops even when the OS pref isn't set. The
- * text-size class beats the base `html, body` rule on specificity. */
-html.bbs-text-large { font-size: 18px; }
-@media (max-width: 640px) { html.bbs-text-large { font-size: 15px; } }
-html.bbs-reduced-motion .bbs-root,
-html.bbs-reduced-motion .bbs-blink { animation: none; }
-html.bbs-reduced-motion .phosphor-ghost { display: none; }
-html.bbs-reduced-motion .sentry-critical.on,
-html.bbs-reduced-motion .sentry-radar::before { animation: none; }
+/* ── Calendar Grid ──────────────────────────────────────────────────────── */
+.bbs-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 2px;
+  text-align: center;
+  font-size: 0.78rem;
+}
+.bbs-cal-day {
+  padding: 0.35rem 0.1rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg-input);
+  cursor: pointer;
+}
+.bbs-cal-day.has-event {
+  border-color: var(--accent);
+  color: var(--fg-bright);
+  font-weight: 700;
+}
+.bbs-cal-day.selected {
+  background: var(--select-bg);
+  color: var(--select-fg);
+}
 
-/* ── Phosphor persistence ─────────────────────────────────────────────────────
- * When the screen text changes, the previous frame lingers as a faint phosphor
- * afterglow and fades linearly to nothing — the slow decay of a real tube. The
- * ghost is a text-only clone of the prior body region injected by the small
- * script in index.html; here we only define how it looks + decays. */
-.phosphor-ghost {
+/* ── Global Search Overlay ──────────────────────────────────────────────── */
+.bbs-overlay {
   position: fixed;
-  pointer-events: none;
-  z-index: 48;
+  inset: 0;
+  z-index: 200;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  display: flex;
+  justify-content: center;
+  padding: 7vh 0.75rem 1rem;
+  overflow-y: auto;
+}
+.bbs-modal {
+  width: 100%;
+  max-width: 680px;
+  height: max-content;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius);
+  box-shadow: 0 0 28px color-mix(in srgb, var(--accent) 22%, transparent);
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
-  white-space: pre;
-  will-change: opacity;
-  opacity: 0.05;                     /* faint */
-  transition: opacity 3s linear;     /* slow, even decay to zero */
 }
-@media (prefers-reduced-motion: reduce) { .phosphor-ghost { display: none; } }
-
-/* ── Mobile / touch ──────────────────────────────────────────────────────────
- * First-class mobile: a single-column terminal that fills the dynamic viewport
- * (100dvh dodges the mobile browser-chrome gap), larger touch targets, and a
- * fitted banner. Touch navigation (slide to move the highlight, release to
- * select) is driven by the small script in index.html; `touch-action: none` on
- * the selectable lists hands those gestures to it instead of the browser. */
-.bbs-root, .bbs-crt { min-height: 100vh; min-height: 100dvh; }
-.bbs-menu, .bbs-list { touch-action: none; }
-
-@media (max-width: 640px) {
-  html, body { font-size: 13px; }
-  .bbs-root { padding: 0.3rem 0.5rem; max-width: 100%; }
-
-  /* Single full-screen list, zoomed: the masthead banner is dropped (the
-     status bar already carries the node name) and the active list fills the
-     viewport as large, finger-sized rows — a mobile-app-style menu rather than
-     a compact block floating up top. */
-  .bbs-banner { display: none; }
-  /* The onboarding masthead is exempt from the banner drop — it is the
-     newcomer's first signpost (F3). Slightly smaller on phones. */
-  .bbs-landing-masthead { display: block; font-size: 1.1rem; }
-  /* Status/footer/nav-labels rendered ~9–11 px; lift clear of the 12 px type
-     floor on a 13 px root (0.95rem = 12.35 px). Colours are untouched, so the
-     amber-palette AA contrast (10.8:1 status, 6.6:1 dim) is unchanged (A11y). */
-  /* Type scale ≤640px (D6): exactly three content sizes — 0.92rem meta/dim
-     (≈12px, the floor), 1rem body, 1.15rem list rows. All the old scattered
-     0.95rem meta values collapse onto 0.92rem here; no content rule drops below
-     12px except the `.ascii-img` art cells (exempt: those are images). */
-  .bbs-statusbar { font-size: 0.92rem; }
-  .bbs-footer { font-size: 0.92rem; }
-  .bbs-navitem .lab { font-size: 0.92rem; }
-  .bbs-landing-foot { font-size: 0.92rem; }
-
-  .bbs-menu {
-    display: flex;
-    flex-direction: column;
-    flex: 1 1 auto;
-    gap: 0;
-    margin: 0.3rem 0;
-  }
-  .bbs-menu-item {
-    flex: 1 1 0;                       /* rows grow to fill the screen evenly */
-    display: flex;
-    align-items: center;
-    font-size: 1.45rem;               /* zoomed */
-    padding: 0 0.7rem;
-    border-bottom: 1px solid var(--border);
-  }
-  .bbs-menu-item:first-child { border-top: 1px solid var(--border); }
-  .bbs-menu-item .key { margin-right: 0.5rem; }
-
-  /* Dynamic lists fill + scroll, with large rows. */
-  .bbs-list {
-    display: flex;
-    flex-direction: column;
-    flex: 1 1 auto;
-    overflow-y: auto;
-    margin: 0.3rem 0;
-  }
-  .bbs-row {
-    display: flex;
-    align-items: center;
-    /* Large finger rows, never under the 44 px touch minimum (3rem is 39 px on
-       the 13 px mobile root, below target — clamp up). */
-    min-height: max(3rem, 44px);
-    font-size: 1.15rem;
-    padding: 0.6rem 0.7rem;
-    border-bottom: 1px solid var(--border);
-  }
-  /* Top-anchor content: panels take their natural height (was `flex:1 1 auto`,
-     which grew the header and bottom-anchored the body, wasting ~50% of the
-     screen). The scrollable `.bbs-list` still fills; the footer/bottom-nav pin
-     to the bottom via the footer's `margin-top:auto`. */
-  .bbs-panel { flex: 0 0 auto; }
-
-  /* No decorative banners anywhere on mobile — the zone "section hero" banners
-     are dropped too (the masthead already is). Content images survive: posted
-     pictures (.bbs-ascii-row) and link previews still render as ASCII. */
-  .bbs-section-hero { display: none; }
-
-  /* Posted/preview ASCII images stay, sized to the narrow column. `clamp` gives
-     a legible floor (7px) that scales with the viewport up to 10px — the old flat
-     0.5rem was 6.5px, illegible (D3). `line-height:1` keeps the grid square so
-     the art doesn't smear. At the responsive 40-col render (~9px/col ≈ 360px) it
-     fits a 390px viewport without the wrap needing to scroll. These cells are the
-     ONE type-scale exemption (they're images, not text). */
-  .ascii-img { font-size: clamp(7px, 2.2vw, 10px); line-height: 1; }
-
-  /* Thread post cards (D1): on mobile a post becomes a spaced card, not a
-     terminal line — author head and body each get their own line, with clear
-     separation and a full-width reply button that meets the 44px tap minimum. */
-  .bbs-post-card {
-    display: block;
-    padding: 0.5rem 0.2rem;
-    border-bottom: 1px solid var(--border);
-  }
-  .bbs-post-head { display: block; margin-bottom: 0.25rem; }
-  .bbs-post-body { display: block; font-size: 1rem; }
-  .bbs-post-actions { display: block; margin-left: 0; margin-top: 0.35rem; }
-  .bbs-post-actions .bbs-post-reply {
-    min-height: 44px;
-    padding: 0 0.4rem;
-    margin-left: -0.4rem;             /* align the tap box with the text edge */
-  }
-
-  /* Keyboard hints are meaningless without a keyboard — swap them for a touch
-     hint that names the bottom bar (the primary return path). Slide over rows to
-     move the highlight, lift to select; the bar below jumps between sections. */
-  .bbs-fkeys { display: none; }
-  .bbs-footer::before {
-    /* \0020 (a real space) follows the middot explicitly: a bare space after a
-       hex escape is swallowed as the escape's terminator, so "\00B7 slide"
-       rendered as "·slide" with no gap. */
-    content: "use the bar below to move around \00B7\0020slide over rows, lift to open";
-    display: block;
-    margin-bottom: 0.15rem;
-    color: var(--fg-dim);
-    font-size: 0.92rem;              /* meta size — ≈12 px on the 13 px mobile root (A11y) */
-  }
-  .bbs-cmdline input, .bbs-signin .bbs-key { font-size: 16px; }  /* stop iOS focus-zoom */
+.bbs-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+.bbs-modal-body {
+  padding: 0.6rem 0.8rem;
+  max-height: 65vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
 }
 
-/* ── Door game: UA 571-C sentry gun ───────────────────────────────────────────
- * A faithful Aliens (1986) UA 571-C remote-sentry control deck — but rendered
- * in OUR phosphor skin: it inherits the active theme's --accent/--fg/--bg via
- * the theme-* class copied onto the overlay, with our scanlines + glow. Pure
- * client-side, no auth. Logic in the script in index.html. */
+/* ── Toasts ─────────────────────────────────────────────────────────────── */
+.bbs-toasts {
+  position: fixed;
+  bottom: 2.75rem;
+  right: 1rem;
+  z-index: 300;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  max-width: min(380px, calc(100vw - 2rem));
+}
+.bbs-toast {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.75rem;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55);
+  font-size: 0.85rem;
+}
+.bbs-toast-ok { border-left: 3px solid var(--ok); }
+.bbs-toast-err { border-left: 3px solid var(--danger); }
+.bbs-toast-warn { border-left: 3px solid var(--warn); }
+.bbs-toast-info { border-left: 3px solid var(--info); }
+.bbs-toast-glyph { font-weight: 700; flex: 0 0 auto; }
+.bbs-toast-msg { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+
+/* ── QR & Code Blocks ───────────────────────────────────────────────────── */
+.bbs-qr-wrap {
+  display: inline-block;
+  padding: 0.5rem;
+  background: #ffffff;
+  border-radius: var(--radius);
+  max-width: 100%;
+}
+.bbs-id-block {
+  font-size: 0.84rem;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+/* ── UA 571-C Sentry Door Game Overlay ──────────────────────────────────── */
 .sentry {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: 500;
   display: none;
   flex-direction: column;
   overflow: auto;
@@ -679,41 +1209,33 @@ html.bbs-reduced-motion .sentry-radar::before { animation: none; }
   text-shadow: 0 0 4px var(--accent);
 }
 .sentry.open { display: flex; }
-.sentry::before {                                   /* scanlines */
-  content: "";
-  position: fixed; inset: 0; pointer-events: none; z-index: 2;
-  background: repeating-linear-gradient(to bottom,
-    rgba(0,0,0,0) 0, rgba(0,0,0,0) 2px, rgba(0,0,0,0.26) 3px, rgba(0,0,0,0.26) 4px);
-}
-.sentry::after {                                    /* phosphor bloom + vignette */
-  content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 1;
-  background:
-    radial-gradient(ellipse 95% 80% at 50% 45%, color-mix(in srgb, var(--accent) 12%, transparent) 0%, rgba(0,0,0,0) 70%),
-    radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.6) 100%);
-}
 .sentry-inner { position: relative; z-index: 3; max-width: 96ch; width: 100%; margin: 0 auto; }
 .sentry-boot { white-space: pre-wrap; color: var(--fg-bright); min-height: 8rem; }
 .sentry-close {
   position: fixed; top: 0.6rem; right: 1rem; z-index: 4; cursor: pointer;
-  color: var(--fg-bright); border: 1px solid var(--border); padding: 0.1rem 0.5rem;
+  background: var(--bg-elevated); color: var(--fg-bright); border: 1px solid var(--border-bright);
+  padding: 0.35rem 0.65rem; min-height: 40px; border-radius: var(--radius);
 }
 .sentry-close:hover { background: var(--accent); color: var(--bg); text-shadow: none; }
 .sentry-title {
-  text-align: center; color: var(--fg-bright); letter-spacing: 0.18em;
-  border: 1px solid var(--border); padding: 0.5rem; margin-bottom: 0.6rem; white-space: pre;
+  text-align: center; color: var(--fg-bright); letter-spacing: 0.14em;
+  border: 1px solid var(--border); padding: 0.5rem; margin-bottom: 0.6rem;
 }
 .sentry-modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin-bottom: 0.6rem; }
-.sentry-cell { border: 1px solid var(--border); padding: 0.4rem 0.5rem; }
-.sentry-cell .lab { color: var(--fg-dim); font-size: 0.78rem; letter-spacing: 0.08em; }
-.sentry-opts { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.3rem; }
-.sentry-opt { padding: 0.15rem 0.45rem; border: 1px solid var(--border); cursor: pointer; user-select: none; }
-.sentry-opt.sel { background: var(--accent); color: var(--bg); text-shadow: none; }
+.sentry-cell { border: 1px solid var(--border); padding: 0.45rem 0.55rem; }
+.sentry-cell .lab { color: var(--fg-dim); font-size: 0.76rem; letter-spacing: 0.08em; }
+.sentry-opts { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.35rem; }
+.sentry-opt {
+  padding: 0.25rem 0.5rem; border: 1px solid var(--border); cursor: pointer;
+  background: transparent; color: var(--fg); min-height: 36px;
+}
+.sentry-opt.sel { background: var(--accent); color: var(--bg); text-shadow: none; font-weight: 700; }
 .sentry-opt.danger.sel { background: #ff5555; color: #0a0a0a; }
 .sentry-status { display: grid; grid-template-columns: 1.4fr 1fr 0.8fr auto; gap: 0.6rem; align-items: stretch; }
-.sentry-box { border: 1px solid var(--border); padding: 0.4rem 0.5rem; display: flex; flex-direction: column; justify-content: center; }
-.sentry-box .lab { color: var(--fg-dim); font-size: 0.78rem; }
-.sentry-rounds { font-size: 2.4rem; line-height: 1; color: var(--fg-bright); }
-.sentry-time { font-size: 1.6rem; color: var(--fg-bright); }
+.sentry-box { border: 1px solid var(--border); padding: 0.45rem 0.55rem; display: flex; flex-direction: column; justify-content: center; }
+.sentry-box .lab { color: var(--fg-dim); font-size: 0.76rem; }
+.sentry-rounds { font-size: 2.3rem; line-height: 1; color: var(--fg-bright); }
+.sentry-time { font-size: 1.5rem; color: var(--fg-bright); }
 .sentry-critical { border: 2px solid #ff5555; color: #ff5555; text-align: center; padding: 0.4rem; opacity: 0.22; letter-spacing: 0.2em; }
 .sentry-critical.on { opacity: 1; animation: sentry-flash 0.5s step-end infinite; }
 @keyframes sentry-flash { 50% { opacity: 0.3; } }
@@ -722,7 +1244,7 @@ html.bbs-reduced-motion .sentry-radar::before { animation: none; }
 .sentry-gauge .fill { position: absolute; left: 0; right: 0; bottom: 0; background: var(--accent); transition: height 0.4s linear; }
 .sentry-gauge.hot .fill { background: #ff5555; }
 .sentry-gauge .gl { position: absolute; top: -1rem; left: 0; color: var(--fg-dim); font-size: 0.7rem; }
-.sentry-radar { width: 6rem; height: 6rem; border-radius: 50%; border: 1px solid var(--border); position: relative; overflow: hidden; align-self: center; }
+.sentry-radar { width: 5.5rem; height: 5.5rem; border-radius: 50%; border: 1px solid var(--border); position: relative; overflow: hidden; align-self: center; }
 .sentry-radar::before {
   content: ""; position: absolute; inset: 0; border-radius: 50%;
   background: conic-gradient(from 0deg, color-mix(in srgb, var(--accent) 45%, transparent) 0deg, transparent 60deg);
@@ -733,161 +1255,181 @@ html.bbs-reduced-motion .sentry-radar::before { animation: none; }
 .sentry-radar .ring.r2 { inset: 40%; }
 @keyframes sentry-sweep { to { transform: rotate(360deg); } }
 .sentry-actions { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; margin: 0.7rem 0; }
-.sentry-btn { border: 1px solid var(--accent); color: var(--accent); padding: 0.45rem 0.9rem; cursor: pointer; letter-spacing: 0.06em; user-select: none; }
+.sentry-btn {
+  border: 1px solid var(--accent); color: var(--accent); background: transparent;
+  padding: 0.5rem 1rem; min-height: 44px; cursor: pointer; letter-spacing: 0.06em;
+}
 .sentry-btn:hover { background: var(--accent); color: var(--bg); text-shadow: none; }
 .sentry-btn.armed { border-color: #ff5555; color: #ff5555; }
-.sentry-log { border: 1px solid var(--border); padding: 0.4rem 0.5rem; margin-top: 0.4rem; min-height: 3.5rem; max-height: 8rem; overflow-y: auto; color: var(--fg-dim); font-size: 0.85rem; white-space: pre-wrap; }
+.sentry-log { border: 1px solid var(--border); padding: 0.45rem 0.55rem; margin-top: 0.4rem; min-height: 3.5rem; max-height: 8rem; overflow-y: auto; color: var(--fg-dim); font-size: 0.84rem; white-space: pre-wrap; }
 .sentry-log .hi { color: var(--fg-bright); }
 .sentry-hint { text-align: center; color: var(--fg-dim); font-size: 0.78rem; margin-top: 0.4rem; }
-@media (max-width: 640px) {
-  .sentry { padding: 0.5rem; }
+
+/* ── First-Class Mobile Phone Surface (<900px) ──────────────────────────── */
+@media (max-width: 899px) {
+  .tui-app {
+    grid-template-rows: var(--topbar-h) minmax(0, 1fr) auto;
+  }
+
+  .tui-body,
+  .tui-body.sidebar-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Slide-out drawer sidebar on phones/tablets */
+  .tui-sidebar,
+  .tui-body.sidebar-collapsed .tui-sidebar {
+    display: flex;
+    position: fixed;
+    top: var(--topbar-h);
+    bottom: var(--bottomnav-h);
+    left: 0;
+    width: min(84vw, 310px);
+    z-index: 120;
+    transform: translateX(-105%);
+    transition: transform 180ms ease;
+    box-shadow: 8px 0 32px rgba(0, 0, 0, 0.7);
+  }
+  .tui-sidebar.mobile-open {
+    transform: translateX(0);
+  }
+
+  .tui-drawer-backdrop.mobile-open {
+    display: block;
+    position: fixed;
+    inset: var(--topbar-h) 0 var(--bottomnav-h) 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 110;
+  }
+
+  .tui-main {
+    padding: 0.85rem 0.75rem 1.4rem;
+  }
+
+  .tui-footer {
+    display: none;
+  }
+
+  .tui-bottomnav {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    background: var(--bg-elevated);
+    border-top: 1px solid var(--border);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    z-index: 60;
+  }
+
+  .tui-bnav-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.12rem;
+    min-height: 54px;
+    padding: 0.25rem 0.15rem;
+    background: transparent;
+    border: 0;
+    color: var(--fg-dim);
+    cursor: pointer;
+    position: relative;
+    font-size: 0.72rem;
+  }
+  .tui-bnav-btn .ico {
+    font-size: 1.15rem;
+    line-height: 1;
+    color: var(--accent);
+  }
+  .tui-bnav-btn.active {
+    background: var(--select-bg);
+    color: var(--select-fg);
+    font-weight: 700;
+  }
+  .tui-bnav-btn.active .ico {
+    color: var(--select-fg);
+  }
+  .tui-bnav-badge {
+    position: absolute;
+    top: 4px;
+    right: calc(50% - 20px);
+    min-width: 1.1rem;
+    height: 1.1rem;
+    padding: 0 0.25rem;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--select-fg);
+    font-size: 0.68rem;
+    font-weight: 700;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .tui-bnav-btn.active .tui-bnav-badge {
+    background: var(--select-fg);
+    color: var(--select-bg);
+  }
+
+  /* Guarantee >=44px tap targets on mobile */
+  .bbs-btn,
+  .bbs-icon-btn,
+  .tui-tab,
+  .tui-side-item {
+    min-height: 44px;
+  }
+
+  .tui-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .bbs-post-reply-indent {
+    margin-left: 0.55rem;
+  }
+
+  .bbs-dm-bubble {
+    max-width: 92%;
+  }
+
+  .bbs-toasts {
+    bottom: calc(var(--bottomnav-h) + 0.75rem);
+    left: 0.75rem;
+    right: 0.75rem;
+    max-width: none;
+  }
+
+  .bbs-overlay {
+    padding: 0;
+  }
+  .bbs-modal {
+    max-width: none;
+    min-height: 100dvh;
+    border-radius: 0;
+  }
+  .bbs-modal-body {
+    max-height: none;
+    flex: 1 1 auto;
+  }
+
+  .ascii-img {
+    font-size: clamp(6.5px, 2.15vw, 9.5px);
+  }
+
+  .sentry { padding: 0.55rem; }
   .sentry-modes { grid-template-columns: 1fr; }
   .sentry-status { grid-template-columns: 1fr; }
-  .sentry-title { letter-spacing: 0.1em; font-size: 0.85rem; }
 }
+
 @media (prefers-reduced-motion: reduce) {
-  .sentry-critical.on { animation: none; }
-  .sentry-radar::before { animation: none; }
+  .sentry-critical.on,
+  .sentry-radar::before {
+    animation: none;
+  }
+}
+html.bbs-reduced-motion .sentry-critical.on,
+html.bbs-reduced-motion .sentry-radar::before {
+  animation: none;
 }
 
-/* ── F8 Encrypted DMs ──────────────────────────────────────────────────────── */
-/* Conversation (inbox) row — mirrors .bbs-thread-row: flex, ellipsised preview,
-   ≥44px tap target, never overflows a 360px viewport. */
-.bbs-dm-convo {
-  display: flex; align-items: center; gap: 0.5rem;
-  white-space: normal; min-height: 44px;
-}
-.bbs-dm-convo .bbs-chip { flex: 0 0 auto; }
-.bbs-dm-name { flex: 0 0 auto; max-width: 40%;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bbs-dm-preview {
-  flex: 1 1 auto; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.bbs-dm-unread { flex: 0 0 auto; color: var(--accent); }
-
-/* Thread bubbles — wrap long text, break unbreakable tokens (URLs/hex) so nothing
-   pushes the page wide. Sent messages tint toward the bright phosphor + right-align. */
-.bbs-dm-thread { margin: 0.25rem 0; }
-.bbs-dm-msg {
-  white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
-  padding: 0.15rem 0.25rem; cursor: default;
-}
-.bbs-dm-msg.bbs-dm-sent { color: var(--fg-bright); text-align: right; }
-.bbs-dm-msg.bbs-dm-sent .accent { color: var(--accent); }
-
-/* F9 native passkey CTA — "waiting for your passkey" pending state. Dim + a
-   gentle pulse while the WebAuthn ceremony / round-trips are in flight; the
-   button keeps its ≥44 px .bbs-cta box. */
-.bbs-cta.bbs-pending {
-  opacity: 0.65;
-  cursor: progress;
-  animation: bbs-pending-pulse 1.1s ease-in-out infinite;
-}
-@keyframes bbs-pending-pulse { 50% { opacity: 0.35; } }
-@media (prefers-reduced-motion: reduce) {
-  .bbs-cta.bbs-pending { animation: none; }
-}
-
-/* ── F11 Global search palette ─────────────────────────────────────────────
- * A phosphor command palette (Cmd/Ctrl+K, /search, or the [⌕] footer twin).
- * Top-anchored, backdrop-dimmed; full-screen on mobile. Reuses the theme vars,
- * so it recolours with the active CRT theme. Sits above the status/bottom bars
- * (z 48/50) but below the sentry Easter egg (z 100). */
-.bbs-search-overlay {
-  position: fixed; inset: 0; z-index: 90;
-  background: color-mix(in srgb, var(--bg) 82%, transparent);
-  display: flex; justify-content: center;
-  padding: 8vh 0.75rem 1rem;
-  overflow-y: auto;
-}
-.bbs-search-panel {
-  width: 100%; max-width: 64ch; height: max-content;
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  box-shadow: 0 0 24px color-mix(in srgb, var(--accent) 22%, transparent);
-  display: flex; flex-direction: column;
-}
-.bbs-search-head {
-  display: flex; align-items: center; gap: 0.5rem;
-  padding: 0.4rem 0.6rem;
-  border-bottom: 1px solid var(--border);
-}
-.bbs-search-glyph { font-size: 1.1rem; }
-.bbs-search-input {
-  flex: 1 1 auto; min-width: 0;
-  background: transparent; border: none; outline: none;
-  color: var(--fg); font: inherit; font-size: 16px;  /* 16px: no iOS focus-zoom */
-  min-height: 44px;
-}
-.bbs-search-input::placeholder { color: var(--fg-dim); }
-.bbs-search-esc {
-  white-space: nowrap; min-height: 44px;
-  display: inline-flex; align-items: center;
-  padding: 0 0.4rem; font-size: 0.85rem;
-}
-.bbs-search-body { padding: 0.25rem; overflow-y: auto; max-height: 60vh; }
-.bbs-search-list { display: flex; flex-direction: column; }
-.bbs-search-row {
-  display: flex; align-items: center; gap: 0.5rem;
-  padding: 0.3rem 0.4rem; min-height: 44px; cursor: pointer;
-}
-.bbs-search-row.selected, .bbs-search-row:hover {
-  background: var(--select-bg); color: var(--select-fg);
-}
-.bbs-search-row.selected .accent, .bbs-search-row:hover .accent,
-.bbs-search-row.selected .bbs-dim, .bbs-search-row:hover .bbs-dim { color: var(--select-fg); }
-.bbs-search-text { display: flex; flex-direction: column; min-width: 0; }
-.bbs-search-title {
-  display: flex; align-items: baseline; gap: 0.4rem;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.bbs-search-sub {
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  font-size: 0.8rem;
-}
-.bbs-search-score {
-  color: var(--accent); font-size: 0.75rem;
-  border: 1px solid var(--border); padding: 0 0.3rem;
-}
-.bbs-search-row.selected .bbs-search-score,
-.bbs-search-row:hover .bbs-search-score { color: var(--select-fg); border-color: var(--select-fg); }
-.bbs-search-empty { padding: 1.2rem 0.6rem; text-align: center; }
-.bbs-search-note { padding: 0.4rem 0.6rem; border-top: 1px solid var(--border); font-size: 0.8rem; }
-.bbs-search-foot {
-  padding: 0.4rem 0.6rem; border-top: 1px solid var(--border);
-  font-size: 0.75rem;
-}
-@media (max-width: 480px) {
-  .bbs-search-overlay { padding: 0; }
-  .bbs-search-panel { max-width: none; min-height: 100dvh; }
-  .bbs-search-body { max-height: none; flex: 1 1 auto; }
-}
-
-/* ── F12 notifications badge ─────────────────────────────────────────────────
- * Small pill carrying the unread mentions/replies count, overlaid on a
- * bottom-nav item. The extra `.bbs-navitem { position: relative }` rule below is
- * appended AFTER the base rule so it wins by source order (same specificity) and
- * establishes the positioning context for the absolutely-placed badge. */
-.bbs-navitem { position: relative; }
-.bbs-navbadge {
-  position: absolute;
-  top: 3px;
-  left: calc(50% + 0.4rem);
-  min-width: 1.1rem;
-  height: 1.1rem;
-  padding: 0 0.25rem;
-  box-sizing: border-box;
-  display: inline-flex; align-items: center; justify-content: center;
-  font-size: 0.7rem; line-height: 1;
-  border-radius: 999px;
-  background: var(--accent);
-  color: var(--bg);
-  text-shadow: none;
-  font-variant-numeric: tabular-nums;
-  pointer-events: none;
-}
-@media (max-width: 640px) {
-  /* Lift the badge type clear of the ~12 px mobile floor (A11y). */
-  .bbs-navbadge { font-size: 0.8rem; height: 1.2rem; min-width: 1.2rem; }
+/* A post opened from a link (notification, search, bookmark): outlined once. */
+.bbs-post.bbs-post-focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }

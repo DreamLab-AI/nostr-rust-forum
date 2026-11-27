@@ -188,9 +188,12 @@ impl Hit {
                 event_id,
                 channel_id,
                 ..
-            } => base_href(&crate::pages::jump_link(event_id, Some(channel_id))),
+            } => base_href(&crate::utils::post_link::jump_link(
+                event_id,
+                Some(channel_id),
+            )),
             Self::SemanticMessage { event_id, id, .. } => {
-                base_href(&crate::pages::jump_link(event_id, Some(id)))
+                base_href(&crate::utils::post_link::jump_link(event_id, Some(id)))
             }
             Self::User { pubkey, .. } => base_href(&format!("/profile/{}", pubkey)),
         }

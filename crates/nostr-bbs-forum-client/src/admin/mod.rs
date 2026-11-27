@@ -20,7 +20,6 @@ pub mod user_table;
 pub mod zone_encryption;
 
 use leptos::prelude::*;
-use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
 use crate::auth::nip98::{fetch_with_nip98_get_signer, fetch_with_nip98_post_signer};
@@ -66,50 +65,7 @@ pub enum MembersView {
     Access,
 }
 
-/// A whitelisted user returned from the relay API.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WhitelistUser {
-    pub pubkey: String,
-    #[serde(default)]
-    pub cohorts: Vec<String>,
-    #[serde(default, alias = "displayName")]
-    pub display_name: Option<String>,
-    #[serde(default, alias = "addedAt")]
-    pub added_at: Option<u64>,
-    #[serde(default, alias = "isAdmin")]
-    pub is_admin: bool,
-    /// Admin-only real name, enriched after the whitelist load from the
-    /// auth-worker `GET /api/admin/registrations` route. Never sourced from
-    /// the relay (the relay never sees real names) and never public.
-    #[serde(default, skip)]
-    pub real_name: Option<String>,
-    /// Claimed public handle (username), enriched from the auth-worker
-    /// `GET /api/admin/registrations` route. Unlike `real_name` this is a
-    /// PUBLIC handle and is used as a display-name source for users whose
-    /// kind-0 profile carries no name (Task #7 — the root cause of hex-only
-    /// names was that the auth `handle` was being discarded here).
-    #[serde(default, skip)]
-    pub handle: Option<String>,
-}
-
-/// A username reservation returned from the auth-worker
-/// `GET /api/admin/registrations` route. Every active reservation is listed
-/// here — both already-whitelisted users and those still awaiting approval.
-/// "Pending" is derived by subtracting the relay whitelist (see
-/// [`AdminStore::pending_registrations`]).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Registration {
-    pub pubkey: String,
-    /// Public claimed handle (username). May be absent for legacy rows.
-    #[serde(default)]
-    pub handle: Option<String>,
-    /// Admin-only real name supplied at signup. Never surfaced publicly.
-    #[serde(default)]
-    pub real_name: Option<String>,
-    /// Unix seconds the reservation was created. Used to sort newest-first.
-    #[serde(default)]
-    pub created_at: u64,
-}
+pub use nostr_bbs_client_core::whitelist::{fetch_whitelist_rows, Registration, WhitelistUser};
 
 /// A channel parsed from a kind-40 event on the relay.
 #[derive(Clone, Debug)]
@@ -972,32 +928,6 @@ pub fn use_admin() -> AdminStore {
 // -- Internal helpers ---------------------------------------------------------
 
 /// Fetch every whitelist row (NIP-98 signed GETs, admin-gated server-side).
-///
-/// Walks all pages: the relay defaults `limit` to 20, and a single-page read
-/// turned every older member into a phantom "pending" registration that no
-/// approval could clear (see [`membership::WhitelistPager`]).
-///
-/// Standalone so non-panel consumers — the admin new-joiner alert producer in
-/// [`crate::stores::admin_alerts`] — can read the whitelist without an
-/// [`AdminStore`] (whose fetch also drives panel signals and real-name
-/// enrichment).
-pub(crate) async fn fetch_whitelist_rows(
-    signer: &dyn Signer,
-) -> Result<Vec<WhitelistUser>, String> {
-    let base = format!(
-        "{}/api/whitelist/list",
-        crate::utils::relay_url::relay_api_base()
-    );
-    let mut pager = membership::WhitelistPager::new();
-    while let Some(query) = pager.next_query() {
-        let body = fetch_with_nip98_get_signer(&format!("{base}{query}"), signer)
-            .await
-            .map_err(|e| format!("Failed to fetch whitelist: {e}"))?;
-        pager.absorb(&body)?;
-    }
-    Ok(pager.into_users())
-}
-
 /// Infer a legacy section ID from a channel name for channels that lack a
 /// section tag. Returns an empty string if no match is found.
 fn infer_legacy_section(name: &str) -> String {

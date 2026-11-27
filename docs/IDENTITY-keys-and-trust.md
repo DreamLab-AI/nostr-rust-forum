@@ -1,9 +1,9 @@
 ---
 title: Identity, Keys & Trust — nostr-rust-forum
 doc_id: NRF-IDENTITY
-version: 0.1.3
+version: 0.1.4
 status: draft-for-ratification
-verified_commit: 3c48e26 (trust-level deletion rights, zone keys at rest, and the admin-flag divergence only; pending-keys section keeps 0065dd9; older sections keep their earlier stamps)
+verified_commit: 3d6d557 (ADR-2036 shared AuthStore superseding BbsSigner); 3c48e26 (trust-level deletion rights, zone keys at rest, and the admin-flag divergence only; pending-keys section keeps 0065dd9; older sections keep their earlier stamps)
 sources:
   - crates/nostr-bbs-core/src/keys.rs
   - crates/nostr-bbs-auth-worker/src/devices.rs
@@ -11,7 +11,7 @@ sources:
   - crates/nostr-bbs-relay-worker/src/cron.rs
   - crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs
   - crates/nostr-bbs-auth-worker/src/schema.rs
-  - crates/nostr-bbs-bbs-client/src/signer.rs
+  - crates/nostr-bbs-client-core/src/auth/mod.rs
 date: 2026-08-31
 ---
 
@@ -170,10 +170,11 @@ notification previews are scoped the same way. The decision is recorded in ADR-2
   check includes the static `ADMIN_PUBKEYS`; `isAdmin` from `GET /api/check-whitelist` does
   not (`auth.rs:182-188`, `whitelist.rs:139-141`). A static-only admin's deletion of a sealed
   original is therefore not honoured by clients. Recorded as `known-findings.md` KF-27.
-- **BBS client holds key material directly.** The retro client's `BbsSigner` parses
-  and holds a `SecretKey` (zeroized on drop) rather than delegating to a forum
-  `sign()` seam (`crates/nostr-bbs-bbs-client/src/signer.rs:64,209,224`) — see
-  `BASELINE-architecture.md` for the ADR-105 §2.3 divergence.
+- **BBS client key custody consolidated (ADR-2036).** The retro client's
+  separate `BbsSigner` (ADR-2008) has been deleted; both `nostr-bbs-forum-client`
+  and `nostr-bbs-bbs-client` now share `nostr_bbs_client_core::auth::AuthStore`
+  (`crates/nostr-bbs-client-core/src/auth/mod.rs`), consolidating key handling
+  into a single browser-client implementation.
 
 ## Invariants (must not silently change)
 
