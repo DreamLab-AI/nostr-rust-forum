@@ -26,9 +26,13 @@ use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, resolve_zone_param};
 use crate::utils::back_nav::{is_in_app_entry, restores_scroll, ForumRoute, FORUMS};
 
-/// How long a restore waits for the page to grow tall enough, in 50 ms steps.
+/// How long a restore keeps trying, in 50 ms steps (content arrives late).
 const RESTORE_ATTEMPTS: u32 = 40;
 const RESTORE_STEP_MS: i32 = 50;
+/// Steps the restored position must hold, with the page tall enough, before
+/// the restore stops re-asserting it (the outgoing page can still be in the
+/// DOM for a moment after the route changes).
+const RESTORE_HOLD_STEPS: u32 = 3;
 
 #[derive(Default)]
 struct ScrollState {
@@ -39,6 +43,10 @@ struct ScrollState {
     /// The page being returned to (by a popstate, or by Back going up), whose
     /// saved position is put back when the route reaches it.
     returning_to: Option<String>,
+    /// Between leaving a page and the route reaching the next one, scroll
+    /// events belong to neither (the DOM swap clamps the offset before the
+    /// route change is seen here), so they are not recorded.
+    frozen: bool,
     /// A restore is in progress; scroll events are not recorded meanwhile
     /// (content growing under it would overwrite the target).
     restoring: bool,
@@ -52,7 +60,27 @@ pub struct ScrollMemory {
     state: StoredValue<ScrollState>,
 }
 
+fn scroll_y() -> Option<f64> {
+    web_sys::window().and_then(|w| w.scroll_y().ok())
+}
+
 impl ScrollMemory {
+    /// The member is leaving the current page: keep its offset as it is now,
+    /// before the next page replaces it, and stop recording until the route
+    /// reaches the next page.
+    fn leave(self) {
+        let y = scroll_y();
+        self.state.update_value(|s| {
+            if !s.frozen && !s.restoring {
+                if let Some(y) = y {
+                    let current = s.current.clone();
+                    s.positions.insert(current, y);
+                }
+            }
+            s.frozen = true;
+        });
+    }
+
     /// Restore `path`'s saved position when the route reaches it.
     fn expect_return(self, path: String) {
         self.state.update_value(|s| s.returning_to = Some(path));
@@ -75,12 +103,13 @@ impl ScrollMemory {
         }) else {
             return;
         };
-        self.restore_step(generation, y, 0);
+        self.restore_step(generation, y, 0, 0);
     }
 
-    /// Scroll to `y` once the page is tall enough to hold it, or as far as it
-    /// goes when it never gets there.
-    fn restore_step(self, generation: u32, y: f64, attempt: u32) {
+    /// Put the window at `y` once the page is tall enough to hold it, and
+    /// keep it there until it has held for a few steps; at the deadline, go
+    /// as far as the page allows.
+    fn restore_step(self, generation: u32, y: f64, attempt: u32, held: u32) {
         let delay = if attempt == 0 { 0 } else { RESTORE_STEP_MS };
         crate::utils::set_timeout_once(
             move || {
@@ -91,19 +120,29 @@ impl ScrollMemory {
                     return;
                 };
                 let max = max_scroll(&window);
-                if max + 1.0 < y && attempt < RESTORE_ATTEMPTS {
-                    self.restore_step(generation, y, attempt + 1);
-                    return;
-                }
-                let target = y.min(max.max(0.0));
-                window.scroll_to_with_x_and_y(0.0, target);
-                self.state.try_update_value(|s| {
-                    if s.generation == generation {
-                        s.restoring = false;
-                        let current = s.current.clone();
-                        s.positions.insert(current, target);
+                let last = attempt >= RESTORE_ATTEMPTS;
+                let mut held = held;
+                if max + 1.0 >= y || last {
+                    let target = y.min(max.max(0.0));
+                    let now = window.scroll_y().unwrap_or(0.0);
+                    if (now - target).abs() > 1.0 {
+                        window.scroll_to_with_x_and_y(0.0, target);
+                        held = 0;
+                    } else {
+                        held += 1;
                     }
-                });
+                    if held >= RESTORE_HOLD_STEPS || last {
+                        self.state.try_update_value(|s| {
+                            if s.generation == generation {
+                                s.restoring = false;
+                                let current = s.current.clone();
+                                s.positions.insert(current, target);
+                            }
+                        });
+                        return;
+                    }
+                }
+                self.restore_step(generation, y, attempt + 1, held);
             },
             delay,
         );
@@ -147,21 +186,45 @@ pub fn provide_scroll_memory() -> ScrollMemory {
     }
 
     let on_scroll = window_event_listener(leptos::ev::scroll, move |_| {
-        let Some(y) = web_sys::window().and_then(|w| w.scroll_y().ok()) else {
+        let Some(y) = scroll_y() else {
             return;
         };
         memory.state.update_value(|s| {
-            if !s.restoring {
+            if !s.restoring && !s.frozen {
                 let current = s.current.clone();
                 s.positions.insert(current, y);
             }
         });
     });
+    // The router updates the location from its own popstate listener, but
+    // the DOM is still the outgoing page here: take its offset now.
     let on_pop = window_event_listener(leptos::ev::popstate, move |_| {
+        memory.leave();
         if let Some(pathname) = web_sys::window().and_then(|w| w.location().pathname().ok()) {
             memory.expect_return(current_app_path(&pathname));
         }
     });
+    // An in-app link click: capture phase, so it runs before the router's
+    // own (bubbling) click handler swaps the page.
+    if let Some(window) = web_sys::window() {
+        gloo::events::EventListener::new_with_options(
+            &window,
+            "click",
+            gloo::events::EventListenerOptions::run_in_capture_phase(),
+            move |ev| {
+                let on_link = ev
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                    .and_then(|el| el.closest("a[href]").ok().flatten())
+                    .is_some();
+                if on_link {
+                    memory.leave();
+                }
+            },
+        )
+        // The layout lives as long as the app.
+        .forget();
+    }
     // The member taking over cancels a restore still waiting for content.
     let interrupts = [
         window_event_listener(leptos::ev::wheel, move |_| memory.cancel_restore()),
@@ -176,10 +239,13 @@ pub fn provide_scroll_memory() -> ScrollMemory {
 
     Effect::new(move |_| {
         let path = current_app_path(&location.pathname.get());
-        let saved = memory.state.try_update_value(|s| {
+        let returning = memory.state.try_update_value(|s| {
             s.current = path.clone();
+            s.frozen = false;
             if s.returning_to.take().as_deref() == Some(path.as_str()) {
-                s.positions.get(&path).copied()
+                // Returning: the saved offset, or the top when none is known
+                // (the outgoing page's offset is still applied otherwise).
+                Some(s.positions.get(&path).copied().unwrap_or(0.0))
             } else {
                 // A fresh visit starts at the top (the router scrolls there);
                 // a restore still running for the page left is abandoned.
@@ -190,8 +256,8 @@ pub fn provide_scroll_memory() -> ScrollMemory {
                 None
             }
         });
-        if let Some(Some(y)) = saved {
-            if y > 0.0 && restores_scroll(&path) {
+        if let Some(Some(y)) = returning {
+            if restores_scroll(&path) {
                 memory.restore(y);
             }
         }
@@ -293,6 +359,7 @@ pub fn BackButton() -> impl IntoView {
             target = "/".to_string();
         }
         if let Some(memory) = memory {
+            memory.leave();
             memory.expect_return(target.clone());
         }
         // Replace, so the page left is not "history" for the next Back (a

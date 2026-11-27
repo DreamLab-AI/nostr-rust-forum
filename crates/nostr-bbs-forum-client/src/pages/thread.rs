@@ -850,7 +850,12 @@ pub fn ThreadPage() -> impl IntoView {
             return;
         };
         let root = topic_root.get();
-        let section = crate::utils::slug_hash::section_slug(&ch.id);
+        let param = section_param();
+        let section = if crate::utils::slug_hash::is_section_slug(&param) {
+            param
+        } else {
+            crate::utils::slug_hash::section_slug(&ch.id)
+        };
         let topic = root
             .as_ref()
             .map(|r| crate::utils::slug_hash::topic_slug(&r.id))

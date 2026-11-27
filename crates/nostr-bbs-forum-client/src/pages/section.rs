@@ -234,9 +234,17 @@ pub fn SectionPage() -> impl IntoView {
         let (Some(pk), Some(ch)) = (auth.pubkey().get(), resolved_channel.get()) else {
             return;
         };
-        let slug = crate::utils::slug_hash::section_slug(&ch.id);
+        // Keep the URL's own hashed slug (an index card hashes the section
+        // tag, a section card the channel id); only a legacy plaintext slug is
+        // replaced by the channel-id hash.
+        let param = section_slug();
+        let slug = if crate::utils::slug_hash::is_section_slug(&param) {
+            param
+        } else {
+            crate::utils::slug_hash::section_slug(&ch.id)
+        };
         let name = if ch.name.trim().is_empty() {
-            humanize_section_slug(&section_slug())
+            humanize_section_slug(&slug)
         } else {
             ch.name.clone()
         };
