@@ -21,7 +21,9 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use nostr_bbs_client_core::auth::use_auth;
 use nostr_bbs_client_core::relay::RelayConnection;
-use nostr_bbs_client_core::stores::channels::{roots_key, topic_key, use_channel_store};
+use nostr_bbs_client_core::stores::channels::{
+    roots_key, topic_key, use_channel_store, ChannelStore,
+};
 use nostr_bbs_client_core::stores::custom_emoji::use_custom_emoji_store;
 use nostr_bbs_client_core::stores::mute::use_mute_store;
 use nostr_bbs_client_core::stores::profile_cache::try_use_profile_cache;
@@ -124,14 +126,16 @@ fn main_pane() -> Option<web_sys::HtmlElement> {
 
 /// Page `key`'s list one step (`older`, else newer) keeping the reader's
 /// place: the row on screen before the page lands is where it is after.
+/// Called from click handlers, which have no reactive owner: the store is
+/// passed in, never looked up from context here.
 fn page_keeping_place(
+    store: ChannelStore,
     relay: &RelayConnection,
     key: &str,
     needles: Vec<String>,
     gated: bool,
     older: bool,
 ) {
-    let store = use_channel_store();
     let anchor: Rc<std::cell::RefCell<Option<scroll_anchor::Anchor>>> = Rc::default();
     let before = {
         let anchor = anchor.clone();
@@ -362,7 +366,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                             disabled=move || loading_older.get()
                             on:click=move |_| {
                                 let cid = cid.get_value();
-                                page_keeping_place(&relay, &cid, vec![cid.clone()], gated, true);
+                                page_keeping_place(channels, &relay, &cid, vec![cid.clone()], gated, true);
                             }
                         >
                             {move || if loading_older.get() { "… Loading" } else { "▼ Load older topics" }}
@@ -628,7 +632,14 @@ pub fn ThreadView(
             else {
                 return;
             };
-            page_keeping_place(&relay, &key, vec![root.id.to_lowercase()], gated, older);
+            page_keeping_place(
+                channels,
+                &relay,
+                &key,
+                vec![root.id.to_lowercase()],
+                gated,
+                older,
+            );
         }
     };
     let page_older = page.clone();
@@ -1111,7 +1122,9 @@ fn PostCard(
             class:bbs-post-root=is_root
             class:bbs-post-reply-indent=!is_root
             id=post_anchor_id(&post.id)
-            data-anchor-id=post.id.clone()
+            // Scroll anchor for paging (replies only: the root always
+            // leads, so it never moves when older replies land under it).
+            data-anchor-id=(!is_root).then(|| post.id.clone())
         >
             <header class="bbs-post-header">
                 <div class="tui-row">
@@ -1343,6 +1356,7 @@ fn PostComposer(
     placeholder: &'static str,
     on_sent: Callback<()>,
 ) -> impl IntoView {
+    let router = use_router();
     let auth = use_auth();
     let relay = expect_context::<RelayConnection>();
     let toasts = use_toasts();
@@ -1547,7 +1561,7 @@ fn PostComposer(
                     <button
                         type="button"
                         class="bbs-btn bbs-btn-primary bbs-btn-sm"
-                        on:click=move |_| use_router().go(Route::Settings)
+                        on:click=move |_| router.go(Route::Settings)
                     >"Sign in"</button>
                 </div>
             }.into_any()

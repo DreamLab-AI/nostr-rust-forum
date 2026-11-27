@@ -98,7 +98,7 @@ fn reply_parent(event: &NostrEvent, channel_id_lower: &str) -> Option<String> {
 ///   no reply target other than the channel. This is exactly what
 ///   `category.rs::publish_topic_root` / `section.rs::publish_topic_root` emit,
 ///   and the shape legacy flat-chat root posts already have.
-/// - A **reply** is any kind-42/kind-1111 that has a [`reply_parent`] (a
+/// - A **reply** is any kind-42/kind-1111 that has a reply parent (a
 ///   non-channel referenced event). Replies fold into their parent root,
 ///   bumping its reply count and last-activity.
 ///
