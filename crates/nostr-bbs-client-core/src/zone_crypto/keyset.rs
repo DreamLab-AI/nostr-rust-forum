@@ -284,6 +284,26 @@ pub fn mint_confirmation(plan: &MintPlan) -> Option<String> {
     ))
 }
 
+/// `plan`, refused when it would mint an epoch below the zone's
+/// `history_from_epoch` floor.
+///
+/// A new key goes straight to every member, so minting below the floor would
+/// hand out a key the floor says must never be granted (see
+/// [`super::grantable_keys`]). The epoch choice itself is left to
+/// [`plan_mint`], whose in-use checks stay intact: this does not raise the
+/// epoch to the floor, it explains why nothing is minted.
+pub fn floor_mint(plan: MintPlan, floor: Option<u32>) -> MintPlan {
+    match (plan, floor) {
+        (MintPlan::Mint { epoch, .. }, Some(floor)) if epoch < floor => MintPlan::Blocked(format!(
+            "The next key would be epoch {epoch}, below this zone's history floor (epoch {floor}), \
+             so it could never be granted. Either this device is out of date (sign in on a device \
+             holding epoch {} or later) or history_from_epoch is set too high.",
+            floor.saturating_sub(1).max(1)
+        )),
+        (plan, _) => plan,
+    }
+}
+
 // -- Missing-epoch re-check ----------------------------------------------------
 
 /// Most automatic grant re-checks per `(zone, epoch)` per session.
@@ -336,6 +356,26 @@ pub fn unheld_slots<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_below_the_history_floor_is_never_minted() {
+        let mint = |epoch| MintPlan::Mint {
+            epoch,
+            note: None,
+            higher_seen: None,
+        };
+        // A key-less device would mint epoch 1 under a floor of 5: refused.
+        let blocked = floor_mint(plan_mint("zone3", None, &[], &[], true), Some(5));
+        let MintPlan::Blocked(why) = blocked else {
+            panic!("expected a refusal, got {blocked:?}");
+        };
+        assert!(why.contains("epoch 1") && why.contains("epoch 5"), "{why}");
+        // At or above the floor, or with no floor, the plan is unchanged.
+        assert_eq!(floor_mint(mint(5), Some(5)), mint(5));
+        assert_eq!(floor_mint(mint(6), Some(5)), mint(6));
+        assert_eq!(floor_mint(mint(2), None), mint(2));
+        assert_eq!(floor_mint(MintPlan::Wait, Some(5)), MintPlan::Wait);
+    }
 
     #[test]
     fn minting_waits_for_the_message_sync() {

@@ -195,22 +195,6 @@ async fn fetch_remote(
     Ok(pick(&found, &owner, zone, epoch).cloned())
 }
 
-/// Merge the relay-held backup of `(zone, epoch)` into this device's ledger
-/// (once per session once found). Returns the number of members newly marked
-/// granted; `Err` when the relay could not be asked, in which case the local
-/// ledger stands alone, as before.
-pub async fn pull(
-    relay: &RelayConnection,
-    identity: &dyn Signer,
-    store: ZoneKeyStore,
-    zone: &str,
-    epoch: u32,
-) -> Result<usize, String> {
-    Ok(pull_detailed(relay, identity, store, zone, epoch)
-        .await?
-        .added())
-}
-
 /// What [`pull_detailed`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pulled {
@@ -222,18 +206,11 @@ pub enum Pulled {
     Missing,
 }
 
-impl Pulled {
-    /// Entries newly marked granted.
-    pub fn added(self) -> usize {
-        match self {
-            Pulled::Merged(n) => n,
-            Pulled::Cached | Pulled::Missing => 0,
-        }
-    }
-}
-
-/// [`pull`], saying whether the relay held a backup at all, so a caller can
-/// publish one that is missing (see [`needs_repair`]).
+/// Merge the relay-held backup of `(zone, epoch)` into this device's ledger
+/// (once per session once found), saying whether the relay held a backup at
+/// all, so a caller can publish one that is missing (see [`needs_repair`]).
+/// `Err` when the relay could not be asked or the backup did not open, in
+/// which case the local ledger stands alone.
 pub async fn pull_detailed(
     relay: &RelayConnection,
     identity: &dyn Signer,
@@ -269,6 +246,23 @@ pub async fn pull_detailed(
 /// backup with this device's subset.
 pub fn needs_repair(pulled: Result<Pulled, &str>, local: usize, authed: bool) -> bool {
     authed && matches!(pulled, Ok(Pulled::Missing)) && local > 0
+}
+
+/// Whether a `(zone, epoch)` whose pull came back `pulled` counts as read
+/// for the first-grant gate: this device then knows everything its admin's
+/// backup records, so a member absent from both is genuinely never granted.
+///
+/// `Err` (the relay did not answer, or a backup was found but did not
+/// decrypt) is not read. Neither is "none" answered before NIP-42 AUTH
+/// (`authed` false), which the relay may have said because it withheld the
+/// event (as in [`needs_repair`]). Either way the gate reports the zone as
+/// unverified rather than presenting its members as never granted.
+pub fn backup_verified(pulled: Result<Pulled, &str>, authed: bool) -> bool {
+    match pulled {
+        Ok(Pulled::Cached | Pulled::Merged(_)) => true,
+        Ok(Pulled::Missing) => authed,
+        Err(_) => false,
+    }
 }
 
 thread_local! {
@@ -403,9 +397,10 @@ pub async fn push(
     slot.wait().await
 }
 
-/// Counts acknowledged-and-recorded grants so a caller can wait for a batch.
-/// Acks may arrive before the total is known (the sender is still looping),
-/// so completion needs both the total ([`expect`](Self::expect)) and the acks.
+/// Counts answered grants (accepted and recorded, or refused) so a caller can
+/// wait for a batch. Answers may arrive before the total is known (the sender
+/// is still looping), so completion needs both the total
+/// ([`expect`](Self::expect)) and the answers.
 pub struct AckCounter {
     acked: Cell<usize>,
     expected: Cell<Option<usize>>,
@@ -434,14 +429,15 @@ impl AckCounter {
         self.check();
     }
 
-    /// One grant was acknowledged and recorded.
+    /// One grant was answered: accepted and recorded, or refused.
     pub fn ack(&self) {
         self.acked.set(self.acked.get() + 1);
         self.check();
     }
 
-    /// Wait until every expected acknowledgement arrived, or `ms` elapsed.
-    /// Rejected grants never ack, so the timeout is what ends a partial batch.
+    /// Wait until every expected answer arrived, or `ms` elapsed. A grant the
+    /// relay never answers (or whose answer a reconnect dropped) never acks,
+    /// so the timeout is what ends such a batch.
     pub async fn wait(&self, ms: u32) {
         let late = self.done.clone();
         let _timer = gloo::timers::callback::Timeout::new(ms, move || late.fill(()));
@@ -596,19 +592,28 @@ mod tests {
     }
 
     #[test]
+    fn only_a_backup_actually_read_verifies_the_gate() {
+        assert!(backup_verified(Ok(Pulled::Merged(0)), true));
+        assert!(backup_verified(Ok(Pulled::Merged(4)), false));
+        assert!(backup_verified(Ok(Pulled::Cached), false));
+        // "None" is an answer only once AUTH completed.
+        assert!(backup_verified(Ok(Pulled::Missing), true));
+        assert!(!backup_verified(Ok(Pulled::Missing), false));
+        // A timeout, or a backup that would not decrypt, is not read.
+        assert!(!backup_verified(
+            Err("timed out waiting for the relay"),
+            true
+        ));
+        assert!(!backup_verified(Err("grant backup does not decrypt"), true));
+    }
+
+    #[test]
     fn a_repair_is_attempted_once_per_session() {
         let owner = "f".repeat(64);
         assert!(claim_repair(&owner, "zone2", 5));
         assert!(!claim_repair(&owner, "zone2", 5));
         assert!(claim_repair(&owner, "zone2", 6));
         assert!(claim_repair(&owner, "zone4", 5));
-    }
-
-    #[test]
-    fn pulled_counts_only_merged_entries() {
-        assert_eq!(Pulled::Merged(4).added(), 4);
-        assert_eq!(Pulled::Missing.added(), 0);
-        assert_eq!(Pulled::Cached.added(), 0);
     }
 
     #[test]

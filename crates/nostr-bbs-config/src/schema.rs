@@ -299,9 +299,11 @@ pub struct Zone {
     /// the agent calls — an operator trade-off, made per zone.
     #[serde(default)]
     pub agent_keys: bool,
-    /// Oldest epoch of this zone's key that admin grants may hand out as
-    /// history. Earlier epochs an admin's browser still holds (a previous
-    /// deployment's keys, say) are never sent; the newest held key always is.
+    /// Oldest epoch of this zone's key that admin grants may hand out. Earlier
+    /// epochs an admin's browser still holds (a previous deployment's keys,
+    /// say) are never sent, the newest held key included: a browser whose
+    /// newest key is below the floor grants nothing for the zone and says so,
+    /// and Create / Rotate refuse to mint an epoch below it.
     /// Projected into the client's `ZONE_CONFIG` as `history_from_epoch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_from_epoch: Option<u32>,

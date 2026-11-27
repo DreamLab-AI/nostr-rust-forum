@@ -14,6 +14,7 @@
 //! (`active = 0`) drops out of the disclosure on the next client refresh, so
 //! its authored items stop carrying a badge.
 
+use nostr_bbs_config::ingress::IngressRole;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use worker::{Env, Response, Result};
@@ -63,16 +64,23 @@ fn active_disclosures(rows: Vec<AgentRegistryRow>) -> Vec<AgentDisclosure> {
 ///
 /// Read-time and write-free: nothing is stored, so the entries cannot be lost
 /// to an operator reset of D1. A registry row for the same pubkey **wins** (it
-/// records who actually signed the registration), config only fills gaps. An
-/// entry with no `authorised_by` is left out: the disclosure exists to name the
-/// authorising principal, and an empty one would mislead. Result is ordered by
-/// name, as the SQL `ORDER BY name` already orders the registry rows.
+/// records who actually signed the registration), config only fills gaps.
+///
+/// Only [`IngressRole::Agent`] and [`IngressRole::Copy`] entries are machine
+/// recipients; an [`IngressRole::Primary`] inbox is a person's own key (the
+/// contact form's operator), so it is never disclosed, whatever its
+/// `authorised_by` says. An entry with no `authorised_by` is left out too: the
+/// disclosure exists to name the authorising principal, and an empty one would
+/// mislead. Result is ordered by name, as the SQL `ORDER BY name` already
+/// orders the registry rows.
 fn merge_ingress_disclosures(
     mut disclosed: Vec<AgentDisclosure>,
     ingress: &[nostr_bbs_config::ingress::IngressRecipient],
 ) -> Vec<AgentDisclosure> {
     for entry in ingress {
-        if entry.authorised_by.is_empty() {
+        if !matches!(entry.role, IngressRole::Agent | IngressRole::Copy)
+            || entry.authorised_by.is_empty()
+        {
             continue;
         }
         if disclosed
@@ -96,8 +104,8 @@ fn merge_ingress_disclosures(
 ///
 /// Lists the active agent set for the disclosure badge. No auth: the response
 /// carries public disclosure fields, for agents the relay currently treats
-/// as active plus any config-declared ingress recipient that names an
-/// authorising principal (see [`merge_ingress_disclosures`]).
+/// as active plus any config-declared agent or copy ingress recipient that
+/// names an authorising principal (see [`merge_ingress_disclosures`]).
 pub async fn handle_agent_disclosure(env: &Env) -> Result<Response> {
     let db = env.d1("DB")?;
     let result = db
@@ -210,13 +218,69 @@ mod tests {
         pubkey: &str,
         authorised_by: &str,
     ) -> nostr_bbs_config::ingress::IngressRecipient {
+        declared_as(label, pubkey, authorised_by, IngressRole::Copy)
+    }
+
+    fn declared_as(
+        label: &str,
+        pubkey: &str,
+        authorised_by: &str,
+        role: IngressRole,
+    ) -> nostr_bbs_config::ingress::IngressRecipient {
         nostr_bbs_config::ingress::IngressRecipient {
             label: label.into(),
             pubkey: pubkey.into(),
-            role: nostr_bbs_config::ingress::IngressRole::Copy,
+            role,
             description: String::new(),
             authorised_by: authorised_by.into(),
         }
+    }
+
+    #[test]
+    fn primary_inbox_is_a_person_and_never_disclosed() {
+        // The contact-form inbox is the operator's own key: a principal on it
+        // must not turn their posts into "AGENT" posts.
+        let out = merge_ingress_disclosures(
+            vec![],
+            &[declared_as(
+                "contact-inbox",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                IngressRole::Primary,
+            )],
+        );
+        assert!(out.is_empty(), "primary inbox disclosed: {out:?}");
+    }
+
+    #[test]
+    fn agent_and_copy_recipients_are_disclosed() {
+        let out = merge_ingress_disclosures(
+            vec![],
+            &[
+                declared_as(
+                    "assistant",
+                    &"a".repeat(64),
+                    &"b".repeat(64),
+                    IngressRole::Agent,
+                ),
+                declared_as(
+                    "monitor",
+                    &"c".repeat(64),
+                    &"b".repeat(64),
+                    IngressRole::Copy,
+                ),
+                declared_as(
+                    "inbox",
+                    &"d".repeat(64),
+                    &"b".repeat(64),
+                    IngressRole::Primary,
+                ),
+            ],
+        );
+        assert_eq!(
+            out.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["assistant", "monitor"]
+        );
     }
 
     #[test]

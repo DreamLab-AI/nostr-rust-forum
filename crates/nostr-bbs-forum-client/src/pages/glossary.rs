@@ -214,6 +214,38 @@ pub fn GlossaryPage() -> impl IntoView {
                          — that an area or event can be shared with."
                     </p>
                 </Entry>
+
+                // Wording taken from the interface itself (breadcrumbs, the
+                // Forums, zone, section and topic pages); keep it in step.
+                <Entry id="reporting" title="Finding your way around and reporting a problem">
+                    <p>
+                        "The breadcrumb at the top of a page usually reads Home › Forums › zone › \
+                         section › topic (if you can reach only one zone, there is no Forums \
+                         step). A "
+                        <em>"zone"</em>
+                        " is a large area; it holds "
+                        <em>"sections"</em>
+                        " (the Forums page sometimes calls these categories or channels); a \
+                         section holds "
+                        <em>"topics"</em>
+                        "."
+                    </p>
+                    <ul class="list-disc pl-5 space-y-1">
+                        <li><em>"Post"</em>": any message in a topic; the first line of the first post is the topic's title."</li>
+                        <li><em>"Reply"</em>": a post answering the topic or another post."</li>
+                        <li><em>"Notification"</em>": an alert under the bell, for example a reply or a mention."</li>
+                        <li><em>"DM"</em>": a private direct message between members."</li>
+                    </ul>
+                    <p>
+                        "Your build version is under Settings, in About; the button beside it \
+                         copies it."
+                    </p>
+                    <p class="text-gray-400">
+                        "When reporting a problem, please include: the build version; your device \
+                         and browser, or the installed app; the page's breadcrumb; what you tapped; \
+                         and what you expected to happen."
+                    </p>
+                </Entry>
             </div>
 
             <div class="mt-10 text-center">

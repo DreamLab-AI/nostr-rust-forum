@@ -302,6 +302,42 @@ pub fn TopicList(
     }
 }
 
+/// Narrow screens (below `sm`) restack the row: the left column takes the
+/// whole width, the title may wrap to two lines, and the byline reads
+/// `last by {name} {pill} • N replies • {time} ago`; the right-hand column
+/// (activity over "started by") is hidden. From `sm` up the two-column layout
+/// is unchanged. Literal class strings, so the Tailwind scan sees them.
+///
+/// The row under a topic title. One non-wrapping flex row, so an agent pill
+/// never makes a row taller than one without.
+const BYLINE_ROW_CLASS: &str =
+    "flex flex-nowrap items-center gap-2 mt-1 text-xs text-gray-500 min-w-0";
+/// "last by", name and pill: the part of the byline that gives way.
+const LAST_BY_CLASS: &str =
+    "flex flex-1 items-center gap-1 min-w-0 overflow-hidden whitespace-nowrap";
+/// The "last by" words never shrink.
+const LAST_BY_LABEL_CLASS: &str = "flex-shrink-0";
+/// The last poster's name truncates, but only once the pill has given way.
+const LAST_BY_NAME_CLASS: &str = "text-gray-400 min-w-0 truncate";
+/// Wrapper of the agent pill (`AgentBadge` renders `<span title><Badge/></span>`
+/// plus a copy glyph). It shrinks a hundred times faster than the name, so it
+/// truncates first. The pill's text sits in an `inline-flex` span, where
+/// `text-overflow` does nothing, so its span becomes a truncating block; the
+/// copy glyph keeps its size.
+const LAST_BY_PILL_CLASS: &str = "flex items-center gap-1 min-w-0 shrink-[100] overflow-hidden \
+     [&>span]:min-w-0 [&>span>span]:block [&>span>span]:truncate [&>button]:flex-shrink-0";
+/// The topic title: up to two lines on a phone, one from `sm`.
+const TITLE_CLASS: &str = "font-semibold text-white group-hover:text-amber-400 \
+     transition-colors line-clamp-2 sm:line-clamp-1";
+/// `• {time} ago` inside the byline, on a phone only (from `sm` the time is
+/// in the right-hand column).
+const BYLINE_ACTIVITY_CLASS: &str = "flex-shrink-0 whitespace-nowrap sm:hidden";
+/// The right-hand column (activity over "started by"): hidden below `sm`,
+/// where "started by" is the least useful field.
+const RIGHT_COLUMN_CLASS: &str = "hidden sm:block flex-shrink-0 text-right text-xs text-gray-500";
+/// The reply count keeps its width.
+const REPLIES_CLASS: &str = "flex items-center gap-1 flex-shrink-0 whitespace-nowrap";
+
 /// A single topic row: title line, latest participant, reply count,
 /// last-activity.
 ///
@@ -342,25 +378,31 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
                     <Avatar pubkey=pk size=AvatarSize::Md />
                 </div>
                 <div class="flex-1 min-w-0">
-                    <h3 class="font-semibold text-white group-hover:text-amber-400 transition-colors line-clamp-1">
+                    <h3 class=TITLE_CLASS>
                         <A href=href attr:class="no-underline text-inherit after:absolute after:inset-0 after:rounded-lg">
                             {title}
                         </A>
                     </h3>
-                    <div class="flex items-center gap-2 mt-1 text-xs text-gray-500 flex-wrap">
-                        <span>"last by "</span>
-                        <span class="text-gray-400"><KeyName pubkey=last_pk key_class="relative z-10 font-mono" /></span>
-                        <AgentBadge pubkey=last_badge_pubkey compact=true />
-                        <span class="text-gray-700">"\u{2022}"</span>
-                        <span class="flex items-center gap-1">
+                    <div class=BYLINE_ROW_CLASS>
+                        <span class=LAST_BY_CLASS>
+                            <span class=LAST_BY_LABEL_CLASS>"last by"</span>
+                            <span class=LAST_BY_NAME_CLASS><KeyName pubkey=last_pk key_class="relative z-10 font-mono" /></span>
+                            <span class=LAST_BY_PILL_CLASS><AgentBadge pubkey=last_badge_pubkey compact=true /></span>
+                        </span>
+                        <span class="text-gray-700 flex-shrink-0">"\u{2022}"</span>
+                        <span class=REPLIES_CLASS>
                             <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
                             {reply_label}
                         </span>
+                        <span class=BYLINE_ACTIVITY_CLASS>
+                            <span class="text-gray-700">"\u{2022} "</span>
+                            {activity.clone()}
+                        </span>
                     </div>
                 </div>
-                <div class="flex-shrink-0 text-right text-xs text-gray-500">
+                <div class=RIGHT_COLUMN_CLASS>
                     <div class="flex items-center gap-1 justify-end">
                         <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <circle cx="12" cy="12" r="10"/>
@@ -406,6 +448,52 @@ fn topic_title(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn classes(c: &str) -> Vec<&str> {
+        c.split_whitespace().collect()
+    }
+
+    #[test]
+    fn byline_is_one_row_that_never_wraps() {
+        // At 390 px a wrapping byline put "last by", the name, the agent pill,
+        // its glyph and the dot on separate lines. One non-wrapping row whose
+        // children may shrink keeps a badged row as tall as an unbadged one.
+        let row = classes(BYLINE_ROW_CLASS);
+        assert!(row.contains(&"flex") && row.contains(&"flex-nowrap"));
+        assert!(!row.contains(&"flex-wrap"));
+        assert!(row.contains(&"min-w-0"));
+        let who = classes(LAST_BY_CLASS);
+        assert!(who.contains(&"min-w-0") && who.contains(&"overflow-hidden"));
+        assert!(classes(LAST_BY_LABEL_CLASS).contains(&"flex-shrink-0"));
+        assert!(classes(LAST_BY_NAME_CLASS).contains(&"truncate"));
+        let pill = classes(LAST_BY_PILL_CLASS);
+        assert!(pill.contains(&"min-w-0") && pill.contains(&"overflow-hidden"));
+        // The pill's text sits in an inline-flex span, where `text-overflow`
+        // does nothing: the wrapper turns that span into a truncating block.
+        assert!(pill.contains(&"[&>span>span]:truncate"));
+        assert!(classes(REPLIES_CLASS).contains(&"flex-shrink-0"));
+    }
+
+    #[test]
+    fn narrow_rows_restack_into_the_left_column() {
+        // Staging at 390 px: the right-hand column kept its full width and
+        // crushed the byline to "la". Below `sm` the left column takes the
+        // whole row; from `sm` up the two-column layout stays.
+        let right = classes(RIGHT_COLUMN_CLASS);
+        assert!(right.contains(&"hidden") && right.contains(&"sm:block"));
+        // Title: up to two lines on a phone, one line from `sm`.
+        let title = classes(TITLE_CLASS);
+        assert!(title.contains(&"line-clamp-2") && title.contains(&"sm:line-clamp-1"));
+        assert!(!title.contains(&"line-clamp-1"));
+        // The activity time moves into the byline on a phone only.
+        let time = classes(BYLINE_ACTIVITY_CLASS);
+        assert!(time.contains(&"sm:hidden") && time.contains(&"flex-shrink-0"));
+        assert!(time.contains(&"whitespace-nowrap"));
+        // The agent pill gives way long before the name does.
+        assert!(classes(LAST_BY_PILL_CLASS).contains(&"shrink-[100]"));
+        assert!(!classes(LAST_BY_NAME_CLASS).contains(&"shrink-[100]"));
+        assert!(classes(LAST_BY_CLASS).contains(&"flex-1"));
+    }
 
     fn ev(
         id: &str,

@@ -44,8 +44,9 @@ use serde::{Deserialize, Serialize};
 /// Longest accepted [`IngressRecipient::label`].
 pub const MAX_LABEL_LEN: usize = 64;
 
-/// What an ingress recipient is for. Informational: it does not change how the
-/// relay admits wraps, only how the entry is described to operators.
+/// What an ingress recipient is for. It does not change how the relay admits
+/// wraps; it decides how the entry is described to operators and whether the
+/// public agent disclosure lists it (`Agent` and `Copy` only, never `Primary`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IngressRole {
@@ -72,8 +73,10 @@ pub struct IngressRecipient {
     #[serde(default, skip_serializing)]
     pub description: String,
     /// Pubkey of the principal who authorised this recipient: 64 hex characters,
-    /// or empty. When set, the public agent disclosure names it as the
-    /// registering principal; when empty the entry is not disclosed.
+    /// or empty. When set on an [`IngressRole::Agent`] or [`IngressRole::Copy`]
+    /// entry, the public agent disclosure names it as the registering
+    /// principal; when empty, or on an [`IngressRole::Primary`] inbox (a
+    /// person's own key), the entry is not disclosed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub authorised_by: String,
 }

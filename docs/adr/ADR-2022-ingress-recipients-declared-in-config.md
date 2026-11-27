@@ -46,8 +46,10 @@ places, and a second recipient (for example a monitoring key that reads a copy) 
    against the whitelist exactly as before.
 4. `GET /api/check-whitelist` adds `ingressRecipient` (boolean). It does not change `isWhitelisted`
    or the access flags.
-5. `GET /api/agents/disclosure` merges entries that have an `authorised_by`, at read time, with no writes.
-   A registry row for the same pubkey wins.
+5. `GET /api/agents/disclosure` merges `agent` and `copy` entries that have an `authorised_by`, at read
+   time, with no writes. A `primary` inbox is a person's own key and is never disclosed (amended
+   2026-11-26: the contact-form inbox had badged the admin's posts as an agent's). A registry row for
+   the same pubkey wins.
 
 ## Consequences
 

@@ -106,6 +106,19 @@ const BASE_CLASS: &str = "copy-key inline p-0 m-0 border-0 bg-transparent text-i
 /// The glyph an icon-only [`CopyKey`] shows at rest.
 const ICON_GLYPH: &str = "\u{29c9}";
 
+/// What a [`CopyKey`] copies unless told otherwise.
+pub const DEFAULT_WHAT: &str = "public key";
+
+/// The accessible label of a [`CopyKey`]: `Copy {what} {display}`, where
+/// `what` defaults to [`DEFAULT_WHAT`].
+pub fn copy_aria_label(what: Option<&str>, display: &str) -> String {
+    let what = what
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .unwrap_or(DEFAULT_WHAT);
+    format!("Copy {what} {display}")
+}
+
 /// An abridged public key that copies the full key when clicked.
 ///
 /// Renders a `<button type="button">` that looks like the inline text it
@@ -133,12 +146,17 @@ pub fn CopyKey(
     /// autocomplete must not blur the textarea and close the dropdown).
     #[prop(optional)]
     keep_focus: bool,
+    /// What is being copied, for the accessible label. Defaults to
+    /// [`DEFAULT_WHAT`] ("public key"); pass e.g. `"build version"` when the
+    /// button copies something that is not a key.
+    #[prop(optional, into)]
+    what: Option<String>,
 ) -> impl IntoView {
     let display = display.unwrap_or_else(|| shorten_pubkey(&full));
     let feedback = RwSignal::new(CopyFeedback::default());
 
     let title = format!("Click to copy {full}");
-    let aria_label = format!("Copy public key {display}");
+    let aria_label = copy_aria_label(what.as_deref(), &display);
     let idle_text = if icon {
         ICON_GLYPH.to_string()
     } else {
@@ -270,6 +288,17 @@ pub fn KeyedTextView(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aria_label_names_what_is_copied() {
+        assert_eq!(copy_aria_label(None, "ab…cd"), "Copy public key ab…cd");
+        assert_eq!(
+            copy_aria_label(Some("build version"), "Build 2026.11.26 (c25b301)"),
+            "Copy build version Build 2026.11.26 (c25b301)"
+        );
+        // A blank `what` falls back rather than reading "Copy  …".
+        assert_eq!(copy_aria_label(Some("  "), "x"), "Copy public key x");
+    }
 
     impl CopyFeedback {
         fn state(&self) -> CopyState {
