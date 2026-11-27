@@ -56,6 +56,11 @@ const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 /// 100-notification visible cap; the oldest id is evicted first on overflow
 /// ([`SeenIds`]).
 const MAX_SEEN_IDS: usize = 2_000;
+/// Cap on each persisted list of already-announced section and member ids
+/// ([`SyncState::announced_channels`], [`SyncState::announced_members`]). Sections
+/// and joins are rare next to posts, so this is generous; the oldest id is
+/// evicted first on overflow.
+const MAX_ANNOUNCED_IDS: usize = 1_000;
 
 // -- Types --------------------------------------------------------------------
 
@@ -160,6 +165,15 @@ struct SyncState {
     baseline: u64,
     #[serde(default)]
     notified_ids: Vec<String>,
+    /// Section (kind-40) ids already turned into a "New section" notice,
+    /// persisted so clearing the visible list does not bring the notice back
+    /// on the next load. Absent in state stored by older builds.
+    #[serde(default)]
+    announced_channels: Vec<String>,
+    /// Member pubkeys already turned into a "New member" notice (admins only),
+    /// persisted for the same reason. Absent in state stored by older builds.
+    #[serde(default)]
+    announced_members: Vec<String>,
 }
 
 /// Insertion-ordered, capacity-bounded set of already-handled event ids.
@@ -250,6 +264,12 @@ pub struct NotificationStoreV2 {
     /// from the persisted [`SyncState::notified_ids`] on construction so dedup
     /// survives reloads and 7-day item eviction.
     seen_messages: RwSignal<SeenIds>,
+    /// Section ids already announced, seeded from and persisted to
+    /// [`SyncState::announced_channels`].
+    announced_channels: RwSignal<SeenIds>,
+    /// Member pubkeys already announced, seeded from and persisted to
+    /// [`SyncState::announced_members`].
+    announced_members: RwSignal<SeenIds>,
 }
 
 impl NotificationStoreV2 {
@@ -264,6 +284,8 @@ impl NotificationStoreV2 {
             owner: RwSignal::new(None),
             seen_channels: RwSignal::new(HashSet::new()),
             seen_messages: RwSignal::new(SeenIds::with_cap(MAX_SEEN_IDS)),
+            announced_channels: RwSignal::new(SeenIds::with_cap(MAX_ANNOUNCED_IDS)),
+            announced_members: RwSignal::new(SeenIds::with_cap(MAX_ANNOUNCED_IDS)),
         }
     }
 
@@ -541,6 +563,14 @@ impl NotificationStoreV2 {
                 state.notified_ids.iter().cloned(),
                 MAX_SEEN_IDS,
             ));
+            store.announced_channels.set(SeenIds::from_ids(
+                state.announced_channels.iter().cloned(),
+                MAX_ANNOUNCED_IDS,
+            ));
+            store.announced_members.set(SeenIds::from_ids(
+                state.announced_members.iter().cloned(),
+                MAX_ANNOUNCED_IDS,
+            ));
             // The visible list is per-account too: swap in this owner's own.
             store.items.set(load_from_storage(&owner_for_items));
             known_profiles.set(HashSet::new());
@@ -577,6 +607,17 @@ impl NotificationStoreV2 {
                 if c.created_at <= baseline {
                     continue;
                 }
+                // A section already announced, even if its notice was cleared
+                // or evicted since, never comes back.
+                let announced = store.announced_channels.get_untracked();
+                if !notice_due(
+                    &store.items.get_untracked(),
+                    &announced,
+                    &c.id,
+                    TOPIC_NOTICE_PREFIX,
+                ) {
+                    continue;
+                }
                 let name = if c.name.is_empty() {
                     "a new section".to_string()
                 } else {
@@ -589,10 +630,18 @@ impl NotificationStoreV2 {
                     Some(&format!("/chat/{}", c.id)),
                     Origin {
                         timestamp: c.created_at,
-                        dedup_id: Some(format!("topic:{}", c.id)),
+                        dedup_id: Some(format!("{TOPIC_NOTICE_PREFIX}{}", c.id)),
                         key: None,
                     },
                 );
+                // Burn the id only if the level let the notice through, as for
+                // posts: raising the level later must still announce it.
+                if notification_kind_allowed(&NotificationKind::Message) {
+                    store.announced_channels.update(|s| {
+                        s.insert(c.id.clone());
+                    });
+                    store.persist_sync_state();
+                }
             }
         });
 
@@ -847,6 +896,17 @@ impl NotificationStoreV2 {
                     known_profiles.update(|s| {
                         s.insert(pk.clone());
                     });
+                    // Announced before (and since cleared or evicted): never
+                    // again, across reloads.
+                    let announced = store.announced_members.get_untracked();
+                    if !notice_due(
+                        &store.items.get_untracked(),
+                        &announced,
+                        pk,
+                        JOIN_NOTICE_PREFIX,
+                    ) {
+                        continue;
+                    }
                     let label = entry.best_label().unwrap_or_else(|| shorten_pubkey(pk));
                     store.add_at(
                         NotificationKind::JoinRequest,
@@ -855,10 +915,16 @@ impl NotificationStoreV2 {
                         Some("/admin"),
                         Origin {
                             timestamp: entry.fetched_at,
-                            dedup_id: Some(format!("join:{}", pk)),
+                            dedup_id: Some(format!("{JOIN_NOTICE_PREFIX}{pk}")),
                             key: Some(pubkey_ref(pk)),
                         },
                     );
+                    if notification_kind_allowed(&NotificationKind::JoinRequest) {
+                        store.announced_members.update(|s| {
+                            s.insert(pk.clone());
+                        });
+                        store.persist_sync_state();
+                    }
                 }
             });
         }
@@ -920,6 +986,8 @@ impl NotificationStoreV2 {
         let state = SyncState {
             baseline: self.baseline.get_untracked(),
             notified_ids: self.seen_messages.with_untracked(|s| s.ids()),
+            announced_channels: self.announced_channels.with_untracked(|s| s.ids()),
+            announced_members: self.announced_members.with_untracked(|s| s.ids()),
         };
         let _ = LocalStorage::set(sync_state_key(&owner), state);
     }
@@ -1067,6 +1135,24 @@ fn system_tag(kind: &NotificationKind) -> &'static str {
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
+}
+
+/// Id prefix of "New section" notices (`topic:<channel id>`).
+const TOPIC_NOTICE_PREFIX: &str = "topic:";
+/// Id prefix of admin "New member" notices (`join:<pubkey>`).
+const JOIN_NOTICE_PREFIX: &str = "join:";
+
+/// Whether the section or member `subject` still needs a notice.
+///
+/// False when its notice (`prefix` + `subject`) is in the visible list, or when
+/// `announced` — persisted across reloads — already holds it. The persisted set
+/// is what keeps a cleared or 7-day-evicted notice from being announced again.
+fn notice_due(items: &[Notification], announced: &SeenIds, subject: &str, prefix: &str) -> bool {
+    if announced.contains(subject) {
+        return false;
+    }
+    let id = format!("{prefix}{subject}");
+    !items.iter().any(|n| n.id == id)
 }
 
 /// Compute the per-pubkey localStorage key for the producer sync state.
@@ -1807,11 +1893,15 @@ mod tests {
         let state = SyncState {
             baseline: 1_700_000_000,
             notified_ids: vec!["a".into(), "b".into(), "c".into()],
+            announced_channels: vec!["chan".into()],
+            announced_members: vec!["member".into()],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: SyncState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.baseline, state.baseline);
         assert_eq!(back.notified_ids, state.notified_ids);
+        assert_eq!(back.announced_channels, state.announced_channels);
+        assert_eq!(back.announced_members, state.announced_members);
     }
 
     #[test]
@@ -1835,5 +1925,85 @@ mod tests {
         let back: SyncState = serde_json::from_str(r#"{"baseline":42}"#).unwrap();
         assert_eq!(back.baseline, 42);
         assert!(back.notified_ids.is_empty());
+    }
+
+    // -- Cleared section / member notices stay cleared -------------------------
+
+    fn notice(id: &str) -> Notification {
+        Notification {
+            id: id.to_string(),
+            kind: NotificationKind::Message,
+            title: String::new(),
+            body: String::new(),
+            timestamp: 1,
+            read: false,
+            link: None,
+            key: None,
+            preview_safe: true,
+        }
+    }
+
+    #[test]
+    fn cleared_section_and_member_notices_do_not_return_after_a_reload() {
+        // Session one: both notices are announced and recorded.
+        let mut channels = SeenIds::with_cap(MAX_ANNOUNCED_IDS);
+        let mut members = SeenIds::with_cap(MAX_ANNOUNCED_IDS);
+        let mut items = vec![notice("topic:chan-1"), notice("join:member-1")];
+        channels.insert("chan-1".into());
+        members.insert("member-1".into());
+        let stored = serde_json::to_string(&SyncState {
+            baseline: 5,
+            notified_ids: Vec::new(),
+            announced_channels: channels.ids(),
+            announced_members: members.ids(),
+        })
+        .unwrap();
+
+        // The member presses "Clear" (visible list only), then reloads: the
+        // list is empty and the dedup sets are rebuilt from the stored state.
+        items.clear();
+        let state: SyncState = serde_json::from_str(&stored).unwrap();
+        let channels = SeenIds::from_ids(state.announced_channels, MAX_ANNOUNCED_IDS);
+        let members = SeenIds::from_ids(state.announced_members, MAX_ANNOUNCED_IDS);
+
+        assert!(
+            !notice_due(&items, &channels, "chan-1", "topic:"),
+            "a cleared section notice must stay cleared"
+        );
+        assert!(
+            !notice_due(&items, &members, "member-1", "join:"),
+            "a cleared member notice must stay cleared"
+        );
+        // A different section / member is still announced.
+        assert!(notice_due(&items, &channels, "chan-2", "topic:"));
+        assert!(notice_due(&items, &members, "member-2", "join:"));
+    }
+
+    #[test]
+    fn a_notice_in_the_visible_list_is_never_due_again() {
+        let items = vec![notice("topic:chan-1")];
+        let seen = SeenIds::with_cap(MAX_ANNOUNCED_IDS);
+        assert!(!notice_due(&items, &seen, "chan-1", "topic:"));
+    }
+
+    #[test]
+    fn announced_ids_are_bounded_oldest_first() {
+        let mut seen = SeenIds::with_cap(MAX_ANNOUNCED_IDS);
+        for n in 0..(MAX_ANNOUNCED_IDS + 10) {
+            seen.insert(format!("c{n}"));
+        }
+        assert_eq!(seen.ids().len(), MAX_ANNOUNCED_IDS);
+        assert!(!seen.contains("c0"));
+        assert!(seen.contains(&format!("c{}", MAX_ANNOUNCED_IDS + 9)));
+    }
+
+    #[test]
+    fn a_legacy_sync_state_without_announced_lists_still_loads() {
+        let back: SyncState =
+            serde_json::from_str(r#"{"baseline":7,"notified_ids":["x"]}"#).unwrap();
+        assert_eq!(back.baseline, 7);
+        assert_eq!(back.notified_ids, vec!["x".to_string()]);
+        assert!(back.announced_channels.is_empty());
+        assert!(back.announced_members.is_empty());
     }
 }

@@ -1044,6 +1044,37 @@ pub fn ThreadPage() -> impl IntoView {
                 }
             }}
 
+            // Topic heading: the breadcrumb alone is small grey text, so the
+            // topic title and its section are repeated here, large and
+            // wrapping, where a member looks first. While the topic is still
+            // loading the title slot shows a muted placeholder instead of the
+            // stand-in "Topic" the breadcrumb falls back to.
+            {move || {
+                // `try_with`: see the breadcrumb above.
+                let loaded = topic_root.try_with(Option::is_some)?;
+                let title = if loaded {
+                    view! { <h1 class="topic-heading-title">{topic_title()}</h1> }.into_any()
+                } else {
+                    view! {
+                        <h1 class="topic-heading-title topic-heading-placeholder">
+                            "Loading topic\u{2026}"
+                        </h1>
+                    }
+                    .into_any()
+                };
+                Some(view! {
+                    <header class="topic-heading">
+                        {title}
+                        <p class="topic-heading-section">
+                            "In section "
+                            <A href=base_href(&section_href()) attr:class="za-hover-text">
+                                {section_name()}
+                            </A>
+                        </p>
+                    </header>
+                })
+            }}
+
             // `try_*` in the nested closures below: Leptos 0.7 drops them a
             // task hop after the route disposed this page, and a store write
             // in between re-runs them (see `history_loader::read_cursor`).
