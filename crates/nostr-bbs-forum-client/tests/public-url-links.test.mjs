@@ -90,3 +90,27 @@ test('only marked, relative hrefs change; everything else is byte-identical', ()
     source.replaceAll(' data-public-url', '').replace(/\n*$/, '\n')
   );
 });
+
+// The retro BBS client shares this hook (its Trunk.toml runs this script):
+// its manifest and touch-icon links resolve under /community/bbs/.
+const bbsCrate = path.join(crate, '..', 'nostr-bbs-bbs-client');
+const bbsSource = fs.readFileSync(path.join(bbsCrate, 'index.html'), 'utf8');
+
+test('the BBS marks its manifest and touch icon and runs this hook', () => {
+  for (const rel of ['manifest', 'apple-touch-icon']) {
+    assert.match(bbsSource, new RegExp(`<link rel="${rel}" href="[^"]*"[^>]* data-public-url`), rel);
+  }
+  const trunk = fs.readFileSync(path.join(bbsCrate, 'Trunk.toml'), 'utf8');
+  assert.match(trunk, /stage = "post_build"\s*\ncommand = "bash"\s*\ncommand_arguments = \["\.\.\/nostr-bbs-forum-client\/tools\/public-url-links\.sh"\]/);
+});
+
+test('the BBS public URL prefixes its marked hrefs and leaves the rest alone', () => {
+  const out = run('/community/bbs/', bbsSource);
+  assert.equal(hrefOf(out, 'manifest'), '/community/bbs/manifest.webmanifest');
+  assert.equal(hrefOf(out, 'apple-touch-icon'), '/community/bbs/icons/icon-192.png');
+  assert.doesNotMatch(out, /data-public-url/);
+  assert.equal(
+    out.replaceAll('href="/community/bbs/', 'href="'),
+    bbsSource.replaceAll(' data-public-url', '').replace(/\n*$/, '\n')
+  );
+});

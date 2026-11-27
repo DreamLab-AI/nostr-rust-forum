@@ -23,11 +23,16 @@
     <link data-trunk rel="copy-file" href="manifest.webmanifest" />
     <link data-trunk rel="copy-dir" href="assets/icons" />
     <link data-trunk rel="copy-file" href="bbs-sw.js" />
-    <link rel="manifest" href="manifest.webmanifest" />
+    <!-- The manifest and touch-icon links carry a marker attribute: the
+         forum's post_build hook (see Trunk.toml) prefixes their relative
+         hrefs with the public URL, so they resolve to /community/bbs/… even
+         when the page is opened as /community/bbs (no trailing slash), where
+         a relative href would point at /community/. -->
+    <link rel="manifest" href="manifest.webmanifest" data-public-url />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="BBS" />
-    <link rel="apple-touch-icon" href="icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="icons/icon-192.png" data-public-url />
 
     <!-- Branding is injected by the host site into window.__ENV__ (THEME,
          NODE_NAME, LOCATION, BANNER_URL, RELAY_URL, ZONE_CONFIG, etc.).
