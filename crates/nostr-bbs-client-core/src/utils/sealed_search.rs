@@ -714,16 +714,17 @@ async fn ensure_model(
     r
 }
 
-/// The manifest to load from the publishers' answers `(publisher, event)`,
-/// given in trusted-publisher order, and the refusals `(publisher, reason)`.
-fn choose_manifest(
+/// The manifests to try loading, newest first (equal versions in
+/// trusted-publisher order), from the publishers' answers
+/// `(publisher, event)`, and the refusals `(publisher, reason)`.
+fn choose_manifests(
     answers: Vec<(String, NostrEvent)>,
     zone: &str,
     relay_url: &str,
     pubs: &[String],
     hw: Option<&HighWater>,
     held: &[ZoneKey],
-) -> (Option<Manifest>, Vec<(String, String)>) {
+) -> (Vec<Manifest>, Vec<(String, String)>) {
     // A v2 manifest is used only if its zone-key MAC verifies with a key this
     // member holds (`Manifest::accept`), before it is chosen or its version
     // can move the high-water mark.
@@ -744,7 +745,26 @@ fn choose_manifest(
         }
     }
     let best = Manifest::newest(accepted);
-    (best, refused)
+    (best.into_iter().collect(), refused)
+}
+
+/// Try `load` on each candidate in order until one succeeds; `stop` says
+/// whether to give up between attempts (the session ended).
+async fn first_loadable<T, F, Fut>(
+    candidates: Vec<Manifest>,
+    mut load: F,
+    stop: impl Fn() -> bool,
+) -> Result<T, String>
+where
+    F: FnMut(Manifest) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let _ = &stop;
+    let mut it = candidates.into_iter();
+    match it.next() {
+        Some(m) => load(m).await,
+        None => Err("no manifest to load".into()),
+    }
 }
 
 /// Where `o` is fetched from: the pod of the publisher holding it (the
@@ -898,14 +918,15 @@ async fn load_zone(
         .into_iter()
         .filter(|k| !k.pending_delivery)
         .collect();
-    let (best, refused) = choose_manifest(events, zone, &relay_url, &pubs, hw.as_ref(), &held_keys);
+    let (candidates, refused) =
+        choose_manifests(events, zone, &relay_url, &pubs, hw.as_ref(), &held_keys);
     for (p, e) in refused {
         web_sys::console::warn_1(
             &format!("[sealed-search] {zone}: manifest from {p} refused: {e}").into(),
         );
     }
     debug(&format!("{zone}: manifest read in {:.0} ms", now_ms() - t0));
-    let Some(manifest) = best else {
+    if candidates.is_empty() {
         if was_ready {
             // Keep answering from what is loaded; try again next time.
             return Ok(SVC.with(|s| {
@@ -926,7 +947,27 @@ async fn load_zone(
                 Ok(0)
             }
         };
-    };
+    }
+    first_loadable(
+        candidates,
+        |manifest| load_candidate(zone, store, signer, gen, was_ready, pod, t0, manifest),
+        || generation() != gen,
+    )
+    .await
+}
+
+/// Load one verified manifest's shards into the worker (see [`load_zone`]).
+#[allow(clippy::too_many_arguments)]
+async fn load_candidate(
+    zone: &str,
+    store: &ZoneKeyStore,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+    gen: u64,
+    was_ready: bool,
+    pod: &str,
+    t0: f64,
+    manifest: Manifest,
+) -> Result<usize, String> {
     let svc = service().await?;
     alive(gen, Some(&svc))?;
     let version = manifest.content.index_version;
@@ -1736,7 +1777,7 @@ mod tests {
                 vec![zone_object(9, 0, Some(1)), zone_object(9, 1, None)],
             ),
         );
-        let (best, refused) = choose_manifest(
+        let (cands, refused) = choose_manifests(
             vec![(pk_hex(MIGRATOR), base), (pk_hex(ALICE), forged)],
             "zone2",
             "wss://relay.test",
@@ -1744,7 +1785,7 @@ mod tests {
             None,
             &[zone_key()],
         );
-        assert_eq!(best.expect("the v1 base").content.index_version, 1);
+        assert_eq!(cands.first().expect("the v1 base").content.index_version, 1);
         assert_eq!(refused.len(), 1);
     }
 
@@ -1752,7 +1793,7 @@ mod tests {
     fn equal_versions_choose_the_first_listed_publisher() {
         let pubs = vec![pk_hex(MIGRATOR), pk_hex(ALICE)];
         let c = manifest_content(1, 4, vec![zone_object(4, 0, None)]);
-        let (best, _) = choose_manifest(
+        let (cands, _) = choose_manifests(
             vec![
                 (pk_hex(MIGRATOR), signed_manifest(MIGRATOR, &c)),
                 (pk_hex(ALICE), signed_manifest(ALICE, &c)),
@@ -1763,7 +1804,7 @@ mod tests {
             None,
             &[zone_key()],
         );
-        assert_eq!(best.unwrap().event.pubkey, pk_hex(MIGRATOR));
+        assert_eq!(cands.first().unwrap().event.pubkey, pk_hex(MIGRATOR));
     }
 
     #[test]

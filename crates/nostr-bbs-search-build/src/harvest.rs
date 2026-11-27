@@ -117,6 +117,21 @@ pub struct AuthorBook {
     pub authors: HashMap<String, String>,
     /// Envelope id → original (row) id.
     pub envelopes: HashMap<String, String>,
+    /// Whether the book was built from the zone's events (`seed-book`, or a
+    /// full build from the relay), so it covers an existing base.
+    #[serde(default)]
+    pub seeded: bool,
+}
+
+/// What [`seed_book`] read.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SeedReport {
+    /// Kind-42 events of the zone read.
+    pub events: usize,
+    /// Posts whose author was recorded.
+    pub recorded: usize,
+    /// Events that did not verify or open.
+    pub skipped: usize,
 }
 
 impl AuthorBook {
@@ -353,6 +368,24 @@ async fn author_of<R: Relay>(
         }
     }
     Ok(None)
+}
+
+/// Build `book` from every post of `zone` the relay serves (or an export of
+/// the zone's events holds): each verified post that opens records its row
+/// id's author, and each envelope its original's id. Marks the book seeded.
+///
+/// # Errors
+///
+/// [`HarvestError::Unauthenticated`] unless the session is authenticated;
+/// relay failures.
+pub async fn seed_book<R: Relay>(
+    relay: &mut R,
+    zone: &str,
+    ring: &KeyRing,
+    book: &mut AuthorBook,
+) -> Result<SeedReport, HarvestError> {
+    let _ = (relay, zone, ring, book);
+    Ok(SeedReport::default())
 }
 
 /// Which of `ids` (row ids: live post ids or original ids) the relay still

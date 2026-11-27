@@ -207,6 +207,18 @@ mod native {
         },
         /// Write the browser model (GGUF Q8_0) and vocab.txt to --out.
         ModelQ8,
+        /// Build the author book from the zone's events (--from-relay, or
+        /// --from-events with an export taken at import), before the first update.
+        SeedBook,
+        /// Exclude posts from the next manifest (operator takedown).
+        Takedown {
+            /// File of post ids (hex, one per line) to take down.
+            #[arg(long)]
+            ids: PathBuf,
+            /// Why (recorded in the report and the job log).
+            #[arg(long)]
+            reason: String,
+        },
     }
 
     struct Fail(String, u8);
@@ -565,9 +577,42 @@ mod native {
                     .as_mut()
                     .ok_or_else(|| Fail("compact needs --state".into(), 2))?;
                 let fold = if *all { Fold::All } else { Fold::Partial };
-                run_compact(&mut job, &mut relay, st, fold).await?
+                run_compact(&mut job, &mut relay, st, &mut book, fold).await?
             }
             Some(Cmd::ModelQ8) => unreachable!("handled before the job is set up"),
+            Some(Cmd::SeedBook) => {
+                let mut relay = open_relay(cli, me).await?.ok_or_else(|| {
+                    Fail("seed-book needs --from-relay or --from-events".into(), 2)
+                })?;
+                if book_path.is_none() {
+                    return Err(Fail(
+                        "seed-book needs --state (the book is kept beside it)".into(),
+                        2,
+                    ));
+                }
+                let r =
+                    nostr_bbs_search_build::harvest::seed_book(&mut relay, zone, &ring, &mut book)
+                        .await
+                        .map_err(JobError::from)?;
+                if !cli.dry_run {
+                    if let Some(p) = &book_path {
+                        book.save(p)?;
+                    }
+                }
+                print_json(&r)?;
+                return Ok(0);
+            }
+            Some(Cmd::Takedown { ids, reason }) => {
+                let st = state
+                    .as_mut()
+                    .ok_or_else(|| Fail("takedown needs --state".into(), 2))?;
+                let list: Vec<String> = io(std::fs::read_to_string(ids))?
+                    .lines()
+                    .map(|l| l.trim().to_lowercase())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                nostr_bbs_search_build::pipeline::run_takedown(&mut job, st, &list, reason).await?
+            }
             None => {
                 let base = BgeEmbedder::new(&model_dir()?, cli.batch, workers);
                 let mut emb = Dumping {
@@ -657,13 +702,13 @@ mod native {
         };
         report.dry_run = cli.dry_run;
         if !cli.dry_run {
-            if let (Some(p), Some(s)) = (state_path, state.as_mut()) {
+            if let Some(s) = state.as_mut() {
                 s.updated_at = now;
-                s.save(p)?;
             }
-            if let Some(p) = &book_path {
-                book.save(p)?;
-            }
+            nostr_bbs_search_build::pipeline::persist(
+                state_path.zip(state.as_ref()).map(|(p, s)| (s, p)),
+                book_path.as_deref().map(|p| (&book, p)),
+            )?;
         }
         print_json(&report)?;
         Ok(if report.missing_key > 0 { 3 } else { 0 })

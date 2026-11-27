@@ -343,9 +343,17 @@ fn update(f: &mut Fixture, state: &mut State) -> Result<Report, JobError> {
 }
 
 fn compact_partial(f: &mut Fixture, state: &mut State) -> Result<Report, JobError> {
-    indexer(f, state, |j, r, s| {
-        block_on(run_compact(j, r, s, Fold::Partial))
-    })
+    compact_with(f, state, Fold::Partial)
+}
+
+fn compact_with(f: &mut Fixture, state: &mut State, fold: Fold) -> Result<Report, JobError> {
+    let me = sk(INDEXER);
+    let keys = ring(&[(1, ZONE_E1)]);
+    let mut pod = DirPod::new(&f.root, ZONE, &pk(INDEXER));
+    let p = pins();
+    let publishers = f.publishers.clone();
+    let mut j = job(&me, &keys, &mut pod, &publishers, &p);
+    block_on(run_compact(&mut j, &mut f.relay, state, &mut f.book, fold))
 }
 
 /// What a browser does: read `m.json` from every trusted publisher, keep the
@@ -711,10 +719,7 @@ fn compaction_folds_update_shards_drops_gone_rows_and_retires_objects_a_run_late
         .all(|o| m.owner_of(o) != pk(INDEXER) || own.contains_key(&o.name)));
 
     // compact --all re-homes everything: no archivist object is referenced.
-    let r = indexer(&mut f, &mut state, |j, rl, s| {
-        block_on(run_compact(j, rl, s, Fold::All))
-    })
-    .unwrap();
+    let r = compact_with(&mut f, &mut state, Fold::All).unwrap();
     assert!(r.published);
     assert_eq!(r.objects_foreign, 0);
     let m = browser_manifest(&f, None);
@@ -825,7 +830,13 @@ fn a_zone_the_relay_withholds_is_refused_not_read_as_empty() {
     assert_eq!(e.exit_code(), 7, "{e}");
     assert_eq!(state.high_water, None);
     let e = indexer(&mut f, &mut state, |j, _, s| {
-        block_on(run_compact(j, &mut gated, s, Fold::All))
+        block_on(run_compact(
+            j,
+            &mut gated,
+            s,
+            &mut Default::default(),
+            Fold::All,
+        ))
     })
     .unwrap_err();
     assert_eq!(e.exit_code(), 7, "{e}");

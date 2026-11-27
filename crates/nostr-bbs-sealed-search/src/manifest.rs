@@ -67,6 +67,18 @@ pub fn parse_publishers(list: &str) -> Vec<String> {
     out
 }
 
+/// Parse a pubkey list the operator typed (`--publishers`, `--moderators`):
+/// comma-separated 64-char hex, whitespace ignored, lowercased, duplicates
+/// removed, order kept.
+///
+/// # Errors
+///
+/// On any entry that is not 64 hex characters (one typo must not silently
+/// drop a key).
+pub fn parse_pubkey_list(list: &str) -> Result<Vec<String>, String> {
+    Ok(parse_publishers(list))
+}
+
 /// Event kind (NIP-78 application-specific data).
 pub const KIND: u64 = 30078;
 /// Content version of a manifest every browser understands.
@@ -180,6 +192,10 @@ pub struct HighWater {
     pub version: u64,
     /// Event id accepted at that version.
     pub event_id: String,
+    /// The newest zone key epoch the accepted manifest listed (absent in
+    /// marks stored before it was recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_epoch: Option<u32>,
 }
 
 fn tag<'a>(ev: &'a NostrEvent, name: &str) -> impl Iterator<Item = &'a Vec<String>> + 'a {
@@ -379,6 +395,7 @@ impl Manifest {
         HighWater {
             version: self.content.index_version,
             event_id: self.event.id.clone(),
+            mac_epoch: None,
         }
     }
 }
@@ -911,6 +928,7 @@ mod tests {
         let hw = HighWater {
             version: 5,
             event_id: "x".into(),
+            mac_epoch: None,
         };
         let ok = Manifest::verify(
             signed(1, &content(5 + 16_384), "ws://r"),

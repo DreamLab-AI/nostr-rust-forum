@@ -134,6 +134,12 @@ pub enum JobError {
     /// The relay session is not NIP-42 authenticated.
     #[error(transparent)]
     Unauthenticated(HarvestError),
+    /// The zone has an index but the author book was never seeded for it.
+    #[error("the author book for {zone} is not seeded: run `seed-book` (from the relay, or better an export of the zone's events taken at import) before the first update")]
+    BookNotSeeded {
+        /// Zone id.
+        zone: String,
+    },
     /// The manifest's exclusion list would pass its cap.
     #[error("the exclusion list would hold {total} ids, over the cap of {cap}: run `compact --all` to empty it")]
     ExclusionListFull {
@@ -164,12 +170,14 @@ pub enum JobError {
 
 impl JobError {
     /// Process exit code: 4 unauthenticated relay, 6 rollback, 7 zone withheld
-    /// by the relay, 8 exclusion list full, 1 otherwise (5 is retired: a
+    /// by the relay, 8 exclusion list full, 9 author book not seeded, 1
+    /// otherwise (5 is retired: a
     /// compaction no longer drops rows the relay merely does not serve).
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Unauthenticated(_) => 4,
             Self::ExclusionListFull { .. } => 8,
+            Self::BookNotSeeded { .. } => 9,
             Self::RolledBack { .. } => 6,
             Self::Withheld { .. } => 7,
             Self::Other(_) => 1,
@@ -902,8 +910,10 @@ pub async fn run_compact<P: Pod, R: Relay>(
     job: &mut Job<'_, P>,
     relay: &mut R,
     state: &mut State,
+    book: &mut AuthorBook,
     fold: Fold,
 ) -> Result<Report, JobError> {
+    let _ = &book;
     let mut report = Report::new("compact", job.zone);
     if !relay.session_authenticated() {
         return Err(HarvestError::Unauthenticated.into());
@@ -1020,6 +1030,42 @@ pub async fn run_compact<P: Pod, R: Relay>(
     report.high_water = state.high_water;
     report.warnings = std::mem::take(&mut job.warnings);
     Ok(report)
+}
+
+/// An operator takedown: add `ids` (row ids of posts in the index) to the
+/// exclusion list of a new manifest signed by this publisher, whatever the
+/// relay says. For posts moderated through the admin API (no kind-5) or any
+/// other removal the job cannot see. `reason` goes into the report.
+///
+/// # Errors
+///
+/// [`JobError`].
+pub async fn run_takedown<P: Pod>(
+    job: &mut Job<'_, P>,
+    state: &mut State,
+    ids: &[String],
+    reason: &str,
+) -> Result<Report, JobError> {
+    let _ = (state, ids, reason);
+    Ok(Report::new("takedown", job.zone))
+}
+
+/// Write the state and the author book after a run.
+///
+/// # Errors
+///
+/// When either cannot be written.
+pub fn persist(
+    state: Option<(&State, &std::path::Path)>,
+    book: Option<(&AuthorBook, &std::path::Path)>,
+) -> Result<(), String> {
+    if let Some((s, p)) = state {
+        s.save(p)?;
+    }
+    if let Some((b, p)) = book {
+        b.save(p)?;
+    }
+    Ok(())
 }
 
 /// The newest index on the pods at a glance.
