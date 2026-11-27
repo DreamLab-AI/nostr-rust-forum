@@ -67,7 +67,7 @@ acceptance_boundary: Established on branch retro-bbs/integration, not on 4e14871
 
 **Website deploy changes this needs (dreamlab-ai-website `deploy.yml`):** the BBS `window.__ENV__` must carry the forum's `VITE_RELAY_URL`, `VITE_POD_API_URL`, `VITE_RELAY_EPOCH`, `SEARCH_PUBLISHERS`, `DEVICE_KEYS_ENABLED`, `SIDESTR_WALLET`, `SIDESTR_CHAINS` and `BRAND_LABEL`, and the BBS trunk step needs `NOSTR_BBS_NIP05_DOMAIN`. Without the same relay URL and epoch, the forum and the BBS compute different relay scopes and each clears the other's cached relay data whenever the member switches between them, so the website change must ship with this one.
 
-Gates run on the integration branch (CI runs the same):
+Gates run locally on the integration branch. CI runs the same, except the wasm32 clippy of the three client crates, the trunk release builds and the module-graph check, which were run only locally:
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo clippy --target wasm32-unknown-unknown -p nostr-bbs-client-core -p nostr-bbs-bbs-client -p nostr-bbs-forum-client --all-features -- -D warnings`
