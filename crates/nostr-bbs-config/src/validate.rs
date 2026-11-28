@@ -445,6 +445,65 @@ fn preview_host_problem(host: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Whether a zone key looks like a misspelt `channels` (ADR-2037): any key
+/// other than exactly `channels` that mentions "pin" or "channel",
+/// case-insensitively (`channel`, `Channels`, `pins`, `pinned_channels`, ...).
+/// The relay worker applies the same rule and fails such pins closed.
+pub fn is_misspelt_pin_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    key != "channels" && (k.contains("pin") || k.contains("channel"))
+}
+
+/// Refuse a `zones` array (as JSON: the `[[zones]]` tables of a `forum.toml`,
+/// or a `ZONE_CONFIG` value) any of whose zones carries a misspelt pin key.
+///
+/// # Errors
+///
+/// A message naming the zone and the key.
+pub fn check_zone_pin_keys(zones: &serde_json::Value) -> Result<(), String> {
+    for z in zones.as_array().into_iter().flatten() {
+        let Some(obj) = z.as_object() else { continue };
+        let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        if let Some(key) = obj.keys().find(|k| is_misspelt_pin_key(k)) {
+            return Err(format!(
+                "zone '{id}' has unknown key '{key}' — did you mean 'channels'? (an \
+                 unrecognised pin key would leave the channel in its old zone)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check a `ZONE_CONFIG` JSON value as deployed (ADR-2037): misspelt pin
+/// keys, malformed or duplicate `channels` entries, and pinning zone ids that
+/// extend another zone's id. Use it on a hand-edited projection before it is
+/// handed to the workers; `forum.toml` gets the same checks on load.
+///
+/// # Errors
+///
+/// Invalid JSON or the first pin problem found.
+pub fn validate_zone_config_json(raw: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("ZONE_CONFIG is not valid JSON: {e}"))?;
+    check_zone_pin_keys(&value)?;
+    let zones: Vec<crate::schema::Zone> = value
+        .as_array()
+        .ok_or("ZONE_CONFIG must be a JSON array")?
+        .iter()
+        .map(|z| {
+            let mut z = z.clone();
+            // The projection's other fields are not this check's concern;
+            // fill the one required field the workers do not need.
+            if let Some(obj) = z.as_object_mut() {
+                obj.entry("display_name")
+                    .or_insert(serde_json::Value::String(String::new()));
+            }
+            serde_json::from_value(z).map_err(|e| format!("ZONE_CONFIG zone: {e}"))
+        })
+        .collect::<Result<_, String>>()?;
+    validate_channel_pins(&zones)
+}
+
 /// ADR-2037 channel pins (`[[zones]] channels`): every entry is a kind-40
 /// event id (64-char lowercase hex), no channel is listed twice, and a zone
 /// that pins channels does not have an id of the form `<other zone id>-…`.
@@ -1433,5 +1492,38 @@ bot_profile = "tag"
         assert!(plain.channels.is_empty());
         let json = serde_json::to_value(&plain).unwrap();
         assert!(json.get("channels").is_none(), "no pins, no key: {json}");
+    }
+
+    #[test]
+    fn misspelt_pin_keys_are_refused_on_load() {
+        let base = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../forum.example.toml"),
+        )
+        .unwrap();
+        for key in ["channel", "Channels", "pins", "pinned_channels"] {
+            let toml = format!(
+                "{base}\n[[zones]]\nid = \"staff\"\ndisplay_name = \"Staff\"\n{key} = [\"{PIN_A}\"]\n"
+            );
+            let err = crate::load_from_str(&toml).unwrap_err().to_string();
+            assert!(err.contains("did you mean 'channels'"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_zone_config_json_is_checked_like_forum_toml() {
+        assert!(validate_zone_config_json(&format!(
+            r#"[{{"id":"open"}},{{"id":"staff","channels":["{PIN_A}"]}}]"#
+        ))
+        .is_ok());
+        let typo =
+            validate_zone_config_json(&format!(r#"[{{"id":"staff","channel":["{PIN_A}"]}}]"#));
+        assert!(typo.unwrap_err().contains("did you mean"));
+        let bad = validate_zone_config_json(r#"[{"id":"staff","channels":["abc"]}]"#);
+        assert!(bad.unwrap_err().contains("64-char"));
+        let doubled = validate_zone_config_json(&format!(
+            r#"[{{"id":"a","channels":["{PIN_A}"]}},{{"id":"b","channels":["{PIN_A}"]}}]"#
+        ));
+        assert!(doubled.unwrap_err().contains("pinned by both"));
+        assert!(validate_zone_config_json("{}").is_err());
     }
 }
