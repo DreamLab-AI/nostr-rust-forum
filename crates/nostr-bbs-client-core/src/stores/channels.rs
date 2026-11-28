@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
-use crate::relay::{ConnectionState, Filter, RelayConnection};
+use crate::relay::{Filter, RelayConnection};
 use crate::stores::deletion_sync::{self, DeletionProgress, DeletionScope, Source};
 use crate::stores::signer_admin::SignerAdminCache;
 use crate::stores::tombstones::{self, Target, Tombstones, LOCAL_DELETER};
@@ -158,10 +158,6 @@ pub struct ChannelStore {
     /// root list is not asked again before its `retry_at`, however often a
     /// view asks, except on a new visit ([`Self::rearm_topic_roots`]).
     roots_backoff: StoredValue<HashMap<String, RootsBackoff>>,
-    /// Topics (lower-case root ids) whose newest-reply REQ has answered,
-    /// with or without a reply: with the COUNT, what
-    /// [`Self::topic_stats_answered`] waits for.
-    topic_latest_answered: RwSignal<HashSet<String>>,
     /// Channels whose root list came back under its limit: every marked
     /// topic root is held, so channel history paging lists no new topic.
     roots_complete: RwSignal<HashSet<String>>,
@@ -177,18 +173,6 @@ pub struct ChannelStore {
     topic_stats_queue: StoredValue<std::collections::VecDeque<(String, String, bool)>>,
     /// Whether a stats batch is in flight (batches go one at a time).
     topic_stats_busy: StoredValue<bool>,
-    /// Topics (lower-case root ids) whose stats batch failed (CLOSED, or
-    /// no answer within [`PAGE_TIMEOUT_MS`]): settled for placement, so a
-    /// late answer updates the row's figures but never places it.
-    topic_stats_given_up: RwSignal<HashSet<String>>,
-    /// Topics of the batch in flight, so a re-queue does not add them again.
-    topic_stats_in_flight: StoredValue<HashSet<String>>,
-    /// Stats batches that failed in a row: the next batch waits
-    /// [`stats_batch_delay_ms`] of it.
-    topic_stats_failures: StoredValue<u32>,
-    /// No stats batch is sent before this time (ms since the epoch): the
-    /// pause after failed batches, which new topics must not skip.
-    topic_stats_paused_until: StoredValue<f64>,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -241,16 +225,11 @@ impl ChannelStore {
             roots_answered: RwSignal::new(HashSet::new()),
             roots_failed: RwSignal::new(HashSet::new()),
             roots_backoff: StoredValue::new(HashMap::new()),
-            topic_latest_answered: RwSignal::new(HashSet::new()),
             roots_complete: RwSignal::new(HashSet::new()),
             topic_latest: RwSignal::new(HashMap::new()),
             topic_stats_asked: StoredValue::new(HashSet::new()),
             topic_stats_queue: StoredValue::new(std::collections::VecDeque::new()),
             topic_stats_busy: StoredValue::new(false),
-            topic_stats_given_up: RwSignal::new(HashSet::new()),
-            topic_stats_in_flight: StoredValue::new(HashSet::new()),
-            topic_stats_failures: StoredValue::new(0),
-            topic_stats_paused_until: StoredValue::new(0.0),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -1373,10 +1352,7 @@ impl ChannelStore {
 
     /// Send the next batch of queued topic stats, unless one is in flight.
     fn pump_topic_stats(&self, relay: &RelayConnection) {
-        // Busy, or pausing after failures (the pause's own timer pumps).
-        if self.topic_stats_busy.get_value()
-            || js_sys::Date::now() < self.topic_stats_paused_until.get_value()
-        {
+        if self.topic_stats_busy.get_value() {
             return;
         }
         let batch: Vec<(String, String, bool)> = self
@@ -1390,8 +1366,6 @@ impl ChannelStore {
             return;
         }
         self.topic_stats_busy.set_value(true);
-        self.topic_stats_in_flight
-            .set_value(batch.iter().map(|(_, r, _)| r.clone()).collect());
         let wait_auth = batch.iter().any(|(_, _, g)| *g);
         for (_, root, _) in &batch {
             self.request_total_of(relay, &topic_key(root), root);
@@ -1410,94 +1384,18 @@ impl ChannelStore {
         });
         let sub: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let done = Rc::new(std::cell::Cell::new(false));
-        // Ends the batch once, however it ends: an answer, a CLOSED, or no
-        // answer within PAGE_TIMEOUT_MS. Without the last two a refused
-        // batch held the pump for the session, and its answer on a later
-        // reconnect placed every row of it at once in front of the reader.
-        let finish: Rc<dyn Fn(StatsBatchEnd)> = {
-            let batch = batch.clone();
+        let on_receipt = {
             let sub = sub.clone();
             let relay = relay.clone();
-            let done = done.clone();
-            Rc::new(move |end: StatsBatchEnd| {
-                if done.replace(true) {
+            Rc::new(move |authed: bool| {
+                if (!authed && wait_auth) || done.replace(true) {
                     return;
                 }
                 if let Some(id) = sub.borrow_mut().take() {
                     relay.unsubscribe(&id);
                 }
-                let failures = store
-                    .topic_stats_failures
-                    .try_update_value(|f| {
-                        *f = match end {
-                            StatsBatchEnd::Answered => 0,
-                            StatsBatchEnd::Failed => f.saturating_add(1),
-                        };
-                        *f
-                    })
-                    .unwrap_or(0);
-                match end {
-                    StatsBatchEnd::Answered => {
-                        // Every newest reply this batch had is in (none for
-                        // a topic without replies).
-                        let _ = store.topic_latest_answered.try_update(|s| {
-                            s.extend(batch.iter().map(|(_, r, _)| r.clone()));
-                        });
-                    }
-                    StatsBatchEnd::Failed => {
-                        // A topic's first failure queues it again at the
-                        // back; after that it waits for a reconnect or a
-                        // visit (`requeue_given_up_stats`).
-                        let again = store
-                            .topic_stats_given_up
-                            .try_with_untracked(|g| retry_after_failure(&batch, g))
-                            .unwrap_or_default();
-                        let _ = store.topic_stats_given_up.try_update(|s| {
-                            s.extend(batch.iter().map(|(_, r, _)| r.clone()));
-                        });
-                        let _ = store
-                            .topic_stats_queue
-                            .try_update_value(|q| q.extend(again));
-                    }
-                }
-                let _ = store.topic_stats_in_flight.try_update_value(HashSet::clear);
-                let _ = store.topic_stats_busy.try_set_value(false);
-                let delay = stats_batch_delay_ms(failures);
-                let relay = relay.clone();
-                if delay == 0 {
-                    store.pump_topic_stats(&relay);
-                } else {
-                    let _ = store
-                        .topic_stats_paused_until
-                        .try_set_value(js_sys::Date::now() + f64::from(delay));
-                    crate::utils::set_timeout_once(
-                        move || {
-                            // The pause is over: clear it, or the pump's own
-                            // check (timers can fire a little early) skips.
-                            let _ = store.topic_stats_paused_until.try_set_value(0.0);
-                            store.pump_topic_stats(&relay);
-                        },
-                        delay,
-                    );
-                }
-            })
-        };
-        let on_receipt = {
-            let finish = finish.clone();
-            Rc::new(move |authed: bool| {
-                if !authed && wait_auth {
-                    return;
-                }
-                finish(StatsBatchEnd::Answered);
-            })
-        };
-        let on_closed = {
-            let finish = finish.clone();
-            Rc::new(move |reason: String| {
-                web_sys::console::warn_1(
-                    &format!("[Stats] topic stats request closed by relay: {reason}").into(),
-                );
-                finish(StatsBatchEnd::Failed);
+                store.topic_stats_busy.set_value(false);
+                store.pump_topic_stats(&relay);
             })
         };
         let filters = batch
@@ -1509,74 +1407,8 @@ impl ChannelStore {
                 ..Default::default()
             })
             .collect();
-        let id = relay.subscribe_with_receipt_or_closed(filters, on_event, on_receipt, on_closed);
+        let id = relay.subscribe_with_receipt(filters, on_event, on_receipt);
         *sub.borrow_mut() = Some(id);
-        arm_stats_timer(
-            relay.clone(),
-            js_sys::Date::now(),
-            stats_relay_connected(relay),
-            done,
-            finish,
-        );
-    }
-
-    /// Queue again the topics among `roots` (a list's topics, of channel
-    /// `cid`, `gated` as the list asks them) whose stats were given up and
-    /// are still not in: on a (re)connect, after AUTH for a gated zone, and
-    /// on a new visit. They stay given up, so whatever arrives updates the
-    /// row's figures (and may count towards "↻ N updated") but never moves
-    /// it. A COUNT that never answered is allowed to go out again. Call it
-    /// once per such transition, not from an effect that re-runs on
-    /// traffic.
-    pub fn requeue_given_up_stats(
-        &self,
-        relay: &RelayConnection,
-        cid: &str,
-        roots: &[String],
-        gated: bool,
-    ) {
-        let pending: HashSet<String> = self.topic_stats_queue.with_value(|q| {
-            q.iter()
-                .map(|(_, r, _)| r.clone())
-                .chain(self.topic_stats_in_flight.with_value(|f| f.clone()))
-                .collect()
-        });
-        let again = self.topic_stats_given_up.with_untracked(|given_up| {
-            requeue_given_up(roots, given_up, &pending, |r| {
-                self.topic_stats_answered_untracked(r)
-            })
-        });
-        if again.is_empty() {
-            return;
-        }
-        // A COUNT lost to a reconnect is never re-sent by the relay:
-        // forget the unanswered ones so `request_total_of` asks again.
-        self.totals.update(|m| {
-            for r in &again {
-                let key = topic_key(r);
-                if m.get(&key).is_some_and(|t| t.counted.is_none()) {
-                    m.remove(&key);
-                }
-            }
-        });
-        self.topic_stats_queue.update_value(|q| {
-            q.extend(again.into_iter().map(|r| (cid.to_string(), r, gated)));
-        });
-        self.pump_topic_stats(relay);
-    }
-
-    /// [`Self::topic_stats_answered`] without tracking.
-    fn topic_stats_answered_untracked(&self, root: &str) -> bool {
-        untrack(|| self.topic_stats_answered(root))
-    }
-
-    /// Whether topic `root`'s stats batch failed and was given up for
-    /// placement (see [`Self::topic_stats_answered`]): a list treats the
-    /// row as placed, so stats that arrive later (from the one retry)
-    /// update its figures in place and never move it. Reactive.
-    pub fn topic_stats_given_up(&self, root: &str) -> bool {
-        self.topic_stats_given_up
-            .with(|s| s.contains(&root.to_lowercase()))
     }
 
     /// Record `ev` as topic `root`'s newest reply if it is one: in the
@@ -1621,18 +1453,21 @@ impl ChannelStore {
         }
     }
 
-    /// Whether the relay has answered both of topic `root`'s stats (asked
-    /// by [`Self::request_topic_stats`]): its reply COUNT and its newest
-    /// reply, which is what places the topic in the list. A list can then
-    /// tell "answered, no replies" from "not in yet". Reactive.
+    /// Whether topic `root`'s stats (asked by [`Self::request_topic_stats`])
+    /// are in far enough to place it in a list: its reply COUNT has
+    /// answered, and either it has no replies or its newest reply (which
+    /// sets its place) has arrived. A topic whose stats never come in is
+    /// never "answered"; a list neither waits for it for ever (first paint
+    /// has a timeout) nor moves its row. Read-only over existing state.
+    /// Reactive.
     pub fn topic_stats_answered(&self, root: &str) -> bool {
         let counted = self
             .totals
-            .with(|m| m.get(&topic_key(root)).is_some_and(|t| t.counted.is_some()));
-        counted
-            && self
-                .topic_latest_answered
-                .with(|s| s.contains(&root.to_lowercase()))
+            .with(|m| m.get(&topic_key(root)).and_then(|t| t.counted));
+        stats_place_known(counted, || {
+            self.topic_latest
+                .with(|m| m.contains_key(&root.to_lowercase()))
+        })
     }
 
     /// Topic `root`'s newest reply as the relay answered it, as
@@ -2333,154 +2168,33 @@ fn buffer_pending_meta(pending: &mut HashMap<String, MetaUpdate>, update: MetaUp
     }
 }
 
-/// How a topic-stats batch ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StatsBatchEnd {
-    /// Its REQ answered (EOSE): the newest replies are in.
-    Answered,
-    /// CLOSED by the relay, or no answer within [`PAGE_TIMEOUT_MS`].
-    Failed,
-}
-
-/// Longest pause before the next stats batch after failures in a row.
-const STATS_BACKOFF_CAP_MS: i32 = 60_000;
-
-/// Pause before the next stats batch after `failures` failed batches in a
-/// row: none after an answer, then 1 s doubling to [`STATS_BACKOFF_CAP_MS`],
-/// so a relay refusing subscriptions is not sent one batch after another.
-fn stats_batch_delay_ms(failures: u32) -> i32 {
-    if failures == 0 {
-        return 0;
+/// Whether a topic's place in a list is known from its stats: the reply
+/// COUNT has answered (`counted`), and either it counted no replies or the
+/// newest reply is in (`latest_known`, asked only then).
+fn stats_place_known(counted: Option<u64>, latest_known: impl FnOnce() -> bool) -> bool {
+    match counted {
+        None => false,
+        Some(0) => true,
+        Some(_) => latest_known(),
     }
-    let doublings = (failures - 1).min(16);
-    (1_000i32.saturating_mul(1 << doublings)).min(STATS_BACKOFF_CAP_MS)
-}
-
-/// Longest a stats batch may wait for its answer, whatever the connection
-/// does meanwhile: then it fails, and a reconnect or a visit asks again.
-const STATS_BATCH_MAX_MS: f64 = 120_000.0;
-
-/// Whether the socket is open. A refused or absent sign-in counts as open:
-/// a gated batch then fails at its next check (and is asked again after a
-/// sign-in), rather than holding the pump, which serves every section.
-fn stats_relay_connected(relay: &RelayConnection) -> bool {
-    relay.connection_state().get_untracked() == ConnectionState::Connected
-}
-
-/// Whether a stats batch fails at a check (every [`PAGE_TIMEOUT_MS`]): when
-/// the socket was open at the previous check (or when the REQ was sent) and
-/// still is, so time offline is not an attempt; or once it has waited
-/// [`STATS_BATCH_MAX_MS`] in all.
-fn stats_timeout_fails(was_connected: bool, connected: bool, waited_ms: f64) -> bool {
-    (was_connected && connected) || waited_ms >= STATS_BATCH_MAX_MS
-}
-
-/// Check a stats batch every [`PAGE_TIMEOUT_MS`] until it is done, failing
-/// it per [`stats_timeout_fails`].
-fn arm_stats_timer(
-    relay: RelayConnection,
-    sent_at: f64,
-    was_connected: bool,
-    done: Rc<std::cell::Cell<bool>>,
-    finish: Rc<dyn Fn(StatsBatchEnd)>,
-) {
-    crate::utils::set_timeout_once(
-        move || {
-            if done.get() {
-                return;
-            }
-            let connected = stats_relay_connected(&relay);
-            if stats_timeout_fails(was_connected, connected, js_sys::Date::now() - sent_at) {
-                finish(StatsBatchEnd::Failed);
-            } else {
-                arm_stats_timer(relay, sent_at, connected, done, finish);
-            }
-        },
-        PAGE_TIMEOUT_MS as i32,
-    );
-}
-
-/// The topics of a failed `batch` to queue again at once: those failing
-/// for the first time (not yet in `given_up`).
-fn retry_after_failure(
-    batch: &[(String, String, bool)],
-    given_up: &HashSet<String>,
-) -> Vec<(String, String, bool)> {
-    batch
-        .iter()
-        .filter(|(_, r, _)| !given_up.contains(r))
-        .cloned()
-        .collect()
-}
-
-/// The topics among `roots` to queue again: given up, still without stats
-/// (`answered`), and neither queued nor in flight (`pending`). Lower-case,
-/// each once, in `roots` order.
-fn requeue_given_up(
-    roots: &[String],
-    given_up: &HashSet<String>,
-    pending: &HashSet<String>,
-    answered: impl Fn(&str) -> bool,
-) -> Vec<String> {
-    let mut seen = HashSet::new();
-    roots
-        .iter()
-        .map(|r| r.to_lowercase())
-        .filter(|r| given_up.contains(r) && !pending.contains(r) && !answered(r))
-        .filter(|r| seen.insert(r.clone()))
-        .collect()
 }
 
 #[cfg(test)]
-mod stats_batch_tests {
+mod stats_place_tests {
     use super::*;
 
     #[test]
-    fn a_failed_batch_pauses_the_pump_with_a_bounded_backoff() {
-        assert_eq!(stats_batch_delay_ms(0), 0, "an answer: next batch at once");
-        assert_eq!(stats_batch_delay_ms(1), 1_000);
-        assert_eq!(stats_batch_delay_ms(2), 2_000);
-        assert_eq!(stats_batch_delay_ms(7), 60_000);
-        assert_eq!(stats_batch_delay_ms(40), STATS_BACKOFF_CAP_MS);
-    }
-
-    #[test]
-    fn time_offline_is_not_an_attempt_but_the_wait_is_bounded() {
-        // Sent while connected and unanswered a full period later.
-        assert!(stats_timeout_fails(true, true, 20_000.0));
-        // Offline now, or back only since the last check: wait.
-        assert!(!stats_timeout_fails(true, false, 20_000.0));
-        assert!(!stats_timeout_fails(false, true, 40_000.0));
-        // Whatever the connection does, never longer than the cap: a
-        // gated batch whose sign-in failed cannot hold the pump.
-        assert!(stats_timeout_fails(false, false, STATS_BATCH_MAX_MS));
-        assert!(stats_timeout_fails(false, true, STATS_BATCH_MAX_MS + 1.0));
-    }
-
-    #[test]
-    fn a_topic_is_retried_at_once_only_on_its_first_failure() {
-        let batch = vec![
-            ("c".to_string(), "a".to_string(), false),
-            ("c".to_string(), "b".to_string(), false),
-        ];
-        let given_up: HashSet<String> = ["b".to_string()].into_iter().collect();
-        let again = retry_after_failure(&batch, &given_up);
-        assert_eq!(again, vec![batch[0].clone()]);
-    }
-
-    #[test]
-    fn given_up_topics_without_stats_are_queued_again_once() {
-        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
-        let roots: Vec<String> = ["A", "b", "c", "d", "e", "a"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let given_up = set(&["a", "b", "c", "d"]);
-        // b is queued or in flight, c has its stats now, e never failed;
-        // "A" and "a" are one topic.
-        let again = requeue_given_up(&roots, &given_up, &set(&["b"]), |r| r == "c");
-        assert_eq!(again, vec!["a".to_string(), "d".to_string()]);
-        assert!(requeue_given_up(&[], &given_up, &HashSet::new(), |_| false).is_empty());
+    fn a_topic_is_placed_once_its_count_and_newest_reply_are_in() {
+        assert!(!stats_place_known(None, || true), "no COUNT yet");
+        assert!(
+            stats_place_known(Some(0), || false),
+            "no replies: nothing to wait for"
+        );
+        assert!(
+            !stats_place_known(Some(3), || false),
+            "replies, newest not in"
+        );
+        assert!(stats_place_known(Some(3), || true));
     }
 }
 

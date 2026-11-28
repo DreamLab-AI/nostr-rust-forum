@@ -231,14 +231,6 @@ fn list_branch(
     }
 }
 
-/// Whether to queue given-up topic stats again now: the relay is ready
-/// (`ready`: connected, and past AUTH in a gated zone) and either this is
-/// a new visit (first run, or another channel than `prev`'s) or it was not
-/// ready at `prev`. One call per reconnect, however many signals moved.
-fn requeue_now(prev: Option<&(Option<String>, bool)>, cid: Option<&String>, ready: bool) -> bool {
-    ready && prev.is_none_or(|(p, was_ready)| p.as_ref() != cid || !was_ready)
-}
-
 /// The display order's state for one channel: whether it is frozen (the
 /// list has painted, so rows keep their place from now on), every topic
 /// whose first stats have landed this visit, with its sealed counterpart
@@ -446,30 +438,6 @@ pub fn SectionPage() -> impl IntoView {
     }
     let topics: Signal<Vec<TopicSummary>> = topics_memo.into();
 
-    // Topics whose stats failed (a refused or unanswered batch) are asked
-    // again once per visit and once each time the relay is back (connected,
-    // and past AUTH in a gated zone): the effect acts only on a change of
-    // channel or a rise of that condition, never on traffic.
-    {
-        let relay_for_requeue = relay.clone();
-        Effect::new(move |prev: Option<(Option<String>, bool)>| {
-            let connected = relay_for_requeue.connection_state().get()
-                == crate::relay::ConnectionState::Connected;
-            let authed = relay_for_requeue.authenticated().get();
-            let cid = channel_id.get();
-            let gated = zone_is_gated(&category_slug(), &load_zones());
-            let ready = connected && (authed || !gated);
-            if let Some(c) = cid.as_deref() {
-                if requeue_now(prev.as_ref(), cid.as_ref(), ready) {
-                    let roots = topics_memo
-                        .with_untracked(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>());
-                    store.requeue_given_up_stats(&relay_for_requeue, c, &roots, gated);
-                }
-            }
-            (cid, ready)
-        });
-    }
-
     // Fetch the section's topic roots once (decision ii: sealed roots carry
     // ["t","topic"]), so dormant topics are listed without paging the channel.
     // A new visit (the first run, or a switch to another section) may ask a
@@ -592,18 +560,7 @@ pub fn SectionPage() -> impl IntoView {
                 .collect::<HashSet<_>>()
         })
     });
-    // Topics whose stats request failed: settled for placement (their late
-    // stats update the row, never place it) and not waited for.
-    let given_up_ids = Memo::new(move |_| {
-        topics.with(|ts| {
-            ts.iter()
-                .filter(|t| store.topic_stats_given_up(&t.id))
-                .map(|t| t.id.clone())
-                .collect::<HashSet<_>>()
-        })
-    });
-    let stats_answered =
-        Memo::new(move |_| answered_ids.with(|a| given_up_ids.with(|g| a.union(g).count())));
+    let stats_answered = Memo::new(move |_| answered_ids.with(HashSet::len));
     let roots_failed = Memo::new(move |_| {
         channel_id
             .get()
@@ -717,9 +674,7 @@ pub fn SectionPage() -> impl IntoView {
                 }
                 let was = s.frozen;
                 s.frozen |= painted;
-                let landed = given_up_ids.with(|given_up| {
-                    first_stats_landed(&answered, given_up, &mut s.answered, &s.aliases)
-                });
+                let landed = first_stats_landed(&answered, &mut s.answered, &s.aliases);
                 let first_stats = if was { landed } else { HashSet::new() };
                 (was, first_stats, s.aliases.clone())
             }) else {
@@ -1176,23 +1131,6 @@ async fn publish_topic_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn failed_stats_are_asked_again_once_per_visit_and_per_reconnect() {
-        let c = Some("c".to_string());
-        // First run, relay ready: a new visit.
-        assert!(requeue_now(None, c.as_ref(), true));
-        // Not ready: never.
-        assert!(!requeue_now(None, c.as_ref(), false));
-        // Same channel, still ready (AUTH flipping in a public zone, or
-        // any other re-run): not again.
-        assert!(!requeue_now(Some(&(c.clone(), true)), c.as_ref(), true));
-        // Ready again after a disconnect: once.
-        assert!(requeue_now(Some(&(c.clone(), false)), c.as_ref(), true));
-        // Another section: a new visit.
-        let d = Some("d".to_string());
-        assert!(requeue_now(Some(&(c.clone(), true)), d.as_ref(), true));
-    }
 
     #[test]
     fn loading_shows_skeleton_rows() {

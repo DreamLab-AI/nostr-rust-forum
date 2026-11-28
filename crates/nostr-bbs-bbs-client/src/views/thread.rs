@@ -262,24 +262,6 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         });
     }
 
-    // Topics whose stats failed are asked again once on this visit and once
-    // each time the relay is back (connected, past AUTH when gated), never
-    // on traffic.
-    {
-        let relay = relay.clone();
-        Effect::new(move |was_ready: Option<bool>| {
-            let connected = relay.connection_state().get()
-                == nostr_bbs_client_core::relay::ConnectionState::Connected;
-            let ready = connected && (!gated || relay.authenticated().get());
-            if ready && was_ready != Some(true) {
-                let roots =
-                    topics.with_untracked(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>());
-                channels.requeue_given_up_stats(&relay, &cid.get_value(), &roots, gated);
-            }
-            ready
-        });
-    }
-
     // What counts as new is what arrived since the reader last opened the
     // board; opening it then marks the channel read at its newest post.
     let last_read_at_open = read_pos
@@ -313,18 +295,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                 .collect::<HashSet<_>>()
         })
     });
-    // Topics whose stats request failed: settled for placement (their late
-    // stats update the row, never place it) and not waited for.
-    let given_up_ids = Memo::new(move |_| {
-        topics.with(|ts| {
-            ts.iter()
-                .filter(|t| channels.topic_stats_given_up(&t.id))
-                .map(|t| t.id.clone())
-                .collect::<HashSet<_>>()
-        })
-    });
-    let stats_answered =
-        Memo::new(move |_| answered_ids.with(|a| given_up_ids.with(|g| a.union(g).count())));
+    let stats_answered = Memo::new(move |_| answered_ids.with(HashSet::len));
     let hold_expired = RwSignal::new(false);
     {
         let armed = StoredValue::new(false);
@@ -414,8 +385,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                     }
                     let was = *frozen;
                     *frozen |= shown;
-                    let landed = given_up_ids
-                        .with(|given_up| first_stats_landed(&answered, given_up, seen, aliases));
+                    let landed = first_stats_landed(&answered, seen, aliases);
                     let first_stats = if was { landed } else { HashSet::new() };
                     (was, first_stats, aliases.clone())
                 })
