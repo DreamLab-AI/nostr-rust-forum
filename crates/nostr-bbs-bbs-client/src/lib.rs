@@ -16,6 +16,7 @@ pub mod prefs;
 pub mod pwa;
 pub mod router;
 pub mod shell;
+pub mod subs;
 pub mod theme;
 pub mod upload;
 pub mod views;

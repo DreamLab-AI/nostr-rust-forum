@@ -1823,3 +1823,316 @@ html.bbs-reduced-motion .sentry-radar::before {
     font-size: 1.6rem;
   }
 }
+
+/* ── Topic subscriptions (src/subs.rs) ──────────────────────────────────────
+ * Row toggle: a `[ ]`/`[*]` button beside the card in a gutter the card
+ * reserves (only for signed-in members), absolutely placed on the title line
+ * and exactly one line high and 3ch wide, so pressing it never changes the
+ * row's height; the board's order is never touched. A touch swipe moves the
+ * card over a strip that says what the swipe will do.
+ * Panel: a right-hand grid column on desktop (only while open, so it never
+ * appears under the reader on load), a right-hand drawer behind a small edge
+ * tab on phones (<= 640px, the shared `MOBILE_MAX_WIDTH_PX`). */
+:root {
+  --subs-w: 17rem;
+}
+
+.bbs-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.bbs-topic-item {
+  position: relative;
+  border-radius: var(--radius);
+  min-width: 0;
+}
+/* Clipped only while the card is off its rest position, so a focus ring or
+ * the toggle's touch area is never cut at rest. */
+.bbs-topic-item.bbs-swiping {
+  overflow: hidden;
+}
+.bbs-topic-slide {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+}
+.bbs-topic-item.bbs-subs-on .bbs-topic-row {
+  padding-left: calc(0.55rem + 3ch + 0.45rem);
+}
+.bbs-sub-toggle {
+  position: absolute;
+  z-index: 2;
+  top: calc(1px + 0.85rem);
+  left: 0.55rem;
+  width: 3ch;
+  height: 1.5em;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  line-height: 1.5;
+  white-space: pre;
+  cursor: pointer;
+}
+/* A larger hit area than the glyphs, without growing the layout box. */
+.bbs-sub-toggle::after {
+  content: "";
+  position: absolute;
+  inset: -0.5rem -0.35rem;
+}
+.bbs-sub-toggle:hover {
+  color: var(--fg-bright);
+}
+.bbs-sub-toggle.on {
+  color: var(--accent);
+  font-weight: 700;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+.bbs-sub-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.bbs-swipe-strip {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 1rem;
+  border: 1px dashed var(--border-bright);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.bbs-swipe-strip-start {
+  justify-content: flex-start;
+}
+.bbs-swipe-strip-end {
+  justify-content: flex-end;
+}
+/* The spring back is set inline by client core, which honours only the
+ * media query; the BBS's own REDUCED MOTION setting is honoured here. */
+html.bbs-reduced-motion .bbs-topic-slide {
+  transition: none !important;
+}
+
+/* Desktop column */
+.tui-body.subs-open {
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--subs-w);
+}
+.tui-body.sidebar-collapsed.subs-open {
+  grid-template-columns: minmax(0, 1fr) var(--subs-w);
+}
+.tui-subs-pane {
+  background: var(--bg-elevated);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 0.65rem 0.55rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+}
+.tui-subs-head {
+  gap: 0.4rem;
+}
+.tui-subs-head > span:first-child {
+  flex: 1 1 auto;
+}
+.tui-subs-close {
+  flex: 0 0 auto;
+  padding: 0 0.45rem;
+}
+.tui-subs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+.tui-subs-item {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 32px;
+  min-width: 0;
+  padding: 0.3rem 0.45rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--fg);
+  text-decoration: none;
+  font-size: 0.86rem;
+}
+.tui-subs-item:hover {
+  background: var(--bg-hover);
+  border-color: var(--border);
+  color: var(--fg-bright);
+}
+.tui-subs-item.unread .tui-subs-name {
+  color: var(--fg-bright);
+}
+/* The new-post numeral, left of the name: a fixed slot (empty at zero), so a
+ * count appearing never moves the name. */
+.tui-subs-num {
+  flex: 0 0 3ch;
+  width: 3ch;
+  text-align: right;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-bright);
+  text-shadow: 0 0 4px var(--accent),
+    0 0 10px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.tui-subs-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tui-subs-empty {
+  margin: 0.25rem 0.45rem;
+  color: var(--fg-dim);
+  font-size: 0.82rem;
+}
+.tui-subs-topbtn {
+  position: relative;
+  white-space: pre;
+}
+
+/* Phone drawer, its scrim and its edge tab (rendered only at <= 640px). */
+.tui-subs-drawer {
+  position: fixed;
+  top: var(--topbar-h);
+  bottom: var(--bottomnav-h);
+  right: 0;
+  z-index: 120;
+  width: min(88vw, 30rem);
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.4rem 0.4rem 1rem;
+  background: var(--bg-elevated);
+  border-left: 1px solid var(--border-bright);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.7);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  transform: translateX(100%);
+  visibility: hidden;
+  transition: transform 180ms ease, visibility 0s linear 180ms;
+}
+.tui-subs-drawer.open {
+  transform: translateX(0);
+  visibility: visible;
+  transition: transform 180ms ease, visibility 0s;
+}
+.tui-subs-drawer .tui-subs-item {
+  min-height: 44px;
+}
+.tui-subs-scrim {
+  display: none;
+}
+.tui-subs-scrim.open {
+  display: block;
+  position: fixed;
+  inset: var(--topbar-h) 0 var(--bottomnav-h) 0;
+  z-index: 110;
+  background: rgba(0, 0, 0, 0.6);
+}
+.tui-subs-tab {
+  position: fixed;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 105;
+  width: 24px;
+  min-height: 64px;
+  padding: 6px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 1px solid var(--border-bright);
+  border-right: 0;
+  border-radius: 6px 0 0 6px;
+  background: var(--bg-elevated);
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 0.36rem;
+  line-height: 1;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+  /* The tab's pull is the tab's own: no scroll or browser gesture on it. */
+  touch-action: none;
+  box-shadow: -2px 0 10px rgba(0, 0, 0, 0.5);
+}
+.tui-subs-tab-label {
+  writing-mode: vertical-rl;
+}
+.tui-subs-tab.has-unread {
+  border-color: var(--accent);
+  color: var(--fg-bright);
+}
+.tui-subs-tab-num {
+  min-width: 18px;
+  padding: 2px 2px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--select-fg);
+  font-weight: 700;
+  text-align: center;
+  box-shadow: 0 0 6px var(--accent);
+}
+.tui-subs-drawer.no-motion,
+html.bbs-reduced-motion .tui-subs-drawer {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bbs-topic-slide {
+    transition: none !important;
+  }
+  .tui-subs-drawer,
+  .tui-subs-drawer.open {
+    transition: none;
+  }
+}
+
+/* Between the phone breakpoint and the desktop layout the column stays a
+ * column (core decides drawer vs column at 640px), narrower. */
+@media (max-width: 899px) {
+  .tui-body.subs-open,
+  .tui-body.sidebar-collapsed.subs-open {
+    grid-template-columns: minmax(0, 1fr) min(var(--subs-w), 34vw);
+  }
+}
+
+/* Phone gutters (the card's padding is 0.4rem here, see above). */
+@media (max-width: 640px),
+  (pointer: coarse) and (orientation: portrait) and (max-width: 899px) {
+  .bbs-topic-item.bbs-subs-on .bbs-topic-row {
+    padding-left: calc(0.3rem + 3ch + 0.3rem);
+  }
+  .bbs-sub-toggle {
+    top: calc(1px + 0.4rem);
+    left: 0.3rem;
+  }
+}

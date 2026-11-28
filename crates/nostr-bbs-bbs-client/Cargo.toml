@@ -59,6 +59,8 @@ web-sys = { workspace = true, features = [
     "EventTarget",
     "HashChangeEvent",
     "KeyboardEvent",
+    "PointerEvent",
+    "NodeList",
     "ClipboardEvent",
     "DataTransfer",
     "DataTransferItemList",
