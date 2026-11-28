@@ -18,6 +18,39 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Client core: topic subscriptions, unread counts and a private cross-device copy (2026-11-28)
+
+Client core plus one provider line in each client's `app.rs`; no view yet, so nothing is visible until the forum and BBS
+panels land. No worker or relay change. None of this has been seen in a browser or against a live relay.
+
+- **Store** (`stores/thread_subs.rs`). A member can subscribe to up to 150 topics. Each subscription records the topic
+  root, its channel and zone, on or off, and when it changed; switching one off leaves a tombstone for 30 days so merges
+  converge. Each topic has a read marker that never moves back, starts at "now" on subscribe and advances when a view
+  calls `mark_read`. Saved per account in localStorage (`nostrbbs:thread_subs:v1:<pubkey>`), merged with what another tab
+  saved on every write, reloaded when another tab writes, removed at sign-out. Topic titles are never stored: the panel
+  list resolves them at runtime from root events in the channel store, fetching missing roots by id (20 a REQ, one in
+  flight) through the usual admission and zone-decrypt path.
+- **Unread counts.** After NIP-42 AUTH, and again after a reconnect, one paced pass asks for each subscribed topic's
+  posts since its marker (`{kinds:[42], #e:[root], since, limit:100}`, at most 9 filters a REQ, one REQ in flight, closed
+  on its answer). While the app is open, counts grow from a new `ChannelStore::on_inserted` hook, fired once per batch
+  from `apply_page`, the live message handler and the channel-history subscription; no polling and no extra open
+  subscription. Edits, the member's own posts and duplicate ids are not counted.
+- **Cross-device copy** (`stores/thread_subs_sync.rs`). A kind-30078 event whose only tag is
+  `["d","nostr-bbs/thread-subs/v1"]`, content NIP-44 encrypted to the member's own key through the auth store's signer.
+  Fetched and merged entry by entry before every publish (newer change wins, off wins a tie, markers take the larger),
+  published at most once a minute. Never published before a successful fetch, nor over a copy that cannot be read. One
+  exception to fetch-first: a best-effort publish on `pagehide` (local-key and passkey sessions) sends the local list
+  without a fetch, so it can overwrite another device's change made since this session's last fetch until that device
+  next publishes. A NIP-07 extension without `nip44`, or any error, leaves the feature local-only. A device-key
+  session's copy belongs to the device key, not the identity, and is refused by the relay unless the device-key gate is
+  on and the device is registered.
+- **Bell.** A reply in a subscribed topic (not the member's own, not an edit) raises an in-app notice titled "New post in
+  a subscribed topic in <section>", judged against the topic's marker rather than the channel's read position. It is
+  the same notice as the existing post notice (same id; a mention stays a mention), uses the existing `Message` kind so
+  stored lists stay readable by older builds, and passes the "Mentions only" level. No push or OS alert.
+- New member data kept across a relay change (`relay_scope`), and a row in the kind-30078 `d`-tag table of
+  [`docs/BASELINE-architecture.md`](docs/BASELINE-architecture.md).
+
 ### Forum client: layout shift and a two-tab notice gap (2026-11-28)
 
 - **Notifications.** A tab that received a "New section" or "New member" notice from another tab (through the storage listener) never recorded its id as announced, so its next sync-state save omitted it and the notice returned after Clear and a reload. That case now records the id. More generally, saving the sync state now merges its id lists (notified posts, announced sections, announced members) with what is already stored, keeping the newest within the existing caps, and the tab adopts the merge, so one tab's save no longer drops ids another tab recorded. The stored format and the baseline are unchanged; Clear still only empties the visible list. Client only. Not seen in a browser.
