@@ -44,7 +44,7 @@
 //! error to skip silently: it is counted, and [`Harvest::hold_back`] keeps
 //! the high-water mark below it so it is read again once the key arrives.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use nostr_bbs_core::event::verify_event_strict;
 use nostr_bbs_core::sealed::{open_sealed_with_conversation_key, parse_sealed};
@@ -95,6 +95,83 @@ impl std::fmt::Debug for ZoneRow {
     }
 }
 
+/// Channels the deployment pins to a zone (ADR-2037), from the zone
+/// config's `channels` lists: channel id (lowercase hex) to zone id.
+///
+/// A post in a channel pinned to another zone is not indexed under this
+/// one, whatever zone its `zk` tag names: the relay now serves that channel
+/// only to the pinned zone's readers, and the index must not hand its text
+/// to readers of the zone it left. Empty (the default) changes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelPins(BTreeMap<String, String>);
+
+/// No channel pins: the behaviour before ADR-2037.
+pub static NO_CHANNEL_PINS: ChannelPins = ChannelPins(BTreeMap::new());
+
+impl ChannelPins {
+    /// Read the pins from a `ZONE_CONFIG` JSON array (the projection every
+    /// worker and client is given). Other zone fields are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Malformed JSON, a pinned id that is not 64-char hex, or a channel
+    /// pinned by two zones (refused rather than guessed: the relay treats
+    /// such a channel's zone as unknown).
+    pub fn from_zone_config_json(raw: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            id: String,
+            #[serde(default)]
+            channels: Vec<String>,
+        }
+        let zones: Vec<Entry> =
+            serde_json::from_str(raw).map_err(|e| format!("zone config: {e}"))?;
+        let mut pins = BTreeMap::new();
+        for z in zones {
+            for c in z.channels {
+                let c = c.trim().to_ascii_lowercase();
+                if !is_hex64(&c) {
+                    return Err(format!(
+                        "zone config: zone {} pins {c:?}, not a 64-hex channel id",
+                        z.id
+                    ));
+                }
+                if let Some(prev) = pins.insert(c.clone(), z.id.clone()) {
+                    if prev != z.id {
+                        return Err(format!(
+                            "zone config: channel {c} is pinned by both {prev} and {}",
+                            z.id
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(Self(pins))
+    }
+
+    /// The zone `channel_id` is pinned to, if any.
+    pub fn zone_of(&self, channel_id: &str) -> Option<&str> {
+        self.0
+            .get(&channel_id.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    /// Whether no channel is pinned.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The channel a kind-42 belongs to: its root-marked `e` tag, else its first
+/// `e` tag (the relay's rule).
+fn channel_of(ev: &NostrEvent) -> Option<&str> {
+    let e_tags = || ev.tags.iter().filter(|t| t.len() >= 2 && t[0] == "e");
+    e_tags()
+        .find(|t| t.get(3).map(String::as_str) == Some("root"))
+        .or_else(|| e_tags().next())
+        .map(|t| t[1].as_str())
+}
+
 /// What a harvest may trust beyond the events themselves.
 #[derive(Debug, Clone, Copy)]
 pub struct Rules<'a> {
@@ -104,6 +181,9 @@ pub struct Rules<'a> {
     /// Hex pubkeys whose kind-5 deletes any post (admins and moderators, from
     /// the job's configuration). Anyone else deletes only their own posts.
     pub moderators: &'a [String],
+    /// Channels pinned to a zone (ADR-2037): a post in a channel pinned to
+    /// another zone is skipped, and excluded if already indexed.
+    pub channel_pins: &'a ChannelPins,
 }
 
 /// How long a second the relay cannot page completely may hold the
@@ -202,6 +282,9 @@ pub struct Harvest {
     pub invalid: usize,
     /// Events whose `zk` names another zone or is malformed.
     pub foreign: usize,
+    /// Events in a channel the zone config pins to another zone (ADR-2037):
+    /// not indexed, and excluded when already in the index.
+    pub pinned_elsewhere: usize,
     /// Events under a held key that do not open (counted, not retried).
     pub undecryptable: usize,
     /// Events under an epoch whose key is not held.
@@ -555,9 +638,25 @@ pub async fn harvest<R: Relay>(
     };
     let mut recs: HashMap<String, Rec> = HashMap::new();
     let mut env_to_inner: HashMap<String, String> = HashMap::new();
+    // Indexed rows whose channel is now pinned to another zone (ADR-2037).
+    let mut pinned_out: HashSet<String> = HashSet::new();
     for ev in &posts {
         if verify_event_strict(ev).is_err() {
             h.invalid += 1;
+            continue;
+        }
+        let pinned = channel_of(ev).and_then(|c| rules.channel_pins.zone_of(c));
+        if pinned.is_some_and(|p| p != zone) {
+            // Not this zone's post any more. It does not move the mark: the
+            // mark follows this zone's posts only. Opened only to learn the
+            // row id (an envelope's is its original's) so an indexed copy
+            // can be excluded; the text is dropped unread.
+            h.pinned_elsewhere += 1;
+            if let Opened::Post(id, ..) = opener.open(ev) {
+                if indexed.contains(&id) {
+                    pinned_out.insert(id);
+                }
+            }
             continue;
         }
         match opener.open(ev) {
@@ -780,6 +879,7 @@ pub async fn harvest<R: Relay>(
     }
     h.exclude = deleted
         .union(&superseded)
+        .chain(pinned_out.iter())
         .filter(|id| indexed.contains(*id))
         .cloned()
         .collect();
@@ -814,5 +914,64 @@ mod tests {
             "an old held post is read again"
         );
         assert_eq!(Harvest::default().high_water(Some(9)), Some(9));
+    }
+
+    // -- ADR-2037 channel pins ---------------------------------------------
+
+    #[test]
+    fn channel_pins_parse_from_zone_config() {
+        let a = "ab".repeat(32);
+        let pins = ChannelPins::from_zone_config_json(&format!(
+            r#"[{{"id":"open","display_name":"Open"}},
+                {{"id":"staff","channels":["{}"," {a} "]}}]"#,
+            a.to_uppercase()
+        ))
+        .unwrap();
+        assert_eq!(pins.zone_of(&a), Some("staff"));
+        assert_eq!(pins.zone_of(&a.to_uppercase()), Some("staff"));
+        assert_eq!(pins.zone_of(&"cd".repeat(32)), None);
+        assert!(ChannelPins::from_zone_config_json(r#"[{"id":"open"}]"#)
+            .unwrap()
+            .is_empty());
+        assert!(NO_CHANNEL_PINS.is_empty());
+    }
+
+    #[test]
+    fn malformed_or_doubled_channel_pins_are_refused() {
+        let a = "ab".repeat(32);
+        assert!(ChannelPins::from_zone_config_json("nope").is_err());
+        assert!(
+            ChannelPins::from_zone_config_json(r#"[{"id":"staff","channels":["abc"]}]"#).is_err()
+        );
+        let err = ChannelPins::from_zone_config_json(&format!(
+            r#"[{{"id":"a","channels":["{a}"]}},{{"id":"b","channels":["{a}"]}}]"#
+        ))
+        .unwrap_err();
+        assert!(err.contains("pinned by both"), "{err}");
+    }
+
+    #[test]
+    fn channel_of_prefers_the_root_marker() {
+        let ev = |tags: Vec<Vec<&str>>| NostrEvent {
+            id: String::new(),
+            pubkey: String::new(),
+            created_at: 0,
+            kind: 42,
+            tags: tags
+                .into_iter()
+                .map(|t| t.into_iter().map(str::to_string).collect())
+                .collect(),
+            content: String::new(),
+            sig: String::new(),
+        };
+        assert_eq!(
+            channel_of(&ev(vec![
+                vec!["e", "topic", "", "reply"],
+                vec!["e", "chan", "", "root"]
+            ])),
+            Some("chan")
+        );
+        assert_eq!(channel_of(&ev(vec![vec!["e", "chan"]])), Some("chan"));
+        assert_eq!(channel_of(&ev(vec![vec!["p", "x"]])), None);
     }
 }
