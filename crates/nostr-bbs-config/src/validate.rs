@@ -498,6 +498,34 @@ pub fn check_zone_pin_keys(zones: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Every key a [`crate::schema::Zone`] serialises when all its fields are
+/// set. A test serialises a fully populated zone and checks this list against
+/// it, so it cannot drift from the schema.
+pub const ZONE_SCHEMA_KEYS: &[&str] = &[
+    "id",
+    "slug",
+    "display_name",
+    "required_cohorts",
+    "write_cohorts",
+    "banner_image_url",
+    "accent_hex",
+    "visibility",
+    "encrypted",
+    "agent_keys",
+    "history_from_epoch",
+    "group_pubkey",
+    "auto_approve",
+    "kanban",
+    "search",
+    "channels",
+];
+
+/// Zone keys a deployed `ZONE_CONFIG` legitimately carries that the config
+/// schema does not model: `section_order` is read only by the clients
+/// (`nostr_bbs_client_core::stores::zones::Zone::section_order`) and is in
+/// every live projection.
+pub const CLIENT_ONLY_ZONE_KEYS: &[&str] = &["section_order"];
+
 /// Check a `ZONE_CONFIG` JSON value as deployed (ADR-2037): misspelt pin
 /// keys, malformed or duplicate `channels` entries, and pinning zone ids that
 /// extend another zone's id. Use it on a hand-edited projection before it is
@@ -510,6 +538,27 @@ pub fn validate_zone_config_json(raw: &str) -> Result<(), String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("ZONE_CONFIG is not valid JSON: {e}"))?;
     check_zone_pin_keys(&value)?;
+    // Strict about keys here (the workers stay tolerant): any key that is
+    // not a schema field or a known client-only field is refused, since the
+    // workers would silently ignore it, and an ignored pin key leaves the
+    // channel in its old zone.
+    for z in value.as_array().into_iter().flatten() {
+        let Some(obj) = z.as_object() else { continue };
+        let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        if let Some(key) = obj.keys().find(|k| {
+            !ZONE_SCHEMA_KEYS.contains(&k.as_str()) && !CLIENT_ONLY_ZONE_KEYS.contains(&k.as_str())
+        }) {
+            return Err(format!(
+                "zone '{id}' has unknown key '{key}': the workers would ignore it (known keys: {})",
+                ZONE_SCHEMA_KEYS
+                    .iter()
+                    .chain(CLIENT_ONLY_ZONE_KEYS)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     let zones: Vec<crate::schema::Zone> = value
         .as_array()
         .ok_or("ZONE_CONFIG must be a JSON array")?
@@ -1583,5 +1632,62 @@ bot_profile = "tag"
             assert!(is_misspelt_pin_key(key), "{key}");
         }
         assert!(!is_misspelt_pin_key("channels"));
+    }
+
+    #[test]
+    fn zone_schema_keys_match_a_fully_populated_zone() {
+        let full = Zone {
+            id: "z".into(),
+            slug: Some("z".into()),
+            display_name: "Z".into(),
+            required_cohorts: vec!["z".into()],
+            write_cohorts: Some(vec!["z".into()]),
+            banner_image_url: Some("/b.webp".into()),
+            accent_hex: Some("#123456".into()),
+            visibility: ZoneVisibility::Hidden,
+            encrypted: true,
+            agent_keys: true,
+            history_from_epoch: Some(1),
+            group_pubkey: Some("ab".repeat(32)),
+            auto_approve: true,
+            kanban: true,
+            search: Some(SearchMode::Sealed),
+            channels: vec![PIN_A.into()],
+        };
+        let json = serde_json::to_value(&full).unwrap();
+        let mut got: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut want = ZONE_SCHEMA_KEYS.to_vec();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
+        // And the fully populated zone validates cleanly as a ZONE_CONFIG.
+        let raw = serde_json::to_string(&vec![full]).unwrap();
+        assert_eq!(validate_zone_config_json(&raw), Ok(()));
+    }
+
+    #[test]
+    fn unknown_zone_keys_are_refused_by_the_zone_config_validator() {
+        for key in [
+            "channel_ids",
+            "channel_pins",
+            "pinnedChannels",
+            "pinned-channels",
+            "pinned_channel",
+            "colour",
+        ] {
+            let raw = format!(r#"[{{"id":"staff","{key}":["{PIN_A}"]}}]"#);
+            let err = validate_zone_config_json(&raw).unwrap_err();
+            assert!(err.contains("staff") && err.contains(key), "{key}: {err}");
+        }
+        // The client-only key every live projection carries is accepted.
+        assert_eq!(
+            validate_zone_config_json(r#"[{"id":"open","section_order":["open-a"]}]"#),
+            Ok(())
+        );
     }
 }

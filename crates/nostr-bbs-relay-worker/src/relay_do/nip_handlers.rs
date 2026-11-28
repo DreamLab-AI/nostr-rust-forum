@@ -1318,8 +1318,9 @@ impl NostrRelayDO {
                 // ADR-2037 review: the channel must be a stored kind-40 with
                 // exactly this id, as for kind-42 (a mixed-case alias would
                 // miss its channel_zones row and skip the zone gate).
-                let channel_known = self.reference_target_channels(&channel_id, 0).await;
-                if let Some(reason) = channel_write_rejection(&channel_id, &channel_known, None) {
+                // A D1 failure is retryable and is not remembered as "unknown".
+                let known = self.stored_channel_known(&channel_id).await;
+                if let Some(reason) = channel_known_rejection(&known) {
                     Self::send_ok(ws, &event.id, false, reason);
                     return;
                 }
@@ -2749,6 +2750,18 @@ pub(crate) fn edit_target_of(event: &NostrEvent) -> Option<String> {
         .map(|t| t[1].to_ascii_lowercase())
 }
 
+/// Refusal for a kind-41 whose channel is not a stored kind-40 with exactly
+/// that id; a lookup that could not be answered is retryable.
+pub(crate) fn channel_known_rejection(
+    known: &Result<(), TargetLookupError>,
+) -> Option<&'static str> {
+    match known {
+        Ok(()) => None,
+        Err(TargetLookupError::Unavailable) => Some("error: channel lookup failed, try again"),
+        Err(TargetLookupError::Missing) => Some("invalid: channel is not a known channel"),
+    }
+}
+
 /// Why a stored-target lookup returned nothing usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TargetLookupError {
@@ -3198,6 +3211,26 @@ impl NostrRelayDO {
     /// The channel(s) a reply's topic `root` lives in, for the F2 placement
     /// check: every stored match must be a kind-42 (a live root, or a sealed
     /// envelope wrapping it). `Err` otherwise.
+    /// Whether `channel_id` is a stored kind-40 with exactly that id. A hit in
+    /// the positive target memo answers at once; otherwise D1 is asked, and
+    /// neither absence nor failure is memoised, so a D1 failure is never
+    /// replayed as "not a known channel".
+    async fn stored_channel_known(&self, channel_id: &str) -> Result<(), TargetLookupError> {
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.ref_target_cache.get(channel_id, now) {
+            return if hit.len() == 1 && hit[0] == channel_id {
+                Ok(())
+            } else {
+                Err(TargetLookupError::Missing)
+            };
+        }
+        let targets = self.lookup_target_events_detailed(channel_id).await?;
+        match targets.as_slice() {
+            [t] if t.kind == 40 && t.id == channel_id => Ok(()),
+            _ => Err(TargetLookupError::Missing),
+        }
+    }
+
     /// The channels the post an edit targets lives in (stored kind-42 or a
     /// sealed original), with lookup failures kept apart from absence.
     async fn edit_target_channels(&self, target: &str) -> Result<Vec<String>, TargetLookupError> {
@@ -10000,5 +10033,18 @@ mod channel_pin_gate_tests {
                 assert!(decide(kind, &ctx));
             }
         }
+    }
+
+    #[test]
+    fn a_kind_41_channel_lookup_failure_is_retryable() {
+        assert_eq!(channel_known_rejection(&Ok(())), None);
+        assert_eq!(
+            channel_known_rejection(&Err(TargetLookupError::Missing)),
+            Some("invalid: channel is not a known channel")
+        );
+        assert_eq!(
+            channel_known_rejection(&Err(TargetLookupError::Unavailable)),
+            Some("error: channel lookup failed, try again")
+        );
     }
 }

@@ -110,17 +110,35 @@ fn is_hex64(s: &str) -> bool {
 /// its old zone.
 pub use nostr_bbs_config::validate::is_misspelt_pin_key;
 
-/// Every 64-hex string in `v` (a string, or an array of strings), lowercased.
+/// How deep [`hex_ids_in`] walks a malformed pin value.
+const PIN_WALK_MAX_DEPTH: usize = 16;
+/// The most ids [`hex_ids_in`] collects from one value.
+const PIN_WALK_MAX_IDS: usize = 1024;
+
+/// Every 64-hex string anywhere in `v` (strings, and the elements and object
+/// values of arrays and objects, recursively), lowercased: the ids a
+/// malformed pin value meant to pin, so they can fail closed. Bounded in
+/// depth and count; beyond either bound the rest is not searched.
 fn hex_ids_in(v: &serde_json::Value) -> Vec<String> {
-    let one = |s: &str| {
-        let t = s.trim();
-        is_hex64(t).then(|| t.to_ascii_lowercase())
-    };
-    match v {
-        serde_json::Value::String(s) => one(s).into_iter().collect(),
-        serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str().and_then(one)).collect(),
-        _ => Vec::new(),
+    fn walk(v: &serde_json::Value, depth: usize, out: &mut Vec<String>) {
+        if depth > PIN_WALK_MAX_DEPTH || out.len() >= PIN_WALK_MAX_IDS {
+            return;
+        }
+        match v {
+            serde_json::Value::String(s) => {
+                let t = s.trim();
+                if is_hex64(t) {
+                    out.push(t.to_ascii_lowercase());
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, depth + 1, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| walk(x, depth + 1, out)),
+            _ => {}
+        }
     }
+    let mut out = Vec::new();
+    walk(v, 0, &mut out);
+    out
 }
 
 /// The full set of zone definitions parsed from `ZONE_CONFIG`.
@@ -805,5 +823,39 @@ mod tests {
             "staff",
             &[vec!["e".to_string(), PINNED.into()]]
         ));
+    }
+
+    #[test]
+    fn ids_nested_anywhere_in_a_malformed_channels_value_fail_closed() {
+        for shape in [
+            format!(r#"{{"x":"{PINNED}"}}"#),
+            format!(r#"[["{PINNED}"]]"#),
+            format!(r#"[{{"id":"{PINNED}"}}]"#),
+        ] {
+            let c = ZoneConfig::from_json(&format!(
+                r#"[{{"id":"open","required_cohorts":["m"]}},
+                    {{"id":"staff","required_cohorts":["staff"],"channels":{shape}}}]"#
+            ));
+            assert_eq!(c.pinned_zone(PINNED), ChannelPin::Conflict, "{shape}");
+            assert!(c.cohorts_can_read("open", &["m".to_string()]), "{shape}");
+            assert_eq!(c.pin_errors().len(), 1, "{shape}");
+        }
+    }
+
+    #[test]
+    fn the_pin_walk_is_bounded() {
+        // Deeper than the bound: nothing past it is collected, and no panic.
+        let mut deep = serde_json::Value::String(PINNED.to_string());
+        for _ in 0..(PIN_WALK_MAX_DEPTH + 4) {
+            deep = serde_json::Value::Array(vec![deep]);
+        }
+        assert!(hex_ids_in(&deep).is_empty());
+        // Many ids: collection stops at the cap.
+        let many = serde_json::Value::Array(
+            (0..PIN_WALK_MAX_IDS + 10)
+                .map(|_| serde_json::Value::String(PINNED.to_string()))
+                .collect(),
+        );
+        assert_eq!(hex_ids_in(&many).len(), PIN_WALK_MAX_IDS);
     }
 }
