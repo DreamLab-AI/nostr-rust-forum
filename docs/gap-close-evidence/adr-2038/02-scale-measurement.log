@@ -1,0 +1,15 @@
+# 2026-11-28T14:46:39Z 400a1e385408b2d76eccc692f8ac666fa0be08c3 + measurement test, COUNT_BUDGET=10000; cargo --release, rusqlite bundled SQLite in-memory; NOT D1
+    Finished `release` profile [optimized] target(s) in 38.95s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/home/devuser/workspace/.tmp/section-stats-target/release/deps/nostr_bbs_relay_worker-cd5e1e6c320d2e1e)
+
+running 1 test
+topics   168 x replies   20 =    3528 msgs in C,     0 other roots: listed  168 truncated false counted  168 | steps roots     31290 activity     72190 counts    572535 | 56 ms
+topics   168 x replies  600 =  100968 msgs in C,     0 other roots: listed  168 truncated false counted   20 | steps roots     31290 activity     72190 counts   2028558 | 131 ms
+topics  1000 x replies  100 =  101000 msgs in C,  2000 other roots: listed 1000 truncated false counted  100 | steps roots    296042 activity    429590 counts   1692790 | 166 ms
+topics  2000 x replies   50 =  102000 msgs in C,  5000 other roots: listed 1000 truncated true  counted  200 | steps roots    403530 activity    429590 counts   1695580 | 177 ms
+test relay_do::section_stats::tests::measure_section_stats_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 749 filtered out; finished in 11.26s
+

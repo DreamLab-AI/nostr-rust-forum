@@ -209,7 +209,7 @@ bounds them (`nip_handlers.rs:71-77`).
   relay only admin-gates 9000-9020 and 39000-39002 on an `h` tag and stores them
   (`relay_do/nip_handlers.rs:60-61,1328-1340`); kind 9 is world-readable
   (`relay_do/nip42.rs:44`). `supported_nips` dropped 29 on 2026-11-16
-  (`crates/nostr-bbs-relay-worker/src/nip11.rs:16`, asserted by the test at `:307`,
+  (`crates/nostr-bbs-relay-worker/src/nip11.rs:16`, asserted by the test at `:312`,
   re-read at `3c48e26`); this bullet previously said it was advertised, and the
   citations were from `0065dd9`. ADR-2030 proposes the group engine.
 - **Deletion and absence gaps (2026-11-22).** No un-tombstone route, a moderator's
@@ -250,6 +250,10 @@ bounds them (`nip_handlers.rs:71-77`).
    only a restored sealed original is also checked client-side (`stores/tombstones.rs:114`).
 8. **A deep-linked page never reports absence from `ChannelStore::loading`**, only from an
    authenticated receipt or the deadline (ADR-2034).
+9. **An aggregate read is admitted by the per-event read rule of what it aggregates, and a refusal
+   is never an empty answer.** `SECTION-STATS` goes through `channel_read_decision_for(42, …)` on
+   `cached_channel_zone` (pin first) and answers a refused or unknown section with the same `CLOSED`
+   text (ADR-2038); a new aggregate must reuse the read rule, not restate it.
 
 ## Change process
 
@@ -294,7 +298,7 @@ The pay routes are live (`PAY_ENABLED = "true"` in production). `crates/nostr-bb
 
 ## Relay read cost — ADR-2018
 
-[ADR-2018](adr/ADR-2018-relay-read-caches-and-activity-throttle.md) makes the relay's D1 cost scale with requests rather than delivered events. The Durable Object holds 60-second memos of channel → zone, viewer cohorts and device owner (`relay_do/read_cache.rs`, fields at `relay_do/mod.rs:97`), the read gate decides membership from the cached cohorts with the pure `zone_read_permitted` (`relay_do/nip_handlers.rs:1746`), and the trust-ledger writes are coalesced by `ActivityLedger` to one flush per pubkey per five minutes. The forcing fact was D1's free tier: 5 M row reads a day, of which the old per-event lookups spent ~70% on machine traffic alone. Any new per-event D1 read on a read path reopens that ADR.
+[ADR-2018](adr/ADR-2018-relay-read-caches-and-activity-throttle.md) makes the relay's D1 cost scale with requests rather than delivered events. The Durable Object holds 60-second memos of channel → zone, viewer cohorts and device owner (`relay_do/read_cache.rs`, fields from `relay_do/mod.rs:122`), the read gate decides membership from the cached cohorts with the pure `zone_read_permitted` (`relay_do/nip_handlers.rs:1746`), and the trust-ledger writes are coalesced by `ActivityLedger` to one flush per pubkey per five minutes. The forcing fact was D1's free tier: 5 M row reads a day, of which the old per-event lookups spent ~70% on machine traffic alone. Any new per-event D1 read on a read path reopens that ADR.
 
 ## Encrypted zones and sealed-original history — ADR-2016, ADR-2017
 
@@ -430,7 +434,7 @@ the rest of this document's `verified_commit` stamp is not re-asserted for the o
   today both replaceable branches keep a late older row, `storage.rs:97-139`), persisted dedup and watermark, and a
   `PeerConnector` implementation (`relay-worker/src/mesh.rs:143`, no implementor today). The
   30 s re-sign and the C re-check need a Durable Object alarm; the only alarm today is idle
-  eviction (`relay_do/mod.rs:371`). Activation order across the estate (round-2 C9): agentbox
+  eviction (`relay_do/mod.rs:448`). Activation order across the estate (round-2 C9): agentbox
   2162; VisionClaw 2159 then 2161 (`public`, `dids`); forum 2030 then 2031 (with the ADR-2032
   30312 publisher, which voice needs); VisionClaw 2157 then 2161 (`space:`); VisionClaw 2160.
 - **Spatial descriptor (ADR-2032).** Extra tags on the home-signed 39000 whose content
@@ -505,3 +509,7 @@ adopted (ADR-2030).
 ## Zone-config channel pins — ADR-2037
 
 [ADR-2037](adr/ADR-2037-pin-a-section-to-a-zone-from-zone-config.md) lets `[[zones]] channels` pin existing kind-40 channels to a zone, so a section can be moved (for example into a hidden, encrypted, admin-only zone) without rewriting any event or `channel_zones` row. The relay consults the pin before D1 in `trust::resolve_channel_zone` (`relay-worker/src/trust.rs:595`) and ahead of both 60 s memos in `cached_channel_zone` (`relay_do/nip_handlers.rs:2982`), through which every read and write gate resolves; the two SQL readers outside that path, `/api/profile-stats` and the Jev triage query, overlay the pin themselves. A channel pinned by two zones, or by a zone whose pin list is malformed or misspelt, is an unanswered lookup (fail closed); a kind-42 or comment into a pinned channel whose `zk` names another zone is refused; `/api/admin/channel-zone` refuses a pinned channel; a non-admin's kind-41 needs write access to the channel's resolved zone; and an edit must target a message of its own channel (clients apply edits only within the same channel). Clients keep the signed tag in `ChannelMeta::section_tag` and route by `ChannelMeta::section = zones::effective_section(..)` (`client-core/src/stores/zones.rs:347`), recomputed on every cache load, so every resolver follows a pin and its removal. A pinned channel is never bound in D1 by the admin UI. The pin protects relay reads and metadata and the key of new posts; history synced under the old zone key stays readable to whoever holds it, and the pinned id is public in the page source. `Zone::is_member` now treats empty cohorts on a non-public zone as admins only, matching the relay.
+
+## Section stats — ADR-2038
+
+[ADR-2038](adr/ADR-2038-one-request-returns-a-section-s-topic-stats.md) adds one relay frame, `["SECTION-STATS", <id>, {"channel": <id>}]`, answered once with every marked topic root of the section, its last activity, last participant and reply count, in board order (`relay-worker/src/relay_do/section_stats.rs`, dispatched in `relay_do/mod.rs`, advertised in NIP-11 as `nostr_bbs.section_stats`). It holds no subscription. Admission is `channel_read_decision_for(42, …)` on the zone `cached_channel_zone` resolves, so cohorts, admin bypass, encrypted zones and ADR-2037 pins decide exactly as for REQ; refusals are `CLOSED` and a missing section is refused like a gated one (invariant 9). The three statements run on the existing `event_tags` indexes with capped walks (1,000 topics, 256 tag rows per activity walk, reply counts capped at 1,000 per topic and 10,000 per answer) and a 30 s per-channel memo; there is no D1 schema change. Both clients ask once per visit when NIP-11 advertises it (`client-core/src/relay/info.rs`, `ChannelStore::request_section_stats`), fold the answer into the order with `max` (`topics::section_stats::fold_section_stats`) before `FrozenBoard` freezes, and fall back to the per-topic pump, which now fills only figures the answer lacks. `FrozenBoard` also counts a late row sitting below a row of lower known activity and re-takes a cap freeze's provisional baseline once. Requirements: [`prd/prd-section-topic-lists.md`](prd/prd-section-topic-lists.md).

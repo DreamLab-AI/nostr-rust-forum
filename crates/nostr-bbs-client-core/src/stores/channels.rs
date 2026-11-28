@@ -19,6 +19,7 @@ use crate::stores::deletion_sync::{self, DeletionProgress, DeletionScope, Source
 use crate::stores::signer_admin::SignerAdminCache;
 use crate::stores::tombstones::{self, Target, Tombstones, LOCAL_DELETER};
 use crate::stores::zones::Zone;
+use crate::topics::section_stats::{SectionStats, SectionStatsState, SECTION_STATS_TIMEOUT_MS};
 use crate::utils::lookup::SyncReceipt;
 use crate::zone_crypto::store::{is_restored_original, ZoneKeyStore};
 
@@ -266,6 +267,13 @@ pub struct ChannelStore {
     /// Listeners told once per batch of genuinely new messages
     /// ([`ChannelStore::on_inserted`]).
     inserted_hooks: StoredValue<Vec<InsertedCallback>, leptos::prelude::LocalStorage>,
+    /// Section stats (ADR-2038) per channel id: pending, answered or failed
+    /// for this visit (reactive). Cleared per visit by
+    /// [`ChannelStore::rearm_section_stats`].
+    section_stats: RwSignal<HashMap<String, SectionStatsState>>,
+    /// Request generation per channel id, so an answer or timeout of an
+    /// earlier request never settles a later one.
+    section_stats_gen: StoredValue<HashMap<String, u64>>,
 }
 
 /// Deliveries of a channel's `ensure_subscribed` REQ, snapshotted at its
@@ -321,6 +329,8 @@ impl ChannelStore {
             topic_stats_busy: StoredValue::new(false),
             first_pages: StoredValue::new(HashMap::new()),
             inserted_hooks: StoredValue::new_local(Vec::new()),
+            section_stats: RwSignal::new(HashMap::new()),
+            section_stats_gen: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
         store
@@ -634,6 +644,9 @@ impl ChannelStore {
 
     /// Start relay subscriptions. Called once from App root after relay connects.
     pub fn start_sync(&self, relay: &RelayConnection) {
+        // ADR-2038: the section stats check reads the relay's NIP-11
+        // document; fetch it now so the first section visit does not wait.
+        crate::relay::info::prefetch();
         if self.sub_id.get_untracked().is_some() {
             return;
         }
@@ -1462,7 +1475,10 @@ impl ChannelStore {
     }
 
     /// Ask, once per session per topic, for the section list's per-topic
-    /// stats of channel `cid`'s topics `roots`: the exact reply total (the
+    /// stats of channel `cid`'s topics `roots`: the fallback, and the
+    /// figures the section stats ([`Self::request_section_stats`],
+    /// ADR-2038) do not carry; pages pass only those topics. The exact
+    /// reply total (the
     /// relay's `#e:[root]` COUNT, as the thread page uses, kept current by
     /// [`Self::note_inserted`]) and the newest reply (`#e:[root]`,
     /// `limit:1`, into [`Self::topic_latest`]). Topics are taken in the
@@ -1568,7 +1584,10 @@ impl ChannelStore {
         ev: &NostrEvent,
     ) {
         let root = nostr_bbs_core::sealed::reply_root_of(ev).map(str::to_lowercase);
-        let opened = nostr_bbs_core::sealed::parse_sealed(&ev.tags).is_none()
+        // An edit is not activity (`classify_topics`, ADR-2038): it carries
+        // its topic's `reply` tag, so a limit-1 answer can be one.
+        let opened = crate::topics::thread::edit_target_of(ev).is_none()
+            && nostr_bbs_core::sealed::parse_sealed(&ev.tags).is_none()
             && ev.content != crate::zone_crypto::PLACEHOLDER_MISSING_KEY
             && ev.content != crate::zone_crypto::PLACEHOLDER_UNDECRYPTABLE;
         if let Some(root) = root.filter(|r| opened && wanted.get(r).is_some_and(|c| c == cid)) {
@@ -1595,6 +1614,122 @@ impl ChannelStore {
                 z.forget(std::slice::from_ref(&ev.id));
             }
         }
+    }
+
+    /// Ask the relay for channel `cid`'s section stats (ADR-2038), once per
+    /// visit: every marked topic with its last activity, last participant
+    /// and reply count, in one frame. Sent only when the relay's NIP-11
+    /// document advertises it; anything else (not advertised, refused,
+    /// malformed, or no answer within [`SECTION_STATS_TIMEOUT_MS`] of this
+    /// call, the NIP-11 fetch included) settles as failed, and the board
+    /// behaves as it did before. In a gated zone call it only once AUTH is
+    /// accepted (as the root list is), so the relay answers the member.
+    pub fn request_section_stats(&self, relay: &RelayConnection, cid: &str) {
+        if self.section_stats.with_untracked(|m| m.contains_key(cid)) {
+            return;
+        }
+        let gen = self
+            .section_stats_gen
+            .try_update_value(|g| {
+                let n = g.entry(cid.to_string()).or_insert(0);
+                *n += 1;
+                *n
+            })
+            .unwrap_or(0);
+        self.section_stats.update(|m| {
+            m.insert(cid.to_string(), SectionStatsState::Pending);
+        });
+        let store = *self;
+        let wire: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        {
+            let relay = relay.clone();
+            let wire = wire.clone();
+            let cid = cid.to_string();
+            crate::utils::set_timeout_once(
+                move || {
+                    if let Some(id) = wire.borrow_mut().take() {
+                        relay.cancel_section_stats(&id);
+                    }
+                    store.settle_section_stats(
+                        &cid,
+                        gen,
+                        SectionStatsState::Failed("timeout".into()),
+                    );
+                },
+                SECTION_STATS_TIMEOUT_MS,
+            );
+        }
+        let relay = relay.clone();
+        let cid = cid.to_string();
+        leptos::task::spawn_local(async move {
+            let advertised = crate::relay::info::nip11()
+                .await
+                .is_ok_and(|doc| crate::topics::section_stats::advertised(&doc));
+            if !advertised {
+                store.settle_section_stats(
+                    &cid,
+                    gen,
+                    SectionStatsState::Failed("not advertised".into()),
+                );
+                return;
+            }
+            let for_cid = cid.clone();
+            let on_answer = Rc::new(move |res: Result<serde_json::Value, String>| {
+                store.settle_section_stats(
+                    &for_cid,
+                    gen,
+                    SectionStatsState::from_answer(&for_cid, res),
+                );
+            });
+            let id = relay.section_stats(&cid, on_answer);
+            *wire.borrow_mut() = Some(id);
+        });
+    }
+
+    /// Settle request `gen` of channel `cid`, unless a newer request (or
+    /// an earlier settlement) got there first.
+    fn settle_section_stats(&self, cid: &str, gen: u64, state: SectionStatsState) {
+        let current = self
+            .section_stats_gen
+            .try_with_value(|g| g.get(cid).copied())
+            .flatten();
+        if current != Some(gen) {
+            return;
+        }
+        let _ = self.section_stats.try_update(|m| {
+            if let Some(slot) = m.get_mut(cid).filter(|s| !s.settled()) {
+                *slot = state;
+            }
+        });
+    }
+
+    /// A new visit to channel `cid`'s list: forget this channel's section
+    /// stats so the visit asks afresh. Call once per visit.
+    pub fn rearm_section_stats(&self, cid: &str) {
+        if self.section_stats.with_untracked(|m| m.contains_key(cid)) {
+            self.section_stats.update(|m| {
+                m.remove(cid);
+            });
+        }
+    }
+
+    /// Channel `cid`'s section stats state for this visit, if asked.
+    /// Reactive.
+    pub fn section_stats_state(&self, cid: &str) -> Option<SectionStatsState> {
+        self.section_stats.with(|m| m.get(cid).cloned())
+    }
+
+    /// Channel `cid`'s section stats, when answered. Reactive.
+    pub fn section_stats(&self, cid: &str) -> Option<std::sync::Arc<SectionStats>> {
+        self.section_stats
+            .with(|m| m.get(cid).and_then(|s| s.stats().cloned()))
+    }
+
+    /// Whether channel `cid`'s section stats have answered or failed this
+    /// visit (not asked counts as not settled). Reactive.
+    pub fn section_stats_settled(&self, cid: &str) -> bool {
+        self.section_stats
+            .with(|m| m.get(cid).is_some_and(SectionStatsState::settled))
     }
 
     /// Whether a deletion of message `id` by `author` is honoured: the

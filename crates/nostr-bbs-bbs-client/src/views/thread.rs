@@ -32,6 +32,7 @@ use nostr_bbs_client_core::stores::reactions::use_reaction_store;
 use nostr_bbs_client_core::stores::read_position::use_read_positions;
 use nostr_bbs_client_core::stores::zones::{load_zones, resolve_zone_param};
 use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
+use nostr_bbs_client_core::topics::section_stats::{fold_section_stats, freeze_ready};
 use nostr_bbs_client_core::topics::{
     board_events, classify_topics, edit_tags, find_topic_root, first_paint_ready, history_settled,
     landing_target, latest_post, latest_version, post_anchor_id, sealed_aliases, thread_events,
@@ -198,6 +199,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         // A new visit may ask a root list that failed earlier again at
         // once (its backoff otherwise holds).
         channels.rearm_topic_roots(&cid.get_value());
+        channels.rearm_section_stats(&cid.get_value());
         Effect::new(move |_| {
             let cid = cid.get_value();
             channels.ensure_subscribed(&relay, &cid);
@@ -206,6 +208,9 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             // after its answer: one round trip less before first paint.
             if !gated || relay.authenticated().get() {
                 channels.request_topic_roots(&relay, &cid, gated);
+                // ADR-2038: the section's topic stats, in the same round
+                // trip and under the same AUTH rule.
+                channels.request_section_stats(&relay, &cid);
             }
             if channels.history_receipt(&cid).settles(gated) {
                 channels.settle_first_page(&cid, gated);
@@ -224,10 +229,18 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             classify_topics(&cid, &board_events(window, roots))
         })
     });
+    // ADR-2038: the relay's section stats give every marked topic its true
+    // last activity and reply count in one answer. Folded into the structure
+    // the board orders by (the per-topic stats below never are).
+    let section_stats = Memo::new(move |_| channels.section_stats(&cid.get_value()));
+    let section_stats_settled =
+        Memo::new(move |_| channels.section_stats_settled(&cid.get_value()));
+    let structured =
+        Memo::new(move |_| fold_section_stats(classified.get(), section_stats.get().as_deref()));
     // The window holds a fraction of a long topic: the relay's exact reply
     // total and newest reply where they are in.
     let topics = Memo::new(move |_| {
-        with_topic_stats(classified.get(), |t| {
+        with_topic_stats(structured.get(), |t| {
             (
                 channels.total_for(&topic_key(&t.id)),
                 channels.topic_latest(&t.id),
@@ -238,10 +251,18 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         let relay = relay.clone();
         Effect::new(move |_| {
             let cid = cid.get_value();
-            if !channels.history_receipt(&cid).settles(gated) {
+            // Once the section stats have answered or failed, and only for
+            // figures they do not carry (all of them when they failed).
+            if !channels.history_receipt(&cid).settles(gated) || !section_stats_settled.get() {
                 return;
             }
-            let ids: Vec<String> = topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect());
+            let stats = section_stats.get();
+            let ids: Vec<String> = topics.with(|ts| {
+                ts.iter()
+                    .filter(|t| stats.as_ref().is_none_or(|s| s.needs_pump(&t.id)))
+                    .map(|t| t.id.clone())
+                    .collect()
+            });
             channels.request_topic_stats(&relay, &cid, &ids, gated);
         });
     }
@@ -268,10 +289,12 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     });
 
     // First paint: once topics are found the board waits (on its "Loading
-    // topics" card) for its history window's settled answer and its root
-    // list (answered or failed), or FIRST_PAINT_TIMEOUT_MS, so dormant topics
-    // do not land under the reader. Stats are not waited for: they never
-    // move a painted row. A store that already holds both paints at once.
+    // topics" card) for its history window's settled answer, its root list
+    // and its section stats (ADR-2038; each answered or failed), or
+    // FIRST_PAINT_TIMEOUT_MS, so dormant topics do not land under the reader;
+    // the section stats never hold the paint past that same timeout. The
+    // per-topic stats are not waited for. A store that already holds all
+    // three paints at once.
     let hold_expired = RwSignal::new(false);
     {
         let armed = StoredValue::new(false);
@@ -300,6 +323,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             || first_paint_ready(
                 channels.history_receipt(&cid).settles(gated),
                 channels.topic_roots_answered(&cid) || channels.topic_roots_failed(&cid),
+                section_stats_settled.get(),
                 hold_expired.get(),
             )
     });
@@ -320,11 +344,14 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     });
 
     // Display order (`FrozenBoard`): provisional while the board loads, in
-    // the true order from structure only (the window's activity, then root
-    // creation; stats never enter it), then frozen once, for the visit, when
-    // the window has settled and the root list has answered or failed (or
-    // FREEZE_CAP_MS after rows first show). After that no row moves; "↻ N
-    // updated" offers real activity newer than the freeze. Leaving the board
+    // the true order from structure and the section stats (the window's
+    // activity, the relay's per-section answer, then root creation; the
+    // per-topic stats never enter it), then frozen once, for the visit, when
+    // the window has settled and the root list and the section stats have
+    // each answered or failed (or FREEZE_CAP_MS after rows first show).
+    // After that no row moves; "↻ N updated" offers real activity newer than
+    // the freeze, and a row that arrived late below a row of lower known
+    // activity. Leaving the board
     // and coming back starts afresh. Every input is a Memo, so the board
     // does not re-run on other channels' traffic.
     let order = RwSignal::new(Vec::<String>::new());
@@ -378,8 +405,14 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             );
         });
     }
-    let ready_to_freeze =
-        Memo::new(move |_| cap_expired.get() || (window_settled.get() && roots_settled.get()));
+    let ready_to_freeze = Memo::new(move |_| {
+        freeze_ready(
+            window_settled.get(),
+            roots_settled.get(),
+            section_stats_settled.get(),
+            cap_expired.get(),
+        )
+    });
     // The newest activity known: every topic's (stats included) and the
     // window's newest message (an edit can come back as a newest reply).
     let newest_known = Memo::new(move |_| {
@@ -405,7 +438,10 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         let newest = newest_known.get();
         let me_now = me.get();
         let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-        let next = classified.with(|structure| {
+        let stats = section_stats.get();
+        let baseline_settled = window_settled.get() || stats.is_some();
+        let known = |id: &str| stats.as_ref().is_some_and(|s| s.activity_known(id));
+        let next = structured.with(|structure| {
             board.try_update_value(|b| {
                 sealed_pairs.with(|pairs| b.note_aliases(pairs.iter().cloned()));
                 // An original opened as it arrived never had its envelope in
@@ -421,6 +457,8 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                         newest_known: newest,
                         now_secs,
                         deleted: &is_deleted,
+                        baseline_settled,
+                        activity_known: &known,
                     },
                 );
                 // Rows show once the board has painted (its loading card
