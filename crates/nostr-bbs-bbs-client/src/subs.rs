@@ -642,8 +642,9 @@ fn width_of(el: &web_sys::Element) -> f64 {
 /// Bind a drawer drag (`kind`) to `el`, previewing the drawer through `drag`
 /// (its offset while a drag is claimed) and settling `panel` on release.
 /// `drawer` gives the drawer element for its width. A claimed drag swallows
-/// the click that ends it. Touch and pen only for a push (a mouse selects
-/// text in the drawer); any pointer for the tab's pull.
+/// the click that ends it, if one comes before the next press. Touch and pen
+/// only for a push (a mouse selects text in the drawer); any pointer for the
+/// tab's pull.
 fn attach_drawer_drag(
     el: &web_sys::HtmlElement,
     kind: DragKind,
@@ -662,7 +663,12 @@ fn attach_drawer_drag(
 
     let down = {
         let tracker = tracker.clone();
+        let swallow = swallow.clone();
         EventListener::new(el, "pointerdown", move |e| {
+            // A new press ends the swallow window of the last drag: mobile
+            // browsers send no click after a moved touch, so a flag left set
+            // would eat the next real tap on a drawer link or the tab.
+            swallow.set(false);
             let Some(pe) = e.dyn_ref::<web_sys::PointerEvent>() else {
                 return;
             };
@@ -777,8 +783,10 @@ fn SubsDrawer(panel: SubsPanel) -> impl IntoView {
     let reduced = Memo::new(move |_| prefs.reduced_motion.get());
 
     // Opening this drawer closes the navigation drawer, and the reverse.
+    // Written only when it changes: an unconditional set notifies every
+    // reader, the effect below among them.
     Effect::new(move |_| {
-        if open.get() {
+        if open.get() && prefs.mobile_drawer_open.get_untracked() {
             prefs.mobile_drawer_open.set(false);
         }
     });
