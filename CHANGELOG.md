@@ -18,6 +18,28 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Relay and clients: one request lists a section's topics in true order (2026-11-28)
+
+Decision: [ADR-2038](docs/adr/ADR-2038-one-request-returns-a-section-s-topic-stats.md); requirements:
+[`docs/prd/prd-section-topic-lists.md`](docs/prd/prd-section-topic-lists.md). Relay worker, client-core and both clients.
+No D1 schema or data change. Not exercised against D1, a live relay or in a browser; costs are measured on native SQLite.
+
+- **Relay.** New frame `["SECTION-STATS", <id>, {"channel": <id>}]`, answered once with every marked topic root of the
+  section, its last activity, last participant and reply count, newest activity first, plus `truncated` past 1,000 topics.
+  Admitted exactly as the section's messages are on REQ (zone cohorts, admin bypass, encrypted zones, zone-config pins,
+  AUTH); a refused or unknown section gets `CLOSED`, never an empty list. Deleted and expired events, edits and other
+  channels' events never count; a sealed root is reported under its envelope id with its original id. Bounded index walks
+  and a reply-count budget; one answer per section per 30 s is computed and shared. Advertised in NIP-11 as
+  `nostr_bbs.section_stats`. Holds no subscription.
+- **Clients (forum and BBS).** A section asks for it with its root list (after AUTH in a gated zone) when the relay
+  advertises it, and the list freezes in true order for every marked topic once the window, the root list and the section
+  stats have each answered or failed (20 s cap unchanged). First paint waits for it only within the existing 1.5 s hold. The
+  per-topic stats now run only for figures the answer lacks, and no longer take an edit as a topic's newest reply. Against
+  an older relay, on a refusal or after 8 s without an answer, the list behaves exactly as before.
+- **"↻ N updated".** Also counts a topic that arrived after the freeze below a topic of lower known activity (never an
+  older page's older topics), and after a freeze forced by the 20 s cap before the window or the section stats arrived, the
+  baseline is taken again when the first of them lands, so a quiet section no longer shows a count.
+
 ### Zones: pin a section to a zone from config (2026-11-28)
 
 Decision: [ADR-2037](docs/adr/ADR-2037-pin-a-section-to-a-zone-from-zone-config.md). Relay worker, both clients,
