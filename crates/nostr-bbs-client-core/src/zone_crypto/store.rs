@@ -2367,6 +2367,17 @@ pub fn is_restored_original(store: Option<ZoneKeyStore>, id: &str) -> bool {
     store.is_some_and(|s| s.cache.with_value(|c| c.envelope_of(id).is_some()))
 }
 
+/// The envelope id sealed original `id` was restored from this session, if
+/// it was (opened on arrival or by a later key). A topic list uses it to
+/// keep the row in place when the original reverts to its envelope's
+/// placeholder. Not reactive. Same restriction as [`is_restored_original`].
+pub fn restored_envelope_of(store: Option<ZoneKeyStore>, id: &str) -> Option<String> {
+    store.and_then(|s| {
+        s.cache
+            .with_value(|c| c.envelope_of(id).map(str::to_string))
+    })
+}
+
 /// The zone-key store, if provided.
 pub fn try_use_zone_key_store() -> Option<ZoneKeyStore> {
     use_context::<ZoneKeyStore>()

@@ -372,6 +372,34 @@ pub fn stable_order(
         .collect()
 }
 
+/// The topics whose first stats have landed since the last call: in
+/// `answered` now, never answered before (`before`, every id answered so
+/// far this visit), and not the other half of a sealed pair (`aliases`,
+/// both ways) that was. Then records them in `before`, with their aliases.
+///
+/// A sealed root that opens is listed under a new id, whose stats are asked
+/// afresh; its row was already placed under the envelope's id, so its
+/// stats landing must not move it again (nor after the key is dropped and
+/// it reverts to the envelope).
+pub fn first_stats_landed(
+    answered: &HashSet<String>,
+    before: &mut HashSet<String>,
+    aliases: &HashMap<String, String>,
+) -> HashSet<String> {
+    let landed: HashSet<String> = answered
+        .iter()
+        .filter(|id| !before.contains(*id) && !aliases.get(*id).is_some_and(|a| before.contains(a)))
+        .cloned()
+        .collect();
+    for id in answered {
+        before.insert(id.clone());
+        if let Some(a) = aliases.get(id) {
+            before.insert(a.clone());
+        }
+    }
+    landed
+}
+
 /// Whether the reader is at the top of a list: the list's first row lies
 /// wholly inside the viewport (`row_*` and `view_*` are top and bottom
 /// edges in the same coordinates). A new topic is then inserted in view
@@ -989,6 +1017,69 @@ mod tests {
         assert_eq!(
             stable_order(&shown, &sorted, &HashMap::new(), &first_stats),
             sorted
+        );
+    }
+
+    fn set(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn first_stats_land_once_per_topic() {
+        let mut before = HashSet::new();
+        let none = HashMap::new();
+        assert_eq!(
+            first_stats_landed(&set(&["a"]), &mut before, &none),
+            set(&["a"])
+        );
+        assert_eq!(
+            first_stats_landed(&set(&["a", "b"]), &mut before, &none),
+            set(&["b"])
+        );
+        // A topic leaving the list (paged out) and coming back is not new.
+        first_stats_landed(&set(&["b"]), &mut before, &none);
+        assert!(first_stats_landed(&set(&["a", "b"]), &mut before, &none).is_empty());
+    }
+
+    #[test]
+    fn a_sealed_root_keeps_its_placement_across_the_swap() {
+        let aliases = both_ways(&[("env", "orig")]);
+        let mut before = HashSet::new();
+        // The envelope's stats landed: placed.
+        first_stats_landed(&set(&["env", "a"]), &mut before, &aliases);
+        // Opened: the original's stats land later under its own id.
+        assert!(first_stats_landed(&set(&["a"]), &mut before, &aliases).is_empty());
+        assert!(first_stats_landed(&set(&["orig", "a"]), &mut before, &aliases).is_empty());
+        // The key is dropped: back to the envelope, still not new.
+        assert!(first_stats_landed(&set(&["env", "a"]), &mut before, &aliases).is_empty());
+    }
+
+    #[test]
+    fn a_swap_and_the_original_s_stats_in_one_update_do_not_move_the_row() {
+        let aliases = both_ways(&[("env", "orig")]);
+        let mut before = HashSet::new();
+        first_stats_landed(&set(&["env", "a", "b"]), &mut before, &aliases);
+        let landed = first_stats_landed(&set(&["orig", "a", "b"]), &mut before, &aliases);
+        assert!(landed.is_empty());
+        // So stable_order swaps it in place and leaves it there.
+        let shown = ids(&["a", "env", "b"]);
+        let sorted = ids(&["orig", "a", "b"]);
+        assert_eq!(
+            stable_order(&shown, &sorted, &aliases, &landed),
+            ids(&["a", "orig", "b"])
+        );
+    }
+
+    #[test]
+    fn an_envelope_never_placed_is_placed_when_its_original_s_stats_land() {
+        // The envelope's stats never came in before it opened: the
+        // original's are its first, so the row is placed (once).
+        let aliases = both_ways(&[("env", "orig")]);
+        let mut before = HashSet::new();
+        first_stats_landed(&set(&["a"]), &mut before, &aliases);
+        assert_eq!(
+            first_stats_landed(&set(&["orig", "a"]), &mut before, &aliases),
+            set(&["orig"])
         );
     }
 
