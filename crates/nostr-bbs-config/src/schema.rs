@@ -249,9 +249,11 @@ pub enum ZoneVisibility {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
     /// Stable internal identifier (`"public"`, `"friends"`, `"family"`,
-    /// `"business"`, ...). This is the key channels' `section` tags and cohort
-    /// rules resolve against — renaming it orphans channels, so it must never
-    /// change once deployed. For the URL segment, prefer [`slug`](Self::slug).
+    /// `"business"`, ...). This is the key channels' `section` tags, the
+    /// relay's `channel_zones` bindings, [`channels`](Self::channels) pins and
+    /// cohort rules resolve against — renaming it orphans channels, so it must
+    /// never change once deployed. For the URL segment, prefer
+    /// [`slug`](Self::slug).
     pub id: String,
     /// Optional URL slug (issue #45). When present the client addresses this
     /// zone as `/<slug>` (e.g. `/welcome`, `/dreamlab`) instead of
@@ -266,6 +268,9 @@ pub struct Zone {
     /// Cohorts required to READ this zone. Admins bypass this unconditionally.
     /// An empty list combined with `visibility = "public"` means unauthenticated
     /// read; an empty list with any other visibility means admin-only read.
+    /// The relay enforces this; the clients' tile gating follows the same rule
+    /// (before ADR-2037 the clients showed an empty-cohort non-public zone as
+    /// open to everyone, though the relay still withheld its content).
     #[serde(default)]
     pub required_cohorts: Vec<String>,
     /// Cohorts required to WRITE to this zone. When absent, falls back to
@@ -340,6 +345,18 @@ pub struct Zone {
     /// zone, and any mode but `off` on a public zone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchMode>,
+    /// Kind-40 channel ids pinned to this zone (ADR-2037): 64-char lowercase
+    /// hex event ids. A pinned channel belongs to this zone whatever its signed
+    /// `section` tag or its relay `channel_zones` row says, so an existing
+    /// section can be moved to another zone (for example a hidden, encrypted,
+    /// admin-only one) from config alone, with no event or database row
+    /// rewritten. Projected into `ZONE_CONFIG` for the relay and both clients;
+    /// omitted from the projection when empty, so a config without pins
+    /// projects byte-for-byte as before. Validation refuses a malformed id and
+    /// an id pinned by two zones. The list is public (it is in the page
+    /// source), so it reveals that the channel exists, though not its content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<String>,
 }
 
 /// Per-zone search mode.

@@ -342,6 +342,7 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
                 }
             }
         }
+        validate_channel_pins(&cfg.zones)?;
     }
 
     for host in &cfg.preview.allowed_hosts {
@@ -440,6 +441,57 @@ fn preview_host_problem(host: &str) -> Result<(), &'static str> {
     }
     if OPEN_SUFFIXES.contains(&host) {
         return Err("is an open-registration suffix; list the specific site beneath it");
+    }
+    Ok(())
+}
+
+/// ADR-2037 channel pins (`[[zones]] channels`): every entry is a kind-40
+/// event id (64-char lowercase hex), no channel is listed twice, and a zone
+/// that pins channels does not have an id of the form `<other zone id>-…`.
+///
+/// The last rule exists because the clients resolve a section to a zone by
+/// exact id or by the first `<zone id>-` prefix in config order, and media
+/// uploads use the prefix rule alone: a channel pinned to `staff-only` while a
+/// zone `staff` exists would have its uploads filed under `staff`.
+fn validate_channel_pins(zones: &[crate::schema::Zone]) -> Result<(), String> {
+    let mut owner: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for zone in zones {
+        for id in &zone.channels {
+            let well_formed =
+                id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            if !well_formed {
+                return Err(format!(
+                    "zone '{}' channels entry '{}' must be a kind-40 event id: 64-char \
+                     lowercase hex",
+                    zone.id, id
+                ));
+            }
+            if let Some(prev) = owner.insert(id.as_str(), zone.id.as_str()) {
+                return Err(if prev == zone.id {
+                    format!("zone '{}' lists channel {id} twice", zone.id)
+                } else {
+                    format!(
+                        "channel {id} is pinned by both zone '{prev}' and zone '{}' — a \
+                         channel can belong to one zone only",
+                        zone.id
+                    )
+                });
+            }
+        }
+        if zone.channels.is_empty() {
+            continue;
+        }
+        if let Some(shadow) = zones
+            .iter()
+            .find(|z| z.id != zone.id && zone.id.starts_with(&format!("{}-", z.id)))
+        {
+            return Err(format!(
+                "zone '{}' pins channels but its id starts with '{}-', so clients would \
+                 file the pinned channels' media under zone '{}'; give the zone an id \
+                 that does not extend another zone's",
+                zone.id, shadow.id, shadow.id
+            ));
+        }
     }
     Ok(())
 }
@@ -982,6 +1034,7 @@ operator = "tier-2"
             kanban: false,
             search: None,
             group_pubkey: None,
+            channels: Vec::new(),
         }
     }
 
@@ -1098,6 +1151,7 @@ operator = "tier-2"
             kanban: false,
             search: None,
             group_pubkey: None,
+            channels: Vec::new(),
         }];
         assert!(validate_config(&cfg).is_ok());
     }
@@ -1121,6 +1175,7 @@ operator = "tier-2"
             kanban: false,
             search: None,
             group_pubkey: None,
+            channels: Vec::new(),
         }];
         assert!(validate_config(&cfg).is_err());
     }
@@ -1144,6 +1199,7 @@ operator = "tier-2"
             kanban: false,
             search: None,
             group_pubkey: None,
+            channels: Vec::new(),
         }
     }
 
@@ -1296,5 +1352,86 @@ bot_profile = "tag"
         assert_eq!(cfg.zones[0].accent_hex.as_deref(), Some("#3b82f6"));
         assert!(cfg.features.poker);
         assert_eq!(cfg.poker, Poker::default());
+    }
+
+    // -- ADR-2037 channel pins ----------------------------------------------
+
+    const PIN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PIN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn pinning(id: &str, channels: &[&str]) -> Zone {
+        Zone {
+            channels: channels.iter().map(|c| c.to_string()).collect(),
+            visibility: ZoneVisibility::Hidden,
+            required_cohorts: vec![id.to_string()],
+            ..zone_with_slug(id, None)
+        }
+    }
+
+    #[test]
+    fn well_formed_channel_pins_validate() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![pinning("open", &[]), pinning("staff", &[PIN_A, PIN_B])];
+        assert!(validate_config(&cfg).is_ok(), "{:?}", validate_config(&cfg));
+    }
+
+    #[test]
+    fn malformed_channel_pins_are_rejected() {
+        let upper = PIN_A.to_uppercase();
+        let short = &PIN_A[..63];
+        let not_hex = "g".repeat(64);
+        let padded = format!(" {}", &PIN_A[..63]);
+        for bad in [upper.as_str(), short, not_hex.as_str(), padded.as_str(), ""] {
+            let mut cfg = baseline_cfg();
+            cfg.zones = vec![pinning("staff", &[bad])];
+            let err = validate_config(&cfg).unwrap_err();
+            assert!(err.contains("64-char"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_channel_pinned_by_two_zones_is_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![
+            pinning("staff", &[PIN_A]),
+            pinning("board", &[PIN_B, PIN_A]),
+        ];
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.contains("pinned by both zone 'staff' and zone 'board'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_channel_listed_twice_by_one_zone_is_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![pinning("staff", &[PIN_A, PIN_A])];
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn a_pinning_zone_may_not_extend_another_zone_id() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![pinning("staff", &[]), pinning("staff-only", &[PIN_A])];
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.contains("starts with 'staff-'"), "{err}");
+        // Without pins the same ids are as valid as they were before.
+        cfg.zones = vec![pinning("staff", &[]), pinning("staff-only", &[])];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn channel_pins_parse_from_toml_and_stay_out_of_an_unpinned_projection() {
+        let toml = format!("id = \"staff\"\ndisplay_name = \"Staff\"\nchannels = [\"{PIN_A}\"]\n");
+        let zone: Zone = toml::from_str(&toml).unwrap();
+        assert_eq!(zone.channels, vec![PIN_A.to_string()]);
+        let json = serde_json::to_value(&zone).unwrap();
+        assert_eq!(json["channels"], serde_json::json!([PIN_A]));
+        let plain: Zone = toml::from_str("id = \"open\"\ndisplay_name = \"Open\"\n").unwrap();
+        assert!(plain.channels.is_empty());
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("channels").is_none(), "no pins, no key: {json}");
     }
 }

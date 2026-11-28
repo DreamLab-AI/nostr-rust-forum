@@ -1,0 +1,1 @@
+{"id":"zone7","slug":"seven","display_name":"Seven","required_cohorts":["seven"],"write_cohorts":["seven-writers"],"banner_image_url":"/b.webp","accent_hex":"#123abc","visibility":"hidden","encrypted":true,"agent_keys":true,"history_from_epoch":2,"group_pubkey":"abababababababababababababababababababababababababababababababab","auto_approve":true,"kanban":true,"search":"sealed"}

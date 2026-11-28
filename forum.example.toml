@@ -118,6 +118,15 @@ banner_url   = ""                                     # optional ASCII-art / ima
 #   accent_hex:        per-zone tile colour (#rgb / #rrggbb), themes the client.
 #   banner_image_url:  hero image for the zone tile.
 #   encrypted:         client-side NIP-44 encryption for zone content.
+#   channels:          kind-40 channel ids (64-char lowercase hex) pinned to this
+#                      zone (ADR-2037). A pinned channel belongs to this zone
+#                      whatever its signed `section` tag or its relay binding
+#                      says, so an existing section can be moved, say into a
+#                      hidden encrypted admin-only zone, without rewriting any
+#                      event or database row. One zone per channel. Posts made
+#                      before the move stay readable to whoever already holds the
+#                      old zone's key and synced them, and the list is public
+#                      (it ships in the page source). Omitted = no pins.
 #
 # Pick your own cohort taxonomy — "members"/"friends"/"family"/"business" below
 # is just one example. Cohorts are arbitrary string labels you assign to users.
@@ -160,6 +169,20 @@ visibility       = "locked"
 accent_hex       = "#8b5cf6"                           # violet
 banner_image_url = "/images/heroes/business-hero.webp"
 encrypted        = false
+
+# A hidden, encrypted zone that only admins read (empty cohorts on a non-public
+# zone = admins only), holding one existing section moved in by its channel id.
+# Uncomment and replace the placeholder id with the channel's kind-40 event id.
+# Avoid an id of the form `<other zone id>-…`: validation refuses it for a
+# zone that pins channels.
+#
+# [[zones]]
+# id               = "staff"
+# display_name     = "Staff"
+# required_cohorts = []
+# visibility       = "hidden"
+# encrypted        = true
+# channels         = ["0000000000000000000000000000000000000000000000000000000000000000"]
 
 
 # ─── Ingress recipients ──────────────────────────────────────────────────────
