@@ -14,7 +14,6 @@ use std::collections::{HashMap, HashSet};
 use nostr_bbs_core::NostrEvent;
 
 use super::thread::edit_target_of;
-use crate::utils::lookup::KeyState;
 
 /// A single topic (kind-42 root) plus its derived thread stats.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,40 +260,93 @@ pub fn first_paint_ready(
     timed_out || (roots_answered && stats_answered >= listed.min(FIRST_PAINT_STATS))
 }
 
-/// Whether a board's key state can no longer change which topics it lists:
-/// no keys are needed, or they have all been fetched (or given up on). A
-/// sealed topic root opens under its ORIGINAL id when its key arrives, so
-/// until then a painted board follows the true order rather than freezing.
-pub fn keys_final(keys: KeyState) -> bool {
-    matches!(
-        keys,
-        KeyState::NotNeeded | KeyState::Settled | KeyState::Stalled
-    )
+/// Whether a painted board pages older history automatically: not when
+/// its root list is complete (paging would add no topic), and otherwise
+/// only once that list has answered, so dormant roots do not land in a list
+/// already on screen. A root list that failed (timed out, or refused by the
+/// relay) or a first-paint hold that expired releases the gate as well, so
+/// a slow or refusing relay never switches paging off for the session.
+pub fn older_paging_armed(
+    roots_complete: bool,
+    roots_answered: bool,
+    roots_failed: bool,
+    hold_expired: bool,
+) -> bool {
+    !roots_complete && (roots_answered || roots_failed || hold_expired)
+}
+
+/// The sealed originals among `events`, as (envelope id, original id). A
+/// sealed topic root is listed under its envelope's id until its key
+/// arrives, then under the original's own id (and back if the key is
+/// dropped); [`stable_order`] uses these pairs to keep the row in place.
+pub fn sealed_aliases(events: &[NostrEvent]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter(|e| e.kind == 42)
+        .filter_map(|e| {
+            nostr_bbs_core::sealed::parse_sealed(&e.tags).map(|r| (e.id.clone(), r.inner_id))
+        })
+        .collect()
 }
 
 /// The order a painted board shows its topics in, given the order it shows
 /// now (`shown`, topic ids) and the true order (`sorted`, by
 /// [`board_order`]).
 ///
-/// A topic already shown keeps its place, however its activity changed;
-/// one that is gone is dropped. A topic not shown yet goes to the top when
-/// it sorts ahead of the first topic still shown (a brand-new topic, or
-/// one the window brings back), otherwise to the bottom (an older page),
-/// each group in true order. With nothing shown the true order is used.
-/// The result never holds an id twice.
-pub fn stable_order(shown: &[String], sorted: &[String]) -> Vec<String> {
+/// - A topic already shown keeps its place, however its activity changed;
+///   one that is gone is dropped.
+/// - A shown topic that is gone but whose alias (`aliases`, both ways
+///   between a sealed envelope and its original, see [`sealed_aliases`]) is
+///   now listed and not shown elsewhere is replaced in place by it.
+/// - A shown topic in `reposition` (its first stats have just landed) moves
+///   once to its true place among the rows that stay: before the first of
+///   them that sorts after it.
+/// - A topic not shown yet goes to the top when it sorts ahead of the first
+///   topic still shown (a brand-new topic, or one the window brings back),
+///   otherwise to the bottom (an older page), each group in true order.
+///
+/// With nothing shown the true order is used. The result never holds an id
+/// twice.
+pub fn stable_order(
+    shown: &[String],
+    sorted: &[String],
+    aliases: &HashMap<String, String>,
+    reposition: &HashSet<String>,
+) -> Vec<String> {
     let rank: HashMap<&str, usize> = sorted
         .iter()
         .enumerate()
         .rev()
         .map(|(i, id)| (id.as_str(), i))
         .collect();
+    let shown_set: HashSet<&str> = shown.iter().map(String::as_str).collect();
     let mut seen: HashSet<&str> = HashSet::with_capacity(sorted.len());
-    let kept: Vec<&str> = shown
-        .iter()
-        .map(String::as_str)
-        .filter(|id| rank.contains_key(id) && seen.insert(id))
-        .collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(shown.len());
+    let mut moving: Vec<&str> = Vec::new();
+    for id in shown.iter().map(String::as_str) {
+        let id = if rank.contains_key(id) {
+            id
+        } else {
+            match aliases.get(id).map(String::as_str) {
+                Some(a) if rank.contains_key(a) && !shown_set.contains(a) => a,
+                _ => continue,
+            }
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+        if reposition.contains(id) {
+            moving.push(id);
+        } else {
+            kept.push(id);
+        }
+    }
+    moving.sort_by_key(|id| rank[id]);
+    for id in moving {
+        let r = rank[id];
+        let at = kept.iter().position(|k| rank[k] > r).unwrap_or(kept.len());
+        kept.insert(at, id);
+    }
     let Some(first) = kept.first().map(|id| rank[id]) else {
         let mut once = HashSet::with_capacity(sorted.len());
         return sorted
@@ -318,6 +370,19 @@ pub fn stable_order(shown: &[String], sorted: &[String]) -> Vec<String> {
         .chain(kept.into_iter().map(str::to_string))
         .chain(bottom)
         .collect()
+}
+
+/// Whether the reader is at the top of a list: the list's first row lies
+/// wholly inside the viewport (`row_*` and `view_*` are top and bottom
+/// edges in the same coordinates). A new topic is then inserted in view
+/// rather than above it; a reader further down keeps their place.
+pub fn first_row_in_full_view(
+    row_top: f64,
+    row_bottom: f64,
+    view_top: f64,
+    view_bottom: f64,
+) -> bool {
+    row_top >= view_top - 0.5 && row_bottom <= view_bottom + 0.5
 }
 
 /// How many shown topics are out of their true place: the fewest rows that
@@ -756,19 +821,16 @@ mod tests {
 
     #[test]
     fn nothing_shown_takes_the_true_order() {
-        assert_eq!(stable_order(&[], &ids(&["a", "b"])), ids(&["a", "b"]));
+        assert_eq!(order(&[], &ids(&["a", "b"])), ids(&["a", "b"]));
         // Every shown topic gone (another section's ids): the true order.
-        assert_eq!(
-            stable_order(&ids(&["x"]), &ids(&["a", "b"])),
-            ids(&["a", "b"])
-        );
+        assert_eq!(order(&ids(&["x"]), &ids(&["a", "b"])), ids(&["a", "b"]));
     }
 
     #[test]
     fn shown_topics_keep_their_place_when_their_activity_changes() {
         // c was bumped by a reply: true order c, a, b. The rows stay.
         let shown = ids(&["a", "b", "c"]);
-        assert_eq!(stable_order(&shown, &ids(&["c", "a", "b"])), shown);
+        assert_eq!(order(&shown, &ids(&["c", "a", "b"])), shown);
         assert_eq!(out_of_order(&shown, &ids(&["c", "a", "b"])), 1);
     }
 
@@ -777,11 +839,11 @@ mod tests {
         let shown = ids(&["b", "c", "d"]);
         // n is newer than everything shown; o and p come from an older page.
         let sorted = ids(&["n", "b", "c", "d", "o", "p"]);
-        assert_eq!(stable_order(&shown, &sorted), sorted);
+        assert_eq!(order(&shown, &sorted), sorted);
         // A late dormant topic that belongs mid-list goes to the bottom,
         // where it reads out of order rather than pushing rows down.
         let sorted = ids(&["b", "m", "c", "d"]);
-        let next = stable_order(&shown, &sorted);
+        let next = order(&shown, &sorted);
         assert_eq!(next, ids(&["b", "c", "d", "m"]));
         assert_eq!(out_of_order(&next, &sorted), 1);
     }
@@ -793,19 +855,19 @@ mod tests {
         // screen, so it goes on top: the rows below it do not move.
         let shown = ids(&["b", "a"]);
         let sorted = ids(&["a", "x", "b"]);
-        assert_eq!(stable_order(&shown, &sorted), ids(&["x", "b", "a"]));
+        assert_eq!(order(&shown, &sorted), ids(&["x", "b", "a"]));
     }
 
     #[test]
     fn gone_topics_are_dropped_and_nothing_is_listed_twice() {
         let shown = ids(&["a", "gone", "b", "a"]);
         let sorted = ids(&["b", "a", "new", "b"]);
-        let next = stable_order(&shown, &sorted);
+        let next = order(&shown, &sorted);
         assert_eq!(next, ids(&["a", "b", "new"]));
         let unique: HashSet<&String> = next.iter().collect();
         assert_eq!(unique.len(), next.len());
         // Duplicates in the true order alone are dropped as well.
-        assert_eq!(stable_order(&[], &ids(&["a", "a"])), ids(&["a"]));
+        assert_eq!(order(&[], &ids(&["a", "a"])), ids(&["a"]));
     }
 
     #[test]
@@ -813,7 +875,7 @@ mod tests {
         // The "updated" control clears the shown order: the next order is
         // the true one and nothing reads out of order.
         let sorted = ids(&["c", "a", "b"]);
-        let next = stable_order(&[], &sorted);
+        let next = order(&[], &sorted);
         assert_eq!(out_of_order(&next, &sorted), 0);
     }
 
@@ -857,12 +919,120 @@ mod tests {
         assert!(updated_accessible_name(4).starts_with(words));
     }
 
+    fn order(shown: &[String], sorted: &[String]) -> Vec<String> {
+        stable_order(shown, sorted, &HashMap::new(), &HashSet::new())
+    }
+
+    fn both_ways(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .flat_map(|(e, o)| {
+                [
+                    (e.to_string(), o.to_string()),
+                    (o.to_string(), e.to_string()),
+                ]
+            })
+            .collect()
+    }
+
     #[test]
-    fn only_final_key_states_let_a_board_freeze() {
-        assert!(keys_final(KeyState::NotNeeded));
-        assert!(keys_final(KeyState::Settled));
-        assert!(keys_final(KeyState::Stalled));
-        assert!(!keys_final(KeyState::Pending));
-        assert!(!keys_final(KeyState::Progressing { until: 1.0 }));
+    fn a_sealed_root_opens_in_place() {
+        // The envelope "env" is shown second; its key arrives and the
+        // original "orig" (older, so it sorts last) replaces it.
+        let shown = ids(&["a", "env", "b"]);
+        let sorted = ids(&["a", "b", "orig"]);
+        let aliases = both_ways(&[("env", "orig")]);
+        let next = stable_order(&shown, &sorted, &aliases, &HashSet::new());
+        assert_eq!(next, ids(&["a", "orig", "b"]));
+        // And back to the placeholder when the key is dropped.
+        let back = stable_order(&next, &ids(&["env", "a", "b"]), &aliases, &HashSet::new());
+        assert_eq!(back, shown);
+        // Without the alias the original would land at the bottom.
+        assert_eq!(order(&shown, &sorted), ids(&["a", "b", "orig"]));
+    }
+
+    #[test]
+    fn an_envelope_whose_original_is_already_shown_is_dropped() {
+        let shown = ids(&["orig", "env", "b"]);
+        let sorted = ids(&["orig", "b"]);
+        let next = stable_order(
+            &shown,
+            &sorted,
+            &both_ways(&[("env", "orig")]),
+            &HashSet::new(),
+        );
+        assert_eq!(next, ids(&["orig", "b"]));
+    }
+
+    #[test]
+    fn a_row_whose_first_stats_land_moves_once_to_its_true_place() {
+        // Frozen after the first stats batches; "d" was dormant-looking and
+        // its stats now show a newer reply: true order a, d, b, c.
+        let shown = ids(&["a", "b", "c", "d"]);
+        let sorted = ids(&["a", "d", "b", "c"]);
+        let first_stats: HashSet<String> = ["d".to_string()].into_iter().collect();
+        let next = stable_order(&shown, &sorted, &HashMap::new(), &first_stats);
+        assert_eq!(next, sorted);
+        assert_eq!(out_of_order(&next, &sorted), 0, "not counted as updated");
+        // A later change to the same row is a real update: it stays put.
+        let sorted = ids(&["b", "a", "d", "c"]);
+        let later = order(&next, &sorted);
+        assert_eq!(later, next);
+        assert_eq!(out_of_order(&later, &sorted), 1);
+    }
+
+    #[test]
+    fn a_repositioned_row_that_sorts_last_goes_to_the_end() {
+        let shown = ids(&["x", "a", "b"]);
+        let sorted = ids(&["a", "b", "x"]);
+        let first_stats: HashSet<String> = ["x".to_string()].into_iter().collect();
+        assert_eq!(
+            stable_order(&shown, &sorted, &HashMap::new(), &first_stats),
+            sorted
+        );
+    }
+
+    #[test]
+    fn sealed_aliases_pair_envelopes_with_their_originals() {
+        let inner = "ab".repeat(32);
+        let env = ev(
+            "env",
+            "migrator",
+            "sealed",
+            5,
+            42,
+            vec![vec!["sealed", inner.as_str(), "1"]],
+        );
+        let plain = ev("p", "a", "t", 5, 42, vec![]);
+        assert_eq!(
+            sealed_aliases(&[env, plain]),
+            vec![("env".to_string(), inner)]
+        );
+    }
+
+    #[test]
+    fn older_paging_is_armed_by_an_answer_a_failure_or_the_hold() {
+        // Complete: never (paging would add no topic).
+        assert!(!older_paging_armed(true, true, false, true));
+        // Not answered yet, hold running: not yet.
+        assert!(!older_paging_armed(false, false, false, false));
+        assert!(older_paging_armed(false, true, false, false));
+        // A failed root list or an expired hold never leaves paging off.
+        assert!(older_paging_armed(false, false, true, false));
+        assert!(older_paging_armed(false, false, false, true));
+    }
+
+    #[test]
+    fn at_top_only_when_the_first_row_is_wholly_in_view() {
+        // Viewport 0..800.
+        assert!(first_row_in_full_view(10.0, 90.0, 0.0, 800.0));
+        assert!(first_row_in_full_view(0.0, 80.0, 0.0, 800.0));
+        // Partly scrolled off the top: the reader is further down.
+        assert!(!first_row_in_full_view(-20.0, 60.0, 0.0, 800.0));
+        // Wholly above.
+        assert!(!first_row_in_full_view(-200.0, -120.0, 0.0, 800.0));
+        // A pane whose top is at 64 px.
+        assert!(!first_row_in_full_view(40.0, 120.0, 64.0, 700.0));
+        assert!(first_row_in_full_view(64.0, 140.0, 64.0, 700.0));
     }
 }
