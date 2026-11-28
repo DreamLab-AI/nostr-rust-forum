@@ -1508,6 +1508,13 @@ impl ChannelStore {
         }
     }
 
+    /// Whether a deletion (kind-5) this store holds names `id`, whoever
+    /// asked for it. A topic list uses it to tell a deleted topic from one
+    /// merely evicted from the history window. Read-only, not tracked.
+    pub fn tombstone_names(&self, id: &str) -> bool {
+        self.tombstones.with_untracked(|t| t.names(id))
+    }
+
     /// Topic `root`'s newest reply as the relay answered it, as
     /// (created_at, author). Reactive.
     pub fn topic_latest(&self, root: &str) -> Option<(u64, String)> {
@@ -2318,6 +2325,7 @@ mod channel_list_tests {
             name: id.into(),
             description: String::new(),
             section: String::new(),
+            section_tag: String::new(),
             picture: String::new(),
             created_at: 1,
         }

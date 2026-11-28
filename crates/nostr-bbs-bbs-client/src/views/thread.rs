@@ -37,7 +37,7 @@ use nostr_bbs_client_core::topics::{
     first_row_in_full_view, history_settled, landing_target, latest_post, latest_version,
     post_anchor_id, sealed_aliases, thread_events, thread_replies, topic_reply_tags,
     topic_root_tags, topic_title, updated_accessible_name, updated_label, with_topic_stats,
-    FrozenBoard, Landing, ReplyView, TopicSummary, FIRST_PAINT_TIMEOUT_MS,
+    BoardInputs, FrozenBoard, Landing, ReplyView, TopicSummary, FIRST_PAINT_TIMEOUT_MS,
 };
 use nostr_bbs_client_core::utils::lookup::zone_is_gated;
 use nostr_bbs_client_core::utils::scroll_anchor;
@@ -284,7 +284,8 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
 
     let settled = Memo::new(move |_| {
         let cid = cid.get_value();
-        channels.history_receipt(&cid).settles(gated) && channels.topic_roots_answered(&cid)
+        channels.history_receipt(&cid).settles(gated)
+            && (channels.topic_roots_answered(&cid) || channels.topic_roots_failed(&cid))
     });
 
     // First paint: once topics are found the board waits (on its "Loading
@@ -295,8 +296,13 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     let hold_expired = RwSignal::new(false);
     {
         let armed = StoredValue::new(false);
+        // Armed once there is something to wait on: topics found, or the
+        // window answered (an empty board with a refused root list still
+        // paints, rather than "Loading topics…" for ever).
         Effect::new(move |_| {
-            if topics.with(Vec::is_empty) || armed.get_value() {
+            let started = !topics.with(Vec::is_empty)
+                || channels.history_receipt(&cid.get_value()).settles(gated);
+            if !started || armed.get_value() {
                 return;
             }
             armed.set_value(true);
@@ -315,7 +321,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             || first_paint_ready(
                 channels.history_receipt(&cid).settles(gated),
                 channels.topic_roots_answered(&cid) || channels.topic_roots_failed(&cid),
-                hold_expired.get() && !topics.with(Vec::is_empty),
+                hold_expired.get(),
             )
     });
     // Sealed envelopes and their originals in this board's lists: a sealed
@@ -341,36 +347,74 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     // updated". Leaving the board and coming back paints afresh.
     let true_ids =
         Memo::new(move |_| topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>()));
-    let by_id = Memo::new(move |_| {
-        topics.with(|ts| {
-            ts.iter()
-                .map(|t| (t.id.clone(), t.clone()))
-                .collect::<HashMap<_, _>>()
-        })
-    });
     let order = RwSignal::new(if painted.get_untracked() {
         true_ids.get_untracked()
     } else {
         Vec::new()
+    });
+    // A row still shown whose topic left the lists (evicted from the
+    // window, kept in place by the board) keeps its last known figures.
+    let by_id = Memo::new(move |prev: Option<&HashMap<String, TopicSummary>>| {
+        let mut map = topics.with(|ts| {
+            ts.iter()
+                .map(|t| (t.id.clone(), t.clone()))
+                .collect::<HashMap<_, _>>()
+        });
+        if let Some(prev) = prev {
+            order.with(|shown| {
+                for id in shown {
+                    if !map.contains_key(id) {
+                        if let Some(t) = prev.get(id) {
+                            map.insert(id.clone(), t.clone());
+                        }
+                    }
+                }
+            });
+        }
+        map
     });
     let board = StoredValue::new(None::<FrozenBoard>);
     {
         let me = auth.pubkey();
         Effect::new(move |_| {
             let shown = painted.get();
+            let cid_now = cid.get_value();
+            // The window counts once it has its settled answer and still
+            // holds the channel's newest messages.
+            let window_settled = channels.history_receipt(&cid_now).settles(gated)
+                && channels.history_cursor(&cid_now).newer_from.is_none();
+            let window_oldest = channels.channel_messages.with(|m| {
+                m.get(&cid_now)
+                    .and_then(|v| v.iter().map(|e| e.created_at).min())
+            });
+            let me_now = me.get_untracked();
+            let deleted = |id: &str| channels.tombstone_names(id);
             let next = topics.with(|sorted| {
                 board.try_update_value(|frozen| {
                     if !shown {
                         return (false, Vec::new());
                     }
-                    let b = frozen.get_or_insert_with(|| FrozenBoard::paint(sorted));
+                    let b =
+                        frozen.get_or_insert_with(|| FrozenBoard::paint(sorted, window_settled));
                     sealed_pairs.with(|pairs| b.note_aliases(pairs.iter().cloned()));
                     // An original opened as it arrived never had its
                     // envelope in a list: the zone cache knows the pair.
                     b.note_aliases(sorted.iter().filter_map(|t| {
                         restored_envelope_of(zk_store, &t.id).map(|env| (env, t.id.clone()))
                     }));
-                    b.update(sorted, me.get_untracked().as_deref());
+                    // The one permitted re-order (a paint before the window
+                    // settled) happens only while the reader is at the top.
+                    let may_reorder = b.shown().first().is_none_or(|id| at_board_top(id));
+                    b.update(
+                        sorted,
+                        &BoardInputs {
+                            me: me_now.as_deref(),
+                            window_settled,
+                            window_oldest,
+                            may_reorder,
+                            deleted: &deleted,
+                        },
+                    );
                     (true, b.shown().to_vec())
                 })
             });
@@ -394,14 +438,18 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         });
     }
     // Real activity newer than the paint, not late stats.
-    let updated = Memo::new(move |_| {
-        order.track();
-        topics.with(|sorted| {
-            board
-                .try_with_value(|b| b.as_ref().map_or(0, |b| b.updated(sorted)))
-                .unwrap_or(0)
+    let updated = {
+        let me = auth.pubkey();
+        Memo::new(move |_| {
+            order.track();
+            let me = me.get();
+            topics.with(|sorted| {
+                board
+                    .try_with_value(|b| b.as_ref().map_or(0, |b| b.updated(sorted, me.as_deref())))
+                    .unwrap_or(0)
+            })
         })
-    });
+    };
     // Older history adds topics only while the root list is incomplete.
     let can_load_older = Memo::new(move |_| {
         let cid = cid.get_value();

@@ -59,7 +59,7 @@ use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::topics::{
     first_paint_ready, first_row_in_full_view, older_paging_armed, sealed_aliases,
-    updated_accessible_name, updated_label, FrozenBoard, FIRST_PAINT_TIMEOUT_MS,
+    updated_accessible_name, updated_label, BoardInputs, FrozenBoard, FIRST_PAINT_TIMEOUT_MS,
 };
 use crate::utils::capitalize;
 use crate::utils::lookup::{
@@ -440,7 +440,11 @@ pub fn SectionPage() -> impl IntoView {
                 // answer (one round trip less before first paint). A gated
                 // zone's root list only counts once AUTH is done, so it
                 // goes out then: its timeout does not run during sign-in.
+                // Re-run on a change of the channel's history as well, so a
+                // root list that failed is asked again once its backoff has
+                // run out (`request_topic_roots` holds it until then).
                 let gated = zone_is_gated(&category_slug(), &load_zones());
+                let _ = store.history_receipt(cid);
                 if !gated || relay_for_roots.authenticated().get() {
                     store.request_topic_roots(&relay_for_roots, cid, gated);
                 }
@@ -598,12 +602,27 @@ pub fn SectionPage() -> impl IntoView {
     // Navigating away and back paints afresh.
     let true_ids =
         Memo::new(move |_| topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>()));
-    let by_id = Memo::new(move |_| {
-        topics.with(|ts| {
+    let order = RwSignal::new(true_ids.get_untracked());
+    // A row still shown whose topic left the lists (evicted from the
+    // window, kept in place by the board) keeps its last known figures.
+    let by_id = Memo::new(move |prev: Option<&HashMap<String, TopicSummary>>| {
+        let mut map = topics.with(|ts| {
             ts.iter()
                 .map(|t| (t.id.clone(), t.clone()))
                 .collect::<HashMap<_, _>>()
-        })
+        });
+        if let Some(prev) = prev {
+            order.with(|shown| {
+                for id in shown {
+                    if !map.contains_key(id) {
+                        if let Some(t) = prev.get(id) {
+                            map.insert(id.clone(), t.clone());
+                        }
+                    }
+                }
+            });
+        }
+        map
     });
     // Sealed envelopes and their originals in this channel's lists.
     let sealed_pairs = Memo::new(move |_| {
@@ -621,7 +640,6 @@ pub fn SectionPage() -> impl IntoView {
             pairs
         })
     });
-    let order = RwSignal::new(true_ids.get_untracked());
     // (channel, the frozen board once painted)
     let board = StoredValue::new((channel_id.get_untracked(), None::<FrozenBoard>));
     {
@@ -629,6 +647,21 @@ pub fn SectionPage() -> impl IntoView {
         Effect::new(move |_| {
             let cid = channel_id.get();
             let painted = matches!(branch.get(), ListBranch::List(_));
+            // The window counts once it has its settled answer and still
+            // holds the channel's newest messages (older paging can detach
+            // it); its oldest message bounds what it orders exactly.
+            let gated = zone_is_gated(&category_slug(), &load_zones());
+            let window_settled = cid.as_deref().is_some_and(|c| {
+                store.history_receipt(c).settles(gated)
+                    && store.history_cursor(c).newer_from.is_none()
+            });
+            let window_oldest = cid.as_deref().and_then(|c| {
+                store
+                    .channel_messages
+                    .with(|m| m.get(c).and_then(|v| v.iter().map(|e| e.created_at).min()))
+            });
+            let me_now = me.get_untracked();
+            let deleted = |id: &str| store.tombstone_names(id);
             let next = topics.with(|sorted| {
                 board.try_update_value(|(for_cid, frozen)| {
                     if *for_cid != cid {
@@ -636,7 +669,7 @@ pub fn SectionPage() -> impl IntoView {
                         *frozen = None;
                     }
                     if frozen.is_none() && painted {
-                        *frozen = Some(FrozenBoard::paint(sorted));
+                        *frozen = Some(FrozenBoard::paint(sorted, window_settled));
                     }
                     let Some(b) = frozen.as_mut() else {
                         return (
@@ -651,7 +684,19 @@ pub fn SectionPage() -> impl IntoView {
                         crate::zone_crypto::store::restored_envelope_of(zone_keys, &t.id)
                             .map(|env| (env, t.id.clone()))
                     }));
-                    b.update(sorted, me.get_untracked().as_deref());
+                    // The one permitted re-order (a paint before the window
+                    // settled) happens only while the reader is at the top.
+                    let may_reorder = b.shown().first().is_none_or(|id| at_list_top(id));
+                    b.update(
+                        sorted,
+                        &BoardInputs {
+                            me: me_now.as_deref(),
+                            window_settled,
+                            window_oldest,
+                            may_reorder,
+                            deleted: &deleted,
+                        },
+                    );
                     (true, b.shown().to_vec())
                 })
             });
@@ -676,14 +721,20 @@ pub fn SectionPage() -> impl IntoView {
     }
     // Real activity newer than the paint, not late stats. Re-read when the
     // shown order or the topics change; the board itself is read untracked.
-    let updated = Memo::new(move |_| {
-        order.track();
-        topics.with(|sorted| {
-            board
-                .try_with_value(|(_, b)| b.as_ref().map_or(0, |b| b.updated(sorted)))
-                .unwrap_or(0)
+    let updated = {
+        let me = auth.pubkey();
+        Memo::new(move |_| {
+            order.track();
+            let me = me.get();
+            topics.with(|sorted| {
+                board
+                    .try_with_value(|(_, b)| {
+                        b.as_ref().map_or(0, |b| b.updated(sorted, me.as_deref()))
+                    })
+                    .unwrap_or(0)
+            })
         })
-    });
+    };
 
     let header_name = move || {
         resolved_channel

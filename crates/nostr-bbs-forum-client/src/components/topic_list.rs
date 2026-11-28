@@ -30,8 +30,8 @@ pub use crate::topics::{classify_topics, topic_title, with_topic_stats, TopicSum
 /// Render the section as a list of topic rows.
 ///
 /// Rows are keyed by topic id alone and listed in `order`, which the page
-/// keeps stable once it has painted (client-core
-/// [`stable_order`](crate::topics::stable_order)): a stats answer or a
+/// freezes once it has painted (client-core
+/// [`FrozenBoard`](crate::topics::FrozenBoard)): a stats answer or a
 /// decrypted title updates a row in place, it never rebuilds or moves it.
 #[component]
 pub fn TopicList(
