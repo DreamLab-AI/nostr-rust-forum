@@ -1924,11 +1924,6 @@ html.bbs-reduced-motion .sentry-radar::before {
 .bbs-swipe-strip-end {
   justify-content: flex-end;
 }
-/* The spring back is set inline by client core, which honours only the
- * media query; the BBS's own REDUCED MOTION setting is honoured here. */
-html.bbs-reduced-motion .bbs-topic-slide {
-  transition: none !important;
-}
 
 /* Desktop column */
 .tui-body.subs-open {

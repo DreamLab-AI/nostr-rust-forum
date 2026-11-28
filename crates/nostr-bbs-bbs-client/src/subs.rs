@@ -22,7 +22,8 @@ use nostr_bbs_client_core::stores::subs_panel::{
 use nostr_bbs_client_core::stores::thread_subs::{use_thread_subs, SubscribedTopic};
 use nostr_bbs_client_core::toast::{use_toasts, ToastStore, ToastVariant};
 use nostr_bbs_client_core::utils::swipe::{
-    commits, lock_decision, Lock, PointerKind, RowSwipeGuard, RowSwipeState, SwipeDir,
+    commits, lock_decision, prefers_reduced_motion, Lock, PointerKind, RowSwipeGuard,
+    RowSwipeState, SwipeDir,
 };
 
 use crate::prefs::use_bbs_prefs;
@@ -118,6 +119,19 @@ pub fn tab_accessible_name(count: usize, capped: bool) -> String {
 pub fn newest_shown(root: Option<u64>, replies: impl IntoIterator<Item = u64>) -> Option<u64> {
     let root = root?;
     Some(replies.into_iter().fold(root, u64::max))
+}
+
+/// The ids a thread view marks read: the id it was opened under (`linked`)
+/// and the root's own id when it differs (a sealed root opens under its
+/// original), each once.
+pub fn read_marker_ids(linked: Option<String>, own: Option<String>) -> Vec<String> {
+    let mut ids: Vec<String> = linked.into_iter().collect();
+    if let Some(own) = own {
+        if !ids.contains(&own) {
+            ids.push(own);
+        }
+    }
+    ids
 }
 
 /// What a key pressed on a focused topic row does.
@@ -405,7 +419,11 @@ pub fn SubsRowFrame(
     channel: String,
     children: Children,
 ) -> impl IntoView {
-    let swipe = RowSwipeState::new();
+    // The spring back honours the system preference and the BBS's own
+    // REDUCED MOTION setting. Read once per row: the setting is changed on
+    // another screen, and returning to a board builds its rows afresh.
+    let reduced_motion = use_bbs_prefs().reduced_motion.get_untracked() || prefers_reduced_motion();
+    let swipe = RowSwipeState::with_reduced_motion(reduced_motion);
     let frame = NodeRef::<leptos::html::Div>::new();
     let guard = StoredValue::new_local(None::<RowSwipeGuard>);
     let ids = StoredValue::new((root.clone(), channel.clone()));
@@ -1046,6 +1064,28 @@ mod tests {
         assert_eq!(newest_shown(Some(10), []), Some(10));
         assert_eq!(newest_shown(Some(10), [12, 11, 4]), Some(12));
         assert_eq!(newest_shown(Some(20), [12]), Some(20), "an edited root");
+    }
+
+    #[test]
+    fn a_thread_marks_its_linked_id_and_its_own_root_id_once_each() {
+        let s = |v: &str| Some(v.to_string());
+        assert!(read_marker_ids(None, None).is_empty());
+        assert_eq!(read_marker_ids(s("a"), None), vec!["a"]);
+        assert_eq!(
+            read_marker_ids(None, s("b")),
+            vec!["b"],
+            "only the root id known"
+        );
+        assert_eq!(
+            read_marker_ids(s("a"), s("a")),
+            vec!["a"],
+            "the same id once"
+        );
+        assert_eq!(
+            read_marker_ids(s("a"), s("b")),
+            vec!["a", "b"],
+            "a sealed root"
+        );
     }
 
     #[test]

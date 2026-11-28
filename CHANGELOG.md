@@ -66,16 +66,17 @@ seen in a browser or against a live relay at the time of writing: checked by uni
 - **Subscribed topics panel.** Alphabetical as delivered, a glowing new-post numeral in a fixed slot left of each
   name (nothing at zero; "N+" and "99+" from `unread_badge`), names on one line with an ellipsis and the full title on
   hover, "Topic unavailable" while a title is unknown, and an empty-state line. Desktop: a right-hand column of the
-  TUI grid, present only while open (open by default, remembered per device, known at first paint, so nothing shifts
-  on load); shown or hidden with `]`, the top-bar `[*]` button (with the total) or the footer's `[]] subs`. At 641 to
+  TUI grid, present only while open (when the member has not chosen, open from 1280 px wide and closed below, by
+  client-core `initial_open_at`; remembered per device; known at first paint, so nothing shifts on load); shown or hidden with `]`, the top-bar `[*]` button (with the total) or the footer's `[]] subs`. At 641 to
   899 px it stays a narrower column. Phones (<= 640 px): a right-hand drawer behind a 24 px `SUBS` edge tab showing the
   total; opened by tapping or pulling the tab, closed by pushing it right, tapping the scrim, Escape or opening a
   topic. No open-by-edge-swipe and no open-by-swipe from content. While open it is a modal dialog: Tab and Shift+Tab
   stay inside, focus returns to the tab on close, and it closes the navigation drawer (and the reverse).
-- **Thread view** calls `mark_read_while_viewing` with the newest shown post's time, so opening a followed thread
-  clears its numeral.
+- **Thread view** calls `mark_read_while_viewing_ids` with the newest shown post's time, under the id it was opened by
+  and the root's own id when they differ (a sealed root), so opening a followed thread clears its numeral.
 - Visitors who are not signed in see neither toggle nor panel. Motion (swipe spring, drawer slide) is off under
-  `prefers-reduced-motion` and under the BBS's own REDUCED MOTION setting. The keys are on the Help screen and in the
+  `prefers-reduced-motion` and under the BBS's own REDUCED MOTION setting (the row spring through
+  `RowSwipeState::with_reduced_motion`). The keys are on the Help screen and in the
   crate README.
 
 ### Client core: topic subscriptions, unread counts and a private cross-device copy (2026-11-28)

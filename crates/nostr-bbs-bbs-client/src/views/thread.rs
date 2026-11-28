@@ -53,7 +53,9 @@ use crate::ascii_img::{extract_image_urls, is_protected_media, AsciiImg};
 use crate::components::{AuthorChip, EmptyCard, MarkdownBody};
 use crate::config::BbsConfig;
 use crate::router::{use_router, Route};
-use crate::subs::{newest_shown, row_key, RowKey, RowSubs, SubsAnnouncer, SubsRowFrame};
+use crate::subs::{
+    newest_shown, read_marker_ids, row_key, RowKey, RowSubs, SubsAnnouncer, SubsRowFrame,
+};
 use crate::views::bookmarks::{is_bookmarked, toggle_bookmark, BookmarkItem};
 
 const BUILTIN_REACTIONS: &[&str] = &["👍", "❤️", "😂", "🔥", "🎉", "👀", "💯", "🙌"];
@@ -982,13 +984,13 @@ pub fn ThreadView(
                 .try_with(|rs| newest_shown(root, rs.iter().map(|r| r.created_at)))
                 .flatten()
         };
-        thread_subs.mark_read_while_viewing(move || wanted_root.try_get_value(), newest);
-        thread_subs.mark_read_while_viewing(
+        thread_subs.mark_read_while_viewing_ids(
             move || {
-                topic_root
+                let linked = wanted_root.try_get_value();
+                let own = topic_root
                     .try_with(|r| r.as_ref().map(|r| r.id.to_ascii_lowercase()))
-                    .flatten()
-                    .filter(|id| wanted_root.try_get_value().as_deref() != Some(id.as_str()))
+                    .flatten();
+                read_marker_ids(linked, own)
             },
             newest,
         );
