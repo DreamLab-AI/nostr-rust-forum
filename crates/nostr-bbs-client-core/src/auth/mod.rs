@@ -772,7 +772,35 @@ impl AuthStore {
     }
 
     /// Log out: zero privkey, clear state and storage.
+    ///
+    /// When topic subscriptions have changes the member's relay copy lacks,
+    /// they get one bounded chance to be published first, while the signer
+    /// is still here (at most `thread_subs::SIGN_OUT_FLUSH_MS`, 3 s); sign-out
+    /// then proceeds whatever happened. A second call while that runs is
+    /// ignored.
     pub fn logout(&self) {
+        if LOGGING_OUT.with(std::cell::Cell::get) {
+            return;
+        }
+        if let Some(job) = crate::stores::thread_subs::sign_out_flush() {
+            LOGGING_OUT.with(|f| f.set(true));
+            let me = *self;
+            leptos::task::spawn_local(async move {
+                crate::stores::thread_subs::within(
+                    job,
+                    crate::stores::thread_subs::SIGN_OUT_FLUSH_MS,
+                )
+                .await;
+                LOGGING_OUT.with(|f| f.set(false));
+                me.finish_logout();
+            });
+            return;
+        }
+        self.finish_logout();
+    }
+
+    /// The sign-out itself (see [`Self::logout`]).
+    fn finish_logout(&self) {
         // ADR-2023: this device must stop waking for the account that signs out.
         crate::utils::push::teardown_on_logout();
         // Zone images fetched for this account must not outlive it.
@@ -972,6 +1000,11 @@ pub fn provide_auth() {
     store.restore_session();
     session::register_pagehide_listener(store);
     provide_context(store);
+}
+
+thread_local! {
+    /// Set while sign-out waits for the last subscriptions publish.
+    static LOGGING_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Get the auth store from context. Panics if `provide_auth()` was not called.

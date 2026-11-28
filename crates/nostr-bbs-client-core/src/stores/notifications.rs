@@ -1496,7 +1496,12 @@ fn followed_marker(
     event: &nostr_bbs_core::NostrEvent,
     followed: &std::collections::HashMap<String, u64>,
 ) -> Option<u64> {
-    if followed.is_empty() || crate::topics::thread::edit_target_of(event).is_some() {
+    // A still-locked sealed envelope names the migrator, not the author, so
+    // it cannot be judged as a subscribed-topic post until it opens.
+    if followed.is_empty()
+        || crate::topics::thread::edit_target_of(event).is_some()
+        || nostr_bbs_core::sealed::parse_sealed(&event.tags).is_some()
+    {
         return None;
     }
     let root = nostr_bbs_core::sealed::reply_root_of(event)?.to_ascii_lowercase();

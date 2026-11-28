@@ -83,6 +83,10 @@ pub struct InsertedMessage {
     pub reply_root: Option<String>,
     /// Whether it is an edit of another post (`["e", id, "", "edit"]`).
     pub edit: bool,
+    /// For a sealed envelope still locked (no zone key yet), the id of the
+    /// original it wraps; its author is unknown until it opens. `None` for
+    /// any other post, including a restored original.
+    pub sealed_inner: Option<String>,
 }
 
 impl InsertedMessage {
@@ -95,6 +99,7 @@ impl InsertedMessage {
             created_at: ev.created_at,
             reply_root: nostr_bbs_core::sealed::reply_root_of(ev).map(str::to_lowercase),
             edit: crate::topics::thread::edit_target_of(ev).is_some(),
+            sealed_inner: nostr_bbs_core::sealed::parse_sealed(&ev.tags).map(|s| s.inner_id),
         }
     }
 }

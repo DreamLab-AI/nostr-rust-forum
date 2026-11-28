@@ -11,16 +11,22 @@
 //!   older copy that still has it on converges on "off" rather than reviving
 //!   it.
 //! - **Read markers**, one per subscribed topic: the newest post time
-//!   (seconds) the member has seen there. A marker never moves backwards. It
-//!   is set to "now" on subscribe, so the first count never walks the whole
-//!   topic, and advanced by [`ThreadSubsStore::mark_read`] when a view shows
-//!   the thread.
-//! - **Unseen posts** are held in memory only, per topic: ids (with their
-//!   time) of posts newer than the marker, by someone else, that are not
-//!   edits. They come from a one-off backlog pass after NIP-42 AUTH (and
-//!   again after a reconnect) and, while the app is open, from the channel
-//!   store's inserted-message hook ([`ChannelStore::on_inserted`]). No
-//!   polling, and no extra open subscription.
+//!   (seconds) the member has seen there. A marker never moves backwards and
+//!   never runs ahead of this device's clock: a post's `created_at` is chosen
+//!   by its author (the relay accepts up to seven days ahead), so every marker
+//!   is clamped to local now wherever it is set or merged. On subscribe it
+//!   starts at the newest reply already held for the topic (or the relay's
+//!   newest, else now), so the first count never walks the whole topic and a
+//!   fast local clock cannot hide the next posts. It is advanced by
+//!   [`ThreadSubsStore::mark_read`] when a view shows the thread.
+//! - **Unseen posts** are held in memory only, per topic: ids of posts newer
+//!   than the marker, by someone else, that are not edits and not still-locked
+//!   sealed envelopes (whose author is unknown until they open). They come
+//!   from a backlog pass after NIP-42 AUTH and, while the app is open, from
+//!   the channel store's inserted-message hook
+//!   ([`ChannelStore::on_inserted`]). After a reconnect the pass asks only
+//!   from each topic's in-session high-water mark. A post deleted later
+//!   (kind 5) stops counting. No polling, and no extra open subscription.
 //!
 //! **Topic titles are never stored**, here or in the synced copy: a title in
 //! an encrypted zone is private to the zone's members, and localStorage and
@@ -32,11 +38,13 @@
 //!
 //! The working copy lives in localStorage under
 //! `nostrbbs:thread_subs:v1:<pubkey>` (per account, shared by the forum and
-//! the BBS on the same origin), is merged on every write with what another
-//! tab stored, is reloaded when another tab writes it, and is removed at
-//! sign-out ([`clear_persisted_for_logout`]). The cross-device copy is a
-//! NIP-44 self-encrypted kind-30078 event: see
-//! [`thread_subs_sync`](crate::stores::thread_subs_sync).
+//! the BBS on the same origin), with the last relay copy seen. It is merged
+//! on every write with what another tab stored, reloaded when another tab
+//! writes it, and removed at sign-out ([`clear_persisted_for_logout`]) after
+//! a bounded last publish. The cross-device copy is a NIP-44 self-encrypted
+//! kind-30078 event: see
+//! [`thread_subs_sync`](crate::stores::thread_subs_sync), which also says who
+//! can see what.
 //!
 //! ## Use
 //!
@@ -46,6 +54,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 
 use gloo::storage::{LocalStorage, Storage};
@@ -59,7 +69,10 @@ use crate::stores::channels::{
     roots_key, topic_key, use_channel_store, ChannelStore, InsertedMessage, PAGE_TIMEOUT_MS,
     RELAY_MAX_FILTERS,
 };
-use crate::stores::thread_subs_sync::{self as sync, LocalOnlyReason, SyncStatus};
+use crate::stores::thread_subs_sync::{
+    self as sync, LocalOnlyReason, Plan, PlanInput, RemoteSeen, SyncStatus, Trigger,
+};
+use crate::stores::zones::Zone;
 use crate::zone_crypto::store::ZoneKeyStore;
 
 // -- Constants ----------------------------------------------------------------
@@ -68,9 +81,15 @@ use crate::zone_crypto::store::ZoneKeyStore;
 /// appended.
 pub const STORAGE_KEY_PREFIX: &str = "nostrbbs:thread_subs:v1:";
 
-/// The most topics one member can follow at once. Keeps the synced copy well
-/// under the relay's 64 KiB content cap; [`ThreadSubsStore::subscribe`]
-/// refuses with [`SubscribeError::LimitReached`] beyond it.
+/// Prefix of the per-account publish lock (one tab publishes at a time).
+const LOCK_KEY_PREFIX: &str = "nostrbbs:thread_subs_lock:v1:";
+
+/// How long a tab's publish lock lasts, milliseconds.
+const LOCK_MS: u64 = 60_000;
+
+/// The most topics one member can follow at once. Keeps the synced copy under
+/// the relay's 64 KiB content cap; [`ThreadSubsStore::subscribe`] refuses with
+/// [`SubscribeError::LimitReached`] beyond it.
 pub const MAX_ACTIVE_SUBSCRIPTIONS: usize = 150;
 
 /// Unread counts above this are shown as "99+" by the views; see
@@ -78,9 +97,10 @@ pub const MAX_ACTIVE_SUBSCRIPTIONS: usize = 150;
 pub const UNREAD_DISPLAY_CAP: usize = 99;
 
 /// How long a tombstone (a subscription switched off) is kept, in
-/// milliseconds: long enough for every device to see it before it is
-/// dropped. A device last synced before that may bring the subscription back.
-pub const TOMBSTONE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// milliseconds: a year, so a device unused for months still sees it before
+/// it is dropped. A tombstone is about 100 bytes and at most
+/// 300 are kept.
+pub const TOMBSTONE_TTL_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 
 /// The most tombstones kept locally (the newest).
 pub(crate) const MAX_TOMBSTONES: usize = 300;
@@ -99,13 +119,33 @@ pub(crate) const ROOT_FETCH_BATCH: usize = 20;
 /// Longest zone id accepted from storage or the synced copy.
 pub(crate) const MAX_ZONE_LEN: usize = 64;
 
-/// Pause before re-sending a backlog or title batch the relay refused,
-/// milliseconds.
-const RETRY_DELAY_MS: i32 = 3_000;
+/// First pause before re-sending a batch the relay refused, milliseconds;
+/// doubled per attempt up to [`RETRY_MAX_MS`].
+const RETRY_BASE_MS: u64 = 3_000;
+/// Longest pause between re-sends, milliseconds.
+const RETRY_MAX_MS: u64 = 60_000;
+/// Re-sends per topic per connection before giving up until the next one.
+const MAX_RETRIES: u32 = 6;
+
+/// Still-locked sealed posts held to count once they open.
+const MAX_PENDING_LOCKED: usize = 500;
+
+/// Delay before a scheduled publish once changes settle, milliseconds.
+const PUBLISH_SETTLE_MS: u64 = 2_000;
+
+/// How long sign-out waits for a last publish, milliseconds.
+pub(crate) const SIGN_OUT_FLUSH_MS: u32 = 3_000;
+
+/// Delay between re-checks of counted posts against deletions, milliseconds.
+const DELETION_RECHECK_MS: i32 = 2_000;
 
 /// The localStorage key of `owner`'s subscriptions.
 pub fn storage_key(owner: &str) -> String {
     format!("{STORAGE_KEY_PREFIX}{owner}")
+}
+
+fn lock_key(owner: &str) -> String {
+    format!("{LOCK_KEY_PREFIX}{owner}")
 }
 
 // -- Public types -------------------------------------------------------------
@@ -222,11 +262,28 @@ pub(crate) struct DocEntry {
     pub rd: Option<u64>,
 }
 
-/// The stored and synced shape: `{"subs":[{r,c,z,on,at,rd}]}`.
+/// The synced shape (and the subscriptions part of the stored one):
+/// `{"subs":[{r,c,z,on,at,rd}]}`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SubsDoc {
     #[serde(default)]
     pub subs: Vec<DocEntry>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// The stored shape: the subscriptions plus, never published, the last relay
+/// copy seen and when this browser last published.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LocalDoc {
+    #[serde(flatten)]
+    pub doc: SubsDoc,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteSeen>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub published_ms: u64,
 }
 
 /// Subscriptions and read markers, keyed by lower-case root id.
@@ -243,9 +300,9 @@ fn is_hex_id(s: &str) -> bool {
 
 impl Subs {
     /// Rebuild from the stored shape, dropping malformed entries (an id that
-    /// is not 64 hex, an over-long channel or zone) and resolving duplicate
-    /// roots by the merge order.
-    pub fn from_doc(doc: SubsDoc) -> Self {
+    /// is not 64 hex, an over-long zone) and resolving duplicate roots by the
+    /// merge order. Markers are clamped to `now_secs`.
+    pub fn from_doc(doc: SubsDoc, now_secs: u64) -> Self {
         let mut out = Subs::default();
         for DocEntry { entry: mut e, rd } in doc.subs {
             e.r = e.r.to_ascii_lowercase();
@@ -260,7 +317,7 @@ impl Subs {
             }
             if let Some(ts) = rd {
                 let m = out.read.entry(e.r.clone()).or_insert(0);
-                *m = (*m).max(ts);
+                *m = (*m).max(ts.min(now_secs));
             }
             out.put(e);
         }
@@ -286,6 +343,15 @@ impl Subs {
         }
     }
 
+    /// The same list without read markers (what the membership digest
+    /// covers).
+    pub fn membership(&self) -> Subs {
+        Subs {
+            entries: self.entries.clone(),
+            read: BTreeMap::new(),
+        }
+    }
+
     /// Insert `e` unless an entry for the same root outranks it.
     fn put(&mut self, e: Entry) {
         match self.entries.get(&e.r) {
@@ -297,11 +363,12 @@ impl Subs {
     }
 
     /// Entry-wise merge: for each root the higher-ranked entry wins (later
-    /// `at`, then off before on); read markers take the larger value. A
-    /// join: commutative, associative and idempotent, so copies merged in
-    /// any order converge. Markers are kept for every root here; dropping the
-    /// ones of topics no longer followed is [`Self::prune`]'s job.
-    pub fn join(&self, other: &Subs) -> Subs {
+    /// `at`, then off before on); read markers take the larger value, clamped
+    /// to `now_secs`. For a fixed `now_secs` a join (commutative, associative,
+    /// idempotent), so copies merged in any order converge. Markers are kept
+    /// for every root here; dropping the ones of topics no longer followed is
+    /// [`Self::prune`]'s job.
+    pub fn join(&self, other: &Subs, now_secs: u64) -> Subs {
         let mut out = self.clone();
         for e in other.entries.values() {
             out.put(e.clone());
@@ -309,6 +376,9 @@ impl Subs {
         for (root, ts) in &other.read {
             let m = out.read.entry(root.clone()).or_insert(0);
             *m = (*m).max(*ts);
+        }
+        for m in out.read.values_mut() {
+            *m = (*m).min(now_secs);
         }
         out
     }
@@ -362,15 +432,16 @@ impl Subs {
         Some(self.read.get(&root).copied().unwrap_or(e.at / 1000))
     }
 
-    /// Follow `root` in `channel` (zone `zone`). The marker is set to
-    /// `now_secs` (never moved back). Returns whether anything changed.
+    /// Follow `root` in `channel` (zone `zone`) with read marker `start_secs`
+    /// (see [`start_marker`]; never moved back). Returns whether anything
+    /// changed.
     pub fn subscribe(
         &mut self,
         root: &str,
         channel: &str,
         zone: &str,
+        start_secs: u64,
         now_ms: u64,
-        now_secs: u64,
     ) -> Result<bool, SubscribeError> {
         let root = root.to_ascii_lowercase();
         let channel = channel.to_ascii_lowercase();
@@ -407,7 +478,7 @@ impl Subs {
         );
         if !was_on {
             let m = self.read.entry(root).or_insert(0);
-            *m = (*m).max(now_secs);
+            *m = (*m).max(start_secs);
         }
         Ok(true)
     }
@@ -434,11 +505,12 @@ impl Subs {
         true
     }
 
-    /// Advance followed topic `root`'s marker to `upto` (seconds). Never
-    /// moves it back; a topic not followed is left alone. Returns whether it
-    /// moved.
-    pub fn mark_read(&mut self, root: &str, upto: u64) -> bool {
+    /// Advance followed topic `root`'s marker to `upto` (seconds), clamped to
+    /// `now_secs`. Never moves it back; a topic not followed is left alone.
+    /// Returns whether it moved.
+    pub fn mark_read(&mut self, root: &str, upto: u64, now_secs: u64) -> bool {
         let root = root.to_ascii_lowercase();
+        let upto = upto.min(now_secs);
         let Some(cur) = self.read_at(&root) else {
             return false;
         };
@@ -456,22 +528,60 @@ fn next_at(prev: Option<&Entry>, now_ms: u64) -> u64 {
     prev.map_or(now_ms, |p| now_ms.max(p.at + 1))
 }
 
-/// Unseen post ids per followed topic, with their `created_at`.
+/// The read marker a new subscription starts at: the newest reply already
+/// held for the topic or the relay's newest reply (`topic_latest`),
+/// whichever is later, clamped to `now_secs`; `now_secs` when neither is
+/// known. Starting from what the relay already has, rather than the local
+/// clock, means a fast local clock cannot hide the next posts.
+pub(crate) fn start_marker(
+    held_newest: Option<u64>,
+    relay_latest: Option<u64>,
+    now_secs: u64,
+) -> u64 {
+    held_newest
+        .into_iter()
+        .chain(relay_latest)
+        .max()
+        .map_or(now_secs, |t| t.min(now_secs))
+}
+
+/// One counted post.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnseenPost {
+    pub created_at: u64,
+    pub pubkey: String,
+}
+
+/// Unseen posts per followed topic.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Unseen {
-    by_root: HashMap<String, HashMap<String, u64>>,
+    by_root: HashMap<String, HashMap<String, UnseenPost>>,
     /// Topics whose backlog answer was full ([`BACKLOG_LIMIT`]): there may
     /// be more unseen posts than counted.
     saturated: HashSet<String>,
+    /// Posts the member marked read this session. A post dated in the future
+    /// stays above the (clamped) marker, so it is dismissed by id instead and
+    /// never counted again this session.
+    dismissed: HashSet<String>,
 }
 
 impl Unseen {
     /// Record unseen post `id` in `root`. Returns whether it was new.
-    pub fn note(&mut self, root: &str, id: &str, created_at: u64) -> bool {
+    pub fn note(&mut self, root: &str, id: &str, created_at: u64, pubkey: &str) -> bool {
+        let id = id.to_ascii_lowercase();
+        if self.dismissed.contains(&id) {
+            return false;
+        }
         self.by_root
             .entry(root.to_string())
             .or_default()
-            .insert(id.to_ascii_lowercase(), created_at)
+            .insert(
+                id,
+                UnseenPost {
+                    created_at,
+                    pubkey: pubkey.to_string(),
+                },
+            )
             .is_none()
     }
 
@@ -480,26 +590,66 @@ impl Unseen {
         self.saturated.insert(root.to_string());
     }
 
+    /// The member saw `root` up to `upto` (unclamped): those posts go, and
+    /// stay gone this session.
+    pub fn dismiss_upto(&mut self, root: &str, upto: u64) {
+        if let Some(ids) = self.by_root.get_mut(root) {
+            let gone: Vec<String> = ids
+                .iter()
+                .filter(|(_, p)| p.created_at <= upto)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in gone {
+                ids.remove(&id);
+                self.dismissed.insert(id);
+            }
+        }
+        self.tidy();
+    }
+
+    /// Every post of `root` goes, and stays gone this session.
+    pub fn dismiss_root(&mut self, root: &str) {
+        if let Some(ids) = self.by_root.remove(root) {
+            self.dismissed.extend(ids.into_keys());
+        }
+        self.tidy();
+    }
+
+    /// Forget posts `ids` (deleted).
+    pub fn remove_ids(&mut self, ids: &HashSet<String>) {
+        for posts in self.by_root.values_mut() {
+            posts.retain(|id, _| !ids.contains(id));
+        }
+        self.tidy();
+    }
+
     /// Bring the sets in line with `subs`: forget topics not followed, and
-    /// posts at or before each topic's marker. A topic whose set empties is
-    /// no longer saturated.
+    /// posts at or before each topic's marker.
     pub fn reconcile(&mut self, subs: &Subs) {
         self.by_root.retain(|root, ids| match subs.read_at(root) {
             Some(read) => {
-                ids.retain(|_, ts| *ts > read);
+                ids.retain(|_, p| p.created_at > read);
                 true
             }
             None => false,
         });
-        let by_root = &self.by_root;
-        self.saturated
-            .retain(|r| subs.is_active(r) && by_root.get(r).is_some_and(|ids| !ids.is_empty()));
-        self.by_root.retain(|_, ids| !ids.is_empty());
+        self.saturated.retain(|r| subs.is_active(r));
+        self.tidy();
     }
 
-    /// The newest unseen post time in `root`, if any.
-    pub fn newest(&self, root: &str) -> Option<u64> {
-        self.by_root.get(root)?.values().copied().max()
+    /// Drop empty topics; a topic with nothing counted is not saturated.
+    fn tidy(&mut self) {
+        self.by_root.retain(|_, ids| !ids.is_empty());
+        let by_root = &self.by_root;
+        self.saturated.retain(|r| by_root.contains_key(r));
+    }
+
+    /// Every counted post as `(id, post)`.
+    pub fn posts(&self) -> Vec<(String, UnseenPost)> {
+        self.by_root
+            .values()
+            .flat_map(|ids| ids.iter().map(|(id, p)| (id.clone(), p.clone())))
+            .collect()
     }
 
     /// `root`'s unread count.
@@ -523,13 +673,14 @@ impl Unseen {
 
 /// The followed topic an inserted or fetched post counts as unseen in, if
 /// any: a reply (not an edit) to a followed topic, by someone other than
-/// `me`, newer than the topic's marker.
+/// `me`, newer than the topic's marker, and not a still-locked sealed
+/// envelope (its author is the migrator until it opens).
 pub(crate) fn unseen_root<'a>(
     msg: &'a InsertedMessage,
     subs: &Subs,
     me: Option<&str>,
 ) -> Option<&'a str> {
-    if msg.edit {
+    if msg.edit || msg.sealed_inner.is_some() {
         return None;
     }
     if me.is_some_and(|m| m.eq_ignore_ascii_case(&msg.pubkey)) {
@@ -540,25 +691,41 @@ pub(crate) fn unseen_root<'a>(
     (msg.created_at > read).then_some(root)
 }
 
-/// The backlog filter for topic `root` read up to `read_at`:
-/// `{"kinds":[42], "#e":[root], "since": read_at + 1, "limit": 100}`.
-pub(crate) fn backlog_filter(root: &str, read_at: u64) -> Filter {
+/// The `since` of a topic's backlog filter: just after its read marker, or,
+/// once a backlog answer this session has delivered posts up to `high`, from
+/// `high` (inclusive: a post in the same second may not have been delivered
+/// yet; duplicates are dropped by id). So a reconnect asks only for what is
+/// newer than what was already seen, not the whole span again.
+pub(crate) fn backlog_since(read_at: u64, high: Option<u64>) -> u64 {
+    read_at.saturating_add(1).max(high.unwrap_or(0))
+}
+
+/// The backlog filter for topic `root` from `since`:
+/// `{"kinds":[42], "#e":[root], "since": since, "limit": 100}`.
+pub(crate) fn backlog_filter(root: &str, since: u64) -> Filter {
     Filter {
         kinds: Some(vec![42]),
         e_tags: Some(vec![root.to_string()]),
-        since: Some(read_at.saturating_add(1)),
+        since: Some(since),
         limit: Some(BACKLOG_LIMIT),
         ..Default::default()
     }
 }
 
-/// `(root, read_at)` pairs split into REQs of at most
+/// `(root, since)` pairs split into REQs of at most
 /// [`BACKLOG_FILTERS_PER_REQ`] filters each.
 pub(crate) fn backlog_batches(items: &[(String, u64)]) -> Vec<Vec<Filter>> {
     items
         .chunks(BACKLOG_FILTERS_PER_REQ)
         .map(|chunk| chunk.iter().map(|(r, t)| backlog_filter(r, *t)).collect())
         .collect()
+}
+
+/// Pause before re-send `attempt` (0-based) of a refused batch: doubling
+/// from [`RETRY_BASE_MS`] to at most [`RETRY_MAX_MS`]; `None` after
+/// [`MAX_RETRIES`] (the next connection tries again).
+pub(crate) fn retry_delay_ms(attempt: u32) -> Option<u64> {
+    (attempt < MAX_RETRIES).then(|| (RETRY_BASE_MS << attempt.min(16)).min(RETRY_MAX_MS))
 }
 
 /// The two filters fetching root ids `ids` (at most [`ROOT_FETCH_BATCH`]): a
@@ -646,32 +813,44 @@ pub(crate) fn resolve_titles(
     out
 }
 
-/// The items of a refused batch to send again: those not already re-sent
-/// once (recorded in `retried`), so a refusal is retried once and never loops.
-pub(crate) fn requeue_once<T>(
-    batch: Vec<T>,
-    key: impl Fn(&T) -> &str,
-    retried: &mut HashSet<String>,
-) -> Vec<T> {
-    batch
-        .into_iter()
-        .filter(|item| retried.insert(key(item).to_string()))
-        .collect()
+/// The newest reply to `root` held in `lists` `keys`, at or before `now_secs`.
+pub(crate) fn newest_held_reply(
+    lists: &HashMap<String, Vec<NostrEvent>>,
+    keys: &[String],
+    root: &str,
+    now_secs: u64,
+) -> Option<u64> {
+    keys.iter()
+        .filter_map(|k| lists.get(k))
+        .flat_map(|v| v.iter())
+        .filter(|e| {
+            e.created_at <= now_secs
+                && nostr_bbs_core::sealed::reply_root_of(e)
+                    .is_some_and(|r| r.eq_ignore_ascii_case(root))
+        })
+        .map(|e| e.created_at)
+        .max()
+}
+
+/// The held event `id` (from `created_at`) and the list holding it.
+fn find_held(channels: ChannelStore, id: &str, created_at: u64) -> Option<(String, NostrEvent)> {
+    channels.channel_messages.with_untracked(|m| {
+        m.iter().find_map(|(list, v)| {
+            let at = v.partition_point(|e| e.created_at < created_at);
+            v[at..]
+                .iter()
+                .take_while(|e| e.created_at == created_at)
+                .find(|e| e.id.eq_ignore_ascii_case(id))
+                .map(|e| (list.clone(), e.clone()))
+        })
+    })
 }
 
 /// Whether any list of `channels` holds event `id` (from `created_at`).
 /// Untracked; the same check the channel store makes before dropping the
 /// decrypt state of an event it fetched for another purpose.
 fn held_anywhere(channels: ChannelStore, id: &str, created_at: u64) -> bool {
-    channels.channel_messages.with_untracked(|m| {
-        m.values().any(|v| {
-            let at = v.partition_point(|e| e.created_at < created_at);
-            v[at..]
-                .iter()
-                .take_while(|e| e.created_at == created_at)
-                .any(|e| e.id == id)
-        })
-    })
+    find_held(channels, id, created_at).is_some()
 }
 
 /// Whether root `root` of `channel` is held in one of the lists
@@ -708,20 +887,23 @@ pub(crate) fn sort_topics(topics: &mut [SubscribedTopic]) {
 
 // -- Persistence --------------------------------------------------------------
 
-/// `owner`'s stored subscriptions; empty when absent or unreadable.
-fn load_subs(owner: &str) -> Subs {
-    LocalStorage::get::<SubsDoc>(storage_key(owner))
-        .map(Subs::from_doc)
-        .unwrap_or_default()
+/// `owner`'s stored copy; empty when absent or unreadable.
+fn load_local(owner: &str, now_secs: u64) -> (Subs, Option<RemoteSeen>, u64) {
+    match LocalStorage::get::<LocalDoc>(storage_key(owner)) {
+        Ok(d) => (Subs::from_doc(d.doc, now_secs), d.remote, d.published_ms),
+        Err(_) => (Subs::default(), None, 0),
+    }
 }
 
-/// Remove `pubkey`'s stored subscriptions at sign-out, so the next account on
-/// this browser does not see them. The synced relay copy, if any, is kept:
-/// it is encrypted to the member and restores the list at their next
-/// sign-in.
+/// Remove `pubkey`'s stored subscriptions (and its publish lock) at sign-out,
+/// so the next account on this browser does not see them. The synced relay
+/// copy, if any, is kept: it is encrypted to the member and restores the list
+/// at their next sign-in. Sign-out first gives pending changes a bounded
+/// chance to reach it.
 pub fn clear_persisted_for_logout(pubkey: Option<&str>) {
     if let Some(pk) = pubkey {
         LocalStorage::delete(storage_key(pk));
+        LocalStorage::delete(lock_key(pk));
     }
 }
 
@@ -735,24 +917,26 @@ fn now_secs() -> u64 {
 
 // -- Reactive store -----------------------------------------------------------
 
-/// The account a set of subscriptions belongs to, held with them in one
-/// signal so the two can never disagree.
+/// The account a set of subscriptions belongs to, held with them (and the
+/// last relay copy seen) in one signal so they can never disagree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Owned {
     owner: Option<String>,
     subs: Subs,
+    remote: Option<RemoteSeen>,
+    published_ms: u64,
 }
 
-/// The backlog pass: topics already asked this connection, those queued, and
-/// the REQ in flight (one at a time).
+/// The backlog pass: topics already asked this connection, those queued,
+/// the REQ in flight (one at a time), refusal retries, and each topic's
+/// high-water mark (kept across reconnects, dropped on an account switch).
 #[derive(Default)]
 struct PumpState {
     done: HashSet<String>,
-    queue: VecDeque<(String, u64)>,
-    /// The batch the REQ in flight asks for, re-queued once if refused.
-    inflight: Vec<(String, u64)>,
-    /// Topics already re-queued once after a refusal on this connection.
-    retried: HashSet<String>,
+    queue: VecDeque<String>,
+    inflight: Vec<String>,
+    retries: HashMap<String, u32>,
+    high: HashMap<String, u64>,
     sub: Option<String>,
     /// Bumped whenever the pass is abandoned (disconnect, account switch),
     /// so answers to an abandoned REQ are ignored.
@@ -760,39 +944,39 @@ struct PumpState {
 }
 
 /// Root fetches for titles: roots already asked this session, those queued,
-/// and the REQ in flight (one at a time).
+/// the REQ in flight (one at a time) and refusal retries.
 #[derive(Default)]
 struct FetchState {
     asked: HashSet<String>,
     queue: VecDeque<String>,
-    /// The roots the REQ in flight asks for, re-queued once if refused.
     inflight: Vec<String>,
-    /// Roots already re-queued once after a refusal this session.
-    retried: HashSet<String>,
+    retries: HashMap<String, u32>,
     sub: Option<String>,
     gen: u64,
 }
 
-/// State of the cross-device copy for the current account.
+/// A reply in a followed topic that arrived as a still-locked sealed
+/// envelope: counted once it opens. `raw` is the envelope when no list holds
+/// it (a backlog delivery), to decrypt again when a zone key arrives.
+#[derive(Clone)]
+struct PendingLocked {
+    root: String,
+    inner_id: String,
+    created_at: u64,
+    raw: Option<NostrEvent>,
+}
+
+/// State of the cross-device copy for the current account, this session.
 #[derive(Clone, Debug, Default)]
 struct SyncCtl {
     /// This account's first fetch-and-merge succeeded: publishing is allowed.
     fetched: bool,
     /// Local-only for the rest of the session (unreadable relay copy, no
-    /// NIP-44, no signer).
+    /// NIP-44).
     disabled: bool,
     busy: bool,
-    /// Local changes the relay copy may lack.
-    dirty: bool,
-    /// Counts local changes, so a publish started before a change does not
-    /// clear `dirty`.
-    seq: u64,
-    last_publish_ms: u64,
-    timer_armed: bool,
-    /// The newest relay copy seen: its id, `created_at` and contents.
-    remote_id: Option<String>,
-    remote_created_at: u64,
-    remote: Option<Subs>,
+    last_fetch_ms: Option<u64>,
+    timer_at: Option<u64>,
 }
 
 /// What the store needs from elsewhere, captured once at the app root.
@@ -802,12 +986,18 @@ struct Deps {
     relay: RelayConnection,
     channels: ChannelStore,
     zone_keys: Option<ZoneKeyStore>,
+    /// The zone configuration, read once (it does not change while the page
+    /// is open).
+    zones: Vec<Zone>,
 }
 
-/// Delay before a publish once changes settle, milliseconds.
-const PUBLISH_SETTLE_MS: u64 = 2_000;
-/// At most one publish per this many milliseconds.
-const PUBLISH_INTERVAL_MS: u64 = 60_000;
+/// How a REQ of the backlog pass or the title fetch ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Answered,
+    /// CLOSED, or no answer in time: re-sent with backoff.
+    Refused,
+}
 
 /// Reactive thread-subscription store, provided via context
 /// ([`provide_thread_subs`], [`use_thread_subs`]). `Copy`; every reading
@@ -816,6 +1006,9 @@ const PUBLISH_INTERVAL_MS: u64 = 60_000;
 pub struct ThreadSubsStore {
     owned: RwSignal<Owned>,
     unseen: RwSignal<Unseen>,
+    /// Bumped when a followed topic's root is inserted, so titles are
+    /// re-resolved then (and on zone-key changes), not on every insert.
+    titles_rev: RwSignal<u64>,
     pubkey: Memo<Option<String>>,
     generation: StoredValue<u64>,
     topics: Memo<Vec<SubscribedTopic>>,
@@ -823,7 +1016,10 @@ pub struct ThreadSubsStore {
     sync_status: RwSignal<SyncStatus>,
     pump: StoredValue<PumpState, leptos::prelude::LocalStorage>,
     fetch: StoredValue<FetchState, leptos::prelude::LocalStorage>,
+    pending: StoredValue<HashMap<String, PendingLocked>, leptos::prelude::LocalStorage>,
+    recheck_armed: StoredValue<bool>,
     sync: StoredValue<SyncCtl>,
+    tab_id: StoredValue<String>,
     deps: StoredValue<Deps, leptos::prelude::LocalStorage>,
 }
 
@@ -831,8 +1027,11 @@ impl ThreadSubsStore {
     fn new(deps: Deps) -> Self {
         let owned = RwSignal::new(Owned::default());
         let unseen = RwSignal::new(Unseen::default());
+        let titles_rev = RwSignal::new(0u64);
         let pubkey = deps.auth.pubkey();
         let channels = deps.channels;
+        let zone_rev = deps.zone_keys.map(|z| z.revision);
+        let zones = std::sync::Arc::new(deps.zones.clone());
 
         // The followed topics of the signed-in account; empty for a moment
         // after an account switch until the switch has loaded the new list.
@@ -848,14 +1047,17 @@ impl ThreadSubsStore {
         };
         let titles = Memo::new(move |_| {
             let wanted: Vec<(String, String)> = current().into_iter().map(|e| (e.r, e.c)).collect();
+            titles_rev.track();
+            if let Some(r) = zone_rev {
+                r.track();
+            }
             channels
                 .channel_messages
-                .with(|m| resolve_titles(m, &wanted))
+                .with_untracked(|m| resolve_titles(m, &wanted))
         });
         let topics = Memo::new(move |_| {
             let entries = current();
             let titles = titles.get();
-            let zones = crate::stores::zones::load_zones();
             let metas: HashMap<String, crate::stores::channels::ChannelMeta> =
                 channels.channels.with(|list| {
                     list.iter()
@@ -901,10 +1103,12 @@ impl ThreadSubsStore {
             }
             unseen.with(Unseen::total)
         });
+        let tab_id = format!("{:016x}", (js_sys::Math::random() * u64::MAX as f64) as u64);
 
         Self {
             owned,
             unseen,
+            titles_rev,
             pubkey,
             generation: StoredValue::new(0),
             topics,
@@ -912,7 +1116,10 @@ impl ThreadSubsStore {
             sync_status: RwSignal::new(SyncStatus::Idle),
             pump: StoredValue::new_local(PumpState::default()),
             fetch: StoredValue::new_local(FetchState::default()),
+            pending: StoredValue::new_local(HashMap::new()),
+            recheck_armed: StoredValue::new(false),
             sync: StoredValue::new(SyncCtl::default()),
+            tab_id: StoredValue::new(tab_id),
             deps: StoredValue::new_local(deps),
         }
     }
@@ -988,23 +1195,38 @@ impl ThreadSubsStore {
 
     // -- Changing -------------------------------------------------------------
 
-    /// Follow topic `root` (a topic root event id) in channel `channel`.
-    /// The topic's read marker starts at now, so only posts from now on count
-    /// as unread. Idempotent.
+    /// Follow topic `root` (a topic root event id) in channel `channel` (its
+    /// kind-40 id). The topic's read marker starts at the newest reply already
+    /// known for it (see the module notes), so only later posts count as
+    /// unread. Idempotent.
+    ///
+    /// **Ship [`Self::mark_read`] with this.** A view that offers a subscribe
+    /// control must, in the same release, call `mark_read` when it shows a
+    /// subscribed thread; otherwise counts and subscribed-topic notices never
+    /// reset when the member reads the thread.
     pub fn subscribe(&self, root: &str, channel: &str) -> Result<(), SubscribeError> {
         self.ensure_owner();
         if self.owned.with_untracked(|o| o.owner.is_none()) {
             return Err(SubscribeError::NotSignedIn);
         }
-        let zone = self.deps.with_value(|d| {
-            crate::zone_crypto::store::channel_zone(d.channels, channel)
+        let now = now_secs();
+        let root_l = root.to_ascii_lowercase();
+        let (zone, start) = self.deps.with_value(|d| {
+            let zone = crate::zone_crypto::store::channel_zone(d.channels, channel)
                 .map(|(z, _, _)| z)
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let keys = [topic_key(&root_l), channel.to_ascii_lowercase()];
+            let held = d
+                .channels
+                .channel_messages
+                .with_untracked(|m| newest_held_reply(m, &keys, &root_l, now));
+            let latest = d.channels.topic_latest(&root_l).map(|(t, _)| t);
+            (zone, start_marker(held, latest, now))
         });
-        let (now_ms, now_secs) = (now_ms(), now_secs());
         let mut result = Ok(false);
+        let at = now_ms();
         self.owned.update(|o| {
-            result = o.subs.subscribe(root, channel, &zone, now_ms, now_secs);
+            result = o.subs.subscribe(root, channel, &zone, start, at);
         });
         if result? {
             self.after_change();
@@ -1042,36 +1264,41 @@ impl ThreadSubsStore {
 
     /// The member has seen followed topic `root` up to `upto` (unix seconds):
     /// pass the `created_at` of the newest post the view shows. Posts at or
-    /// before it stop counting as unread. Never moves the marker back; a
-    /// topic not followed is ignored.
+    /// before it stop counting as unread. The stored marker never moves back
+    /// and never past this device's clock (a post can be dated in the future);
+    /// the posts shown are dismissed for the session either way. A topic not
+    /// followed is ignored.
     pub fn mark_read(&self, root: &str, upto: u64) {
         self.ensure_owner();
+        let root = root.to_ascii_lowercase();
+        let now = now_secs();
         let mut changed = false;
         self.owned.update(|o| {
-            changed = o.subs.mark_read(root, upto);
+            changed = o.subs.mark_read(&root, upto, now);
         });
+        self.unseen.update(|u| u.dismiss_upto(&root, upto));
         if changed {
             self.after_change();
         }
     }
 
-    /// Mark every followed topic read: each marker moves to now, or to the
-    /// newest unseen post if that is later (a post dated in the future).
+    /// Mark every followed topic read: each marker moves to now and every
+    /// counted post is dismissed (including any dated in the future).
     pub fn mark_all_read(&self) {
         self.ensure_owner();
         let now = now_secs();
-        let targets: Vec<(String, u64)> = self.owned.with_untracked(|o| {
-            self.unseen.with_untracked(|u| {
-                o.subs
-                    .active()
-                    .map(|e| (e.r.clone(), u.newest(&e.r).unwrap_or(0).max(now)))
-                    .collect()
-            })
-        });
+        let roots: Vec<String> = self
+            .owned
+            .with_untracked(|o| o.subs.active().map(|e| e.r.clone()).collect());
         let mut changed = false;
         self.owned.update(|o| {
-            for (root, upto) in &targets {
-                changed |= o.subs.mark_read(root, *upto);
+            for root in &roots {
+                changed |= o.subs.mark_read(root, now, now);
+            }
+        });
+        self.unseen.update(|u| {
+            for root in &roots {
+                u.dismiss_root(root);
             }
         });
         if changed {
@@ -1084,11 +1311,7 @@ impl ThreadSubsStore {
     fn after_change(&self) {
         self.reconcile_unseen();
         self.persist();
-        self.sync.update_value(|c| {
-            c.dirty = true;
-            c.seq += 1;
-        });
-        self.sync_kick();
+        self.schedule_sync();
     }
 
     fn reconcile_unseen(&self) {
@@ -1100,32 +1323,53 @@ impl ThreadSubsStore {
         }
     }
 
+    /// Merge `memory` with what is stored for its owner.
+    fn merged_with_stored(memory: &Owned, owner: &str) -> Owned {
+        let now = now_ms();
+        let (subs, remote, published_ms) = load_local(owner, now / 1000);
+        let mut merged = memory.subs.join(&subs, now / 1000);
+        merged.prune(now);
+        Owned {
+            owner: memory.owner.clone(),
+            subs: merged,
+            remote: RemoteSeen::newer(memory.remote.clone(), remote),
+            published_ms: memory.published_ms.max(published_ms),
+        }
+    }
+
     /// Save to the owner's key, merged with what is stored (another tab may
     /// have written since), and adopt the merge.
     fn persist(&self) {
-        let Some(owner) = self.owned.with_untracked(|o| o.owner.clone()) else {
+        let memory = self.owned.get_untracked();
+        let Some(owner) = memory.owner.clone() else {
             return;
         };
-        let memory = self.owned.with_untracked(|o| o.subs.clone());
-        let mut merged = memory.join(&load_subs(&owner));
-        merged.prune(now_ms());
-        let _ = LocalStorage::set(storage_key(&owner), merged.to_doc());
-        if merged != memory {
-            self.owned.update(|o| o.subs = merged);
+        let next = Self::merged_with_stored(&memory, &owner);
+        let _ = LocalStorage::set(
+            storage_key(&owner),
+            LocalDoc {
+                doc: next.subs.to_doc(),
+                remote: next.remote.clone(),
+                published_ms: next.published_ms,
+            },
+        );
+        if next != memory {
+            self.owned.set(next);
             self.reconcile_unseen();
         }
     }
 
     /// Load-only reload after another tab wrote a subscriptions key: merge
-    /// what is stored for the current owner into memory. Never writes.
+    /// what is stored for the current owner into memory. Never writes, never
+    /// schedules a publish (the tab that made the change does that).
     fn reload_from_storage(&self) {
-        let Some(owner) = self.owned.with_untracked(|o| o.owner.clone()) else {
+        let memory = self.owned.get_untracked();
+        let Some(owner) = memory.owner.clone() else {
             return;
         };
-        let memory = self.owned.with_untracked(|o| o.subs.clone());
-        let merged = memory.join(&load_subs(&owner));
-        if merged != memory {
-            self.owned.update(|o| o.subs = merged);
+        let next = Self::merged_with_stored(&memory, &owner);
+        if next != memory {
+            self.owned.set(next);
             self.reconcile_unseen();
         }
     }
@@ -1134,23 +1378,34 @@ impl ThreadSubsStore {
 
     /// Make the loaded list the signed-in account's, in one step: the owner
     /// and its subscriptions change together, and everything belonging to
-    /// the previous account (unseen sets, the backlog pass, title fetches,
-    /// the relay copy's state) is dropped. In-flight work for the previous
-    /// account sees a new generation and discards its answers.
+    /// the previous account (unseen sets, the backlog pass and its high-water
+    /// marks, title fetches, pending sealed posts, the relay copy's state) is
+    /// dropped. In-flight work for the previous account sees a new generation
+    /// and discards its answers.
     fn ensure_owner(&self) {
         let pk = self.pubkey.get_untracked();
         if self.owned.with_untracked(|o| o.owner == pk) {
             return;
         }
-        let subs = pk.as_deref().map(load_subs).unwrap_or_default();
+        let (subs, remote, published_ms) = pk
+            .as_deref()
+            .map(|p| load_local(p, now_secs()))
+            .unwrap_or_default();
         self.generation.update_value(|g| *g += 1);
         self.stop_pump();
+        self.pump.update_value(|p| p.high.clear());
         self.stop_fetch();
         self.fetch.update_value(|f| f.asked.clear());
+        self.pending.update_value(HashMap::clear);
         self.sync.set_value(SyncCtl::default());
         self.sync_status.set(SyncStatus::Idle);
         self.unseen.set(Unseen::default());
-        self.owned.set(Owned { owner: pk, subs });
+        self.owned.set(Owned {
+            owner: pk,
+            subs,
+            remote,
+            published_ms,
+        });
     }
 
     fn generation(&self) -> u64 {
@@ -1161,37 +1416,196 @@ impl ThreadSubsStore {
         self.owned.with_untracked(|o| o.owner.clone())
     }
 
+    fn owner_ready(&self) -> bool {
+        let pk = self.pubkey.get_untracked();
+        self.owned
+            .with_untracked(|o| o.owner.is_some() && o.owner == pk)
+    }
+
     // -- Live counts ----------------------------------------------------------
 
-    /// The channel store inserted `batch`: count replies in followed topics.
+    /// The channel store inserted `batch`: count replies in followed topics,
+    /// hold still-locked sealed ones until they open, and re-resolve titles
+    /// when a followed root arrived.
     fn on_inserted(&self, batch: &[InsertedMessage]) {
-        let pk = self.pubkey.get_untracked();
-        let fresh: Vec<(String, String, u64)> = self.owned.with_untracked(|o| {
-            if o.owner.is_none() || o.owner != pk {
-                return Vec::new();
-            }
-            batch
-                .iter()
-                .filter_map(|m| {
-                    unseen_root(m, &o.subs, o.owner.as_deref())
-                        .map(|r| (r.to_string(), m.id.clone(), m.created_at))
-                })
-                .collect()
-        });
-        if fresh.is_empty() {
+        if !self.owner_ready() {
             return;
         }
-        self.unseen.update(|u| {
-            for (root, id, ts) in &fresh {
-                u.note(root, id, *ts);
+        let (fresh, locked, root_arrived) = self.owned.with_untracked(|o| {
+            let mut fresh = Vec::new();
+            let mut locked = Vec::new();
+            let mut root_arrived = false;
+            for m in batch {
+                let id = m.id.to_ascii_lowercase();
+                if o.subs.is_active(&id)
+                    || m.sealed_inner
+                        .as_deref()
+                        .is_some_and(|i| o.subs.is_active(i))
+                {
+                    root_arrived = true;
+                }
+                if let (Some(inner), Some(root)) = (&m.sealed_inner, &m.reply_root) {
+                    if o.subs.read_at(root).is_some_and(|r| m.created_at > r) {
+                        locked.push((
+                            m.id.clone(),
+                            PendingLocked {
+                                root: root.clone(),
+                                inner_id: inner.clone(),
+                                created_at: m.created_at,
+                                raw: None,
+                            },
+                        ));
+                    }
+                } else if let Some(root) = unseen_root(m, &o.subs, o.owner.as_deref()) {
+                    fresh.push((root.to_string(), m.clone()));
+                }
+            }
+            (fresh, locked, root_arrived)
+        });
+        if root_arrived {
+            self.titles_rev.update(|r| *r += 1);
+        }
+        self.hold_locked(locked);
+        if !fresh.is_empty() {
+            self.unseen.update(|u| {
+                for (root, m) in &fresh {
+                    u.note(root, &m.id, m.created_at, &m.pubkey);
+                }
+            });
+        }
+    }
+
+    fn hold_locked(&self, locked: Vec<(String, PendingLocked)>) {
+        if locked.is_empty() {
+            return;
+        }
+        self.pending.update_value(|p| {
+            for (env, item) in locked {
+                if p.len() >= MAX_PENDING_LOCKED {
+                    break;
+                }
+                p.entry(env).or_insert(item);
             }
         });
+    }
+
+    /// A zone key changed: count the sealed posts that have now opened.
+    /// A held envelope is found under its original id once the store has
+    /// re-decrypted it; one no list holds is decrypted again here. Counted by
+    /// the original id only, so the id change cannot count it twice.
+    fn resolve_pending(&self) {
+        let Some(deps) = self.deps.try_with_value(Clone::clone) else {
+            return;
+        };
+        let items: Vec<(String, PendingLocked)> = self
+            .pending
+            .try_with_value(|p| p.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        if items.is_empty() || !self.owner_ready() {
+            return;
+        }
+        let me = self.me();
+        let mut done: Vec<String> = Vec::new();
+        let mut counted: Vec<(String, InsertedMessage)> = Vec::new();
+        for (env, item) in items {
+            let still = self.owned.with_untracked(|o| {
+                o.subs
+                    .read_at(&item.root)
+                    .is_some_and(|r| item.created_at > r)
+            });
+            if !still {
+                done.push(env);
+                continue;
+            }
+            let opened = match &item.raw {
+                None => find_held(deps.channels, &item.inner_id, item.created_at),
+                Some(raw) => deps.zone_keys.and_then(|z| {
+                    let ev = z.prepare_incoming(raw.clone());
+                    let open = nostr_bbs_core::sealed::parse_sealed(&ev.tags).is_none();
+                    if !held_anywhere(deps.channels, &ev.id, ev.created_at) {
+                        z.forget(std::slice::from_ref(&ev.id));
+                    }
+                    open.then(|| (String::new(), ev))
+                }),
+            };
+            if let Some((list, ev)) = opened {
+                let msg = InsertedMessage::of(&list, &ev);
+                let root = self.owned.with_untracked(|o| {
+                    unseen_root(&msg, &o.subs, me.as_deref()).map(str::to_string)
+                });
+                if let Some(root) = root {
+                    counted.push((root, msg));
+                }
+                done.push(env);
+            }
+        }
+        self.pending.update_value(|p| {
+            for env in &done {
+                p.remove(env);
+            }
+        });
+        if !counted.is_empty() {
+            self.unseen.update(|u| {
+                for (root, m) in &counted {
+                    u.note(root, &m.id, m.created_at, &m.pubkey);
+                }
+            });
+        }
+    }
+
+    /// Re-check counted posts against deletions, at most every
+    /// [`DELETION_RECHECK_MS`]: a post a kind 5 has removed stops counting.
+    fn arm_deletion_recheck(&self) {
+        if self.recheck_armed.get_value() {
+            return;
+        }
+        self.recheck_armed.set_value(true);
+        let store = *self;
+        crate::utils::set_timeout_once(
+            move || {
+                if store.recheck_armed.try_set_value(false).is_some() {
+                    return;
+                }
+                store.recheck_deleted();
+            },
+            DELETION_RECHECK_MS,
+        );
+    }
+
+    fn recheck_deleted(&self) {
+        let Some(deps) = self.deps.try_with_value(Clone::clone) else {
+            return;
+        };
+        let posts = self.unseen.with_untracked(Unseen::posts);
+        if posts.is_empty() {
+            return;
+        }
+        let gone: HashSet<String> = posts
+            .into_iter()
+            .filter(|(id, p)| {
+                let stub = NostrEvent {
+                    id: id.clone(),
+                    pubkey: p.pubkey.clone(),
+                    created_at: p.created_at,
+                    kind: 42,
+                    tags: Vec::new(),
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                !deps.channels.admits_message(deps.zone_keys, &stub)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if !gone.is_empty() {
+            self.unseen.update(|u| u.remove_ids(&gone));
+        }
     }
 
     // -- Backlog pass ---------------------------------------------------------
 
     /// Abandon the backlog pass: close the REQ in flight and forget what was
-    /// asked, so the next connection asks again.
+    /// asked, so the next connection asks again (from each topic's high-water
+    /// mark, which is kept).
     fn stop_pump(&self) {
         let sub = self
             .pump
@@ -1200,7 +1614,7 @@ impl ThreadSubsStore {
                 p.done.clear();
                 p.queue.clear();
                 p.inflight.clear();
-                p.retried.clear();
+                p.retries.clear();
                 p.sub.take()
             })
             .flatten();
@@ -1210,14 +1624,14 @@ impl ThreadSubsStore {
     }
 
     /// Queue the followed topics not yet asked on this connection.
-    fn enqueue_backlog(&self, wanted: Vec<(String, u64)>) {
+    fn enqueue_backlog(&self, roots: Vec<String>) {
         let added = self
             .pump
             .try_update_value(|p| {
                 let mut added = false;
-                for (root, read) in wanted {
+                for root in roots {
                     if p.done.insert(root.clone()) {
-                        p.queue.push_back((root, read));
+                        p.queue.push_back(root);
                         added = true;
                     }
                 }
@@ -1230,8 +1644,8 @@ impl ThreadSubsStore {
     }
 
     /// Send the next backlog REQ unless one is in flight: up to
-    /// [`BACKLOG_FILTERS_PER_REQ`] topics, closed on its answer (or a CLOSED,
-    /// or a timeout), then the next.
+    /// [`BACKLOG_FILTERS_PER_REQ`] topics, each from [`backlog_since`], closed
+    /// on its answer; refused or unanswered batches are re-sent with backoff.
     fn pump_next(&self) {
         let next = self
             .pump
@@ -1240,24 +1654,48 @@ impl ThreadSubsStore {
                     return None;
                 }
                 let n = p.queue.len().min(BACKLOG_FILTERS_PER_REQ);
-                let batch: Vec<(String, u64)> = p.queue.drain(..n).collect();
+                let batch: Vec<String> = p.queue.drain(..n).collect();
                 p.inflight = batch.clone();
                 // Reserve the slot before subscribing; the real id replaces
                 // it once `subscribe` returns.
                 p.sub = Some(String::new());
-                Some((batch, p.gen))
+                let items: Vec<(String, Option<u64>)> = batch
+                    .into_iter()
+                    .map(|r| {
+                        let high = p.high.get(&r).copied();
+                        (r, high)
+                    })
+                    .collect();
+                Some((items, p.gen))
             })
             .flatten();
-        let Some((batch, gen)) = next else {
+        let Some((items, gen)) = next else {
             return;
         };
         let Some(deps) = self.deps.try_with_value(Clone::clone) else {
             return;
         };
+        // Since: from the marker (read now, so it is current) and the
+        // high-water mark. Topics no longer followed are skipped.
+        let items: Vec<(String, u64)> = self.owned.with_untracked(|o| {
+            items
+                .into_iter()
+                .filter_map(|(r, high)| o.subs.read_at(&r).map(|t| (r, backlog_since(t, high))))
+                .collect()
+        });
+        if items.is_empty() {
+            self.pump.update_value(|p| {
+                p.sub = None;
+                p.inflight.clear();
+            });
+            self.pump_next();
+            return;
+        }
         let store = *self;
-        let wanted: HashSet<String> = batch.iter().map(|(r, _)| r.clone()).collect();
-        let delivered: Rc<RefCell<HashMap<String, u64>>> = Rc::default();
-        let filters = backlog_batches(&batch)
+        let wanted: HashSet<String> = items.iter().map(|(r, _)| r.clone()).collect();
+        // Per topic: posts delivered and the newest `created_at` seen.
+        let delivered: Rc<RefCell<HashMap<String, (u64, u64)>>> = Rc::default();
+        let filters = backlog_batches(&items)
             .into_iter()
             .next()
             .unwrap_or_default();
@@ -1273,53 +1711,67 @@ impl ThreadSubsStore {
             })
         };
         let done = Rc::new(Cell::new(false));
-        // `refused`: the relay answered CLOSED (e.g. its per-connection
-        // subscription cap, likely right after AUTH): re-queue the batch once,
-        // after a pause.
-        let finish: Rc<dyn Fn(bool)> = {
+        let finish: Rc<dyn Fn(Outcome)> = {
             let relay = deps.relay.clone();
-            Rc::new(move |refused: bool| {
-                if done.replace(true) {
+            Rc::new(move |outcome: Outcome| {
+                if done.replace(true) || store.pump.try_with_value(|p| p.gen) != Some(gen) {
                     return;
                 }
-                let current = store.pump.try_with_value(|p| p.gen) == Some(gen);
-                if !current {
-                    return;
-                }
-                let (sub, retry) = store
+                let delivered = delivered.borrow().clone();
+                let (sub, retry_in) = store
                     .pump
                     .try_update_value(|p| {
                         let inflight = std::mem::take(&mut p.inflight);
-                        let again = if refused {
-                            requeue_once(inflight, |(r, _)| r.as_str(), &mut p.retried)
-                        } else {
-                            Vec::new()
-                        };
-                        let retry = !again.is_empty();
-                        p.queue.extend(again);
-                        (p.sub.take(), retry)
+                        let mut retry_in: Option<u64> = None;
+                        for root in inflight {
+                            match outcome {
+                                Outcome::Answered => {
+                                    p.retries.remove(&root);
+                                    if let Some((_, newest)) = delivered.get(&root) {
+                                        let h = p.high.entry(root).or_insert(0);
+                                        *h = (*h).max(*newest);
+                                    }
+                                }
+                                Outcome::Refused => {
+                                    let n = p.retries.entry(root.clone()).or_insert(0);
+                                    if let Some(d) = retry_delay_ms(*n) {
+                                        *n += 1;
+                                        p.queue.push_back(root);
+                                        retry_in = Some(retry_in.map_or(d, |x| x.max(d)));
+                                    }
+                                }
+                            }
+                        }
+                        (p.sub.take(), retry_in)
                     })
-                    .unwrap_or((None, false));
+                    .unwrap_or((None, None));
                 if let Some(id) = sub.filter(|s| !s.is_empty()) {
                     relay.unsubscribe(&id);
                 }
-                let full: Vec<String> = delivered
-                    .borrow()
-                    .iter()
-                    .filter(|(_, n)| **n >= BACKLOG_LIMIT)
-                    .map(|(r, _)| r.clone())
-                    .collect();
-                if !full.is_empty() {
-                    store.unseen.update(|u| {
-                        for r in &full {
-                            u.saturate(r);
-                        }
-                    });
+                if outcome == Outcome::Answered {
+                    let full: Vec<String> = delivered
+                        .iter()
+                        .filter(|(_, (n, _))| *n >= BACKLOG_LIMIT)
+                        .map(|(r, _)| r.clone())
+                        .collect();
+                    if !full.is_empty() {
+                        store.unseen.update(|u| {
+                            for r in &full {
+                                u.saturate(r);
+                            }
+                        });
+                    }
                 }
-                if retry {
-                    crate::utils::set_timeout_once(move || store.pump_next(), RETRY_DELAY_MS);
-                } else {
-                    store.pump_next();
+                match retry_in {
+                    Some(ms) => crate::utils::set_timeout_once(
+                        move || {
+                            if store.pump.try_with_value(|p| p.gen) == Some(gen) {
+                                store.pump_next();
+                            }
+                        },
+                        ms as i32,
+                    ),
+                    None => store.pump_next(),
                 }
             })
         };
@@ -1327,13 +1779,13 @@ impl ThreadSubsStore {
             let finish = finish.clone();
             Rc::new(move |authed: bool| {
                 if authed {
-                    finish(false);
+                    finish(Outcome::Answered);
                 }
             })
         };
         let on_closed = {
             let finish = finish.clone();
-            Rc::new(move |_reason: String| finish(true))
+            Rc::new(move |_reason: String| finish(Outcome::Refused))
         };
         let id = deps
             .relay
@@ -1355,34 +1807,59 @@ impl ThreadSubsStore {
             deps.relay.unsubscribe(&id);
             return;
         }
-        crate::utils::set_timeout_once(move || finish(false), PAGE_TIMEOUT_MS as i32);
+        crate::utils::set_timeout_once(move || finish(Outcome::Refused), PAGE_TIMEOUT_MS as i32);
     }
 
     /// One backlog delivery: admitted and decrypted exactly as the store's
     /// other read paths do (so an edit or the author is judged on the post
-    /// itself, not a sealed envelope), counted if it is unseen, and its
-    /// decrypt state dropped unless a list holds it.
+    /// itself), counted if it is unseen, held if it is a still-locked sealed
+    /// post, and its decrypt state dropped unless a list holds it.
     fn on_backlog_event(
         &self,
         deps: &Deps,
         wanted: &HashSet<String>,
-        delivered: &Rc<RefCell<HashMap<String, u64>>>,
-        ev: NostrEvent,
+        delivered: &Rc<RefCell<HashMap<String, (u64, u64)>>>,
+        raw: NostrEvent,
     ) {
-        let Some((list, ev)) = deps.channels.ingest(deps.zone_keys, ev, "") else {
+        let raw_copy = nostr_bbs_core::sealed::parse_sealed(&raw.tags)
+            .is_some()
+            .then(|| raw.clone());
+        let Some((list, ev)) = deps.channels.ingest(deps.zone_keys, raw, "") else {
             return;
         };
         let msg = InsertedMessage::of(&list, &ev);
         if let Some(root) = msg.reply_root.as_deref().filter(|r| wanted.contains(*r)) {
-            *delivered.borrow_mut().entry(root.to_string()).or_insert(0) += 1;
+            {
+                let mut d = delivered.borrow_mut();
+                let slot = d.entry(root.to_string()).or_insert((0, 0));
+                slot.0 += 1;
+                // Never let a post dated in the future raise the mark.
+                slot.1 = slot.1.max(msg.created_at.min(now_secs()));
+            }
             let me = self.me();
-            let counted = self
-                .owned
-                .with_untracked(|o| unseen_root(&msg, &o.subs, me.as_deref()).map(str::to_string));
+            let (counted, still_locked) = self.owned.with_untracked(|o| {
+                let counted = unseen_root(&msg, &o.subs, me.as_deref()).map(str::to_string);
+                let locked = msg.sealed_inner.is_some()
+                    && o.subs.read_at(root).is_some_and(|r| msg.created_at > r);
+                (counted, locked)
+            });
             if let Some(root) = counted {
                 self.unseen.update(|u| {
-                    u.note(&root, &msg.id, msg.created_at);
+                    u.note(&root, &msg.id, msg.created_at, &msg.pubkey);
                 });
+            }
+            if still_locked {
+                if let Some(inner) = msg.sealed_inner.clone() {
+                    self.hold_locked(vec![(
+                        msg.id.clone(),
+                        PendingLocked {
+                            root: root.to_string(),
+                            inner_id: inner,
+                            created_at: msg.created_at,
+                            raw: raw_copy,
+                        },
+                    )]);
+                }
             }
         }
         if !held_anywhere(deps.channels, &ev.id, ev.created_at) {
@@ -1403,7 +1880,7 @@ impl ThreadSubsStore {
                 for root in f.queue.drain(..).chain(f.inflight.drain(..)) {
                     f.asked.remove(&root);
                 }
-                f.retried.clear();
+                f.retries.clear();
                 f.sub.take()
             })
             .flatten();
@@ -1442,10 +1919,10 @@ impl ThreadSubsStore {
     }
 
     /// Send the next root fetch unless one is in flight: up to
-    /// [`ROOT_FETCH_BATCH`] ids, closed on its answer. Each root enters the
-    /// channel store's root list for its channel through the usual admission
-    /// and decrypt path, so a root still locked becomes readable when its
-    /// zone key arrives.
+    /// [`ROOT_FETCH_BATCH`] ids, closed on its answer, re-sent with backoff if
+    /// refused. Each root enters the channel store's root list for its
+    /// channel through the usual admission and decrypt path, so a root still
+    /// locked becomes readable when its zone key arrives.
     fn fetch_next(&self) {
         let next = self
             .fetch
@@ -1478,34 +1955,49 @@ impl ThreadSubsStore {
             })
         };
         let done = Rc::new(Cell::new(false));
-        // As in `pump_next`: a refused batch is re-queued once, after a pause.
-        let finish: Rc<dyn Fn(bool)> = {
+        let finish: Rc<dyn Fn(Outcome)> = {
             let relay = deps.relay.clone();
-            Rc::new(move |refused: bool| {
+            Rc::new(move |outcome: Outcome| {
                 if done.replace(true) || store.fetch.try_with_value(|f| f.gen) != Some(gen) {
                     return;
                 }
-                let (sub, retry) = store
+                let (sub, retry_in) = store
                     .fetch
                     .try_update_value(|f| {
                         let inflight = std::mem::take(&mut f.inflight);
-                        let again = if refused {
-                            requeue_once(inflight, String::as_str, &mut f.retried)
-                        } else {
-                            Vec::new()
-                        };
-                        let retry = !again.is_empty();
-                        f.queue.extend(again);
-                        (f.sub.take(), retry)
+                        let mut retry_in: Option<u64> = None;
+                        for root in inflight {
+                            if outcome == Outcome::Answered {
+                                f.retries.remove(&root);
+                                continue;
+                            }
+                            let n = f.retries.entry(root.clone()).or_insert(0);
+                            if let Some(d) = retry_delay_ms(*n) {
+                                *n += 1;
+                                f.queue.push_back(root);
+                                retry_in = Some(retry_in.map_or(d, |x| x.max(d)));
+                            } else {
+                                // Given up: may be asked again next session
+                                // step (reconnect).
+                                f.asked.remove(&root);
+                            }
+                        }
+                        (f.sub.take(), retry_in)
                     })
-                    .unwrap_or((None, false));
+                    .unwrap_or((None, None));
                 if let Some(id) = sub.filter(|s| !s.is_empty()) {
                     relay.unsubscribe(&id);
                 }
-                if retry {
-                    crate::utils::set_timeout_once(move || store.fetch_next(), RETRY_DELAY_MS);
-                } else {
-                    store.fetch_next();
+                match retry_in {
+                    Some(ms) => crate::utils::set_timeout_once(
+                        move || {
+                            if store.fetch.try_with_value(|f| f.gen) == Some(gen) {
+                                store.fetch_next();
+                            }
+                        },
+                        ms as i32,
+                    ),
+                    None => store.fetch_next(),
                 }
             })
         };
@@ -1513,13 +2005,13 @@ impl ThreadSubsStore {
             let finish = finish.clone();
             Rc::new(move |authed: bool| {
                 if authed {
-                    finish(false);
+                    finish(Outcome::Answered);
                 }
             })
         };
         let on_closed = {
             let finish = finish.clone();
-            Rc::new(move |_reason: String| finish(true))
+            Rc::new(move |_reason: String| finish(Outcome::Refused))
         };
         let id = deps.relay.subscribe_with_receipt_or_closed(
             root_fetch_filters(&batch),
@@ -1543,24 +2035,49 @@ impl ThreadSubsStore {
             deps.relay.unsubscribe(&id);
             return;
         }
-        crate::utils::set_timeout_once(move || finish(false), PAGE_TIMEOUT_MS as i32);
+        crate::utils::set_timeout_once(move || finish(Outcome::Refused), PAGE_TIMEOUT_MS as i32);
     }
 
     // -- Cross-device copy ----------------------------------------------------
 
-    /// Start or schedule the relay copy's work when it can run: signed in, the
-    /// relay session authenticated, not local-only, nothing in flight. The
-    /// first run for an account fetches and merges; later runs publish
-    /// pending changes, at most once per [`PUBLISH_INTERVAL_MS`].
-    fn sync_kick(&self) {
-        let ready = self
-            .deps
+    fn is_extension(&self) -> bool {
+        self.deps
+            .with_value(|d| d.auth.state().with_untracked(|s| s.is_nip07))
+    }
+
+    fn relay_ready(&self) -> bool {
+        self.deps
             .with_value(|d| d.relay.authenticated().get_untracked())
-            && self.owned.with_untracked(|o| o.owner.is_some())
-            && self
-                .owned
-                .with_untracked(|o| o.owner == self.pubkey.get_untracked());
-        if !ready {
+            && self.owner_ready()
+    }
+
+    /// The publish decision for `trigger` from the current state.
+    fn plan_now(&self, trigger: Trigger) -> Plan {
+        let now = now_ms();
+        let (mut subs, remote, published_ms) = self
+            .owned
+            .with_untracked(|o| (o.subs.clone(), o.remote.clone(), o.published_ms));
+        subs.prune(now);
+        let local = sync::digests(&subs).ok();
+        let ctl = self.sync.get_value();
+        sync::plan(&PlanInput {
+            fetched: ctl.fetched,
+            disabled: ctl.disabled,
+            local: local.as_ref(),
+            local_empty: subs.entries.is_empty(),
+            remote: remote.as_ref(),
+            extension: self.is_extension(),
+            trigger,
+            now_ms: now,
+            last_fetch_ms: ctl.last_fetch_ms,
+            published_ms,
+        })
+    }
+
+    /// After a change, a reconnect or a sync: start the first sync for the
+    /// account, or arm the timer for the next publish the plan allows.
+    fn schedule_sync(&self) {
+        if !self.relay_ready() {
             return;
         }
         let ctl = self.sync.get_value();
@@ -1568,55 +2085,66 @@ impl ThreadSubsStore {
             return;
         }
         if !ctl.fetched {
-            self.spawn_sync();
-        } else if ctl.dirty {
-            self.schedule_publish();
+            self.spawn_sync(Trigger::Scheduled);
+            return;
+        }
+        match self.plan_now(Trigger::Scheduled) {
+            Plan::Wait { until_ms } => self.arm_timer(until_ms),
+            Plan::Publish | Plan::Refetch => self.arm_timer(now_ms() + PUBLISH_SETTLE_MS),
+            Plan::TooLarge => self
+                .sync_status
+                .set(SyncStatus::LocalOnly(LocalOnlyReason::TooLarge)),
+            Plan::Nothing => self.sync_status.set(SyncStatus::Synced),
+            Plan::Blocked => {}
         }
     }
 
-    fn schedule_publish(&self) {
+    fn arm_timer(&self, at_ms: u64) {
         let ctl = self.sync.get_value();
-        if ctl.timer_armed {
+        if ctl.timer_at.is_some_and(|t| t <= at_ms) {
             return;
         }
-        self.sync.update_value(|c| c.timer_armed = true);
-        let earliest = ctl.last_publish_ms.saturating_add(PUBLISH_INTERVAL_MS);
-        let delay = earliest.saturating_sub(now_ms()).max(PUBLISH_SETTLE_MS);
+        self.sync.update_value(|c| c.timer_at = Some(at_ms));
         let gen = self.generation();
         let store = *self;
+        let delay = at_ms.saturating_sub(now_ms()).min(i32::MAX as u64) as i32;
         crate::utils::set_timeout_once(
             move || {
                 if store.generation() != gen {
                     return;
                 }
-                store.sync.update_value(|c| c.timer_armed = false);
+                store.sync.update_value(|c| {
+                    if c.timer_at == Some(at_ms) {
+                        c.timer_at = None;
+                    }
+                });
                 let ctl = store.sync.get_value();
-                if ctl.dirty && !ctl.busy && !ctl.disabled {
-                    store.spawn_sync();
+                if ctl.busy || ctl.disabled || !store.relay_ready() {
+                    return;
+                }
+                match store.plan_now(Trigger::Scheduled) {
+                    Plan::Publish | Plan::Refetch => store.spawn_sync(Trigger::Scheduled),
+                    Plan::Wait { until_ms } => store.arm_timer(until_ms),
+                    _ => {}
                 }
             },
-            delay.min(i32::MAX as u64) as i32,
+            delay,
         );
     }
 
-    fn spawn_sync(&self) {
+    fn spawn_sync(&self, trigger: Trigger) {
         let store = *self;
         let gen = self.generation();
         self.sync.update_value(|c| c.busy = true);
         self.sync_status.set(SyncStatus::Syncing);
         leptos::task::spawn_local(async move {
-            let outcome = store.sync_once(gen).await;
+            let outcome = store.sync_once(gen, trigger).await;
             if store.generation() != gen {
                 return;
             }
             store.sync.update_value(|c| c.busy = false);
             match outcome {
-                Ok(()) => {
-                    store.sync_status.set(SyncStatus::Synced);
-                    if store.sync.get_value().dirty {
-                        store.schedule_publish();
-                    }
-                }
+                Ok(()) => store.schedule_sync(),
                 Err(reason) => {
                     if reason.ends_session() {
                         store.sync.update_value(|c| c.disabled = true);
@@ -1641,137 +2169,226 @@ impl ThreadSubsStore {
         Ok(signer)
     }
 
-    /// Fetch the relay copy, merge it into the local list, and publish the
-    /// merge when the relay copy lacks something. Never publishes before a
-    /// successful fetch, nor over a copy it cannot read.
-    async fn sync_once(&self, gen: u64) -> Result<(), LocalOnlyReason> {
-        let signer = self.sync_signer()?;
+    /// Fetch the relay copy and merge it in. A copy whose id is the one last
+    /// seen (kept with the local copy, so across reloads too) is not
+    /// decrypted again.
+    async fn fetch_and_merge(
+        &self,
+        signer: &dyn nostr_bbs_core::signer::Signer,
+        relay: &RelayConnection,
+        gen: u64,
+    ) -> Result<(), LocalOnlyReason> {
         let owner = signer.public_key().to_string();
-        let relay = self.deps.with_value(|d| d.relay.clone());
-        let seq0 = self.sync.get_value().seq;
-
-        let remote_ev = sync::fetch_latest(&relay, &owner).await?;
+        let latest = sync::fetch_latest(relay, &owner).await?;
         if self.generation() != gen {
             return Ok(());
         }
-        let known = self.sync.get_value();
-        let remote: Option<Subs> = match &remote_ev {
-            Some(ev) if known.remote_id.as_deref() == Some(ev.id.as_str()) => known.remote,
-            Some(ev) => Some(sync::open(&*signer, ev).await?),
-            None => None,
-        };
-        if self.generation() != gen {
-            return Ok(());
-        }
-        let remote_created_at = remote_ev.as_ref().map_or(0, |e| e.created_at);
-        if let Some(r) = &remote {
-            self.adopt_remote(r);
-        }
-        self.sync.update_value(|c| {
-            c.fetched = true;
-            c.remote_id = remote_ev.as_ref().map(|e| e.id.clone());
-            c.remote_created_at = c.remote_created_at.max(remote_created_at);
-            c.remote = remote.clone();
-        });
-
-        let now = now_ms();
-        let local = self.owned.with_untracked(|o| {
-            let mut s = o.subs.clone();
-            s.prune(now);
-            s
-        });
-        let needed = match remote {
-            None => !local.entries.is_empty(),
-            Some(mut r) => {
-                r.prune(now);
-                r != local
-            }
-        };
-        if needed {
-            let created_at = now_secs().max(self.sync.get_value().remote_created_at + 1);
-            let ev = sync::seal(&*signer, &local, created_at).await?;
+        self.sync.update_value(|c| c.last_fetch_ms = Some(now_ms()));
+        let known = self.owned.with_untracked(|o| o.remote.clone());
+        if let Some(ev) = latest.filter(|ev| sync::remote_changed(known.as_ref(), ev)) {
+            let mut remote = sync::open(signer, &ev, now_secs()).await?;
             if self.generation() != gen {
                 return Ok(());
             }
-            sync::publish(&relay, &ev).await?;
-            if self.generation() != gen {
-                return Ok(());
-            }
-            self.sync.update_value(|c| {
-                c.last_publish_ms = now_ms();
-                c.remote_id = Some(ev.id.clone());
-                c.remote_created_at = ev.created_at;
-                c.remote = Some(local.clone());
+            let now = now_ms();
+            let local = self.owned.with_untracked(|o| o.subs.clone());
+            let merged = local.join(&remote, now / 1000);
+            remote.prune(now);
+            let d = sync::digests(&remote).unwrap_or(sync::Digests {
+                full: String::new(),
+                entries: String::new(),
             });
+            self.owned.update(|o| {
+                o.subs = merged;
+                o.remote = Some(RemoteSeen {
+                    id: ev.id.clone(),
+                    created_at: ev.created_at,
+                    digest: d.full,
+                    entries_digest: d.entries,
+                });
+            });
+            self.persist();
+            self.reconcile_unseen();
         }
-        self.sync.update_value(|c| {
-            if c.seq == seq0 {
-                c.dirty = false;
-            }
-        });
+        self.sync.update_value(|c| c.fetched = true);
         Ok(())
     }
 
-    /// Merge the relay copy `remote` into the local list and save.
-    fn adopt_remote(&self, remote: &Subs) {
-        let memory = self.owned.with_untracked(|o| o.subs.clone());
-        let merged = memory.join(remote);
-        if merged != memory {
-            self.owned.update(|o| o.subs = merged);
+    /// Fetch, merge and, if the plan says so, publish. Re-fetches when the
+    /// fetch has gone stale by the time the copy is sealed (a NIP-07 prompt
+    /// can take minutes), and starts over if the relay copy changed
+    /// meanwhile. Never publishes before a successful fetch, nor over a copy
+    /// it cannot read (that fails the fetch with `Unreadable`).
+    async fn sync_once(&self, gen: u64, trigger: Trigger) -> Result<(), LocalOnlyReason> {
+        let signer = self.sync_signer()?;
+        let relay = self.deps.with_value(|d| d.relay.clone());
+        for _ in 0..3 {
+            self.fetch_and_merge(&*signer, &relay, gen).await?;
+            if self.generation() != gen {
+                return Ok(());
+            }
+            match self.plan_now(trigger) {
+                Plan::Publish => {}
+                Plan::Refetch => continue,
+                Plan::TooLarge => return Err(LocalOnlyReason::TooLarge),
+                Plan::Wait { .. } | Plan::Nothing | Plan::Blocked => return Ok(()),
+            }
+            // At sign-out this tab must publish whatever another holds.
+            let locked = trigger == Trigger::SignOut || self.acquire_lock();
+            if !locked {
+                return Ok(());
+            }
+            let result = self.seal_and_publish(&*signer, &relay, gen).await;
+            if trigger != Trigger::SignOut {
+                self.release_lock();
+            }
+            match result {
+                Ok(true) => return Ok(()),
+                Ok(false) => continue,
+                Err(e) => return Err(e),
+            }
         }
-        self.persist();
-        self.reconcile_unseen();
+        Ok(())
     }
 
-    /// On `pagehide`, publish pending changes if that can finish without
-    /// waiting: a local-key or passkey signer (a NIP-07 extension cannot
-    /// answer while the page unloads), after this session's first merge.
-    ///
-    /// **The one exception to fetch-then-merge before publishing**: a fetch
-    /// cannot complete while the page unloads, so the copy published is the
-    /// local list, which holds the last relay copy this session saw. A change
-    /// another device published since that fetch is overwritten on the relay;
-    /// it comes back when that device next merges and publishes (its local
-    /// copy still has it), unless that device has signed out since, which
-    /// removed its local copy. Best effort: the frame may not leave before the
-    /// page goes, in which case the change is published at the next session's
-    /// first merge.
-    fn flush_on_pagehide(&self) {
+    /// Seal the local list and publish it unless the relay copy changed while
+    /// sealing. `Ok(false)`: it changed; fetch, merge and seal again.
+    async fn seal_and_publish(
+        &self,
+        signer: &dyn nostr_bbs_core::signer::Signer,
+        relay: &RelayConnection,
+        gen: u64,
+    ) -> Result<bool, LocalOnlyReason> {
+        let now = now_ms();
+        let (mut snapshot, remote) = self
+            .owned
+            .with_untracked(|o| (o.subs.clone(), o.remote.clone()));
+        snapshot.prune(now);
+        let d = sync::digests(&snapshot)?;
+        let created_at = now_secs().max(remote.as_ref().map_or(0, |r| r.created_at + 1));
+        let ev = sync::seal(signer, &snapshot, created_at).await?;
+        if self.generation() != gen {
+            return Ok(true);
+        }
+        let fetched_at = self.sync.get_value().last_fetch_ms.unwrap_or(0);
+        if now_ms().saturating_sub(fetched_at) > sync::FRESH_FETCH_MS {
+            let latest = sync::fetch_latest(relay, signer.public_key()).await?;
+            if self.generation() != gen {
+                return Ok(true);
+            }
+            self.sync.update_value(|c| c.last_fetch_ms = Some(now_ms()));
+            if latest.is_some_and(|l| sync::remote_changed(remote.as_ref(), &l)) {
+                return Ok(false);
+            }
+        }
+        sync::publish(relay, &ev).await?;
+        if self.generation() != gen {
+            return Ok(true);
+        }
+        self.owned.update(|o| {
+            o.remote = Some(RemoteSeen {
+                id: ev.id.clone(),
+                created_at: ev.created_at,
+                digest: d.full,
+                entries_digest: d.entries,
+            });
+            o.published_ms = now_ms();
+        });
+        self.persist();
+        Ok(true)
+    }
+
+    /// Take the per-account publish lock unless another tab holds a live one.
+    fn acquire_lock(&self) -> bool {
+        let Some(owner) = self.me() else {
+            return false;
+        };
+        let mine = self.tab_id.get_value();
+        let key = lock_key(&owner);
+        let now = now_ms();
+        if let Ok(v) = LocalStorage::get::<(String, u64)>(&key) {
+            if v.0 != mine && v.1 > now {
+                return false;
+            }
+        }
+        let _ = LocalStorage::set(&key, (mine.clone(), now + LOCK_MS));
+        LocalStorage::get::<(String, u64)>(&key).is_ok_and(|v| v.0 == mine)
+    }
+
+    fn release_lock(&self) {
+        let Some(owner) = self.me() else {
+            return;
+        };
+        let key = lock_key(&owner);
+        if LocalStorage::get::<(String, u64)>(&key).is_ok_and(|v| v.0 == self.tab_id.get_value()) {
+            LocalStorage::delete(key);
+        }
+    }
+
+    /// The page was hidden: publish pending changes now, fetching and merging
+    /// first (the page can still wait while hidden).
+    fn flush_on_hidden(&self) {
         let ctl = self.sync.get_value();
-        if !ctl.dirty || !ctl.fetched || ctl.disabled || ctl.busy {
+        if ctl.busy || ctl.disabled || !ctl.fetched || !self.relay_ready() {
             return;
         }
-        let nip07 = self
-            .deps
-            .with_value(|d| d.auth.state().with_untracked(|s| s.is_nip07));
-        if nip07 {
+        if matches!(
+            self.plan_now(Trigger::Hidden),
+            Plan::Publish | Plan::Refetch
+        ) {
+            self.spawn_sync(Trigger::Hidden);
+        }
+    }
+
+    /// The page is going: publish pending changes only if that needs no
+    /// waiting (a local-key or passkey signer) and the last fetch is recent
+    /// enough ([`sync::PAGEHIDE_FRESH_MS`]) that no relay copy can have been
+    /// missed. Best effort; the last relay copy seen is not updated, so the
+    /// next session checks what actually arrived.
+    fn flush_on_pagehide(&self) {
+        let ctl = self.sync.get_value();
+        if ctl.busy || !self.relay_ready() {
+            return;
+        }
+        if self.plan_now(Trigger::PageHide) != Plan::Publish {
             return;
         }
         let Ok(signer) = self.sync_signer() else {
             return;
         };
-        let local = self.owned.with_untracked(|o| o.subs.clone());
-        let created_at = now_secs().max(ctl.remote_created_at + 1);
+        let now = now_ms();
+        let (mut local, remote) = self
+            .owned
+            .with_untracked(|o| (o.subs.clone(), o.remote.clone()));
+        local.prune(now);
+        let created_at = now_secs().max(remote.as_ref().map_or(0, |r| r.created_at + 1));
         let relay = self.deps.with_value(|d| d.relay.clone());
-        let store = *self;
-        let gen = self.generation();
         leptos::task::spawn_local(async move {
             if let Ok(ev) = sync::seal(&*signer, &local, created_at).await {
-                if store.generation() != gen {
-                    return;
-                }
                 relay.publish(&ev);
-                // `dirty` stays set: if the page is kept (back/forward cache)
-                // or the frame never left, the normal path publishes again,
-                // fetching and merging first.
-                store.sync.update_value(|c| {
-                    c.last_publish_ms = now_ms();
-                    c.remote_id = Some(ev.id.clone());
-                    c.remote_created_at = ev.created_at;
-                    c.remote = Some(local);
-                });
             }
         });
+    }
+
+    /// A last publish before sign-out removes the local copy, if one is
+    /// pending and allowed; `None` when there is nothing to do.
+    fn sign_out_job(&self) -> Option<Pin<Box<dyn Future<Output = ()>>>> {
+        self.ensure_owner();
+        let ctl = self.sync.get_value();
+        if ctl.disabled || !ctl.fetched || !self.relay_ready() {
+            return None;
+        }
+        if !matches!(
+            self.plan_now(Trigger::SignOut),
+            Plan::Publish | Plan::Refetch
+        ) {
+            return None;
+        }
+        let store = *self;
+        let gen = self.generation();
+        Some(Box::pin(async move {
+            let _ = store.sync_once(gen, Trigger::SignOut).await;
+        }))
     }
 
     // -- Wiring ---------------------------------------------------------------
@@ -1780,7 +2397,9 @@ impl ThreadSubsStore {
     /// [`provide_thread_subs`].
     fn start(&self) {
         let store = *self;
-        let (relay, channels) = self.deps.with_value(|d| (d.relay.clone(), d.channels));
+        let (relay, channels, zone_keys) = self
+            .deps
+            .with_value(|d| (d.relay.clone(), d.channels, d.zone_keys));
         let authed = relay.authenticated();
         let pubkey = self.pubkey;
         let owned = self.owned;
@@ -1798,31 +2417,27 @@ impl ThreadSubsStore {
         }));
 
         // Backlog pass and title fetches: after AUTH settles, again after a
-        // reconnect (AUTH drops and returns), and for topics that become
-        // followed meanwhile (here or merged from another device or tab).
+        // reconnect (AUTH drops and returns; the pass then asks from each
+        // topic's high-water mark), and for topics that become followed
+        // meanwhile (here or merged from another device or tab).
         Effect::new(move |_| {
             let is_authed = authed.get();
             let pk = pubkey.get();
-            let (owner_ok, backlog, roots) = owned.with(|o| {
+            let (owner_ok, roots) = owned.with(|o| {
                 let ok = o.owner.is_some() && o.owner == pk;
-                let backlog: Vec<(String, u64)> = o
-                    .subs
-                    .active()
-                    .filter_map(|e| o.subs.read_at(&e.r).map(|t| (e.r.clone(), t)))
-                    .collect();
                 let roots: Vec<(String, String)> = o
                     .subs
                     .active()
                     .map(|e| (e.r.clone(), e.c.clone()))
                     .collect();
-                (ok, backlog, roots)
+                (ok, roots)
             });
             if !is_authed || !owner_ok {
                 store.stop_pump();
                 store.stop_fetch();
                 return;
             }
-            store.enqueue_backlog(backlog);
+            store.enqueue_backlog(roots.iter().map(|(r, _)| r.clone()).collect());
             store.enqueue_root_fetches(roots);
         });
 
@@ -1833,8 +2448,23 @@ impl ThreadSubsStore {
             let is_authed = authed.get();
             let _ = owner_memo.get();
             if is_authed {
-                store.sync_kick();
+                store.schedule_sync();
             }
+        });
+
+        // Sealed posts that open when a zone key arrives.
+        if let Some(z) = zone_keys {
+            let revision = z.revision;
+            Effect::new(move |_| {
+                revision.track();
+                store.resolve_pending();
+            });
+        }
+
+        // Deletions: the channel store's lists change when a kind 5 lands.
+        Effect::new(move |_| {
+            channels.channel_messages.track();
+            store.arm_deletion_recheck();
         });
 
         // Another tab wrote a subscriptions key (any account: the reload reads
@@ -1843,12 +2473,24 @@ impl ThreadSubsStore {
             store.reload_from_storage();
         });
 
-        // Last chance to publish pending changes.
-        let listener =
+        // Hidden: the page can still wait, so fetch, merge and publish.
+        let hidden = gloo::events::EventListener::new(
+            &gloo::utils::document(),
+            "visibilitychange",
+            move |_| {
+                if gloo::utils::document().hidden() {
+                    store.flush_on_hidden();
+                }
+            },
+        );
+        hidden.forget();
+
+        // Going: publish only what needs no waiting.
+        let going =
             gloo::events::EventListener::new(&gloo::utils::window(), "pagehide", move |_| {
                 store.flush_on_pagehide();
             });
-        listener.forget();
+        going.forget();
     }
 }
 
@@ -1876,6 +2518,33 @@ fn accept_root(deps: &Deps, wanted: &HashSet<String>, ev: NostrEvent) {
     }
 }
 
+// -- Sign-out -----------------------------------------------------------------
+
+thread_local! {
+    /// The store, for sign-out (which runs outside any reactive owner).
+    static GLOBAL: Cell<Option<ThreadSubsStore>> = const { Cell::new(None) };
+}
+
+/// A bounded last publish to run before sign-out removes the local copy:
+/// `Some` when pending changes can be published (the first fetch this
+/// session succeeded, the relay session is authenticated, the signer is still
+/// there). The caller waits at most [`SIGN_OUT_FLUSH_MS`] via [`within`]
+/// before signing out regardless; changes made on this device since its last
+/// successful publish are then lost with the local copy.
+pub(crate) fn sign_out_flush() -> Option<Pin<Box<dyn Future<Output = ()>>>> {
+    GLOBAL.with(Cell::get)?.sign_out_job()
+}
+
+/// Run `job` for at most `ms` milliseconds; the job is dropped (with the
+/// signer it holds) if the time runs out.
+pub(crate) async fn within(job: Pin<Box<dyn Future<Output = ()>>>, ms: u32) {
+    let slot: Rc<crate::relay::OneShot<()>> = crate::relay::OneShot::new();
+    let late = slot.clone();
+    let _timer = gloo::timers::callback::Timeout::new(ms, move || late.fill(()));
+    let timeout = Box::pin(async move { slot.wait().await });
+    let _ = futures_util::future::select(job, timeout).await;
+}
+
 // -- Context ------------------------------------------------------------------
 
 /// Provide the thread-subscription store and start it. Call once at the app
@@ -1888,9 +2557,11 @@ pub fn provide_thread_subs() -> ThreadSubsStore {
         relay: expect_context::<RelayConnection>(),
         channels: use_channel_store(),
         zone_keys: crate::zone_crypto::store::try_use_zone_key_store(),
+        zones: crate::stores::zones::load_zones(),
     };
     let store = ThreadSubsStore::new(deps);
     provide_context(store);
+    GLOBAL.with(|g| g.set(Some(store)));
     store.start();
     store
 }
@@ -1905,7 +2576,6 @@ pub fn use_thread_subs() -> ThreadSubsStore {
 pub fn try_use_thread_subs() -> Option<ThreadSubsStore> {
     use_context::<ThreadSubsStore>()
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1956,6 +2626,7 @@ mod tests {
             created_at,
             reply_root: root.map(str::to_string),
             edit,
+            sealed_inner: None,
         }
     }
 
@@ -1964,8 +2635,8 @@ mod tests {
     #[test]
     fn doc_round_trips_and_uses_the_compact_shape() {
         let mut s = Subs::default();
-        s.subscribe(&id(1), &chan(1), "zone1", NOW_MS, NOW).unwrap();
-        s.subscribe(&id(2), &chan(2), "", NOW_MS, NOW).unwrap();
+        s.subscribe(&id(1), &chan(1), "zone1", NOW, NOW_MS).unwrap();
+        s.subscribe(&id(2), &chan(2), "", NOW, NOW_MS).unwrap();
         s.unsubscribe(&id(2), NOW_MS + 5);
         let json = serde_json::to_string(&s.to_doc()).unwrap();
         assert_eq!(
@@ -1979,7 +2650,7 @@ mod tests {
                 NOW_MS + 5
             )
         );
-        let back = Subs::from_doc(serde_json::from_str(&json).unwrap());
+        let back = Subs::from_doc(serde_json::from_str(&json).unwrap(), NOW);
         assert_eq!(back, s);
     }
 
@@ -1994,7 +2665,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let s = Subs::from_doc(doc);
+        let s = Subs::from_doc(doc, NOW);
         assert_eq!(s.entries.len(), 1);
         assert!(s.is_active(&id(3)));
         assert_eq!(s.read_at(&id(3)), Some(9));
@@ -2003,9 +2674,9 @@ mod tests {
     #[test]
     fn a_missing_field_or_extra_field_still_loads() {
         let doc: SubsDoc = serde_json::from_str(r#"{"subs":[],"extra":1}"#).unwrap();
-        assert_eq!(Subs::from_doc(doc), Subs::default());
+        assert_eq!(Subs::from_doc(doc, NOW), Subs::default());
         let doc: SubsDoc = serde_json::from_str("{}").unwrap();
-        assert_eq!(Subs::from_doc(doc), Subs::default());
+        assert_eq!(Subs::from_doc(doc, NOW), Subs::default());
     }
 
     // -- markers --
@@ -2013,17 +2684,17 @@ mod tests {
     #[test]
     fn subscribe_sets_the_marker_to_now_and_markers_never_go_back() {
         let mut s = Subs::default();
-        s.subscribe(&id(1), &chan(1), "", NOW_MS, NOW).unwrap();
+        s.subscribe(&id(1), &chan(1), "", NOW, NOW_MS).unwrap();
         assert_eq!(s.read_at(&id(1)), Some(NOW));
-        assert!(s.mark_read(&id(1), NOW + 10));
-        assert!(!s.mark_read(&id(1), NOW + 5));
+        assert!(s.mark_read(&id(1), NOW + 10, NOW + 1_000_000));
+        assert!(!s.mark_read(&id(1), NOW + 5, NOW + 1_000_000));
         assert_eq!(s.read_at(&id(1)), Some(NOW + 10));
         // Re-subscribing an active topic leaves the marker alone.
-        s.subscribe(&id(1), &chan(1), "", NOW_MS + 1, NOW + 1)
+        s.subscribe(&id(1), &chan(1), "", NOW + 1, NOW_MS + 1)
             .unwrap();
         assert_eq!(s.read_at(&id(1)), Some(NOW + 10));
         // A topic not followed is ignored.
-        assert!(!s.mark_read(&id(9), NOW));
+        assert!(!s.mark_read(&id(9), NOW, NOW + 1_000_000));
         assert_eq!(s.read_at(&id(9)), None);
     }
 
@@ -2036,7 +2707,7 @@ mod tests {
     #[test]
     fn roots_are_case_insensitive() {
         let mut s = Subs::default();
-        s.subscribe(&id(0xabc).to_uppercase(), &chan(1), "", NOW_MS, NOW)
+        s.subscribe(&id(0xabc).to_uppercase(), &chan(1), "", NOW, NOW_MS)
             .unwrap();
         assert!(s.is_active(&id(0xabc)));
         assert!(s.unsubscribe(&id(0xabc).to_uppercase(), NOW_MS + 1));
@@ -2049,10 +2720,10 @@ mod tests {
     fn the_active_cap_refuses_with_a_clear_error_and_frees_on_unsubscribe() {
         let mut s = Subs::default();
         for n in 0..MAX_ACTIVE_SUBSCRIPTIONS as u32 {
-            s.subscribe(&id(n), &chan(1), "", NOW_MS, NOW).unwrap();
+            s.subscribe(&id(n), &chan(1), "", NOW, NOW_MS).unwrap();
         }
         let err = s
-            .subscribe(&id(9999), &chan(1), "", NOW_MS, NOW)
+            .subscribe(&id(9999), &chan(1), "", NOW, NOW_MS)
             .unwrap_err();
         assert_eq!(
             err,
@@ -2062,10 +2733,10 @@ mod tests {
         );
         assert!(err.to_string().contains("150"));
         // An already-followed topic is not refused.
-        assert_eq!(s.subscribe(&id(0), &chan(1), "", NOW_MS, NOW), Ok(false));
+        assert_eq!(s.subscribe(&id(0), &chan(1), "", NOW, NOW_MS), Ok(false));
         s.unsubscribe(&id(0), NOW_MS + 1);
         assert_eq!(
-            s.subscribe(&id(9999), &chan(1), "", NOW_MS + 2, NOW),
+            s.subscribe(&id(9999), &chan(1), "", NOW, NOW_MS + 2),
             Ok(true)
         );
     }
@@ -2074,20 +2745,20 @@ mod tests {
     fn invalid_ids_are_refused() {
         let mut s = Subs::default();
         assert_eq!(
-            s.subscribe("abc", &chan(1), "", NOW_MS, NOW),
+            s.subscribe("abc", &chan(1), "", NOW, NOW_MS),
             Err(SubscribeError::InvalidTopic)
         );
         assert_eq!(
-            s.subscribe(&id(1), "", "", NOW_MS, NOW),
+            s.subscribe(&id(1), "", "", NOW, NOW_MS),
             Err(SubscribeError::InvalidTopic)
         );
         assert_eq!(
-            s.subscribe(&id(1), "general", "", NOW_MS, NOW),
+            s.subscribe(&id(1), "general", "", NOW, NOW_MS),
             Err(SubscribeError::InvalidTopic),
             "a channel is a kind-40 event id, not a slug"
         );
         assert_eq!(
-            s.subscribe(&id(1), &chan(1), &"z".repeat(MAX_ZONE_LEN + 1), NOW_MS, NOW),
+            s.subscribe(&id(1), &chan(1), &"z".repeat(MAX_ZONE_LEN + 1), NOW, NOW_MS),
             Err(SubscribeError::InvalidTopic)
         );
     }
@@ -2098,12 +2769,12 @@ mod tests {
     fn newer_entry_wins_and_tombstones_beat_older_subscriptions() {
         let a = subs_of(&[entry(&id(1), true, 100)], &[(&id(1), 50)]);
         let b = subs_of(&[entry(&id(1), false, 200)], &[]);
-        let m = a.join(&b);
+        let m = a.join(&b, NOW);
         assert!(!m.is_active(&id(1)));
-        assert_eq!(m, b.join(&a));
+        assert_eq!(m, b.join(&a, NOW));
         // A re-subscription after the tombstone wins in turn.
         let c = subs_of(&[entry(&id(1), true, 300)], &[(&id(1), 70)]);
-        assert!(m.join(&c).is_active(&id(1)));
+        assert!(m.join(&c, NOW).is_active(&id(1)));
     }
 
     #[test]
@@ -2112,19 +2783,19 @@ mod tests {
         let off = entry(&id(1), false, 100);
         let a = subs_of(std::slice::from_ref(&on), &[]);
         let b = subs_of(std::slice::from_ref(&off), &[]);
-        assert_eq!(a.join(&b), b.join(&a));
-        assert!(!a.join(&b).is_active(&id(1)), "off wins a tie");
+        assert_eq!(a.join(&b, NOW), b.join(&a, NOW));
+        assert!(!a.join(&b, NOW).is_active(&id(1)), "off wins a tie");
         let mut other = on.clone();
         other.c = chan(2);
         let c = subs_of(&[other], &[]);
-        assert_eq!(a.join(&c), c.join(&a));
+        assert_eq!(a.join(&c, NOW), c.join(&a, NOW));
     }
 
     #[test]
     fn read_markers_take_the_maximum() {
         let a = subs_of(&[entry(&id(1), true, 100)], &[(&id(1), 50)]);
         let b = subs_of(&[entry(&id(1), true, 90)], &[(&id(1), 80)]);
-        assert_eq!(a.join(&b).read_at(&id(1)), Some(80));
+        assert_eq!(a.join(&b, NOW).read_at(&id(1)), Some(80));
     }
 
     #[test]
@@ -2141,10 +2812,10 @@ mod tests {
             &[entry(&id(1), true, 300), entry(&id(2), true, 300)],
             &[(&id(1), 20), (&id(2), 5)],
         );
-        assert_eq!(a.join(&b), b.join(&a));
-        assert_eq!(a.join(&b).join(&c), a.join(&b.join(&c)));
-        assert_eq!(a.join(&a), a);
-        let all = a.join(&b).join(&c);
+        assert_eq!(a.join(&b, NOW), b.join(&a, NOW));
+        assert_eq!(a.join(&b, NOW).join(&c, NOW), a.join(&b.join(&c, NOW), NOW));
+        assert_eq!(a.join(&a, NOW), a);
+        let all = a.join(&b, NOW).join(&c, NOW);
         assert!(all.is_active(&id(1)));
         assert!(!all.is_active(&id(2)));
         assert!(all.is_active(&id(3)));
@@ -2157,7 +2828,7 @@ mod tests {
         assert!(s.unsubscribe(&id(1), NOW_MS));
         assert_eq!(s.entries[&id(1)].at, NOW_MS + 10_001);
         let stale = subs_of(&[entry(&id(1), true, NOW_MS + 10_000)], &[]);
-        assert!(!s.join(&stale).is_active(&id(1)));
+        assert!(!s.join(&stale, NOW).is_active(&id(1)));
     }
 
     // -- tombstones --
@@ -2198,7 +2869,7 @@ mod tests {
         let me = "aa".repeat(32);
         let other = "bb".repeat(32);
         let mut s = Subs::default();
-        s.subscribe(&id(1), &chan(1), "", NOW_MS, NOW).unwrap();
+        s.subscribe(&id(1), &chan(1), "", NOW, NOW_MS).unwrap();
         let r = id(1);
         assert_eq!(
             unseen_root(&msg(Some(&r), &other, NOW + 1, false, 1), &s, Some(&me)),
@@ -2233,15 +2904,15 @@ mod tests {
     #[test]
     fn unseen_ids_are_deduplicated_and_reset_by_the_marker() {
         let mut s = Subs::default();
-        s.subscribe(&id(1), &chan(1), "", NOW_MS, NOW).unwrap();
+        s.subscribe(&id(1), &chan(1), "", NOW, NOW_MS).unwrap();
         let r = id(1);
         let mut u = Unseen::default();
-        assert!(u.note(&r, &id(100), NOW + 1));
+        assert!(u.note(&r, &id(100), NOW + 1, "bb"));
         assert!(
-            !u.note(&r, &id(100).to_uppercase(), NOW + 1),
+            !u.note(&r, &id(100).to_uppercase(), NOW + 1, "bb"),
             "same id once"
         );
-        u.note(&r, &id(101), NOW + 5);
+        u.note(&r, &id(101), NOW + 5, "bb");
         assert_eq!(
             u.count(&r),
             UnreadCount {
@@ -2249,7 +2920,7 @@ mod tests {
                 capped: false
             }
         );
-        s.mark_read(&r, NOW + 1);
+        s.mark_read(&r, NOW + 1, NOW + 1_000_000);
         u.reconcile(&s);
         assert_eq!(u.count(&r).count, 1);
         s.unsubscribe(&r, NOW_MS + 1);
@@ -2261,16 +2932,16 @@ mod tests {
     #[test]
     fn counts_cap_for_display_and_saturate_on_a_full_backlog() {
         let mut s = Subs::default();
-        s.subscribe(&id(1), &chan(1), "", NOW_MS, NOW).unwrap();
+        s.subscribe(&id(1), &chan(1), "", NOW, NOW_MS).unwrap();
         let r = id(1);
         let mut u = Unseen::default();
         for n in 0..=UNREAD_DISPLAY_CAP as u32 {
-            u.note(&r, &id(500 + n), NOW + 1);
+            u.note(&r, &id(500 + n), NOW + 1, "bb");
         }
         assert_eq!(u.count(&r).count, UNREAD_DISPLAY_CAP + 1);
         assert!(u.count(&r).capped);
         let mut u = Unseen::default();
-        u.note(&r, &id(1), NOW + 1);
+        u.note(&r, &id(1), NOW + 1, "bb");
         u.saturate(&r);
         assert_eq!(
             u.count(&r),
@@ -2280,7 +2951,7 @@ mod tests {
             }
         );
         assert!(u.total().capped);
-        s.mark_read(&r, NOW + 2);
+        s.mark_read(&r, NOW + 2, NOW + 1_000_000);
         u.reconcile(&s);
         assert_eq!(u.count(&r), UnreadCount::default());
     }
@@ -2288,16 +2959,14 @@ mod tests {
     // -- retries --
 
     #[test]
-    fn a_refused_batch_is_requeued_once_and_never_loops() {
-        let mut retried = HashSet::new();
-        let batch = vec![(id(1), 5u64), (id(2), 6)];
-        let again = requeue_once(batch.clone(), |(r, _)| r.as_str(), &mut retried);
-        assert_eq!(again, batch);
-        let again = requeue_once(batch, |(r, _)| r.as_str(), &mut retried);
-        assert!(again.is_empty());
-        let mixed = vec![(id(2), 6u64), (id(3), 7)];
-        let again = requeue_once(mixed, |(r, _)| r.as_str(), &mut retried);
-        assert_eq!(again, vec![(id(3), 7)]);
+    fn a_refused_batch_backs_off_and_gives_up_after_a_bound() {
+        let delays: Vec<Option<u64>> = (0..8).map(retry_delay_ms).collect();
+        assert_eq!(delays[0], Some(3_000));
+        assert_eq!(delays[1], Some(6_000));
+        assert_eq!(delays[2], Some(12_000));
+        assert_eq!(delays[5], Some(60_000), "capped");
+        assert_eq!(delays[6], None, "bounded: the next connection tries again");
+        assert!(delays.iter().flatten().all(|d| *d <= 60_000));
     }
 
     // -- filters --
@@ -2314,7 +2983,7 @@ mod tests {
         let f = serde_json::to_value(&reqs[0][0]).unwrap();
         assert_eq!(
             f,
-            serde_json::json!({"kinds": [42], "#e": [id(0)], "since": 1001, "limit": 100})
+            serde_json::json!({"kinds": [42], "#e": [id(0)], "since": 1000, "limit": 100})
         );
     }
 
@@ -2419,5 +3088,185 @@ mod tests {
     fn storage_keys_are_per_account() {
         assert_eq!(storage_key("ab"), "nostrbbs:thread_subs:v1:ab".to_string());
         assert_ne!(storage_key(&"a".repeat(64)), storage_key(&"b".repeat(64)));
+    }
+
+    // -- clamps (future-dated posts) --
+
+    #[test]
+    fn markers_never_run_ahead_of_the_local_clock() {
+        let mut s = Subs::default();
+        s.subscribe(&id(1), &chan(1), "", NOW, NOW_MS).unwrap();
+        // A post dated a week ahead must not mute the topic for a week.
+        assert!(s.mark_read(&id(1), NOW + 604_800, NOW + 10));
+        assert_eq!(s.read_at(&id(1)), Some(NOW + 10));
+        // Loaded or synced markers are clamped too.
+        let doc: SubsDoc = serde_json::from_value(serde_json::json!({"subs": [
+            {"r": id(2), "c": chan(1), "on": true, "at": NOW_MS, "rd": NOW + 604_800}
+        ]}))
+        .unwrap();
+        assert_eq!(Subs::from_doc(doc, NOW).read_at(&id(2)), Some(NOW));
+        // And merging cannot carry a future marker in.
+        let mut future = subs_of(&[entry(&id(3), true, NOW_MS)], &[]);
+        future.read.insert(id(3), NOW + 604_800);
+        let here = subs_of(&[entry(&id(3), true, NOW_MS)], &[(&id(3), NOW - 5)]);
+        assert_eq!(here.join(&future, NOW).read_at(&id(3)), Some(NOW));
+        assert_eq!(future.join(&here, NOW).read_at(&id(3)), Some(NOW));
+    }
+
+    #[test]
+    fn a_new_subscription_starts_from_what_the_relay_has_not_the_clock() {
+        // A fast local clock: now is an hour ahead of the topic's newest
+        // reply; the marker starts at the reply, so the next post counts.
+        assert_eq!(start_marker(Some(NOW - 3600), None, NOW), NOW - 3600);
+        assert_eq!(
+            start_marker(Some(NOW - 3600), Some(NOW - 60), NOW),
+            NOW - 60
+        );
+        assert_eq!(start_marker(None, Some(NOW + 999), NOW), NOW, "clamped");
+        assert_eq!(start_marker(None, None, NOW), NOW);
+    }
+
+    #[test]
+    fn the_newest_held_reply_ignores_the_root_other_topics_and_the_future() {
+        let mut lists: HashMap<String, Vec<NostrEvent>> = HashMap::new();
+        let reply = |n: u32, root: &str, at: u64| NostrEvent {
+            id: id(700 + n),
+            pubkey: "bb".repeat(32),
+            created_at: at,
+            kind: 42,
+            tags: vec![
+                vec!["e".into(), chan(1), "".into(), "root".into()],
+                vec!["e".into(), root.to_string(), "".into(), "reply".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        lists.insert(
+            chan(1),
+            vec![
+                root_event(&id(1), "Title"),
+                reply(1, &id(1), NOW - 50),
+                reply(2, &id(2), NOW - 10),
+                reply(3, &id(1), NOW + 500),
+            ],
+        );
+        let keys = [topic_key(&id(1)), chan(1)];
+        assert_eq!(
+            newest_held_reply(&lists, &keys, &id(1), NOW),
+            Some(NOW - 50)
+        );
+        assert_eq!(newest_held_reply(&lists, &keys, &id(9), NOW), None);
+    }
+
+    // -- high-water mark --
+
+    #[test]
+    fn after_a_reconnect_the_backlog_asks_only_from_the_high_water_mark() {
+        // First pass: just after the marker.
+        assert_eq!(backlog_since(1_000, None), 1_001);
+        // A previous answer delivered posts up to 5_000: ask from there
+        // (inclusive), not from the marker again.
+        assert_eq!(backlog_since(1_000, Some(5_000)), 5_000);
+        // A marker moved past the mark wins.
+        assert_eq!(backlog_since(9_000, Some(5_000)), 9_001);
+    }
+
+    // -- dismissal, deletion, sealed posts --
+
+    #[test]
+    fn marking_read_dismisses_posts_dated_in_the_future_for_the_session() {
+        let mut s = Subs::default();
+        s.subscribe(&id(1), &chan(1), "", NOW, NOW_MS).unwrap();
+        let r = id(1);
+        let mut u = Unseen::default();
+        u.note(&r, &id(100), NOW + 604_800, "bb");
+        u.note(&r, &id(101), NOW + 5, "bb");
+        s.mark_read(&r, NOW + 604_800, NOW + 10);
+        u.reconcile(&s);
+        // The marker is clamped, so reconcile alone keeps the future post…
+        assert_eq!(u.count(&r).count, 1);
+        // …but dismissing by what was shown removes it, and it stays gone.
+        u.dismiss_upto(&r, NOW + 604_800);
+        assert_eq!(u.count(&r).count, 0);
+        assert!(!u.note(&r, &id(100), NOW + 604_800, "bb"));
+        u.note(&r, &id(102), NOW + 20, "bb");
+        u.dismiss_root(&r);
+        assert_eq!(u.total().count, 0);
+    }
+
+    #[test]
+    fn a_deleted_post_stops_counting() {
+        let mut u = Unseen::default();
+        let r = id(1);
+        u.note(&r, &id(100), NOW + 1, "bb");
+        u.note(&r, &id(101), NOW + 2, "bb");
+        u.saturate(&r);
+        let gone: HashSet<String> = [id(100)].into_iter().collect();
+        u.remove_ids(&gone);
+        assert_eq!(u.count(&r).count, 1);
+        u.remove_ids(&[id(101)].into_iter().collect());
+        assert_eq!(
+            u.count(&r),
+            UnreadCount::default(),
+            "empty is not saturated"
+        );
+    }
+
+    #[test]
+    fn a_still_locked_sealed_post_is_not_counted_until_it_opens() {
+        let mut s = Subs::default();
+        s.subscribe(&id(1), &chan(1), "", NOW, NOW_MS).unwrap();
+        let other = "bb".repeat(32);
+        let mut locked = msg(Some(&id(1)), &other, NOW + 1, false, 1);
+        locked.sealed_inner = Some(id(555));
+        assert_eq!(unseen_root(&locked, &s, None), None);
+        // Opened: counted under the original's id, once.
+        let mut opened = msg(Some(&id(1)), &other, NOW + 1, false, 1);
+        opened.id = id(555);
+        assert_eq!(unseen_root(&opened, &s, None), Some(id(1).as_str()));
+        let mut u = Unseen::default();
+        assert!(u.note(&id(1), &opened.id, NOW + 1, &other));
+        assert!(!u.note(&id(1), &opened.id, NOW + 1, &other));
+        assert_eq!(u.count(&id(1)).count, 1);
+    }
+
+    #[test]
+    fn tombstones_last_a_year() {
+        let mut s = subs_of(
+            &[
+                entry(&id(1), false, NOW_MS - 200 * 24 * 3600 * 1000),
+                entry(&id(2), false, NOW_MS - 400 * 24 * 3600 * 1000),
+            ],
+            &[],
+        );
+        s.prune(NOW_MS);
+        assert!(s.entries.contains_key(&id(1)), "200 days: kept");
+        assert!(!s.entries.contains_key(&id(2)), "400 days: dropped");
+    }
+
+    #[test]
+    fn the_local_copy_round_trips_with_the_relay_record() {
+        let mut s = Subs::default();
+        s.subscribe(&id(1), &chan(1), "", NOW, NOW_MS).unwrap();
+        let doc = LocalDoc {
+            doc: s.to_doc(),
+            remote: Some(RemoteSeen {
+                id: id(9),
+                created_at: 5,
+                digest: "d".into(),
+                entries_digest: "e".into(),
+            }),
+            published_ms: 7,
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: LocalDoc = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, doc);
+        // The synced shape never carries the local record.
+        let synced: SubsDoc = serde_json::from_str(&json).unwrap();
+        assert!(!serde_json::to_string(&synced).unwrap().contains("remote"));
+        // A copy stored before the record existed still loads.
+        let old: LocalDoc =
+            serde_json::from_str(&serde_json::to_string(&s.to_doc()).unwrap()).unwrap();
+        assert_eq!(old.remote, None);
     }
 }

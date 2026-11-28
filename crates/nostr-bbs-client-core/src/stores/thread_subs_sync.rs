@@ -10,31 +10,54 @@
 //! zone inbox-key backup (`zone_crypto::inbox_key::build_backup`). No other
 //! envelope, no hand-rolled cryptography.
 //!
-//! What the relay (and anyone who asks it: kind 30078 is not read-gated) can
-//! still see: the author, the `d` tag, when the copy last changed and roughly
-//! how large it is.
+//! ## Who can see what
+//!
+//! - **Anyone** who asks the relay (kind 30078 is not read-gated) can see the
+//!   copy's author, its `d` tag, when it last changed and roughly how large it
+//!   is — not which topics it lists.
+//! - **The relay operator** can see more: the client's own reads name the
+//!   followed topics. The unread backlog asks `#e:[root]` with `since` at the
+//!   topic's read marker, and title fetches ask for roots by id, on the
+//!   member's authenticated connection. So the operator can learn, from its
+//!   logs, which topics a member follows and roughly how far they have read.
+//!   Third parties cannot: those REQs travel over the member's TLS
+//!   connection and are not stored as events.
 //!
 //! ## Rules
 //!
+//! The publish decision is one pure function (`plan`, unit-tested).
+//!
 //! - Fetch, then merge entry by entry
 //!   ([`Subs::join`](crate::stores::thread_subs)), before every publish: a
-//!   replaceable event is last-writer-wins for the whole list. **One
-//!   exception**: the best-effort publish on `pagehide` (local-key and passkey
-//!   sessions only) cannot wait for a fetch, so it publishes the local list,
-//!   which holds the last relay copy this session saw. A change another device
-//!   published since then is overwritten on the relay until that device next
-//!   merges and publishes it again (its local copy keeps it) — lost only if
-//!   that device signed out meanwhile, since sign-out removes the local copy.
+//!   replaceable event is last-writer-wins for the whole list. A fetch older
+//!   than [`FRESH_FETCH_MS`] when the copy is about to go out (a NIP-07
+//!   prompt can take minutes) is repeated, and the copy re-merged and
+//!   re-sealed if the relay's copy changed meanwhile.
 //! - Never publish before this session's first fetch succeeded (a timeout is
 //!   a failure, an empty answer is not), nor over a copy that cannot be
 //!   decrypted or read: that would wipe what another device wrote.
-//! - At most one publish per minute, plus a best-effort one on `pagehide`.
+//! - Pending changes go out when the page is hidden (`visibilitychange`, when
+//!   the page can still wait for the relay), at sign-out (bounded), and
+//!   otherwise at most once per [`PUBLISH_INTERVAL_MS`]. On `pagehide` the
+//!   copy is published only if the last fetch is under
+//!   [`PAGEHIDE_FRESH_MS`] old (normally the hide just before it), so it never
+//!   overwrites a copy it has not seen.
+//! - With a NIP-07 extension signer every publish costs prompts, so only
+//!   subscribing and unsubscribing schedule one; read markers ride along with
+//!   the next such publish, or go alone at most once per
+//!   [`EXTENSION_MARKER_INTERVAL_MS`].
+//! - The last relay copy seen (id, `created_at` and digests) is kept with the
+//!   local copy, so an unchanged relay copy is never decrypted again, and
+//!   other tabs see that nothing is pending. One tab publishes at a time
+//!   (a short-lived lock in localStorage).
 //! - Without NIP-44 (a NIP-07 extension lacking `nip44`), or on any error, the
 //!   feature stays local-only ([`SyncStatus::LocalOnly`]); the local list
 //!   keeps working.
 //! - The plaintext is held to [`MAX_PLAINTEXT_BYTES`] so the encrypted content
 //!   stays under the relay's 64 KiB content cap; the oldest tombstones are
-//!   left out first, a followed topic never.
+//!   left out first, a followed topic never. The decision compares digests of
+//!   that bounded encoding, so a list trimmed to fit does not look changed
+//!   and is not republished every session.
 //!
 //! ## Device keys (ADR-099, `DEVICE_KEYS_ENABLED`)
 //!
@@ -57,6 +80,8 @@ use std::rc::Rc;
 
 use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::{verify_event_strict, NostrEvent, UnsignedEvent};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::relay::{Filter, OneShot, RelayConnection};
 use crate::stores::thread_subs::{Subs, SubsDoc};
@@ -122,6 +147,188 @@ impl LocalOnlyReason {
     }
 }
 
+/// At most one scheduled publish per this many milliseconds.
+pub const PUBLISH_INTERVAL_MS: u64 = 60_000;
+
+/// With a NIP-07 extension signer, a copy whose only change is read markers
+/// is published at most once per this many milliseconds (30 minutes).
+pub const EXTENSION_MARKER_INTERVAL_MS: u64 = 30 * 60_000;
+
+/// A fetch older than this when the copy is about to be published is
+/// repeated first, milliseconds.
+pub const FRESH_FETCH_MS: u64 = 5_000;
+
+/// On `pagehide` (no time to fetch) the copy is published only if the last
+/// fetch is younger than this, milliseconds.
+pub const PAGEHIDE_FRESH_MS: u64 = 10_000;
+
+/// The newest relay copy this browser has merged or published: its event id
+/// and `created_at`, and the digests of its contents (as [`digests`]
+/// computes them). Kept with the local copy, never published.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RemoteSeen {
+    pub id: String,
+    pub created_at: u64,
+    pub digest: String,
+    pub entries_digest: String,
+}
+
+impl RemoteSeen {
+    /// The newer of two records (by `created_at`, then id), for merging what
+    /// two tabs stored.
+    pub fn newer(a: Option<RemoteSeen>, b: Option<RemoteSeen>) -> Option<RemoteSeen> {
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                if (b.created_at, &b.id) > (a.created_at, &a.id) {
+                    Some(b)
+                } else {
+                    Some(a)
+                }
+            }
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// SHA-256 digests (hex) of a list as it would be published: `full` over the
+/// bounded encoding, `entries` over the same trimmed list without read
+/// markers. Used only
+/// to tell whether two lists differ; not a security measure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Digests {
+    pub full: String,
+    pub entries: String,
+}
+
+/// The [`Digests`] of `subs`; [`LocalOnlyReason::TooLarge`] when it cannot be
+/// published at all.
+pub(crate) fn digests(subs: &Subs) -> Result<Digests, LocalOnlyReason> {
+    let hash = |s: &str| hex::encode(Sha256::digest(s.as_bytes()));
+    let (trimmed, json) = bounded(subs)?;
+    let membership = serde_json::to_string(&trimmed.membership().to_doc())
+        .map_err(|_| LocalOnlyReason::TooLarge)?;
+    Ok(Digests {
+        full: hash(&json),
+        entries: hash(&membership),
+    })
+}
+
+/// Whether relay copy `latest` is newer than the one last seen (`known`):
+/// a different event, later (`created_at`, then id). A stale answer naming an
+/// older copy is not a change.
+pub(crate) fn remote_changed(known: Option<&RemoteSeen>, latest: &NostrEvent) -> bool {
+    match known {
+        None => true,
+        Some(k) => k.id != latest.id && (latest.created_at, &latest.id) > (k.created_at, &k.id),
+    }
+}
+
+/// What asked for a publish decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Trigger {
+    /// A timer after a local change, or a sync after AUTH.
+    Scheduled,
+    /// The page was hidden (`visibilitychange`): it can still wait.
+    Hidden,
+    /// The page is going (`pagehide`): it cannot wait for anything.
+    PageHide,
+    /// The member is signing out: last chance, bounded by the caller.
+    SignOut,
+}
+
+/// Inputs of [`plan`].
+#[derive(Clone, Debug)]
+pub(crate) struct PlanInput<'a> {
+    /// This session's first fetch of the relay copy succeeded.
+    pub fetched: bool,
+    /// Local-only for the session (unreadable relay copy, no NIP-44).
+    pub disabled: bool,
+    /// The local list's digests; `None` when it is too large to publish.
+    pub local: Option<&'a Digests>,
+    /// The local list has no entries at all.
+    pub local_empty: bool,
+    /// The newest relay copy merged or published.
+    pub remote: Option<&'a RemoteSeen>,
+    /// The signer is a NIP-07 extension (every publish prompts).
+    pub extension: bool,
+    pub trigger: Trigger,
+    pub now_ms: u64,
+    /// When the relay copy was last fetched, if this session has.
+    pub last_fetch_ms: Option<u64>,
+    /// When this browser last published, 0 if never.
+    pub published_ms: u64,
+}
+
+/// The publish decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Plan {
+    /// Not allowed: no successful fetch yet this session, or local-only.
+    Blocked,
+    /// Nothing the relay copy lacks (or nothing worth a prompt now).
+    Nothing,
+    /// The list cannot be published at any size.
+    TooLarge,
+    /// Publish, but not before this time (milliseconds).
+    Wait { until_ms: u64 },
+    /// Publish after fetching again: the last fetch is too old.
+    Refetch,
+    /// Publish now: the last fetch is fresh.
+    Publish,
+}
+
+/// Decide whether to publish the local list (see the module rules).
+pub(crate) fn plan(p: &PlanInput<'_>) -> Plan {
+    if p.disabled || !p.fetched {
+        return Plan::Blocked;
+    }
+    let Some(local) = p.local else {
+        return Plan::TooLarge;
+    };
+    let (full_differs, entries_differ) = match p.remote {
+        None if p.local_empty => return Plan::Nothing,
+        None => (true, true),
+        Some(r) => (r.digest != local.full, r.entries_digest != local.entries),
+    };
+    if !full_differs {
+        return Plan::Nothing;
+    }
+    let markers_only = !entries_differ;
+    if p.trigger == Trigger::PageHide && p.extension {
+        // An extension cannot answer while the page unloads.
+        return Plan::Nothing;
+    }
+    let interval = if markers_only && p.extension {
+        EXTENSION_MARKER_INTERVAL_MS
+    } else {
+        PUBLISH_INTERVAL_MS
+    };
+    let earliest = p.published_ms.saturating_add(interval);
+    match p.trigger {
+        Trigger::Scheduled if p.now_ms < earliest => {
+            return Plan::Wait { until_ms: earliest };
+        }
+        // Hiding the page is not worth an extension prompt for markers alone
+        // inside their interval; anything else goes now.
+        Trigger::Hidden | Trigger::PageHide
+            if markers_only && p.extension && p.now_ms < earliest =>
+        {
+            return Plan::Nothing;
+        }
+        _ => {}
+    }
+    let age = p.last_fetch_ms.map(|t| p.now_ms.saturating_sub(t));
+    match p.trigger {
+        Trigger::PageHide => match age {
+            Some(a) if a <= PAGEHIDE_FRESH_MS => Plan::Publish,
+            _ => Plan::Nothing,
+        },
+        _ => match age {
+            Some(a) if a <= FRESH_FETCH_MS => Plan::Publish,
+            _ => Plan::Refetch,
+        },
+    }
+}
+
 /// NIP-44 v2 padded plaintext length for an `n`-byte plaintext.
 pub(crate) fn nip44_padded_len(n: usize) -> usize {
     if n <= 32 {
@@ -149,14 +356,21 @@ pub(crate) fn nip44_payload_len(n: usize) -> usize {
 /// does not fit, the oldest tombstones are left out until it does; if the
 /// followed topics alone do not fit, nothing is published.
 pub(crate) fn encode_bounded(subs: &Subs) -> Result<String, LocalOnlyReason> {
+    bounded(subs).map(|(_, json)| json)
+}
+
+/// [`encode_bounded`], also returning the list as trimmed, so other
+/// measures (the membership digest) can be taken over exactly what is
+/// published.
+pub(crate) fn bounded(subs: &Subs) -> Result<(Subs, String), LocalOnlyReason> {
     let mut out = subs.clone();
     let entries = &out.entries;
     out.read.retain(|r, _| entries.get(r).is_some_and(|e| e.on));
     let encode =
         |s: &Subs| serde_json::to_string(&s.to_doc()).map_err(|_| LocalOnlyReason::TooLarge);
-    let mut json = encode(&out)?;
+    let json = encode(&out)?;
     if json.len() <= MAX_PLAINTEXT_BYTES {
-        return Ok(json);
+        return Ok((out, json));
     }
     let mut tombs: Vec<(u64, String)> = out
         .entries
@@ -179,9 +393,9 @@ pub(crate) fn encode_bounded(subs: &Subs) -> Result<String, LocalOnlyReason> {
         }
     }
     loop {
-        json = encode(&out)?;
+        let json = encode(&out)?;
         if json.len() <= MAX_PLAINTEXT_BYTES {
-            return Ok(json);
+            return Ok((out, json));
         }
         match tombs.next() {
             Some((_, root)) => {
@@ -192,11 +406,12 @@ pub(crate) fn encode_bounded(subs: &Subs) -> Result<String, LocalOnlyReason> {
     }
 }
 
-/// Parse a decrypted copy; `None` when it is not the expected JSON.
-pub(crate) fn decode(plain: &str) -> Option<Subs> {
+/// Parse a decrypted copy, markers clamped to `now_secs`; `None` when it is
+/// not the expected JSON.
+pub(crate) fn decode(plain: &str, now_secs: u64) -> Option<Subs> {
     serde_json::from_str::<SubsDoc>(plain)
         .ok()
-        .map(Subs::from_doc)
+        .map(|d| Subs::from_doc(d, now_secs))
 }
 
 /// The unsigned event: kind 30078, the `d` tag and nothing else.
@@ -257,14 +472,19 @@ pub(crate) async fn seal(
         .map_err(|_| LocalOnlyReason::NoSigner)
 }
 
-/// Decrypt and read a copy with the signer's own key.
-pub(crate) async fn open(signer: &dyn Signer, ev: &NostrEvent) -> Result<Subs, LocalOnlyReason> {
+/// Decrypt and read a copy with the signer's own key (markers clamped to
+/// `now_secs`).
+pub(crate) async fn open(
+    signer: &dyn Signer,
+    ev: &NostrEvent,
+    now_secs: u64,
+) -> Result<Subs, LocalOnlyReason> {
     let owner = signer.public_key().to_string();
     let plain = signer
         .nip44_decrypt(&owner, &ev.content)
         .await
         .map_err(|_| LocalOnlyReason::Unreadable)?;
-    decode(&plain).ok_or(LocalOnlyReason::Unreadable)
+    decode(&plain, now_secs).ok_or(LocalOnlyReason::Unreadable)
 }
 
 /// Ask the relay for `owner`'s current copy. `Ok(None)` when it answered with
@@ -324,6 +544,9 @@ mod tests {
     use crate::stores::thread_subs::{Entry, MAX_ACTIVE_SUBSCRIPTIONS};
     use nostr_bbs_core::keys::generate_keypair;
     use nostr_bbs_core::signer::PrfSigner;
+
+    /// A clock past every marker the tests use, so clamping changes nothing.
+    const LATER: u64 = u64::MAX;
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         futures::executor::block_on(f)
@@ -399,7 +622,7 @@ mod tests {
     fn the_event_has_kind_30078_and_only_the_d_tag() {
         let s = signer();
         let mut subs = Subs::default();
-        subs.subscribe(&id(1), &id(2), "zone1", 1_000, 1).unwrap();
+        subs.subscribe(&id(1), &id(2), "zone1", 1, 1_000).unwrap();
         let ev = block_on(seal(&s, &subs, 1_700_000_000)).unwrap();
         assert_eq!(ev.kind, 30078);
         assert_eq!(ev.pubkey, s.public_key());
@@ -418,12 +641,12 @@ mod tests {
     fn seal_then_open_round_trips() {
         let s = signer();
         let mut subs = Subs::default();
-        subs.subscribe(&id(1), &id(2), "zone1", 1_000, 1).unwrap();
-        subs.subscribe(&id(3), &id(2), "", 1_001, 1).unwrap();
-        subs.mark_read(&id(3), 50);
+        subs.subscribe(&id(1), &id(2), "zone1", 1, 1_000).unwrap();
+        subs.subscribe(&id(3), &id(2), "", 1, 1_001).unwrap();
+        subs.mark_read(&id(3), 50, LATER);
         subs.unsubscribe(&id(1), 2_000);
         let ev = block_on(seal(&s, &subs, 1_700_000_000)).unwrap();
-        let back = block_on(open(&s, &ev)).unwrap();
+        let back = block_on(open(&s, &ev, LATER)).unwrap();
         assert_eq!(back, subs);
     }
 
@@ -432,10 +655,10 @@ mod tests {
         let mine = signer();
         let theirs = signer();
         let mut subs = Subs::default();
-        subs.subscribe(&id(1), &id(2), "", 1_000, 1).unwrap();
+        subs.subscribe(&id(1), &id(2), "", 1, 1_000).unwrap();
         let ev = block_on(seal(&mine, &subs, 1_700_000_000)).unwrap();
         assert_eq!(
-            block_on(open(&theirs, &ev)),
+            block_on(open(&theirs, &ev, LATER)),
             Err(LocalOnlyReason::Unreadable)
         );
     }
@@ -450,7 +673,7 @@ mod tests {
         );
         let plain = encode_bounded(&subs).unwrap();
         assert!(plain.len() <= MAX_PLAINTEXT_BYTES);
-        let back = decode(&plain).unwrap();
+        let back = decode(&plain, LATER).unwrap();
         assert_eq!(back.active_count(), MAX_ACTIVE_SUBSCRIPTIONS);
         let ev = block_on(seal(&s, &subs, 1_700_000_000)).unwrap();
         assert!(
@@ -485,9 +708,9 @@ mod tests {
     #[test]
     fn markers_of_topics_not_followed_are_not_published() {
         let mut subs = Subs::default();
-        subs.subscribe(&id(1), &id(2), "", 1_000, 1).unwrap();
+        subs.subscribe(&id(1), &id(2), "", 1, 1_000).unwrap();
         subs.read.insert(id(9), 5);
-        let back = decode(&encode_bounded(&subs).unwrap()).unwrap();
+        let back = decode(&encode_bounded(&subs).unwrap(), LATER).unwrap();
         assert!(!back.read.contains_key(&id(9)));
         assert!(back.read.contains_key(&id(1)));
     }
@@ -497,7 +720,7 @@ mod tests {
         let me = signer();
         let other = signer();
         let mut subs = Subs::default();
-        subs.subscribe(&id(1), &id(2), "", 1_000, 1).unwrap();
+        subs.subscribe(&id(1), &id(2), "", 1, 1_000).unwrap();
         let old = block_on(seal(&me, &subs, 100)).unwrap();
         let new = block_on(seal(&me, &subs, 200)).unwrap();
         let theirs = block_on(seal(&other, &subs, 300)).unwrap();
@@ -521,9 +744,9 @@ mod tests {
 
     #[test]
     fn decode_rejects_what_is_not_the_copy() {
-        assert!(decode("not json").is_none());
-        assert!(decode("[1,2]").is_none());
-        assert_eq!(decode("{}"), Some(Subs::default()));
+        assert!(decode("not json", LATER).is_none());
+        assert!(decode("[1,2]", LATER).is_none());
+        assert_eq!(decode("{}", LATER), Some(Subs::default()));
     }
 
     #[test]
@@ -533,5 +756,263 @@ mod tests {
         assert!(!LocalOnlyReason::RelayError.ends_session());
         assert!(!LocalOnlyReason::TooLarge.ends_session());
         assert!(!LocalOnlyReason::NoSigner.ends_session());
+    }
+
+    // -- publish decision --
+
+    fn dig(full: &str, entries: &str) -> Digests {
+        Digests {
+            full: full.into(),
+            entries: entries.into(),
+        }
+    }
+
+    fn seen(full: &str, entries: &str) -> RemoteSeen {
+        RemoteSeen {
+            id: "1".repeat(64),
+            created_at: 100,
+            digest: full.into(),
+            entries_digest: entries.into(),
+        }
+    }
+
+    const T: u64 = 10_000_000;
+
+    fn input<'a>(local: &'a Digests, remote: Option<&'a RemoteSeen>) -> PlanInput<'a> {
+        PlanInput {
+            fetched: true,
+            disabled: false,
+            local: Some(local),
+            local_empty: false,
+            remote,
+            extension: false,
+            trigger: Trigger::Scheduled,
+            now_ms: T,
+            last_fetch_ms: Some(T),
+            published_ms: 0,
+        }
+    }
+
+    #[test]
+    fn never_publishes_before_a_successful_fetch_or_over_an_unreadable_copy() {
+        let local = dig("a", "x");
+        let p = PlanInput {
+            fetched: false,
+            ..input(&local, None)
+        };
+        assert_eq!(plan(&p), Plan::Blocked);
+        for trigger in [Trigger::Hidden, Trigger::PageHide, Trigger::SignOut] {
+            assert_eq!(
+                plan(&PlanInput {
+                    trigger,
+                    ..p.clone()
+                }),
+                Plan::Blocked
+            );
+        }
+        // An unreadable relay copy disables the session: left alone.
+        let p = PlanInput {
+            disabled: true,
+            ..input(&local, None)
+        };
+        assert_eq!(plan(&p), Plan::Blocked);
+    }
+
+    #[test]
+    fn nothing_to_publish_when_the_relay_copy_matches_or_both_are_empty() {
+        let local = dig("a", "x");
+        let same = seen("a", "x");
+        assert_eq!(plan(&input(&local, Some(&same))), Plan::Nothing);
+        let p = PlanInput {
+            local_empty: true,
+            ..input(&local, None)
+        };
+        assert_eq!(plan(&p), Plan::Nothing);
+        assert_eq!(plan(&input(&local, None)), Plan::Publish);
+        let p = PlanInput {
+            local: None,
+            ..input(&local, None)
+        };
+        assert_eq!(plan(&p), Plan::TooLarge);
+    }
+
+    #[test]
+    fn a_stale_fetch_is_repeated_before_publishing() {
+        let local = dig("a", "x");
+        let old = seen("b", "y");
+        let p = PlanInput {
+            last_fetch_ms: Some(T - FRESH_FETCH_MS - 1),
+            ..input(&local, Some(&old))
+        };
+        assert_eq!(plan(&p), Plan::Refetch);
+        let p = PlanInput {
+            last_fetch_ms: Some(T - FRESH_FETCH_MS),
+            ..input(&local, Some(&old))
+        };
+        assert_eq!(plan(&p), Plan::Publish);
+        // At most one scheduled publish a minute.
+        let p = PlanInput {
+            published_ms: T - 1_000,
+            ..input(&local, Some(&old))
+        };
+        assert_eq!(
+            plan(&p),
+            Plan::Wait {
+                until_ms: T - 1_000 + PUBLISH_INTERVAL_MS
+            }
+        );
+    }
+
+    #[test]
+    fn an_extension_signer_publishes_markers_alone_rarely() {
+        let local = dig("a", "x");
+        let markers_only = seen("b", "x");
+        let ext = |trigger, published_ms| PlanInput {
+            extension: true,
+            trigger,
+            published_ms,
+            ..input(&local, Some(&markers_only))
+        };
+        // Read markers alone: not before the long interval, hidden or not.
+        assert_eq!(
+            plan(&ext(Trigger::Scheduled, T - 120_000)),
+            Plan::Wait {
+                until_ms: T - 120_000 + EXTENSION_MARKER_INTERVAL_MS
+            }
+        );
+        assert_eq!(plan(&ext(Trigger::Hidden, T - 120_000)), Plan::Nothing);
+        assert_eq!(
+            plan(&ext(Trigger::Scheduled, T - EXTENSION_MARKER_INTERVAL_MS)),
+            Plan::Publish
+        );
+        // At sign-out the markers go too (the local copy is about to go).
+        assert_eq!(plan(&ext(Trigger::SignOut, T - 120_000)), Plan::Publish);
+        // A subscribe or unsubscribe goes at the normal pace.
+        let membership = seen("b", "y");
+        let p = PlanInput {
+            extension: true,
+            published_ms: T - 120_000,
+            ..input(&local, Some(&membership))
+        };
+        assert_eq!(plan(&p), Plan::Publish);
+        // A local-key signer publishes markers at the normal pace.
+        let p = PlanInput {
+            published_ms: T - 120_000,
+            ..input(&local, Some(&markers_only))
+        };
+        assert_eq!(plan(&p), Plan::Publish);
+        // An extension can never publish on pagehide.
+        assert_eq!(plan(&ext(Trigger::PageHide, 0)), Plan::Nothing);
+    }
+
+    #[test]
+    fn hide_and_sign_out_skip_the_interval_and_pagehide_needs_a_recent_fetch() {
+        let local = dig("a", "x");
+        let old = seen("b", "y");
+        let base = PlanInput {
+            published_ms: T - 1_000,
+            ..input(&local, Some(&old))
+        };
+        assert_eq!(
+            plan(&PlanInput {
+                trigger: Trigger::Hidden,
+                ..base.clone()
+            }),
+            Plan::Publish
+        );
+        assert_eq!(
+            plan(&PlanInput {
+                trigger: Trigger::SignOut,
+                ..base.clone()
+            }),
+            Plan::Publish
+        );
+        let stale = PlanInput {
+            trigger: Trigger::Hidden,
+            last_fetch_ms: Some(T - 60_000),
+            ..base.clone()
+        };
+        assert_eq!(plan(&stale), Plan::Refetch);
+        let pagehide = PlanInput {
+            trigger: Trigger::PageHide,
+            last_fetch_ms: Some(T - PAGEHIDE_FRESH_MS),
+            ..base.clone()
+        };
+        assert_eq!(plan(&pagehide), Plan::Publish);
+        let pagehide_stale = PlanInput {
+            last_fetch_ms: Some(T - PAGEHIDE_FRESH_MS - 1),
+            ..pagehide
+        };
+        assert_eq!(plan(&pagehide_stale), Plan::Nothing, "never blind");
+    }
+
+    #[test]
+    fn a_relay_copy_counts_as_changed_only_when_newer() {
+        let s = signer();
+        let mut subs = Subs::default();
+        subs.subscribe(&id(1), &id(2), "", 1, 1_000).unwrap();
+        let ev = block_on(seal(&s, &subs, 200)).unwrap();
+        assert!(remote_changed(None, &ev));
+        let same = RemoteSeen {
+            id: ev.id.clone(),
+            created_at: 200,
+            digest: String::new(),
+            entries_digest: String::new(),
+        };
+        assert!(
+            !remote_changed(Some(&same), &ev),
+            "same copy: not decrypted again"
+        );
+        let newer_known = RemoteSeen {
+            id: "f".repeat(64),
+            created_at: 300,
+            ..same.clone()
+        };
+        assert!(!remote_changed(Some(&newer_known), &ev), "a stale answer");
+        let older_known = RemoteSeen {
+            id: "0".repeat(64),
+            created_at: 100,
+            ..same
+        };
+        assert!(remote_changed(Some(&older_known), &ev));
+    }
+
+    #[test]
+    fn a_list_trimmed_to_fit_does_not_look_changed_after_it_is_published() {
+        // The worst case sheds tombstones to fit. The digest is over the
+        // bounded encoding, so the published copy (decoded) and the local
+        // list agree, and the plan says nothing is pending.
+        let subs = worst_case(
+            MAX_ACTIVE_SUBSCRIPTIONS,
+            crate::stores::thread_subs::MAX_ZONE_LEN,
+        );
+        let local = digests(&subs).unwrap();
+        let published = decode(&encode_bounded(&subs).unwrap(), LATER).unwrap();
+        assert!(
+            published.entries.len() < subs.entries.len(),
+            "tombstones were shed"
+        );
+        let remote = digests(&published).unwrap();
+        assert_eq!(local, remote);
+        let r = RemoteSeen {
+            id: "1".repeat(64),
+            created_at: 1,
+            digest: remote.full,
+            entries_digest: remote.entries,
+        };
+        assert_eq!(plan(&input(&local, Some(&r))), Plan::Nothing);
+    }
+
+    #[test]
+    fn digests_separate_membership_from_markers() {
+        let mut a = Subs::default();
+        a.subscribe(&id(1), &id(2), "", 1, 1_000).unwrap();
+        let mut b = a.clone();
+        b.mark_read(&id(1), 99, LATER);
+        let (da, db) = (digests(&a).unwrap(), digests(&b).unwrap());
+        assert_ne!(da.full, db.full);
+        assert_eq!(da.entries, db.entries);
+        b.unsubscribe(&id(1), 2_000);
+        assert_ne!(da.entries, digests(&b).unwrap().entries);
     }
 }
