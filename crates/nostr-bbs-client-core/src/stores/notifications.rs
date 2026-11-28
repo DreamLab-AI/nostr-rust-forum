@@ -117,20 +117,23 @@ fn post_body(author: &str, content: &str, channel: &str, encrypted: bool) -> Str
 }
 
 /// Where a notification came from: when, the stable dedup id of its source
-/// event (if any), and the member key its body may name.
+/// event (if any), the member key its body may name, and whether it is a post
+/// in a topic the member subscribed to (see [`level_admits`]).
 struct Origin {
     timestamp: u64,
     dedup_id: Option<String>,
     key: Option<KeyRef>,
+    followed: bool,
 }
 
 impl Origin {
-    /// Now, with no dedup id and no key.
+    /// Now, with no dedup id and no key, not from a subscribed topic.
     fn now() -> Self {
         Self {
             timestamp: now_secs(),
             dedup_id: None,
             key: None,
+            followed: false,
         }
     }
 }
@@ -358,6 +361,7 @@ impl NotificationStoreV2 {
             timestamp,
             dedup_id,
             key,
+            followed,
         } = origin;
         // A sender controls the timestamp they put on a DM rumor or a post. A
         // future one would sort to the top and, because age is computed with
@@ -371,7 +375,9 @@ impl NotificationStoreV2 {
         //                   join approvals, RSVPs, system) — never generic
         //                   channel chatter,
         //   All          -> everything.
-        if !notification_kind_allowed(&kind) {
+        // A post in a subscribed topic also passes MentionsOnly (see
+        // `level_admits`).
+        if !notice_allowed(&kind, followed) {
             return;
         }
 
@@ -483,6 +489,7 @@ impl NotificationStoreV2 {
                 timestamp,
                 dedup_id: Some(format!("dm:{wrap_id}")),
                 key: Some(pubkey_ref(sender)),
+                followed: false,
             },
         );
     }
@@ -527,6 +534,8 @@ impl NotificationStoreV2 {
         let my_pubkey = auth.pubkey();
         // Captured here: the effects below cannot reach context later.
         let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
+        // Subscribed topics (absent in an app that does not provide them).
+        let thread_subs = crate::stores::thread_subs::try_use_thread_subs();
 
         // Join-effect dedup state, declared up-front so the resolver below can
         // reset it on an account switch. `known_profiles` holds pubkeys already
@@ -647,6 +656,7 @@ impl NotificationStoreV2 {
                         timestamp: c.created_at,
                         dedup_id: Some(format!("{TOPIC_NOTICE_PREFIX}{}", c.id)),
                         key: None,
+                        followed: false,
                     },
                 );
                 // Burn the id only if the level let the notice through, as for
@@ -679,6 +689,11 @@ impl NotificationStoreV2 {
             // read re-runs this effect so the badge clears), then index per
             // channel below.
             let read_map = read_positions.read_timestamps();
+            // Read markers of subscribed topics (tracked: subscribing or
+            // reading a topic re-runs this effect).
+            let followed = thread_subs
+                .map(|s| s.followed_markers())
+                .unwrap_or_default();
             // Whether this run recorded any newly-seen event id; if so we persist
             // the dedup set + baseline once at the end (not per event).
             let mut seen_changed = false;
@@ -712,11 +727,16 @@ impl NotificationStoreV2 {
                         .map(|pk| event_mentions(event, pk))
                         .unwrap_or(false);
 
+                    // A reply (not an edit) in a subscribed topic is judged by
+                    // the topic's own read marker instead of the channel's:
+                    // opening a section's topic list marks the whole channel
+                    // read without showing a single reply.
+                    let followed_read = followed_marker(event, &followed);
                     let verdict = classify_post(
                         &event.pubkey,
                         event.created_at,
                         me.as_deref(),
-                        read_ts,
+                        followed_read.unwrap_or(read_ts),
                         baseline,
                         mentions_me,
                     );
@@ -751,10 +771,22 @@ impl NotificationStoreV2 {
                     // notification as `Mention` so it survives the MentionsOnly
                     // notification level; plain channel posts stay `Message` and
                     // are gated out under it.
+                    //
+                    // Precedence: a mention stays a mention; otherwise a post
+                    // in a subscribed topic gets its own title (never the topic
+                    // title, which this list would store unencrypted) and
+                    // passes MentionsOnly; otherwise a plain message. One
+                    // notice per event whichever it is: same dedup id.
+                    let is_followed = followed_read.is_some();
                     let (kind, title) = if mentions_me {
                         (
                             NotificationKind::Mention,
                             format!("You were mentioned in {}", channel_name),
+                        )
+                    } else if is_followed {
+                        (
+                            NotificationKind::Message,
+                            format!("New post in a subscribed topic in {}", channel_name),
                         )
                     } else {
                         (
@@ -762,7 +794,8 @@ impl NotificationStoreV2 {
                             format!("New reply in {}", channel_name),
                         )
                     };
-                    let level_allows = notification_kind_allowed(&kind);
+                    let followed_notice = is_followed && !mentions_me;
+                    let level_allows = notice_allowed(&kind, followed_notice);
                     if should_burn(
                         verdict.is_permanent(),
                         verdict == PostVerdict::Notify,
@@ -808,6 +841,7 @@ impl NotificationStoreV2 {
                             // The author key is persisted with the entry:
                             // left out for an encrypted zone, like the name.
                             key: (!encrypted).then(|| pubkey_ref(&event.pubkey)),
+                            followed: followed_notice,
                         },
                     );
                 }
@@ -942,6 +976,7 @@ impl NotificationStoreV2 {
                             timestamp: entry.fetched_at,
                             dedup_id: Some(format!("{JOIN_NOTICE_PREFIX}{pk}")),
                             key: Some(pubkey_ref(pk)),
+                            followed: false,
                         },
                     );
                     if notification_kind_allowed(&NotificationKind::JoinRequest) {
@@ -1421,12 +1456,51 @@ fn classify_post(
 ///   channel `Message` traffic (new topics / new posts) is suppressed.
 /// - `All`: everything is allowed.
 fn notification_kind_allowed(kind: &NotificationKind) -> bool {
+    notice_allowed(kind, false)
+}
+
+/// [`notification_kind_allowed`] for a notice that may be a post in a topic
+/// the member subscribed to (`followed`).
+fn notice_allowed(kind: &NotificationKind, followed: bool) -> bool {
+    level_admits(
+        crate::stores::preferences::notification_level_pref(),
+        kind,
+        followed,
+    )
+}
+
+/// Whether notification level `level` lets a notice of `kind` through.
+///
+/// A post in a subscribed topic (`followed`) is let through by
+/// `MentionsOnly` as well as `All`: subscribing is the member asking for that
+/// topic by name, which is what `MentionsOnly` keeps (mentions and other
+/// notices addressed to the member), not the generic channel chatter it
+/// drops. `None` still lets nothing through.
+fn level_admits(
+    level: crate::stores::preferences::NotificationLevel,
+    kind: &NotificationKind,
+    followed: bool,
+) -> bool {
     use crate::stores::preferences::NotificationLevel;
-    match crate::stores::preferences::notification_level_pref() {
+    match level {
         NotificationLevel::All => true,
         NotificationLevel::None => false,
-        NotificationLevel::MentionsOnly => !matches!(kind, NotificationKind::Message),
+        NotificationLevel::MentionsOnly => followed || !matches!(kind, NotificationKind::Message),
     }
+}
+
+/// The read marker of the subscribed topic `event` replies to, if it replies
+/// to one and is not an edit: the gate a subscribed-topic notice uses in place
+/// of the channel's read position.
+fn followed_marker(
+    event: &nostr_bbs_core::NostrEvent,
+    followed: &std::collections::HashMap<String, u64>,
+) -> Option<u64> {
+    if followed.is_empty() || crate::topics::thread::edit_target_of(event).is_some() {
+        return None;
+    }
+    let root = nostr_bbs_core::sealed::reply_root_of(event)?.to_ascii_lowercase();
+    followed.get(&root).copied()
 }
 
 /// Whether `event` @-mentions `pubkey` — i.e. carries a `p` tag whose value is
@@ -2304,5 +2378,144 @@ mod tests {
         assert_eq!(back.notified_ids, vec!["x".to_string()]);
         assert!(back.announced_channels.is_empty());
         assert!(back.announced_members.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod subscribed_topic_tests {
+    use super::*;
+    use crate::stores::preferences::NotificationLevel;
+    use std::collections::HashMap;
+
+    const ROOT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn reply(tags: Vec<Vec<String>>) -> nostr_bbs_core::NostrEvent {
+        nostr_bbs_core::NostrEvent {
+            id: "f".repeat(64),
+            pubkey: "b".repeat(64),
+            created_at: 10,
+            kind: 42,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        }
+    }
+
+    fn e(v: &str, marker: &str) -> Vec<String> {
+        vec!["e".into(), v.into(), String::new(), marker.into()]
+    }
+
+    #[test]
+    fn mentions_only_admits_subscribed_topic_posts_but_none_admits_nothing() {
+        let msg = NotificationKind::Message;
+        assert!(level_admits(NotificationLevel::All, &msg, false));
+        assert!(level_admits(NotificationLevel::All, &msg, true));
+        assert!(!level_admits(NotificationLevel::MentionsOnly, &msg, false));
+        assert!(level_admits(NotificationLevel::MentionsOnly, &msg, true));
+        assert!(level_admits(
+            NotificationLevel::MentionsOnly,
+            &NotificationKind::Mention,
+            false
+        ));
+        assert!(!level_admits(NotificationLevel::None, &msg, true));
+        assert!(!level_admits(
+            NotificationLevel::None,
+            &NotificationKind::Mention,
+            false
+        ));
+    }
+
+    #[test]
+    fn only_a_reply_to_a_subscribed_topic_uses_its_marker() {
+        let followed: HashMap<String, u64> = [(ROOT.to_string(), 42)].into_iter().collect();
+        let chan = "c".repeat(64);
+        let r = reply(vec![e(&chan, "root"), e(&ROOT.to_uppercase(), "reply")]);
+        assert_eq!(followed_marker(&r, &followed), Some(42));
+        // An edit of a post in the topic is not a new post.
+        let edit = reply(vec![
+            e(&chan, "root"),
+            e(ROOT, "reply"),
+            e(&"d".repeat(64), "edit"),
+        ]);
+        assert_eq!(followed_marker(&edit, &followed), None);
+        // The root itself, and a reply to another topic.
+        assert_eq!(
+            followed_marker(&reply(vec![e(&chan, "root")]), &followed),
+            None
+        );
+        let other = reply(vec![e(&chan, "root"), e(&"2".repeat(64), "reply")]);
+        assert_eq!(followed_marker(&other, &followed), None);
+        assert_eq!(followed_marker(&r, &HashMap::new()), None);
+    }
+
+    #[test]
+    fn a_subscribed_reply_is_judged_by_the_topic_marker_not_the_channel() {
+        // The channel was marked read at 100 (the section list was opened);
+        // the topic was last read at 5. A reply at 10 is unread in the topic.
+        let channel_read = 100;
+        let topic_read = 5;
+        assert_eq!(
+            classify_post(
+                &"b".repeat(64),
+                10,
+                Some(&"a".repeat(64)),
+                channel_read,
+                1,
+                false
+            ),
+            PostVerdict::AlreadyRead
+        );
+        assert_eq!(
+            classify_post(
+                &"b".repeat(64),
+                10,
+                Some(&"a".repeat(64)),
+                topic_read,
+                1,
+                false
+            ),
+            PostVerdict::Notify
+        );
+        // Own posts and pre-baseline posts are still never notified.
+        assert_eq!(
+            classify_post(
+                &"a".repeat(64),
+                10,
+                Some(&"a".repeat(64)),
+                topic_read,
+                1,
+                false
+            ),
+            PostVerdict::OwnPost
+        );
+        assert_eq!(
+            classify_post(
+                &"b".repeat(64),
+                10,
+                Some(&"a".repeat(64)),
+                topic_read,
+                20,
+                false
+            ),
+            PostVerdict::BeforeBaseline
+        );
+    }
+
+    #[test]
+    fn a_stored_list_with_an_unknown_kind_keeps_its_other_entries() {
+        // The evidence for not adding a NotificationKind variant being safe
+        // either way: the stored list is parsed item by item, so an unknown
+        // kind drops only that item. Subscribed-topic notices reuse
+        // `Message`, so an older build reads them unchanged.
+        let now = 1_000_000;
+        let value = serde_json::json!({ "items": [
+            {"id": "post:a", "kind": "SubscribedReply", "title": "t", "body": "b",
+             "timestamp": now, "read": false, "link": null},
+            {"id": "post:b", "kind": "Message", "title": "t", "body": "b",
+             "timestamp": now, "read": false, "link": null}
+        ]});
+        let items = parse_persisted_items(&value, now);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "post:b");
     }
 }
