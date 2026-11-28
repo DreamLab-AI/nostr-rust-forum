@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
-use crate::relay::{Filter, RelayConnection};
+use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::deletion_sync::{self, DeletionProgress, DeletionScope, Source};
 use crate::stores::signer_admin::SignerAdminCache;
 use crate::stores::tombstones::{self, Target, Tombstones, LOCAL_DELETER};
@@ -187,6 +187,12 @@ pub struct ChannelStore {
     /// Stats batches that failed in a row: the next batch waits
     /// [`stats_batch_delay_ms`] of it.
     topic_stats_failures: StoredValue<u32>,
+    /// No stats batch is sent before this time (ms since the epoch): the
+    /// pause after failed batches, which new topics must not skip.
+    topic_stats_paused_until: StoredValue<f64>,
+    /// Given-up topic -> (channel id, gated), to queue it again on a
+    /// reconnect or a new visit ([`Self::requeue_given_up_stats`]).
+    topic_stats_given_up_from: StoredValue<HashMap<String, (String, bool)>>,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -248,6 +254,8 @@ impl ChannelStore {
             topic_stats_given_up: RwSignal::new(HashSet::new()),
             topic_stats_retried: StoredValue::new(HashSet::new()),
             topic_stats_failures: StoredValue::new(0),
+            topic_stats_paused_until: StoredValue::new(0.0),
+            topic_stats_given_up_from: StoredValue::new(HashMap::new()),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -1370,7 +1378,10 @@ impl ChannelStore {
 
     /// Send the next batch of queued topic stats, unless one is in flight.
     fn pump_topic_stats(&self, relay: &RelayConnection) {
-        if self.topic_stats_busy.get_value() {
+        // Busy, or pausing after failures (the pause's own timer pumps).
+        if self.topic_stats_busy.get_value()
+            || js_sys::Date::now() < self.topic_stats_paused_until.get_value()
+        {
             return;
         }
         let batch: Vec<(String, String, bool)> = self
@@ -1440,6 +1451,11 @@ impl ChannelStore {
                         let _ = store.topic_stats_given_up.try_update(|s| {
                             s.extend(batch.iter().map(|(_, r, _)| r.clone()));
                         });
+                        let _ = store.topic_stats_given_up_from.try_update_value(|m| {
+                            for (cid, r, g) in batch.iter() {
+                                m.insert(r.clone(), (cid.clone(), *g));
+                            }
+                        });
                         // Queue each topic again once, at the back.
                         let again: Vec<(String, String, bool)> = store
                             .topic_stats_retried
@@ -1466,6 +1482,9 @@ impl ChannelStore {
                 if delay == 0 {
                     store.pump_topic_stats(&relay);
                 } else {
+                    let _ = store
+                        .topic_stats_paused_until
+                        .try_set_value(js_sys::Date::now() + f64::from(delay));
                     crate::utils::set_timeout_once(move || store.pump_topic_stats(&relay), delay);
                 }
             })
@@ -1499,10 +1518,46 @@ impl ChannelStore {
             .collect();
         let id = relay.subscribe_with_receipt_or_closed(filters, on_event, on_receipt, on_closed);
         *sub.borrow_mut() = Some(id);
-        crate::utils::set_timeout_once(
-            move || finish(StatsBatchEnd::Failed),
-            PAGE_TIMEOUT_MS as i32,
-        );
+        let ready = stats_relay_ready(relay, wait_auth);
+        arm_stats_timer(relay.clone(), wait_auth, ready, done, finish);
+    }
+
+    /// Queue again channel `cid`'s topics whose stats were given up and are
+    /// still not in: on a (re)connect, after AUTH for a gated zone, and on a
+    /// new visit. They stay given up, so whatever arrives updates the row's
+    /// figures (and may count towards "↻ N updated") but never moves it.
+    /// Each gets its one retry again. Call it from a reactive context that
+    /// tracks only the connection state, AUTH and the visited channel.
+    pub fn requeue_given_up_stats(&self, relay: &RelayConnection, cid: &str) {
+        let given_up = self.topic_stats_given_up.with_untracked(|s| s.clone());
+        let queued: HashSet<String> = self
+            .topic_stats_queue
+            .with_value(|q| q.iter().map(|(_, r, _)| r.clone()).collect());
+        let from = self.topic_stats_given_up_from.with_value(|m| m.clone());
+        let again = requeue_given_up(&given_up, &queued, |r| {
+            from.get(r).is_some_and(|(c, _)| c == cid) && !self.topic_stats_answered_untracked(r)
+        });
+        if again.is_empty() {
+            return;
+        }
+        self.topic_stats_retried.update_value(|retried| {
+            for r in &again {
+                retried.remove(r);
+            }
+        });
+        self.topic_stats_queue.update_value(|q| {
+            for r in again {
+                if let Some((c, g)) = from.get(&r) {
+                    q.push_back((c.clone(), r, *g));
+                }
+            }
+        });
+        self.pump_topic_stats(relay);
+    }
+
+    /// [`Self::topic_stats_answered`] without tracking.
+    fn topic_stats_answered_untracked(&self, root: &str) -> bool {
+        untrack(|| self.topic_stats_answered(root))
     }
 
     /// Whether topic `root`'s stats batch failed and was given up for
@@ -2291,6 +2346,63 @@ fn stats_batch_delay_ms(failures: u32) -> i32 {
     (1_000i32.saturating_mul(1 << doublings)).min(STATS_BACKOFF_CAP_MS)
 }
 
+/// Whether a stats batch's REQ can be answered now: the socket is open and,
+/// for a gated batch, NIP-42 AUTH has completed.
+fn stats_relay_ready(relay: &RelayConnection, wait_auth: bool) -> bool {
+    relay.connection_state().get_untracked() == ConnectionState::Connected
+        && (!wait_auth || relay.authenticated().get_untracked())
+}
+
+/// Whether a stats batch's timeout, at a check every [`PAGE_TIMEOUT_MS`],
+/// is a failure: only when the relay could answer both at the previous
+/// check (or when the REQ was sent) and now. Time spent disconnected or
+/// waiting for AUTH (a signer prompt left open) is not an attempt; the
+/// relay replays the REQ when it is back.
+fn stats_timeout_fails(was_ready: bool, ready_now: bool) -> bool {
+    was_ready && ready_now
+}
+
+/// Check a stats batch every [`PAGE_TIMEOUT_MS`] until it is done, failing
+/// it per [`stats_timeout_fails`].
+fn arm_stats_timer(
+    relay: RelayConnection,
+    wait_auth: bool,
+    was_ready: bool,
+    done: Rc<std::cell::Cell<bool>>,
+    finish: Rc<dyn Fn(StatsBatchEnd)>,
+) {
+    crate::utils::set_timeout_once(
+        move || {
+            if done.get() {
+                return;
+            }
+            let ready = stats_relay_ready(&relay, wait_auth);
+            if stats_timeout_fails(was_ready, ready) {
+                finish(StatsBatchEnd::Failed);
+            } else {
+                arm_stats_timer(relay, wait_auth, ready, done, finish);
+            }
+        },
+        PAGE_TIMEOUT_MS as i32,
+    );
+}
+
+/// The given-up topics to queue again: those `wanted` (of the visited
+/// channel, and still without stats) that are not already queued.
+fn requeue_given_up(
+    given_up: &HashSet<String>,
+    queued: &HashSet<String>,
+    wanted: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut again: Vec<String> = given_up
+        .iter()
+        .filter(|r| !queued.contains(*r) && wanted(r))
+        .cloned()
+        .collect();
+    again.sort();
+    again
+}
+
 /// Whether a topic of a failed batch is queued again: once only.
 fn retry_stats_topic(already_retried: bool) -> bool {
     !already_retried
@@ -2307,6 +2419,27 @@ mod stats_batch_tests {
         assert_eq!(stats_batch_delay_ms(2), 2_000);
         assert_eq!(stats_batch_delay_ms(7), 60_000);
         assert_eq!(stats_batch_delay_ms(40), STATS_BACKOFF_CAP_MS);
+    }
+
+    #[test]
+    fn time_offline_or_waiting_for_auth_is_not_an_attempt() {
+        // Sent while connected and still unanswered a full period later.
+        assert!(stats_timeout_fails(true, true));
+        // Disconnected (or AUTH pending) now: wait.
+        assert!(!stats_timeout_fails(true, false));
+        // Back since the last check: give it a full period.
+        assert!(!stats_timeout_fails(false, true));
+        assert!(!stats_timeout_fails(false, false));
+    }
+
+    #[test]
+    fn given_up_topics_without_stats_are_queued_again() {
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        let given_up = set(&["a", "b", "c", "d"]);
+        // b is already queued, c has its stats now, d is another channel.
+        let again = requeue_given_up(&given_up, &set(&["b"]), |r| r == "a" || r == "b");
+        assert_eq!(again, vec!["a".to_string()]);
+        assert!(requeue_given_up(&HashSet::new(), &HashSet::new(), |_| true).is_empty());
     }
 
     #[test]
