@@ -652,6 +652,20 @@ async fn handle_channel_zone_upsert(mut req: Request, env: &Env) -> Result<Respo
         }
     };
 
+    // ADR-2037: a channel pinned in ZONE_CONFIG (or caught in a pin
+    // misconfiguration) is never bound here. The pin decides its zone; a row
+    // written now would silently take over once the pin is removed.
+    if crate::zone_config::ZoneConfig::load(env).pin_blocks_binding(&channel_id) {
+        return json_response(
+            &req,
+            env,
+            &serde_json::json!({
+                "error": "channel is pinned to a zone by ZONE_CONFIG; remove the pin before binding it"
+            }),
+            409,
+        );
+    }
+
     let zone = match &body.zone {
         Some(z)
             if !z.is_empty()

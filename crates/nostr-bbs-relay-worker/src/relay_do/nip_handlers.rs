@@ -1315,6 +1315,20 @@ impl NostrRelayDO {
                     );
                     return;
                 }
+                // ADR-2037 review: a channel's metadata (name, about,
+                // picture, pin/unpin control) is written only by those who may
+                // write its zone, as its kind-42 posts are. A zone-config pin
+                // decides the zone first; an unanswered lookup refuses.
+                let zone_cfg = ZoneConfig::load(&self.env);
+                let zone = zone_for_write(self.cached_channel_zone(&channel_id, &zone_cfg).await);
+                let may_write = match &zone {
+                    Ok(Some(z)) => trust::has_zone_write_access(&principal, z, &self.env).await,
+                    _ => false,
+                };
+                if let Some(reason) = channel_metadata_zone_rejection(&zone, may_write) {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
             }
 
             // kind-1984 (report): TL1+ required
@@ -1506,6 +1520,18 @@ impl NostrRelayDO {
                 Self::send_ok(ws, &event.id, false, reason);
                 return;
             }
+            // ADR-2037 review: an edit's target must be a message in this
+            // same channel, as a reply's topic must. Clients fold an edit
+            // into its target wherever the edit was posted, so an edit filed
+            // in another channel (another zone) could otherwise rewrite a
+            // post the author can no longer write to.
+            if let Some(target) = edit_target_of(&event) {
+                let target_channels = self.reply_topic_channels(&target).await;
+                if let Some(reason) = edit_target_rejection(&channel_id, &target_channels) {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+            }
             // Only a channel EXPLICITLY bound to a zone (a `channel_zones` row,
             // written solely by the admin-only /api/admin/channel-zone endpoint)
             // is write-gated. An undeclared channel is UNSCOPED: it belongs to no
@@ -1583,6 +1609,16 @@ impl NostrRelayDO {
         if is_reference_kind(event.kind) {
             let cfg = ZoneConfig::load(&self.env);
             let scope = self.resolve_reference_scope(&event, &cfg).await;
+            // ADR-2037: a comment (or any reference kind) on a message in a
+            // pinned channel that names another zone in a `zk` tag was
+            // encrypted for the zone the channel left; refuse it.
+            if event.tags.iter().any(|t| t.len() >= 2 && t[0] == "zk") {
+                let pinned = self.reference_pinned_zones(&event, &cfg).await;
+                if pinned_foreign_zk(&pinned, &event.tags) {
+                    Self::send_ok(ws, &event.id, false, PINNED_FOREIGN_ZK_REASON);
+                    return;
+                }
+            }
             let mut writable: Vec<String> = Vec::new();
             if let RefScope::Zones(zs) = &scope {
                 for z in zs {
@@ -2687,6 +2723,51 @@ pub(crate) fn channel_write_rejection(
     }
 }
 
+/// The post a kind-42 edits: its first `e` tag marked `edit`
+/// (`["e", <target>, <relay>, "edit"]`), lowercased.
+pub(crate) fn edit_target_of(event: &NostrEvent) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "edit")
+        .map(|t| t[1].to_ascii_lowercase())
+}
+
+/// Refusal for a kind-42 edit whose target is not a stored message of
+/// `channel_id` (or could not be looked up: fail closed).
+pub(crate) fn edit_target_rejection(
+    channel_id: &str,
+    target_channels: &Result<Vec<String>, ()>,
+) -> Option<&'static str> {
+    match target_channels {
+        Ok(cs) if !cs.is_empty() && cs.iter().all(|c| c == channel_id) => None,
+        _ => Some("invalid: edit target is not a message in this channel"),
+    }
+}
+
+/// ADR-2037: whether an event targeting messages in channels pinned to
+/// `pinned` zones carries a `zk` tag naming any other zone.
+pub(crate) fn pinned_foreign_zk(pinned: &[String], tags: &[Vec<String>]) -> bool {
+    pinned
+        .iter()
+        .any(|p| crate::zone_config::zk_names_other_zone(p, tags))
+}
+
+/// The zone gate on a non-admin's kind-41 (channel metadata) once the
+/// channel's zone is resolved: refused when the lookup failed, or when the
+/// channel has a zone the author may not write. An unscoped channel (no pin,
+/// no `channel_zones` row) is gated by trust level alone, as before.
+pub(crate) fn channel_metadata_zone_rejection(
+    zone: &Result<Option<String>, &'static str>,
+    may_write: bool,
+) -> Option<&'static str> {
+    match zone {
+        Err(reason) => Some(reason),
+        Ok(Some(_)) if !may_write => Some("zone access denied"),
+        Ok(_) => None,
+    }
+}
+
 /// OK reason for a kind-42 into a pinned channel whose `zk` names another
 /// zone (ADR-2037): the client encrypted for the zone the channel used to be in.
 pub(crate) const PINNED_FOREIGN_ZK_REASON: &str =
@@ -2925,6 +3006,31 @@ impl NostrRelayDO {
         } else {
             RefScope::Zones(zones)
         }
+    }
+
+    /// The pinned zones (ADR-2037) of the channels a reference-kind event's
+    /// targets live in, through the same memoised target lookup as
+    /// [`Self::resolve_reference_scope`]. A target that cannot be resolved
+    /// contributes nothing here; the scope check refuses it separately.
+    async fn reference_pinned_zones(
+        &self,
+        event: &NostrEvent,
+        zone_cfg: &ZoneConfig,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for target in reference_targets(event).iter().take(MAX_REFERENCE_TARGETS) {
+            let Ok(channels) = self.reference_target_channels(target, 1).await else {
+                continue;
+            };
+            for channel in channels {
+                if let crate::zone_config::ChannelPin::Pinned(z) = zone_cfg.pinned_zone(&channel) {
+                    if !out.iter().any(|o| o == z) {
+                        out.push(z.to_string());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The stored event(s) id `id` names: the event with that id if stored;
@@ -9716,6 +9822,108 @@ mod channel_pin_gate_tests {
                 channel_read_decision_for(42, &zone, &doubled, &ctx),
                 ReadDecision::Withhold
             ));
+        }
+    }
+
+    // -- Review fixes: metadata, edits, comments, locked target zones -----------
+
+    #[test]
+    fn channel_metadata_needs_write_access_to_the_resolved_zone() {
+        let zones = zones();
+        // Pinned channel: an old-zone member (even the creator at TL2/TL3)
+        // may not rename it, set its picture or post pin control events.
+        let zone = zone_for_write(zone_seen(&zones, Ok(Some("open".to_string()))));
+        let member_may = zones.cohorts_can_write("staff", &["members".to_string()]);
+        assert_eq!(
+            channel_metadata_zone_rejection(&zone, member_may),
+            Some("zone access denied")
+        );
+        let staff_may = zones.cohorts_can_write("staff", &["staff".to_string()]);
+        assert_eq!(channel_metadata_zone_rejection(&zone, staff_may), None);
+        // A lookup that could not be answered refuses.
+        assert!(channel_metadata_zone_rejection(&Err("error: zone lookup failed"), true).is_some());
+        // An unscoped channel stays gated by trust level alone.
+        assert_eq!(channel_metadata_zone_rejection(&Ok(None), false), None);
+    }
+
+    #[test]
+    fn an_edit_must_target_a_message_in_its_own_channel() {
+        assert_eq!(
+            edit_target_rejection(PINNED, &Ok(vec![PINNED.to_string()])),
+            None
+        );
+        for bad in [Ok(vec!["other".to_string()]), Ok(vec![]), Err(())] {
+            assert!(edit_target_rejection(PINNED, &bad).is_some(), "{bad:?}");
+        }
+        assert!(
+            edit_target_rejection(PINNED, &Ok(vec![PINNED.to_string(), "other".to_string()]))
+                .is_some()
+        );
+        let edit = NostrEvent {
+            id: "x".into(),
+            pubkey: "p".into(),
+            created_at: 1,
+            kind: 42,
+            tags: vec![
+                vec!["e".into(), "chan".into(), "".into(), "root".into()],
+                vec!["e".into(), "ABCD".into(), "".into(), "edit".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        assert_eq!(edit_target_of(&edit).as_deref(), Some("abcd"));
+    }
+
+    #[test]
+    fn a_comment_on_a_pinned_message_under_another_zone_key_is_refused() {
+        let zk = |zone: &str| {
+            vec![
+                vec!["e".to_string(), "target".into()],
+                vec!["zk".to_string(), zone.into(), "1".into(), "ab".repeat(32)],
+            ]
+        };
+        let pinned = vec!["staff".to_string()];
+        assert!(pinned_foreign_zk(&pinned, &zk("open")));
+        assert!(!pinned_foreign_zk(&pinned, &zk("staff")));
+        // No pinned target: nothing changes.
+        assert!(!pinned_foreign_zk(&[], &zk("open")));
+    }
+
+    /// The pinned zone is `locked` rather than `hidden`: definitions and
+    /// metadata stay visible to everyone (the tile renders), content does not.
+    fn locked_zones() -> ZoneConfig {
+        ZoneConfig::from_json(&format!(
+            r#"[{{"id":"open","required_cohorts":["members"],"visibility":"locked","encrypted":true}},
+                {{"id":"staff","required_cohorts":["staff"],"visibility":"locked","encrypted":true,
+                  "channels":["{PINNED}"]}}]"#
+        ))
+        .with_encryption(true)
+    }
+
+    #[test]
+    fn a_channel_pinned_to_a_locked_zone_exposes_its_definition_not_its_posts() {
+        let zones = locked_zones();
+        let zone = block_on(resolve_channel_zone(&zones, PINNED, || {
+            std::future::ready(Ok(Some("open".to_string())))
+        }));
+        assert_eq!(zone, Ok(Some("staff".to_string())));
+        let decide = |kind, ctx: &ViewerContext| {
+            matches!(
+                channel_read_decision_for(kind, &zone, &zones, ctx),
+                ReadDecision::Deliver
+            )
+        };
+        for ctx in [viewer(&["members"], true, false), viewer(&[], false, false)] {
+            // kind-40 and kind-41 (name, about, picture, creator, raw
+            // section tag, rename history) are served to non-members.
+            assert!(decide(40, &ctx));
+            assert!(decide(41, &ctx));
+            assert!(!decide(42, &ctx));
+        }
+        for ctx in [viewer(&["staff"], true, false), viewer(&[], true, true)] {
+            for kind in [40, 41, 42] {
+                assert!(decide(kind, &ctx));
+            }
         }
     }
 }

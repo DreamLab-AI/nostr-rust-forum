@@ -104,6 +104,29 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Whether a zone object key looks like a misspelt `channels` (ADR-2037):
+/// any key other than exactly `channels` that mentions "pin" or "channel",
+/// case-insensitively (`channel`, `Channels`, `pins`, `pinned_channels`, ...).
+/// serde would silently ignore such a key, and the channel it meant to pin
+/// would stay in its old zone.
+pub fn is_misspelt_pin_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    key != "channels" && (k.contains("pin") || k.contains("channel"))
+}
+
+/// Every 64-hex string in `v` (a string, or an array of strings), lowercased.
+fn hex_ids_in(v: &serde_json::Value) -> Vec<String> {
+    let one = |s: &str| {
+        let t = s.trim();
+        is_hex64(t).then(|| t.to_ascii_lowercase())
+    };
+    match v {
+        serde_json::Value::String(s) => one(s).into_iter().collect(),
+        serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str().and_then(one)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The full set of zone definitions parsed from `ZONE_CONFIG`.
 #[derive(Debug, Clone, Default)]
 pub struct ZoneConfig {
@@ -111,6 +134,16 @@ pub struct ZoneConfig {
     /// Deployment master gate (`ENCRYPTION_ENABLED`). With the gate off no
     /// zone is treated as encrypted, whatever its `encrypted` flag says.
     encryption_enabled: bool,
+    /// ADR-2037: zones whose `channels` list holds an entry that is not a
+    /// 64-hex id, or that carry a misspelt pin key. Every pin such a zone
+    /// declares fails closed ([`ChannelPin::Conflict`]).
+    broken_pin_zones: Vec<String>,
+    /// ADR-2037: 64-hex ids found under a misspelt pin key. The operator
+    /// meant to pin them; which zone is unknown, so they fail closed.
+    quarantined: Vec<String>,
+    /// Pin configuration errors found at parse time, logged once per isolate
+    /// by [`Self::load`].
+    pin_errors: Vec<String>,
 }
 
 impl ZoneConfig {
@@ -130,7 +163,26 @@ impl ZoneConfig {
         if trimmed.is_empty() {
             return Self::default();
         }
-        Self::from_json(trimmed).with_encryption(enabled)
+        let cfg = Self::from_json(trimmed).with_encryption(enabled);
+        if !cfg.pin_errors.is_empty() {
+            // Once per isolate: the config is parsed per request, and it can
+            // only change with a redeploy, which starts new isolates.
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                worker::console_error!(
+                    "ZONE_CONFIG channel pins misconfigured; affected pins fail closed: {}",
+                    cfg.pin_errors.join("; ")
+                );
+            }
+        }
+        cfg
+    }
+
+    /// ADR-2037 pin configuration errors found when parsing (empty when the
+    /// pins are well formed).
+    pub fn pin_errors(&self) -> &[String] {
+        &self.pin_errors
     }
 
     /// Set the deployment encryption gate (`ENCRYPTION_ENABLED`).
@@ -141,14 +193,43 @@ impl ZoneConfig {
 
     /// Parse a `ZONE_CONFIG` JSON array from a string. Malformed input yields an
     /// empty config (deny-by-default). Shared by [`Self::load`] and unit tests.
+    ///
+    /// ADR-2037: a zone whose `channels` holds an entry that is not 64 hex
+    /// digits, or that carries a misspelt pin key ([`is_misspelt_pin_key`]),
+    /// has all its pins fail closed, and 64-hex ids under a misspelt key fail
+    /// closed too; each case is recorded in [`Self::pin_errors`]. A malformed
+    /// entry cannot be tied to the channel it was meant to name, so that
+    /// channel itself still falls back to its `channel_zones` row: config
+    /// validation is what catches it before deploy.
     pub fn from_json(raw: &str) -> Self {
-        match serde_json::from_str::<Vec<Zone>>(raw.trim()) {
-            Ok(zones) => Self {
-                zones,
-                encryption_enabled: false,
-            },
-            Err(_) => Self::default(),
+        let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(raw.trim()) else {
+            return Self::default();
+        };
+        let mut out = Self::default();
+        for v in values {
+            let Ok(zone) = serde_json::from_value::<Zone>(v.clone()) else {
+                return Self::default();
+            };
+            if let Some(obj) = v.as_object() {
+                for (key, val) in obj.iter().filter(|(k, _)| is_misspelt_pin_key(k)) {
+                    out.pin_errors.push(format!(
+                        "zone {} has unknown key {key:?} (did you mean \"channels\"?)",
+                        zone.id
+                    ));
+                    out.quarantined.extend(hex_ids_in(val));
+                    out.broken_pin_zones.push(zone.id.clone());
+                }
+            }
+            if let Some(bad) = zone.channels.iter().find(|c| !is_hex64(c.trim())) {
+                out.pin_errors.push(format!(
+                    "zone {} pins {bad:?}, which is not a 64-hex channel id",
+                    zone.id
+                ));
+                out.broken_pin_zones.push(zone.id.clone());
+            }
+            out.zones.push(zone);
         }
+        out
     }
 
     /// Ids of every configured zone (used by the opt-in Jev triage sweep to
@@ -164,11 +245,19 @@ impl ZoneConfig {
 
     /// The zone that pins `channel_id` through its `channels` list
     /// (ADR-2037). Ids compare case-insensitively, so a mixed-case alias of a
-    /// pinned channel is still pinned; entries that are not 64 hex digits are
-    /// skipped. A channel listed by one zone more than once is still
+    /// pinned channel is still pinned. A channel pinned by a zone with a
+    /// malformed pin list, or named under a misspelt pin key, is
+    /// [`ChannelPin::Conflict`]. A channel listed by one zone more than once is still
     /// [`ChannelPin::Pinned`]; listed by two different zones it is
     /// [`ChannelPin::Conflict`].
     pub fn pinned_zone(&self, channel_id: &str) -> ChannelPin<'_> {
+        if self
+            .quarantined
+            .iter()
+            .any(|q| q.eq_ignore_ascii_case(channel_id))
+        {
+            return ChannelPin::Conflict;
+        }
         let mut found: Option<&str> = None;
         for z in &self.zones {
             let pins = z
@@ -179,6 +268,9 @@ impl ZoneConfig {
             if !pins {
                 continue;
             }
+            if self.broken_pin_zones.contains(&z.id) {
+                return ChannelPin::Conflict;
+            }
             match found {
                 Some(prev) if prev != z.id => return ChannelPin::Conflict,
                 _ => found = Some(z.id.as_str()),
@@ -188,6 +280,14 @@ impl ZoneConfig {
             Some(z) => ChannelPin::Pinned(z),
             None => ChannelPin::Unpinned,
         }
+    }
+
+    /// Whether `POST /api/admin/channel-zone` must refuse to bind
+    /// `channel_id` (ADR-2037): any pin, including a conflicting one, decides
+    /// the channel's zone, and a row written now would take over silently
+    /// once the pin is removed.
+    pub fn pin_blocks_binding(&self, channel_id: &str) -> bool {
+        !matches!(self.pinned_zone(channel_id), ChannelPin::Unpinned)
     }
 
     /// The zone's bound group pubkey, if one is configured and well formed
@@ -456,7 +556,7 @@ mod tests {
         ]"#;
         ZoneConfig {
             zones: serde_json::from_str(json).unwrap(),
-            encryption_enabled: false,
+            ..ZoneConfig::default()
         }
     }
 
@@ -534,18 +634,65 @@ mod tests {
     }
 
     #[test]
-    fn pins_compare_case_insensitively_and_skip_malformed_entries() {
+    fn pins_compare_case_insensitively() {
         let upper = "AB".repeat(32);
         let c = ZoneConfig::from_json(&format!(
-            r#"[{{"id":"staff","required_cohorts":["staff"],"channels":[" {upper} ","abc","{}"]}}]"#,
-            "zz".repeat(32)
+            r#"[{{"id":"staff","required_cohorts":["staff"],"channels":[" {upper} "]}}]"#
         ));
+        assert!(c.pin_errors().is_empty());
         // A mixed-case entry, or a mixed-case alias of the id, is still pinned.
         assert_eq!(c.pinned_zone(&"ab".repeat(32)), ChannelPin::Pinned("staff"));
         assert_eq!(c.pinned_zone(&upper), ChannelPin::Pinned("staff"));
-        // Entries that are not 64 hex digits name nothing.
-        assert_eq!(c.pinned_zone("abc"), ChannelPin::Unpinned);
-        assert_eq!(c.pinned_zone(&"zz".repeat(32)), ChannelPin::Unpinned);
+    }
+
+    #[test]
+    fn a_malformed_entry_makes_every_pin_of_its_zone_fail_closed() {
+        let good = "ab".repeat(32);
+        let c = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"staff","required_cohorts":["staff"],"channels":["{good}","{}"]}},
+                {{"id":"other","required_cohorts":["o"],"channels":["{OTHER}"]}}]"#,
+            &OTHER[..63]
+        ));
+        // The well-formed pin in the broken zone is withheld from everyone
+        // rather than falling back to its channel_zones row.
+        assert_eq!(c.pinned_zone(&good), ChannelPin::Conflict);
+        assert!(c.pin_blocks_binding(&good));
+        // A well-formed zone elsewhere is unaffected.
+        assert_eq!(c.pinned_zone(OTHER), ChannelPin::Pinned("other"));
+        assert_eq!(c.pin_errors().len(), 1);
+        assert!(c.pin_errors()[0].contains("staff"), "{:?}", c.pin_errors());
+        // The zone itself still gates as before.
+        assert!(c.cohorts_can_read("staff", &["staff".to_string()]));
+    }
+
+    #[test]
+    fn a_misspelt_pin_key_fails_its_ids_closed() {
+        for key in ["channel", "Channels", "pins", "pinned_channels"] {
+            let c = ZoneConfig::from_json(&format!(
+                r#"[{{"id":"staff","required_cohorts":["staff"],"{key}":["{PINNED}"]}}]"#
+            ));
+            assert_eq!(c.pinned_zone(PINNED), ChannelPin::Conflict, "{key}");
+            assert!(c.pin_blocks_binding(PINNED), "{key}");
+            assert_eq!(c.pin_errors().len(), 1, "{key}");
+        }
+        // A single string under a misspelt key is caught too.
+        let c = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"staff","required_cohorts":["staff"],"channel":"{PINNED}"}}]"#
+        ));
+        assert_eq!(c.pinned_zone(PINNED), ChannelPin::Conflict);
+        // Other zone keys are not mistaken for pin keys.
+        for key in ["section_order", "kanban", "search"] {
+            assert!(!is_misspelt_pin_key(key), "{key}");
+        }
+        assert!(!is_misspelt_pin_key("channels"));
+    }
+
+    #[test]
+    fn an_unpinned_channel_may_be_bound() {
+        let c = pinned_cfg();
+        assert!(c.pin_blocks_binding(PINNED));
+        assert!(!c.pin_blocks_binding(OTHER));
+        assert!(!cfg().pin_blocks_binding(PINNED));
     }
 
     #[test]
