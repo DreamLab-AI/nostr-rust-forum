@@ -1,0 +1,66 @@
+# 2026-11-28T14:53:21Z HEAD 6ba03edb92877acf14bd1f30a38c6b0b7f0681f7
+$ node scripts/adr-index-gen.js docs/adr --check
+ok: 37 ADR(s) valid (--check, README not written)
+exit 0
+$ bash scripts/tests/adr-ratchet-evidence.test.sh
+ok   activated to live without fields fails
+ok   empty acceptance_boundary fails
+ok   edit with no closing transition passes
+ok   record already complete and live is not a transition
+ok   large record closed with both fields passes (no SIGPIPE)
+ok   large record closed without fields fails (no SIGPIPE)
+exit 0
+$ bash scripts/tests/adr-evidence-class.test.sh
+ok   valid single value passes
+ok   valid +-joined value passes
+ok   unknown value (vibes) fails
+ok   empty segment (source+) fails
+exit 0
+$ bash scripts/adr-ratchet.sh docs/adr origin/fix/topic-list-stability HEAD
+adr-ratchet: origin/fix/topic-list-stability..HEAD in docs/adr — added undecided 0, closed from proposed 0, exempt 0, added decided 1
+  · docs/adr/ADR-2038-one-request-returns-a-section-s-topic-stats.md (accepted on arrival: not backlog)
+adr-ratchet: evidence gate — 1 record(s) became complete/live, 0 without evidence_class/acceptance_boundary
+  ⇒ docs/adr/ADR-2038-one-request-returns-a-section-s-topic-stats.md (closing transition)
+ADR-RATCHET-OK
+exit 0
+$ node crates/nostr-bbs-forum-client/tools/table3d-test.mjs
+# pass 32
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 185.306873
+exit 0
+$ node --test crates/nostr-bbs-forum-client/tests/
+# pass 0
+# fail 1
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 64.110389
+exit 1
+$ bash scripts/validate-forum-config.sh forum.example.toml
+validated forum.example.toml
+exit 0
+$ bash scripts/anti-drift-lint.sh
+anti-drift lint (forum): clean.
+exit 0
+$ node scripts/identity-vector-parity.mjs
+      "id": "invalid-root-equals-order",
+      "ok": true,
+      "rejected_as": "scalar_out_of_range"
+    }
+  ]
+}
+exit 0
+
+$ node --test crates/nostr-bbs-forum-client/tests/*.test.mjs   (the CI form; the directory form above is not what CI runs)
+# tests 29
+# suites 0
+# pass 29
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 4766.786815
+exit 0
