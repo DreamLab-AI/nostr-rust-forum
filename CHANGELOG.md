@@ -18,6 +18,27 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Zones: pin a section to a zone from config (2026-11-28)
+
+Decision: [ADR-2037](docs/adr/ADR-2037-pin-a-section-to-a-zone-from-zone-config.md). Relay worker, both clients,
+`nostr-bbs-config` and `nostr-bbs-search-build`. With no pins configured nothing changes, and `ZONE_CONFIG` projects
+byte-for-byte as before. Not exercised against a live relay or in a browser.
+
+- **Config.** `[[zones]] channels = [<kind-40 id>, ...]` pins existing channels to that zone. Validation refuses a malformed
+  id, a channel listed twice or pinned by two zones, and a pinning zone whose id extends another zone's (`<zone>-...`).
+- **Relay.** The pin decides a channel's zone ahead of its `channel_zones` row and ahead of the 60 s memo, for every read
+  and write gate, profile stats and the triage sweep; a pinned channel resolves while D1 is down, and a double pin fails
+  closed. A post into a pinned channel encrypted for another zone is refused.
+- **Clients.** A pinned channel is listed, opened, searched and encrypted under its pinned zone (forum and BBS). The cached
+  channel list heals on load, so adding or removing a pin needs only a reload; caches from older builds load unchanged.
+  The admin Channels tab shows "Pinned to zone X by zone config" instead of "Bind to zone" for a pinned channel.
+- **Tiles.** A non-public zone with no `required_cohorts` (admins only on the relay) is no longer shown to everyone as an
+  open tile. Public zones with no cohorts stay open.
+- **Sealed search.** `nostr-bbs-search-build --zone-config <file>` leaves posts of a channel pinned to another zone out of
+  an index, and a reconcile excludes those already in it.
+- **Limits.** Posts made before the move stay under the old zone's key, so anyone who synced them or holds that key can
+  still read them; the pinned id is visible in page source; existing images stay under the old zone's media path.
+
 ### Forum client: layout shift and a two-tab notice gap (2026-11-28)
 
 - **Notifications.** A tab that received a "New section" or "New member" notice from another tab (through the storage listener) never recorded its id as announced, so its next sync-state save omitted it and the notice returned after Clear and a reload. That case now records the id. More generally, saving the sync state now merges its id lists (notified posts, announced sections, announced members) with what is already stored, keeping the newest within the existing caps, and the tab adopts the merge, so one tab's save no longer drops ids another tab recorded. The stored format and the baseline are unchanged; Clear still only empties the visible list. Client only. Not seen in a browser.
