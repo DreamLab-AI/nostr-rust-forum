@@ -34,15 +34,17 @@ use nostr_bbs_client_core::stores::zones::{load_zones, resolve_zone_param};
 use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
 use nostr_bbs_client_core::topics::{
     board_events, classify_topics, edit_tags, find_topic_root, first_paint_ready,
-    first_row_in_full_view, history_settled, landing_target, latest_post, latest_version,
-    out_of_order, post_anchor_id, sealed_aliases, stable_order, thread_events, thread_replies,
-    topic_reply_tags, topic_root_tags, topic_title, updated_accessible_name, updated_label,
-    with_topic_stats, Landing, ReplyView, TopicSummary, FIRST_PAINT_TIMEOUT_MS,
+    first_row_in_full_view, first_stats_landed, history_settled, landing_target, latest_post,
+    latest_version, out_of_order, post_anchor_id, sealed_aliases, stable_order, thread_events,
+    thread_replies, topic_reply_tags, topic_root_tags, topic_title, updated_accessible_name,
+    updated_label, with_topic_stats, Landing, ReplyView, TopicSummary, FIRST_PAINT_TIMEOUT_MS,
 };
 use nostr_bbs_client_core::utils::lookup::zone_is_gated;
 use nostr_bbs_client_core::utils::scroll_anchor;
 use nostr_bbs_client_core::utils::{format_relative_time, set_timeout_once, shorten_pubkey};
-use nostr_bbs_client_core::zone_crypto::store::{try_use_zone_key_store, ZoneWriter};
+use nostr_bbs_client_core::zone_crypto::store::{
+    restored_envelope_of, try_use_zone_key_store, ZoneWriter,
+};
 use nostr_bbs_client_core::zone_crypto::{encryption_enabled, has_zk_tag};
 use nostr_bbs_core::event::{NostrEvent, UnsignedEvent};
 
@@ -214,6 +216,9 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     // zone the root list came back empty and was never asked again.
     {
         let relay = relay.clone();
+        // A new visit may ask a root list that failed earlier again at
+        // once (its backoff otherwise holds).
+        channels.rearm_topic_roots(&cid.get_value());
         Effect::new(move |_| {
             let cid = cid.get_value();
             channels.ensure_subscribed(&relay, &cid);
@@ -350,8 +355,9 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         Vec::new()
     });
     {
-        // (frozen, topics whose first stats had landed, sealed pairs both
-        // ways: an envelope leaves the list when it opens, so pairs are kept.)
+        // (frozen, every topic whose first stats have landed this visit with
+        // its sealed counterpart, sealed pairs both ways: an envelope leaves
+        // the list when it opens, so pairs are kept.)
         let state = StoredValue::new((
             false,
             HashSet::<String>::new(),
@@ -369,14 +375,18 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                             aliases.insert(orig.clone(), env.clone());
                         }
                     });
+                    // An original opened as it arrived never had its
+                    // envelope in a list: the zone cache knows the pair.
+                    for id in &ids {
+                        if let Some(env) = restored_envelope_of(zk_store, id) {
+                            aliases.insert(env.clone(), id.clone());
+                            aliases.insert(id.clone(), env);
+                        }
+                    }
                     let was = *frozen;
                     *frozen |= shown;
-                    let first_stats: HashSet<String> = if was {
-                        answered.difference(seen).cloned().collect()
-                    } else {
-                        HashSet::new()
-                    };
-                    *seen = answered;
+                    let landed = first_stats_landed(&answered, seen, aliases);
+                    let first_stats = if was { landed } else { HashSet::new() };
                     (was, first_stats, aliases.clone())
                 })
             else {

@@ -58,8 +58,9 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::topics::{
-    first_paint_ready, first_row_in_full_view, older_paging_armed, out_of_order, sealed_aliases,
-    stable_order, updated_accessible_name, updated_label, FIRST_PAINT_TIMEOUT_MS,
+    first_paint_ready, first_row_in_full_view, first_stats_landed, older_paging_armed,
+    out_of_order, sealed_aliases, stable_order, updated_accessible_name, updated_label,
+    FIRST_PAINT_TIMEOUT_MS,
 };
 use crate::utils::capitalize;
 use crate::utils::lookup::{
@@ -231,11 +232,12 @@ fn list_branch(
 }
 
 /// The display order's state for one channel: whether it is frozen (the
-/// list has painted, so rows keep their place from now on), the topics
-/// whose first stats had landed by the last update (a row whose first
-/// stats land after the freeze is placed once, see
-/// [`stable_order`]), and every sealed envelope and original seen, both
-/// ways (an envelope leaves the list when it opens, so the pair is kept).
+/// list has painted, so rows keep their place from now on), every topic
+/// whose first stats have landed this visit, with its sealed counterpart
+/// (a row whose first stats land after the freeze is placed once, see
+/// [`first_stats_landed`] and [`stable_order`]), and every sealed envelope
+/// and original seen, both ways (an envelope leaves the list when it
+/// opens, so the pair is kept).
 struct OrderState {
     cid: Option<String>,
     frozen: bool,
@@ -243,9 +245,12 @@ struct OrderState {
     aliases: HashMap<String, String>,
 }
 
+/// Height of the forum's sticky header (`h-16`), when it cannot be measured.
+const HEADER_FALLBACK_PX: f64 = 64.0;
+
 /// Whether the reader is at the top of the topic list: the page is not
 /// scrolled, or row `id` (the first shown, by its `data-anchor-id`) lies
-/// wholly in the window's viewport.
+/// wholly in the part of the window below the sticky header.
 fn at_list_top(id: &str) -> bool {
     let Some(window) = web_sys::window() else {
         return false;
@@ -258,17 +263,26 @@ fn at_list_top(id: &str) -> bool {
         .ok()
         .and_then(|h| h.as_f64())
         .unwrap_or(0.0);
+    let Some(document) = window.document() else {
+        return false;
+    };
+    // The sticky header covers the top of the viewport: a row under it is
+    // not in view.
+    let header_bottom = document
+        .query_selector("header")
+        .ok()
+        .flatten()
+        .map(|h| h.get_bounding_client_rect().bottom())
+        .filter(|b| b.is_finite() && *b >= 0.0)
+        .unwrap_or(HEADER_FALLBACK_PX);
     let id: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
-    window
-        .document()
-        .and_then(|d| {
-            d.query_selector(&format!("[data-anchor-id=\"{id}\"]"))
-                .ok()
-                .flatten()
-        })
+    document
+        .query_selector(&format!("[data-anchor-id=\"{id}\"]"))
+        .ok()
+        .flatten()
         .is_some_and(|el| {
             let r = el.get_bounding_client_rect();
-            first_row_in_full_view(r.top(), r.bottom(), 0.0, height)
+            first_row_in_full_view(r.top(), r.bottom(), header_bottom, height)
         })
 }
 
@@ -425,6 +439,16 @@ pub fn SectionPage() -> impl IntoView {
         });
     }
     let topics: Signal<Vec<TopicSummary>> = topics_memo.into();
+
+    // A new visit to a section may ask a root list that failed earlier
+    // again at once (its backoff otherwise holds; see
+    // `ChannelStore::request_topic_roots`). Created before the request
+    // effect below, so it runs first; tracks the channel id only.
+    Effect::new(move |_| {
+        if let Some(cid) = channel_id.get() {
+            store.rearm_topic_roots(&cid);
+        }
+    });
 
     // Fetch the section's topic roots once (decision ii: sealed roots carry
     // ["t","topic"]), so dormant topics are listed without paging the channel.
@@ -642,14 +666,20 @@ pub fn SectionPage() -> impl IntoView {
                         s.aliases.insert(orig.clone(), env.clone());
                     }
                 });
+                // An original opened as it arrived never had its envelope
+                // in a list: the zone cache knows the pair.
+                for id in &ids {
+                    if let Some(env) =
+                        crate::zone_crypto::store::restored_envelope_of(zone_keys, id)
+                    {
+                        s.aliases.insert(env.clone(), id.clone());
+                        s.aliases.insert(id.clone(), env);
+                    }
+                }
                 let was = s.frozen;
                 s.frozen |= painted;
-                let first_stats: HashSet<String> = if was {
-                    answered.difference(&s.answered).cloned().collect()
-                } else {
-                    HashSet::new()
-                };
-                s.answered = answered;
+                let landed = first_stats_landed(&answered, &mut s.answered, &s.aliases);
+                let first_stats = if was { landed } else { HashSet::new() };
                 (was, first_stats, s.aliases.clone())
             }) else {
                 return;
