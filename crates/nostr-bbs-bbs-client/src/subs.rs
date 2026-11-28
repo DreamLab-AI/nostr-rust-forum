@@ -354,7 +354,16 @@ impl RowSubs {
         match self.toggle.toggle(root, channel) {
             Ok(on) => {
                 if announce {
-                    self.announce.set(toggle_announcement(on).to_string());
+                    // Cleared, then set on the next tick: the same words twice
+                    // in a row (two rows subscribed in turn) are still spoken.
+                    let region = self.announce;
+                    region.set(String::new());
+                    nostr_bbs_client_core::utils::set_timeout_once(
+                        move || {
+                            let _ = region.try_set(toggle_announcement(on).to_string());
+                        },
+                        50,
+                    );
                 }
             }
             Err(e) => {
