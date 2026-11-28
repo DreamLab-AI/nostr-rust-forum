@@ -39,6 +39,14 @@ Built on the client-core subscriptions store below. Not seen in a browser.
 - **Section "new" badge** (live defect, before this work): it showed for any section active in the past 24 hours,
   whatever had been read, so it never cleared. It now shows only for activity newer than the channel's read position
   (the one the index's "N new" chip uses and opening the section advances).
+- **Page freeze fixed.** Opening a subscribed thread could hang the tab: the thread page's mark-read effect read the
+  subscriptions and called a method that wrote them back unconditionally, so it re-ran for ever (a microtask loop
+  that starved the page). State is now written only when something changes.
+- Subscribe and unsubscribe publish within seconds (read markers alone at most every 30 minutes, or on page hide for a
+  local-key session), so little is pending when sign-out closes the connection. A relay copy that has disappeared is
+  republished. A still-locked sealed topic is followed under its original id (the one its replies name). After a
+  swipe, the next tap on the row is no longer eaten, and a mouse press released elsewhere no longer blocks later
+  touches.
 - Fixes after a browser check: the mobile drawer and its tab carry `touch-action: pan-y` (a horizontal drag was taken
   by the browser and cancelled the close swipe), the drawer's swipe binding belongs to each open drawer, and the tab's
   drag-to-open uses the row swipe's axis rule. The desktop column starts open only from 1280 px wide when the member

@@ -36,10 +36,12 @@
 //! - Never publish before this session's first fetch succeeded (a timeout is
 //!   a failure, an empty answer is not), nor over a copy that cannot be
 //!   decrypted or read: that would wipe what another device wrote.
-//! - Pending changes go out at most once per [`PUBLISH_INTERVAL_MS`],
-//!   rate-limited on the last attempt (failures back off up to 30 minutes);
-//!   hiding the page (`visibilitychange`, when it can still wait for the
-//!   relay) skips that interval only for a subscribe or unsubscribe; sign-out
+//! - A subscribe or unsubscribe goes out within seconds
+//!   ([`MEMBERSHIP_PUBLISH_INTERVAL_MS`]); read markers alone at most every
+//!   [`MARKER_PUBLISH_INTERVAL_MS`], or when the page is hidden
+//!   (`visibilitychange`) for a local-key signer — publishing each read
+//!   would show anyone polling the copy when the member reads. Attempts are
+//!   rate-limited on the last attempt (failures back off up to 30 minutes); sign-out
 //!   gets one bounded publish (local-key and passkey sessions; it writes
 //!   nothing to storage). A declined signature stops prompts for the session
 //!   until the member subscribes or unsubscribes again. Signer calls are
@@ -171,10 +173,21 @@ pub(crate) fn failure_backoff_ms(failures: u32) -> u64 {
 
 /// At most one scheduled publish per this many milliseconds.
 pub const PUBLISH_INTERVAL_MS: u64 = 60_000;
+// (Now the first step of the failure backoff; see `failure_backoff_ms`.)
 
-/// With a NIP-07 extension signer, a copy whose only change is read markers
-/// is published at most once per this many milliseconds (30 minutes).
-pub const EXTENSION_MARKER_INTERVAL_MS: u64 = 30 * 60_000;
+/// A copy whose only change is read markers is published at most once per
+/// this many milliseconds (30 minutes) by a scheduled publish, for every
+/// signer; a local-key signer also publishes them when the page is hidden.
+pub const MARKER_PUBLISH_INTERVAL_MS: u64 = 30 * 60_000;
+
+/// The same interval under its earlier name (extension signers had it
+/// first).
+pub const EXTENSION_MARKER_INTERVAL_MS: u64 = MARKER_PUBLISH_INTERVAL_MS;
+
+/// A subscribe or unsubscribe is published at most once per this many
+/// milliseconds (after a short settle), so it is rarely still pending at
+/// sign-out.
+pub const MEMBERSHIP_PUBLISH_INTERVAL_MS: u64 = 5_000;
 
 /// A fetch older than this when the copy is about to be published is
 /// repeated first, milliseconds.
@@ -320,10 +333,16 @@ pub(crate) fn plan(p: &PlanInput<'_>) -> Plan {
         // An extension cannot answer while the page unloads.
         return Plan::Nothing;
     }
-    let interval = if markers_only && p.extension {
-        EXTENSION_MARKER_INTERVAL_MS
+    // A subscribe or unsubscribe goes out within seconds, so little is ever
+    // pending at sign-out (whose last publish often cannot finish before the
+    // socket closes). Read markers alone are lazy for every signer: at most
+    // every 30 minutes, or when the page is hidden (a local-key signer) —
+    // publishing each read would let anyone polling the copy's author and
+    // `d` tag see when the member reads.
+    let interval = if markers_only {
+        MARKER_PUBLISH_INTERVAL_MS
     } else {
-        PUBLISH_INTERVAL_MS
+        MEMBERSHIP_PUBLISH_INTERVAL_MS
     };
     let earliest = p.published_ms.saturating_add(interval).max(p.not_before_ms);
     match p.trigger {
@@ -334,9 +353,11 @@ pub(crate) fn plan(p: &PlanInput<'_>) -> Plan {
         Trigger::Hidden | Trigger::PageHide if p.now_ms < p.not_before_ms => {
             return Plan::Nothing;
         }
-        // Hiding the page skips the interval only for a membership change
-        // (subscribe or unsubscribe); markers alone wait for theirs.
-        Trigger::Hidden | Trigger::PageHide if markers_only && p.now_ms < earliest => {
+        // Markers alone on hide: a local-key signer publishes them (no
+        // prompt); an extension waits for their interval.
+        Trigger::Hidden | Trigger::PageHide
+            if markers_only && p.extension && p.now_ms < earliest =>
+        {
             return Plan::Nothing;
         }
         _ => {}
@@ -876,7 +897,7 @@ mod tests {
             ..input(&local, Some(&old))
         };
         assert_eq!(plan(&p), Plan::Publish);
-        // At most one scheduled publish a minute.
+        // A subscribe or unsubscribe waits only seconds after a publish.
         let p = PlanInput {
             published_ms: T - 1_000,
             ..input(&local, Some(&old))
@@ -884,7 +905,7 @@ mod tests {
         assert_eq!(
             plan(&p),
             Plan::Wait {
-                until_ms: T - 1_000 + PUBLISH_INTERVAL_MS
+                until_ms: T - 1_000 + MEMBERSHIP_PUBLISH_INTERVAL_MS
             }
         );
     }
@@ -921,12 +942,24 @@ mod tests {
             ..input(&local, Some(&membership))
         };
         assert_eq!(plan(&p), Plan::Publish);
-        // A local-key signer publishes markers at the normal pace.
+        // A local-key signer's scheduled publish of markers alone is just as
+        // lazy (privacy: each read must not show on the relay)...
         let p = PlanInput {
             published_ms: T - 120_000,
             ..input(&local, Some(&markers_only))
         };
-        assert_eq!(plan(&p), Plan::Publish);
+        assert_eq!(
+            plan(&p),
+            Plan::Wait {
+                until_ms: T - 120_000 + MARKER_PUBLISH_INTERVAL_MS
+            }
+        );
+        // ...but they go when the page is hidden (no prompt to cost).
+        let hidden = PlanInput {
+            trigger: Trigger::Hidden,
+            ..p
+        };
+        assert_eq!(plan(&hidden), Plan::Publish);
         // An extension can never publish on pagehide.
         assert_eq!(plan(&ext(Trigger::PageHide, 0)), Plan::Nothing);
     }
@@ -1065,16 +1098,23 @@ mod tests {
     }
 
     #[test]
-    fn hiding_skips_the_interval_only_for_a_membership_change() {
+    fn hiding_publishes_markers_only_for_a_local_signer() {
         let local = dig("a", "x");
-        // Markers alone, inside the interval: hiding waits, any signer.
+        // Markers alone, inside the interval: an extension waits on hide, a
+        // local-key signer publishes.
         let markers = seen("b", "x");
         let p = PlanInput {
             trigger: Trigger::Hidden,
             published_ms: T - 1_000,
+            extension: true,
             ..input(&local, Some(&markers))
         };
         assert_eq!(plan(&p), Plan::Nothing);
+        let local_signer = PlanInput {
+            extension: false,
+            ..p
+        };
+        assert_eq!(plan(&local_signer), Plan::Publish);
         // A subscribe or unsubscribe goes on hide at once.
         let membership = seen("b", "y");
         let p = PlanInput {
