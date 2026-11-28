@@ -16,6 +16,7 @@
 //! - Per-identity auto-saved drafts (`draft:v2:`), bookmarks, mute, read positions
 //! - Image picker + clipboard image paste via NIP-98 Solid Pod PUT
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use leptos::prelude::*;
@@ -32,11 +33,13 @@ use nostr_bbs_client_core::stores::read_position::use_read_positions;
 use nostr_bbs_client_core::stores::zones::{load_zones, resolve_zone_param};
 use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
 use nostr_bbs_client_core::topics::{
-    board_events, classify_topics, edit_tags, find_topic_root, history_settled, landing_target,
-    latest_post, latest_version, post_anchor_id, thread_events, thread_replies, topic_reply_tags,
-    topic_root_tags, topic_title, with_topic_stats, Landing, ReplyView, TopicSummary,
+    board_events, classify_topics, edit_tags, find_topic_root, first_paint_ready, history_settled,
+    keys_final, landing_target, latest_post, latest_version, out_of_order, post_anchor_id,
+    stable_order, thread_events, thread_replies, topic_reply_tags, topic_root_tags, topic_title,
+    updated_accessible_name, updated_label, with_topic_stats, Landing, ReplyView, TopicSummary,
+    FIRST_PAINT_TIMEOUT_MS,
 };
-use nostr_bbs_client_core::utils::lookup::zone_is_gated;
+use nostr_bbs_client_core::utils::lookup::{deadline_for, key_state_memo, zone_is_gated};
 use nostr_bbs_client_core::utils::scroll_anchor;
 use nostr_bbs_client_core::utils::{format_relative_time, set_timeout_once, shorten_pubkey};
 use nostr_bbs_client_core::zone_crypto::store::{try_use_zone_key_store, ZoneWriter};
@@ -252,6 +255,109 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         let cid = cid.get_value();
         channels.history_receipt(&cid).settles(gated) && channels.topic_roots_answered(&cid)
     });
+
+    // First paint: once topics are found the board waits (on its "Loading
+    // topics" card) for the root list and the first stats, or
+    // FIRST_PAINT_TIMEOUT_MS, so dormant topics and the relay's newest
+    // replies do not re-sort rows already on screen. A store that already
+    // holds them paints at once.
+    let stats_answered = Memo::new(move |_| {
+        topics.with(|ts| {
+            ts.iter()
+                .filter(|t| channels.topic_stats_answered(&t.id))
+                .count()
+        })
+    });
+    let hold_expired = RwSignal::new(false);
+    {
+        let armed = StoredValue::new(false);
+        Effect::new(move |_| {
+            if topics.with(Vec::is_empty) || armed.get_value() {
+                return;
+            }
+            armed.set_value(true);
+            set_timeout_once(
+                move || {
+                    let _ = hold_expired.try_set(true);
+                },
+                FIRST_PAINT_TIMEOUT_MS,
+            );
+        });
+    }
+    // Latched: once painted, the board stays painted.
+    let painted = Memo::new(move |prev: Option<&bool>| {
+        prev.copied().unwrap_or(false)
+            || (settled.get()
+                && first_paint_ready(true, stats_answered.get(), topics.with(Vec::len), false))
+            || (hold_expired.get() && !topics.with(Vec::is_empty))
+    });
+    // An encrypted zone's sealed topic roots open under their original ids
+    // when the keys arrive: the order freezes only once the keys are final.
+    let keys = {
+        let deadline = deadline_for(move || cid.try_get_value());
+        let auth_pubkey = auth.pubkey();
+        key_state_memo(
+            move || zk_store.is_some() && is_enc,
+            move |now| zk_store.and_then(|z| z.key_phase_for(auth_pubkey.get().as_deref(), now)),
+            deadline,
+        )
+    };
+
+    // Display order: the true order until the board has painted and its
+    // keys are final; then a listed topic keeps its place, a new one goes on
+    // top and an older page at the bottom, with the reader's place kept.
+    // Leaving the board and coming back starts afresh.
+    let true_ids =
+        Memo::new(move |_| topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>()));
+    let by_id = Memo::new(move |_| {
+        topics.with(|ts| {
+            ts.iter()
+                .map(|t| (t.id.clone(), t.clone()))
+                .collect::<HashMap<_, _>>()
+        })
+    });
+    let order = RwSignal::new(if painted.get_untracked() {
+        true_ids.get_untracked()
+    } else {
+        Vec::new()
+    });
+    {
+        let frozen = StoredValue::new(false);
+        Effect::new(move |_| {
+            let ids = true_ids.get();
+            let shown = painted.get();
+            let freeze = shown && keys_final(keys.get());
+            let Some(was) = frozen.try_update_value(|f| {
+                let was = *f;
+                *f |= freeze;
+                was
+            }) else {
+                return;
+            };
+            let next = order.with_untracked(|current| {
+                let next = if !shown {
+                    Vec::new()
+                } else if was {
+                    stable_order(current, &ids)
+                } else {
+                    ids.clone()
+                };
+                (next != *current).then_some(next)
+            });
+            if let Some(next) = next {
+                let anchor = if was {
+                    scroll_anchor::capture(main_pane().as_deref())
+                } else {
+                    None
+                };
+                order.set(next);
+                if let Some(a) = anchor {
+                    scroll_anchor::restore(a, main_pane());
+                }
+            }
+        });
+    }
+    let updated = Memo::new(move |_| order.with(|o| true_ids.with(|t| out_of_order(o, t))));
     // Older history adds topics only while the root list is incomplete.
     let can_load_older = Memo::new(move |_| {
         let cid = cid.get_value();
@@ -307,6 +413,23 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                     })}
                 </div>
                 <div class="tui-actions">
+                    // Always laid out, hidden at zero: its appearing never
+                    // moves the list below.
+                    <button
+                        type="button"
+                        class="bbs-btn bbs-btn-ghost bbs-btn-sm bbs-updated-btn"
+                        class:bbs-hidden-keep-space=move || updated.try_get().unwrap_or(0) == 0
+                        disabled=move || updated.try_get().unwrap_or(0) == 0
+                        aria-label=move || updated_accessible_name(updated.try_get().unwrap_or(0))
+                        title="Re-sort by latest activity"
+                        on:click=move |_| {
+                            if let Some(ids) = true_ids.try_get_untracked() {
+                                order.set(ids);
+                            }
+                        }
+                    >
+                        {move || updated_label(updated.try_get().unwrap_or(0))}
+                    </button>
                     <button
                         type="button"
                         class="bbs-btn bbs-btn-primary"
@@ -329,10 +452,11 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             </Show>
 
             {move || {
-                if !topics.try_with(Vec::is_empty).unwrap_or(false) {
+                if !order.try_with(Vec::is_empty).unwrap_or(false) {
                     return ().into_any();
                 }
-                let (title, body) = if !settled.try_get().unwrap_or(false) {
+                let held = !topics.try_with(Vec::is_empty).unwrap_or(true);
+                let (title, body) = if held || !settled.try_get().unwrap_or(false) {
                     ("Loading topics…", "Fetching this board's topics (and zone keys if encrypted) from the relay.")
                 } else if auth.is_authenticated().get() {
                     ("Board is empty", "No topics in this board yet. Tap '+ New Topic' to start the conversation.")
@@ -343,17 +467,19 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             }}
 
             <div class="tui-stack">
+                // Keyed by topic id alone: a stats answer or a decrypted
+                // title updates a row in place, it never rebuilds it.
                 <For
-                    each=move || topics.try_get().unwrap_or_default()
-                    key=|t| (t.id.clone(), t.reply_count, t.last_activity, t.content.len(), t.last_pubkey.clone())
-                    children=move |t: TopicSummary| {
-                        let is_unread = t.last_activity > last_read_at_open;
+                    each=move || order.try_get().unwrap_or_default()
+                    key=|id| id.clone()
+                    children=move |id: String| {
                         view! {
                             <TopicRow
-                                topic=t
+                                id=id
+                                topics=by_id
                                 zone=zone_rows.try_get_value().unwrap_or_default()
                                 channel_id=cid.try_get_value().unwrap_or_default()
-                                is_unread=is_unread
+                                last_read_at_open=last_read_at_open
                                 encrypted=is_enc
                             />
                         }
@@ -388,24 +514,67 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
 /// One topic row: title, NEW and lock badges, reply count, the most recent
 /// poster and the time of the latest activity, and the starter when someone
 /// else spoke last.
+///
+/// The row reads its topic from `topics` by id and each field through its
+/// own memo, so late fields update in place. Every line has a fixed height
+/// (`bbs.css`, `.bbs-topic-*`), so they never change the row's height.
 #[component]
 fn TopicRow(
-    topic: TopicSummary,
+    id: String,
+    topics: Memo<HashMap<String, TopicSummary>>,
     zone: String,
     channel_id: String,
-    is_unread: bool,
+    /// The channel's read position when the board was opened: a topic
+    /// active since then is NEW.
+    last_read_at_open: u64,
     encrypted: bool,
 ) -> impl IntoView {
     let router = use_router();
-    let title = topic_title(&topic.content);
-    let started_by_other = topic.reply_count > 0 && topic.last_pubkey != topic.pubkey;
-    let root_id = topic.id.clone();
+    let root_id = id.clone();
+    let anchor_id = id.clone();
+    // A topic briefly missing from the map (the row is about to go) keeps
+    // showing what it showed.
+    let topic = Memo::new(move |prev: Option<&Option<TopicSummary>>| {
+        topics
+            .try_with(|m| m.get(&id).cloned())
+            .flatten()
+            .or_else(|| prev.cloned().flatten())
+    });
+    let field = move |f: fn(&TopicSummary) -> String| {
+        Memo::new(move |_| {
+            topic
+                .try_with(|t| t.as_ref().map(f))
+                .flatten()
+                .unwrap_or_default()
+        })
+    };
+    let title = field(|t| topic_title(&t.content));
+    let last_pk = field(|t| t.last_pubkey.clone());
+    let author_pk = field(|t| t.pubkey.clone());
+    let replies = field(|t| replies_label(t.reply_count));
+    let activity = field(|t| format_relative_time(t.last_activity));
+    let started_by_other = Memo::new(move |_| {
+        topic
+            .try_with(|t| {
+                t.as_ref()
+                    .is_some_and(|t| t.reply_count > 0 && t.last_pubkey != t.pubkey)
+            })
+            .unwrap_or(false)
+    });
+    let is_unread = Memo::new(move |_| {
+        topic
+            .try_with(|t| {
+                t.as_ref()
+                    .is_some_and(|t| t.last_activity > last_read_at_open)
+            })
+            .unwrap_or(false)
+    });
     view! {
         <div
-            class="tui-card tui-card-interactive tui-stack"
+            class="tui-card tui-card-interactive tui-stack bbs-topic-row"
             role="button"
             tabindex="0"
-            data-anchor-id=topic.id.clone()
+            data-anchor-id=anchor_id
             on:click=move |_| router.go(Route::Thread {
                 zone: zone.clone(),
                 channel_id: channel_id.clone(),
@@ -413,24 +582,24 @@ fn TopicRow(
                 focus: None,
             })
         >
-            <div class="tui-row-between">
-                <div class="tui-row">
-                    {is_unread.then(|| view! { <span class="bbs-badge bbs-badge-accent">"NEW"</span> })}
+            <div class="tui-row-between bbs-topic-head">
+                <div class="tui-row bbs-topic-title-row">
+                    {move || is_unread.try_get().unwrap_or(false).then(|| view! { <span class="bbs-badge bbs-badge-accent">"NEW"</span> })}
                     {encrypted.then(|| view! { <span class="bbs-badge bbs-badge-ok">"🔒"</span> })}
-                    <strong>{title}</strong>
+                    <strong class="bbs-topic-title">{move || title.try_get().unwrap_or_default()}</strong>
                 </div>
-                <span class="bbs-badge">{replies_label(topic.reply_count)}</span>
+                <span class="bbs-badge bbs-topic-replies">{move || replies.try_get().unwrap_or_default()}</span>
             </div>
-            <div class="tui-row-between" style="font-size:0.8rem">
-                <div class="tui-row">
+            <div class="tui-row-between bbs-topic-meta" style="font-size:0.8rem">
+                <div class="tui-row bbs-topic-people">
                     <span class="tui-muted">"last by"</span>
-                    <AuthorChip pubkey=topic.last_pubkey.clone() />
-                    {started_by_other.then(|| view! {
+                    {move || view! { <AuthorChip pubkey=last_pk.try_get().unwrap_or_default() /> }}
+                    {move || started_by_other.try_get().unwrap_or(false).then(|| view! {
                         <span class="tui-muted">"· started by"</span>
-                        <AuthorChip pubkey=topic.pubkey.clone() />
+                        <AuthorChip pubkey=author_pk.try_get().unwrap_or_default() />
                     })}
                 </div>
-                <span class="tui-muted">{format_relative_time(topic.last_activity)}</span>
+                <span class="tui-muted bbs-topic-time">{move || activity.try_get().unwrap_or_default()}</span>
             </div>
         </div>
     }
@@ -1663,5 +1832,68 @@ fn PostComposer(
                 </div>
             }.into_any()
         }}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The sheet's text with comments removed, for rule checks.
+    fn css() -> String {
+        let raw = include_str!("../../assets/bbs.css");
+        let mut out = String::new();
+        let mut rest = raw;
+        while let Some(at) = rest.find("/*") {
+            out.push_str(&rest[..at]);
+            rest = rest[at..]
+                .find("*/")
+                .map_or("", |end| &rest[at + end + 2..]);
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The body of the first rule whose selector list ends with `selector`,
+    /// searching from `from`.
+    fn rule<'a>(css: &'a str, selector: &str, from: usize) -> &'a str {
+        let at = css[from..]
+            .find(&format!("{selector} {{"))
+            .map(|i| from + i)
+            .unwrap_or_else(|| panic!("no rule for {selector}"));
+        let body = &css[at..];
+        &body[..body.find('}').expect("rule closes")]
+    }
+
+    #[test]
+    fn topic_rows_have_fixed_line_heights() {
+        let css = css();
+        // Neither line of a row wraps, so "started by" or a long title never
+        // adds a line.
+        assert!(rule(&css, ".bbs-topic-meta", 0).contains("flex-wrap: nowrap"));
+        assert!(rule(&css, ".bbs-topic-title-row", 0).contains("flex-wrap: nowrap"));
+        assert!(rule(&css, ".bbs-topic-people", 0).contains("flex-wrap: nowrap"));
+        let title = rule(&css, ".bbs-topic-title", 0);
+        assert!(title.contains("white-space: nowrap") && title.contains("text-overflow: ellipsis"));
+        // The reply count and time keep their width.
+        assert!(rule(&css, ".bbs-topic-time", 0).contains("flex: 0 0 auto"));
+    }
+
+    #[test]
+    fn phone_titles_always_take_two_lines() {
+        // In the 2x phone layout the title may wrap to two lines and always
+        // reserves both (em, so it follows the text scale).
+        let css = css();
+        let phone = css.find("--fs-mobile: 2;").expect("the phone media query");
+        let title = rule(&css, ".bbs-topic-title", phone);
+        assert!(title.contains("-webkit-line-clamp: 2"));
+        assert!(title.contains("min-height: 3em"));
+        assert!(title.contains("white-space: normal"));
+    }
+
+    #[test]
+    fn the_updated_control_keeps_its_space_when_hidden() {
+        let css = css();
+        let hidden = rule(&css, ".bbs-hidden-keep-space", 0);
+        assert!(hidden.contains("visibility: hidden"));
+        assert!(!hidden.contains("display: none"));
     }
 }
