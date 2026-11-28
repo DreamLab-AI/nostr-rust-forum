@@ -1391,7 +1391,10 @@ impl ChannelStore {
     }
 
     /// Ask, once per session per topic, for the section list's per-topic
-    /// stats of channel `cid`'s topics `roots`: the exact reply total (the
+    /// stats of channel `cid`'s topics `roots`: the fallback, and the
+    /// figures the section stats ([`Self::request_section_stats`],
+    /// ADR-2038) do not carry; pages pass only those topics. The exact
+    /// reply total (the
     /// relay's `#e:[root]` COUNT, as the thread page uses, kept current by
     /// [`Self::note_inserted`]) and the newest reply (`#e:[root]`,
     /// `limit:1`, into [`Self::topic_latest`]). Topics are taken in the
