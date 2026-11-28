@@ -75,7 +75,7 @@ pub(crate) fn section_stats_advert() -> serde_json::Value {
         "verb": section_stats::VERB,
         "version": section_stats::VERSION,
         "max_topics": section_stats::MAX_TOPICS,
-        "reply_count_cap": section_stats::REPLY_COUNT_CAP,
+        "count_visit_cap": section_stats::COUNT_VISIT_CAP,
         "memo_secs": section_stats::MEMO_TTL_SECS,
     })
 }
@@ -155,6 +155,11 @@ pub struct NostrRelayDO {
     /// ADR-2038: computed `SECTION-STATS` payloads per channel, reused for
     /// `section_stats::MEMO_TTL_SECS`. Read only after admission.
     pub(crate) section_stats_cache: TtlCache<serde_json::Value>,
+    /// ADR-2038: one computation per channel, a few at once.
+    pub(crate) section_stats_flight: section_stats::SingleFlight,
+    /// ADR-2038: until when (seconds) to skip migration 0017's roots index
+    /// after finding it missing.
+    pub(crate) section_stats_index_retry: std::cell::Cell<u64>,
 }
 
 impl DurableObject for NostrRelayDO {
@@ -186,6 +191,8 @@ impl DurableObject for NostrRelayDO {
             zone_epoch_cache: TtlCache::new(LOOKUP_TTL_SECS),
             activity: ActivityLedger::new(),
             section_stats_cache: TtlCache::new(section_stats::MEMO_TTL_SECS),
+            section_stats_flight: section_stats::SingleFlight::default(),
+            section_stats_index_retry: std::cell::Cell::new(0),
         }
     }
 
