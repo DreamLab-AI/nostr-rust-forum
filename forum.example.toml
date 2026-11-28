@@ -170,16 +170,19 @@ accent_hex       = "#8b5cf6"                           # violet
 banner_image_url = "/images/heroes/business-hero.webp"
 encrypted        = false
 
-# A hidden, encrypted zone that only admins read (empty cohorts on a non-public
-# zone = admins only), holding one existing section moved in by its channel id.
-# Uncomment and replace the placeholder id with the channel's kind-40 event id.
-# Avoid an id of the form `<other zone id>-…`: validation refuses it for a
-# zone that pins channels.
+# A hidden, encrypted area for a few people, holding one existing section moved
+# in by its channel id. Give it its own cohort: the zone key is granted to that
+# cohort's holders (plus the admin who grants it), so every admin who should
+# read new posts needs the cohort too. With `required_cohorts = []` the relay
+# would still serve the zone to admins only, but only the admin who minted the
+# key could decrypt new posts. Uncomment and replace the placeholder id with
+# the channel's kind-40 event id. Avoid an id of the form `<other zone id>-…`:
+# validation refuses it for a zone that pins channels.
 #
 # [[zones]]
 # id               = "staff"
 # display_name     = "Staff"
-# required_cohorts = []
+# required_cohorts = ["staff"]
 # visibility       = "hidden"
 # encrypted        = true
 # channels         = ["0000000000000000000000000000000000000000000000000000000000000000"]

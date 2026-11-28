@@ -1523,7 +1523,9 @@ impl NostrRelayDO {
             // (write_cohorts ?? required_cohorts) so a public zone can still be
             // read-by-all yet write-restricted.
             // F3: an unanswered lookup refuses the write (fail closed).
-            let zone = match zone_for_write(self.cached_channel_zone(&channel_id).await) {
+            let zone_cfg = ZoneConfig::load(&self.env);
+            let zone = match zone_for_write(self.cached_channel_zone(&channel_id, &zone_cfg).await)
+            {
                 Ok(zone) => zone,
                 Err(reason) => {
                     Self::send_ok(ws, &event.id, false, reason);
@@ -1533,7 +1535,7 @@ impl NostrRelayDO {
             // ADR-2037: a post into a pinned channel encrypted to any other
             // zone's key is refused, encrypted pinned zone or not.
             if let crate::zone_config::ChannelPin::Pinned(pinned) =
-                ZoneConfig::load(&self.env).pinned_zone(&channel_id)
+                zone_cfg.pinned_zone(&channel_id)
             {
                 if crate::zone_config::zk_names_other_zone(pinned, &event.tags) {
                     Self::send_ok(ws, &event.id, false, PINNED_FOREIGN_ZK_REASON);
@@ -1579,7 +1581,8 @@ impl NostrRelayDO {
         // write access to that message's zone, and an encrypted zone takes no
         // plaintext comment. The target is resolved from D1.
         if is_reference_kind(event.kind) {
-            let scope = self.resolve_reference_scope(&event).await;
+            let cfg = ZoneConfig::load(&self.env);
+            let scope = self.resolve_reference_scope(&event, &cfg).await;
             let mut writable: Vec<String> = Vec::new();
             if let RefScope::Zones(zs) = &scope {
                 for z in zs {
@@ -1588,7 +1591,6 @@ impl NostrRelayDO {
                     }
                 }
             }
-            let cfg = ZoneConfig::load(&self.env);
             let (author_cohorts, author_cohort_admin) =
                 self.cached_viewer_cohorts(&principal).await;
             if let Some(reason) = reference_write_rejection(
@@ -1736,7 +1738,10 @@ impl NostrRelayDO {
         {
             let bound: Option<String> = if event.kind == 42 {
                 match filter::channel_tag(&event) {
-                    Some(cid) => match zone_for_write(self.cached_channel_zone(&cid).await) {
+                    Some(cid) => match zone_for_write(
+                        self.cached_channel_zone(&cid, &ZoneConfig::load(&self.env))
+                            .await,
+                    ) {
                         Ok(zone) => zone,
                         Err(reason) => {
                             Self::send_ok(ws, &event.id, false, reason);
@@ -2844,19 +2849,19 @@ impl NostrRelayDO {
     /// (bound channels only). `Err` when D1 could not answer: callers fail
     /// closed (see [`trust::ZoneLookupError`]).
     ///
-    /// ADR-2037: the zone-config pin is consulted first, ahead of both memos,
-    /// so a pin is never shadowed by a remembered `channel_zones` answer and
-    /// a pinned channel resolves while D1 is down. Pinned answers are not
-    /// memoised (the config is read per call, as every gate here does).
+    /// ADR-2037: the zone-config pin in `zones` (the caller's snapshot of
+    /// `ZONE_CONFIG`, taken once per REQ, COUNT, broadcast or EVENT) is
+    /// consulted first, ahead of both memos, so a pin is never shadowed by a
+    /// remembered `channel_zones` answer and a pinned channel resolves while
+    /// D1 is down. Pinned answers are not memoised; they cost a scan of the
+    /// pin lists and no D1 or JS call.
     pub(crate) async fn cached_channel_zone(
         &self,
         channel_id: &str,
+        zones: &ZoneConfig,
     ) -> Result<Option<String>, trust::ZoneLookupError> {
-        let zones = ZoneConfig::load(&self.env);
-        trust::resolve_channel_zone(&zones, channel_id, || {
-            self.memoised_channel_zone(channel_id)
-        })
-        .await
+        trust::resolve_channel_zone(zones, channel_id, || self.memoised_channel_zone(channel_id))
+            .await
     }
 
     /// [`Self::cached_channel_zone`] once the pin check found no pin: the
@@ -2886,7 +2891,11 @@ impl NostrRelayDO {
     /// Where a reference-kind event's targets live (see [`RefScope`]). Each
     /// target is resolved from D1, never from tags the event mirrors (see
     /// [`Self::reference_target_channels`]). Lookups fail closed.
-    pub(crate) async fn resolve_reference_scope(&self, event: &NostrEvent) -> RefScope {
+    pub(crate) async fn resolve_reference_scope(
+        &self,
+        event: &NostrEvent,
+        zone_cfg: &ZoneConfig,
+    ) -> RefScope {
         let targets = reference_targets(event);
         if targets.is_empty() {
             return RefScope::Unscoped;
@@ -2900,7 +2909,7 @@ impl NostrRelayDO {
                 return RefScope::Unknown;
             };
             for channel in channels {
-                match self.cached_channel_zone(&channel).await {
+                match self.cached_channel_zone(&channel, zone_cfg).await {
                     Ok(Some(zone)) => {
                         if !zones.contains(&zone) {
                             zones.push(zone);
@@ -3434,7 +3443,7 @@ impl NostrRelayDO {
         // Reactions, comments and reports follow the message they reference
         // (F4), resolved from D1 by the target's own channel.
         if is_reference_kind(event.kind) {
-            let scope = self.resolve_reference_scope(event).await;
+            let scope = self.resolve_reference_scope(event, zones).await;
             let is_author = ctx.access_pubkey.as_deref() == Some(event.pubkey.as_str())
                 || ctx.session_pubkey.as_deref() == Some(event.pubkey.as_str());
             return reference_read_decision(&scope, zones, ctx, is_author);
@@ -3460,7 +3469,7 @@ impl NostrRelayDO {
             // `trust::has_zone_access` applies (public read, or whitelist
             // admin, or a required cohort); `ctx.viewer_is_admin` carries the
             // whitelist admin flag that function used to re-read.
-            let zone = self.cached_channel_zone(&cid).await;
+            let zone = self.cached_channel_zone(&cid, zones).await;
             return channel_read_decision_for(event.kind, &zone, zones, ctx);
         }
 
@@ -3594,7 +3603,7 @@ impl NostrRelayDO {
             {
                 let mut count = 0u64;
                 for (channel, n) in groups {
-                    let zone = self.cached_channel_zone(&channel).await;
+                    let zone = self.cached_channel_zone(&channel, &zones).await;
                     if matches!(
                         channel_read_decision_for(42, &zone, &zones, &ctx),
                         ReadDecision::Deliver
