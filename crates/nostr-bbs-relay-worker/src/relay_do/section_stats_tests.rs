@@ -10,6 +10,7 @@ use nostr_bbs_core::NostrEvent;
 use rusqlite::{types::Value, Connection};
 
 const MIGRATION_0004: &str = include_str!("../../migrations/0004_event_tags.sql");
+const MIGRATION_0017: &str = include_str!("../../migrations/0017_topic_root_channel_index.sql");
 const NOW: u64 = 2_000_000;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -23,6 +24,13 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 }
 
 fn db() -> Connection {
+    let c = db_without_index();
+    c.execute_batch(MIGRATION_0017).unwrap();
+    c
+}
+
+/// The schema before migration 0017 (the roots index).
+fn db_without_index() -> Connection {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(crate::EVENTS_CREATE_SQL).unwrap();
     c.execute_batch(crate::CHANNEL_CREATORS_CREATE_SQL).unwrap();
@@ -85,8 +93,8 @@ impl<'a> Sqlite<'a> {
         label: &'static str,
         sql: &str,
         params: Vec<Value>,
-    ) -> Vec<T> {
-        let mut s = self.c.prepare(sql).unwrap();
+    ) -> Result<Vec<T>, String> {
+        let mut s = self.c.prepare(sql).map_err(|e| e.to_string())?;
         let names: Vec<String> = s.column_names().map(|n| n.to_string()).collect();
         let out: Vec<T> = s
             .query_map(rusqlite::params_from_iter(params.iter()), |r| {
@@ -108,7 +116,7 @@ impl<'a> Sqlite<'a> {
             .collect();
         let steps = s.get_status(rusqlite::StatementStatus::VmStep);
         self.steps.borrow_mut().push((label, steps));
-        out
+        Ok(out)
     }
 
     fn steps(&self, label: &str) -> i32 {
@@ -126,55 +134,68 @@ fn ids(ids: &[String]) -> Value {
 }
 
 impl StatsDb for Sqlite<'_> {
-    async fn roots(&self, channel: &str, now: u64, limit: usize) -> Result<Vec<RootRow>, String> {
-        Ok(self.rows(
-            "roots",
-            &roots_sql(),
-            vec![
-                Value::Text(channel.into()),
-                Value::Integer(now as i64),
-                Value::Integer(limit as i64),
-            ],
-        ))
+    async fn roots(
+        &self,
+        channel: &str,
+        now: u64,
+        limit: usize,
+        indexed: bool,
+    ) -> Result<Vec<RootRow>, String> {
+        let mut params = vec![
+            Value::Text(channel.into()),
+            Value::Integer(now as i64),
+            Value::Integer(limit as i64),
+        ];
+        if indexed {
+            self.rows("roots", &roots_indexed_sql(), params)
+        } else {
+            params.push(Value::Integer(ROOTS_VISIT_CAP as i64));
+            self.rows("roots", &roots_walk_sql(), params)
+        }
     }
-    async fn activity(
+    async fn stats(
         &self,
         channel: &str,
         now: u64,
         list: &[String],
-    ) -> Result<Vec<ActivityRow>, String> {
-        Ok(self.rows(
-            "activity",
-            &activity_sql(),
+        with_counts: bool,
+    ) -> Result<Vec<StatsRow>, String> {
+        self.rows(
+            "stats",
+            &stats_sql(with_counts),
             vec![
                 Value::Text(channel.into()),
                 Value::Integer(now as i64),
                 ids(list),
                 Value::Integer(ACTIVITY_WALK_ROWS),
+                Value::Integer(COUNT_VISIT_CAP as i64),
             ],
-        ))
+        )
     }
-    async fn counts(
-        &self,
-        channel: &str,
-        now: u64,
-        list: &[String],
-    ) -> Result<Vec<CountRow>, String> {
-        Ok(self.rows(
-            "counts",
-            &counts_sql(),
-            vec![
-                Value::Text(channel.into()),
-                Value::Integer(now as i64),
-                ids(list),
-                Value::Integer((REPLY_COUNT_CAP + 1) as i64),
-            ],
-        ))
+    async fn exists(&self, channel: &str) -> Result<bool, String> {
+        let n: i64 = self
+            .c
+            .query_row(
+                &format!("SELECT COUNT(*) FROM ({EXISTS_SQL})"),
+                [channel],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        self.steps.borrow_mut().push(("exists", 0));
+        Ok(n > 0)
     }
 }
 
 fn answer(c: &Connection, channel: &str) -> SectionAnswer {
-    block_on(compute(&Sqlite::new(c), channel, NOW)).unwrap()
+    run(&Sqlite::new(c), channel, true)
+}
+
+/// The answer through `db`, indexed or not; panics for a missing section.
+fn run(db: &Sqlite<'_>, channel: &str, indexed: bool) -> SectionAnswer {
+    block_on(compute(db, channel, NOW, indexed))
+        .unwrap()
+        .0
+        .expect("the section exists")
 }
 
 // ---------------------------------------------------------------------------
@@ -480,7 +501,26 @@ fn answer_equals_classify_topics_on_seeded_sections() {
         assert_matches_oracle(&a, C, &all);
         // 24 plain roots (one deleted), 3 sealed, 1 dual-present.
         assert_eq!(a.topics.len(), 23 + 3 + 1, "seed {seed}");
+        // The fallback walk (no 0017 index) gives the same answer.
+        let s = Sqlite::new(&c);
+        let walked = run(&s, C, false);
+        assert_eq!(walked.topics, a.topics, "seed {seed}: walk = index");
     }
+}
+
+#[test]
+fn a_missing_index_falls_back_to_the_walk_and_says_so() {
+    let c = db_without_index();
+    store(&c, &[root(&hex(1), C, &hex(7), 100)]);
+    let (a, absent) = block_on(compute(&Sqlite::new(&c), C, NOW, true)).unwrap();
+    assert!(
+        absent,
+        "the index error is reported for the caller to remember"
+    );
+    assert_eq!(a.unwrap().topics.len(), 1);
+    // A section with no roots and no kind-40 does not exist.
+    let (none, _) = block_on(compute(&Sqlite::new(&c), D, NOW, false)).unwrap();
+    assert_eq!(none, None);
 }
 
 #[test]
@@ -509,6 +549,11 @@ fn deleted_root_and_newest_reply_are_not_counted() {
         Some(hex(8).as_str())
     );
     delete(&c, &r);
+    // No root and no kind-40 left: the section is unknown, refused like a
+    // gated one. With its kind-40 stored it is an empty, existing section.
+    let (gone, _) = block_on(compute(&Sqlite::new(&c), C, NOW, true)).unwrap();
+    assert_eq!(gone, None);
+    store(&c, &[ev(C, &hex(7), 1, 40, vec![])]);
     assert!(answer(&c, C).topics.is_empty());
 }
 
@@ -659,12 +704,12 @@ fn more_roots_than_the_cap_truncate_to_the_newest() {
 }
 
 #[test]
-fn a_topic_past_the_reply_cap_reports_an_unknown_count() {
+fn a_topic_past_the_count_visit_cap_reports_an_unknown_count() {
     let c = db();
     let big = hex(1);
     let small = hex(2);
     let mut events = vec![root(&big, C, &hex(7), 100), root(&small, C, &hex(7), 101)];
-    for n in 0..=REPLY_COUNT_CAP {
+    for n in 0..COUNT_VISIT_CAP {
         events.push(reply(&hex(10 + n), C, &big, &hex(8), 200 + n));
     }
     events.push(reply(&hex(5_000), C, &small, &hex(8), 150));
@@ -672,23 +717,23 @@ fn a_topic_past_the_reply_cap_reports_an_unknown_count() {
     let a = answer(&c, C);
     let by: HashMap<&str, &TopicStat> = a.topics.iter().map(|t| (t.id.as_str(), t)).collect();
     assert_eq!(by[big.as_str()].replies, None);
-    assert_eq!(by[big.as_str()].last_at, Some(200 + REPLY_COUNT_CAP));
+    assert_eq!(by[big.as_str()].last_at, Some(200 + COUNT_VISIT_CAP - 1));
     assert_eq!(by[small.as_str()].replies, Some(1));
 }
 
 #[test]
-fn counting_stops_at_the_budget_in_activity_order() {
-    // 25 topics of 1,000 replies: the budget (10,000) covers the 10 most
-    // active and leaves the rest unknown.
+fn counting_stops_at_the_budget() {
+    // 150 topics of 200 replies: the first statement (100 topics) visits
+    // 20,000 count rows, the budget; the next reports activity only.
     let c = db();
     let mut events = Vec::new();
-    let mut n = 100u64;
-    for t in 0..25u64 {
+    let mut n = 10_000u64;
+    for t in 0..150u64 {
         let r = hex(1 + t);
         events.push(root(&r, C, &hex(7), 100 + t));
-        for k in 0..1_000u64 {
+        for k in 0..200u64 {
             n += 1;
-            events.push(reply(&hex(n), C, &r, &hex(8), 10_000 + t * 2_000 + k));
+            events.push(reply(&hex(n), C, &r, &hex(8), 100_000 + t * 1_000 + k));
         }
     }
     store(&c, &events);
@@ -699,8 +744,12 @@ fn counting_stops_at_the_budget_in_activity_order() {
         counted[k..].iter().all(|x| !x),
         "counted is a prefix: {counted:?}"
     );
-    assert_eq!(k as u64, COUNT_BUDGET / 1_000, "{counted:?}");
-    assert!(a.topics[..k].iter().all(|t| t.replies == Some(1_000)));
+    assert_eq!(k, STATS_BATCH, "{counted:?}");
+    assert!(a.topics[..k].iter().all(|t| t.replies == Some(200)));
+    assert!(
+        a.topics.iter().all(|t| t.last_at.is_some()),
+        "activity for all"
+    );
 }
 
 #[test]
@@ -774,77 +823,56 @@ fn cost(topics: u64, replies: u64, noise: u64) -> (i32, i32, i32) {
     }
     store(&c, &events);
     let s = Sqlite::new(&c);
-    block_on(compute(&s, C, NOW)).unwrap();
-    (s.steps("roots"), s.steps("activity"), s.steps("counts"))
+    run(&s, C, true);
+    (s.steps("roots"), s.steps("stats"), 0)
 }
 
 #[test]
-fn activity_cost_follows_topics_not_messages() {
-    let (_, few, _) = cost(20, 5, 0);
-    let (_, many, _) = cost(20, 800, 0);
-    // 160x the messages: the activity walk stops at the newest reply.
-    assert!(many < few * 2, "activity steps {few} -> {many}");
-    // Other channels' traffic costs the root query nothing.
+fn root_cost_ignores_other_channels() {
+    // Other channels' traffic costs the roots statement nothing.
     let (quiet, _, _) = cost(20, 5, 0);
     let (busy, _, _) = cost(20, 5, 20_000);
     assert!(busy < quiet * 2, "root steps {quiet} -> {busy}");
 }
 
 #[test]
-fn count_and_activity_cost_stop_growing_with_topic_size() {
-    // Every topic past the cap: doubling each topic's replies leaves the
+fn stats_cost_stops_growing_with_topic_size() {
+    // Every topic past the caps: doubling each topic's replies leaves the
     // statements' work where it was.
-    let (_, act_a, cnt_a) = cost(10, 1_500, 0);
-    let (_, act_b, cnt_b) = cost(10, 3_000, 0);
-    assert!(cnt_b * 10 < cnt_a * 12, "count steps {cnt_a} -> {cnt_b}");
-    assert!(act_b * 10 < act_a * 12, "activity steps {act_a} -> {act_b}");
+    let (_, a, _) = cost(10, 1_500, 0);
+    let (_, b, _) = cost(10, 3_000, 0);
+    assert!(b * 10 < a * 12, "stats steps {a} -> {b}");
 }
 
 /// Aliases of the base tables in the statements: a `SCAN` of any of them is
 /// a full table scan. (`SCAN x` reads the bounded walk subquery, `SCAN jv`
 /// / `jt` / `js` the JSON table-valued functions.)
-const TABLE_ALIASES: [&str; 10] = [
-    "events",
-    "event_tags",
-    "ev",
-    "r",
-    "t",
-    "c",
-    "d",
-    "w",
-    "xt",
-    "s",
-];
+const TABLE_ALIASES: [&str; 8] = ["events", "event_tags", "ev", "r", "t", "c", "w", "s"];
 
 #[test]
 fn no_statement_scans_events_or_the_channel() {
     let c = db();
+    let base = || vec![Value::Text(C.into()), Value::Integer(NOW as i64)];
+    let with = |mut v: Vec<Value>, more: Vec<Value>| {
+        v.extend(more);
+        v
+    };
     for (sql, params) in [
+        (roots_indexed_sql(), with(base(), vec![Value::Integer(10)])),
         (
-            roots_sql(),
-            vec![
-                Value::Text(C.into()),
-                Value::Integer(NOW as i64),
-                Value::Integer(10),
-            ],
+            roots_walk_sql(),
+            with(base(), vec![Value::Integer(10), Value::Integer(100)]),
         ),
         (
-            activity_sql(),
-            vec![
-                Value::Text(C.into()),
-                Value::Integer(NOW as i64),
-                ids(&[hex(1)]),
-                Value::Integer(ACTIVITY_WALK_ROWS),
-            ],
-        ),
-        (
-            counts_sql(),
-            vec![
-                Value::Text(C.into()),
-                Value::Integer(NOW as i64),
-                ids(&[hex(1)]),
-                Value::Integer(10),
-            ],
+            stats_sql(true),
+            with(
+                base(),
+                vec![
+                    ids(&[hex(1)]),
+                    Value::Integer(ACTIVITY_WALK_ROWS),
+                    Value::Integer(10),
+                ],
+            ),
         ),
     ] {
         let plan: Vec<String> = c
@@ -867,8 +895,9 @@ fn no_statement_scans_events_or_the_channel() {
             }
         }
         assert!(
-            plan.iter()
-                .any(|l| l.contains("idx_event_tags_time") || l.contains("idx_event_tags_lookup")),
+            plan.iter().any(|l| l.contains("idx_event_tags_time")
+                || l.contains("idx_event_tags_lookup")
+                || l.contains("idx_events_topic_root_channel")),
             "plan: {plan:?}"
         );
     }
@@ -1079,18 +1108,345 @@ fn measure_section_stats_cost() {
         store(&c, &events);
         let s = Sqlite::new(&c);
         let t0 = std::time::Instant::now();
-        let a = block_on(compute(&s, C, NOW)).unwrap();
+        let a = run(&s, C, true);
         let ms = t0.elapsed().as_millis();
         println!(
             "topics {topics:>5} x replies {replies:>4} = {:>7} msgs in C, {noise_roots:>5} other roots: \
-             listed {:>4} truncated {:<5} counted {:>4} | steps roots {:>9} activity {:>9} counts {:>9} | {ms} ms",
+             listed {:>4} truncated {:<5} counted {:>4} | steps roots {:>9} stats {:>9} | {ms} ms",
             topics * (replies + 1),
             a.topics.len(),
             a.truncated,
             a.topics.iter().filter(|t| t.replies.is_some()).count(),
             s.steps("roots"),
-            s.steps("activity"),
-            s.steps("counts"),
+            s.steps("stats"),
         );
     }
+}
+
+/// Review scenarios (PR #134 follow-up), measured before and after the fix
+/// (run with `--ignored --nocapture`): the common case, a topic buried in
+/// reactions, and a small section on a relay with many topics elsewhere.
+#[test]
+#[ignore = "measurement; run by hand"]
+fn measure_review_scenarios() {
+    struct Case {
+        name: &'static str,
+        topics: u64,
+        replies: u64,
+        reactions_on_first: u64,
+        other_roots: u64,
+    }
+    for case in [
+        Case {
+            name: "common: 300 topics x 30 replies, 2k roots elsewhere",
+            topics: 300,
+            replies: 30,
+            reactions_on_first: 0,
+            other_roots: 2_000,
+        },
+        Case {
+            name: "worst: 20 topics, one with 3 replies + 50k reactions",
+            topics: 20,
+            replies: 3,
+            reactions_on_first: 50_000,
+            other_roots: 0,
+        },
+        Case {
+            name: "worst: 10-topic section, 50k topic roots elsewhere",
+            topics: 10,
+            replies: 5,
+            reactions_on_first: 0,
+            other_roots: 50_000,
+        },
+    ] {
+        let c = db();
+        let mut events = Vec::new();
+        let mut n = 10_000_000u64;
+        for t in 0..case.topics {
+            let r = hex(1 + t);
+            events.push(root(&r, C, &hex(7), 100 + t));
+            for k in 0..case.replies {
+                n += 1;
+                events.push(reply(&hex(n), C, &r, &hex(8), 1_000 + t * case.replies + k));
+            }
+        }
+        for k in 0..case.reactions_on_first {
+            n += 1;
+            events.push(ev(
+                &hex(n),
+                &hex(6),
+                900_000 + k,
+                7,
+                vec![tag(&["e", &hex(1)])],
+            ));
+        }
+        for k in 0..case.other_roots {
+            n += 1;
+            events.push(root(&hex(n), D, &hex(7), 800_000 + k));
+        }
+        store(&c, &events);
+        let s = Sqlite::new(&c);
+        let t0 = std::time::Instant::now();
+        let a = run(&s, C, true);
+        let ms = t0.elapsed().as_millis();
+        let steps = s.steps.borrow();
+        let total: i64 = steps.iter().map(|(_, v)| *v as i64).sum();
+        println!(
+            "{:<55} statements {:>3} VM steps {:>10} | {:>4} ms | listed {:>4} counted {:>4} truncated {}",
+            case.name,
+            steps.len(),
+            total,
+            ms,
+            a.topics.len(),
+            a.topics.iter().filter(|t| t.replies.is_some()).count(),
+            a.truncated
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR #134 review: work bounded by rows visited, not only rows that qualify
+// ---------------------------------------------------------------------------
+
+/// Total VM steps of one answer for a section of 20 topics (5 replies each)
+/// whose first topic also carries `reactions` kind-7 references, and a relay
+/// holding `other_roots` topic roots in another channel, newer than ours.
+fn visited_cost(reactions: u64, other_roots: u64, with_index: bool) -> (i64, SectionAnswer) {
+    let c = if with_index { db() } else { db_without_index() };
+    let mut events = Vec::new();
+    let mut n = 50_000_000u64;
+    for t in 0..20u64 {
+        let r = hex(1 + t);
+        events.push(root(&r, C, &hex(7), 100 + t));
+        for k in 0..5u64 {
+            n += 1;
+            events.push(reply(&hex(n), C, &r, &hex(8), 1_000 + t * 5 + k));
+        }
+    }
+    for k in 0..reactions {
+        n += 1;
+        events.push(ev(
+            &hex(n),
+            &hex(6),
+            900_000 + k,
+            7,
+            vec![tag(&["e", &hex(1)])],
+        ));
+    }
+    for k in 0..other_roots {
+        n += 1;
+        events.push(root(&hex(n), D, &hex(7), 800_000 + k));
+    }
+    store(&c, &events);
+    let s = Sqlite::new(&c);
+    let a = run(&s, C, with_index);
+    let total = s.steps.borrow().iter().map(|(_, v)| *v as i64).sum();
+    (total, a)
+}
+
+#[test]
+fn a_topic_buried_in_reactions_costs_a_bounded_walk() {
+    let (few, a) = visited_cost(4_000, 0, true);
+    let (many, b) = visited_cost(16_000, 0, true);
+    assert!(
+        many * 10 < few * 13,
+        "steps {few} -> {many}: the walk must stop at its cap"
+    );
+    let first = |x: &SectionAnswer| x.topics.iter().find(|t| t.id == hex(1)).cloned().unwrap();
+    assert_eq!(
+        first(&b).replies,
+        None,
+        "past the visit cap the count is unknown"
+    );
+    assert_eq!(first(&b).last_at, None, "and so is the last activity");
+    assert_eq!(first(&a).replies, None);
+    // Every other topic keeps its exact figures.
+    assert!(b
+        .topics
+        .iter()
+        .filter(|t| t.id != hex(1))
+        .all(|t| t.replies == Some(5)));
+}
+
+#[test]
+fn a_small_section_does_not_pay_for_the_whole_relay() {
+    // With the 0017 index: the roots statement reads only this channel's.
+    let (few, a) = visited_cost(0, 2_000, true);
+    let (many, b) = visited_cost(0, 16_000, true);
+    assert!(many * 10 < few * 13, "steps {few} -> {many}");
+    assert_eq!((a.topics.len(), b.topics.len()), (20, 20));
+    assert!(!b.truncated);
+    // Without it: a bounded walk that says it stopped.
+    let (_, w) = visited_cost(0, ROOTS_VISIT_CAP as u64 + 10, false);
+    assert!(w.truncated, "a walk that hit its cap reports truncated");
+}
+
+#[test]
+fn expiry_parses_as_the_req_path_does() {
+    // REQ: `u64::parse` of the first `expiration` value, expired if < now.
+    let c = db();
+    let r = hex(1);
+    let mut plus = reply(&hex(2), C, &r, &hex(8), 110);
+    plus.tags.push(tag(&["expiration", "+1"]));
+    let mut padded = reply(&hex(3), C, &r, &hex(8), 120);
+    padded
+        .tags
+        .push(tag(&["expiration", &format!("{:0>24}", 5)]));
+    let mut junk = reply(&hex(4), C, &r, &hex(8), 130);
+    junk.tags.push(tag(&["expiration", "12x"]));
+    store(&c, &[root(&r, C, &hex(7), 100), plus, padded, junk]);
+    for e in ["+1", &format!("{:0>24}", 5), "12x"] {
+        let parsed = e.parse::<u64>().ok().is_some_and(|x| x < NOW);
+        assert_eq!(parsed, e != "12x", "{e}");
+    }
+    let t = answer(&c, C).topics[0].clone();
+    assert_eq!(
+        (t.replies, t.last_at),
+        (Some(1), Some(130)),
+        "only the unparsable one stays"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Single flight (PR #134 review finding 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn readers_of_one_channel_share_one_computation() {
+    let sf = SingleFlight::default();
+    let Role::Lead(lead) = sf.begin("a") else {
+        panic!("first is the leader")
+    };
+    let Role::Wait(w1) = sf.begin("a") else {
+        panic!("second waits")
+    };
+    let Role::Wait(w2) = sf.begin("a") else {
+        panic!("third waits")
+    };
+    let answer: Shared = Ok(Some(serde_json::json!({"topics": []})));
+    lead.finish(answer.clone());
+    assert_eq!(block_on(w1.wait()), answer);
+    assert_eq!(block_on(w2.wait()), answer);
+    // Released: the next reader of the channel leads a new computation.
+    assert!(matches!(sf.begin("a"), Role::Lead(_)));
+}
+
+#[test]
+fn computations_are_capped_across_channels_and_released_on_drop() {
+    let sf = SingleFlight::default();
+    let a = sf.begin("a");
+    let b = sf.begin("b");
+    assert!(matches!((&a, &b), (Role::Lead(_), Role::Lead(_))));
+    assert!(matches!(sf.begin("c"), Role::Busy), "cap {MAX_CONCURRENT}");
+    let Role::Wait(w) = sf.begin("a") else {
+        panic!("a is running")
+    };
+    drop(a); // abandoned (e.g. the request errored before finish)
+    assert!(block_on(w.wait()).is_err(), "a waiter never hangs");
+    assert!(matches!(sf.begin("c"), Role::Lead(_)), "slot released");
+    drop(b);
+}
+
+/// Emit the statements, a seeded section and SQLite's own results to the
+/// directory in `SECTION_STATS_D1_DIR`, so the same SQL can be run on a
+/// local D1 (`wrangler d1 execute --local`) and compared (not a gate).
+#[test]
+#[ignore = "emits files for a local D1 check; run by hand"]
+fn emit_local_d1_check() {
+    let Ok(dir) = std::env::var("SECTION_STATS_D1_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    let c = db();
+    let all = seeded(&c, 7);
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut seed = String::new();
+    for e in &all {
+        seed.push_str(&format!(
+            "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES ({}, {}, {}, {}, {}, {}, {});\n",
+            quote(&e.id),
+            quote(&e.pubkey),
+            e.created_at,
+            e.kind,
+            quote(&serde_json::to_string(&e.tags).unwrap()),
+            quote(&e.content),
+            quote(&e.sig)
+        ));
+    }
+    std::fs::write(dir.join("02-seed.sql"), seed).unwrap();
+    std::fs::write(dir.join("01-0017.sql"), MIGRATION_0017).unwrap();
+    let a = answer(&c, C);
+    let keys: Vec<String> = a.topics.iter().map(|t| t.id.clone()).collect();
+    let inline = |sql: &str, params: &[String]| {
+        let mut out = sql.to_string();
+        for (i, p) in params.iter().enumerate().rev() {
+            out = out.replace(&format!("?{}", i + 1), p);
+        }
+        out
+    };
+    let (ch, now) = (quote(C), NOW.to_string());
+    let stmts = [
+        (
+            "q_roots_indexed",
+            inline(
+                &roots_indexed_sql(),
+                &[ch.clone(), now.clone(), "1001".into()],
+            ),
+        ),
+        (
+            "q_roots_walk",
+            inline(
+                &roots_walk_sql(),
+                &[
+                    ch.clone(),
+                    now.clone(),
+                    "1001".into(),
+                    ROOTS_VISIT_CAP.to_string(),
+                ],
+            ),
+        ),
+        (
+            "q_stats",
+            inline(
+                &stats_sql(true),
+                &[
+                    ch.clone(),
+                    now.clone(),
+                    quote(&serde_json::to_string(&keys).unwrap()),
+                    ACTIVITY_WALK_ROWS.to_string(),
+                    COUNT_VISIT_CAP.to_string(),
+                ],
+            ),
+        ),
+    ];
+    let mut expected = serde_json::Map::new();
+    for (name, sql) in &stmts {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql};\n")).unwrap();
+        let mut s = c.prepare(sql).unwrap();
+        let cols: Vec<String> = s.column_names().map(|n| n.to_string()).collect();
+        let rows: Vec<serde_json::Value> = s
+            .query_map([], |r| {
+                let mut m = serde_json::Map::new();
+                for (i, n) in cols.iter().enumerate() {
+                    let v = match r.get::<_, Value>(i)? {
+                        Value::Null => serde_json::Value::Null,
+                        Value::Integer(n) => serde_json::json!(n),
+                        Value::Real(f) => serde_json::json!(f),
+                        Value::Text(t) => serde_json::Value::String(t),
+                        Value::Blob(_) => serde_json::Value::Null,
+                    };
+                    m.insert(n.clone(), v);
+                }
+                Ok(serde_json::Value::Object(m))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        expected.insert(name.to_string(), serde_json::Value::Array(rows));
+    }
+    std::fs::write(
+        dir.join("expected.json"),
+        serde_json::Value::Object(expected).to_string(),
+    )
+    .unwrap();
 }

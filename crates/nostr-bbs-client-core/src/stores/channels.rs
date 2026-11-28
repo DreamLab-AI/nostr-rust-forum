@@ -935,12 +935,18 @@ impl ChannelStore {
                 let event_ts = event.created_at;
                 let event_id = event.id.clone();
                 let inserted = InsertedMessage::of(&cid, &event);
+                let topic = reply_topic(&event);
                 channel_msgs.update(|m| {
                     let events = m.entry(cid.clone()).or_insert_with(Vec::new);
                     newly_added = insert_message(events, event);
                 });
                 if newly_added {
                     store.note_inserted(&cid, &event_id, event_ts);
+                    // A live reply grows its topic's total too (seeded by the
+                    // section stats or a COUNT), so the row's count moves.
+                    if let Some(root) = topic {
+                        store.note_inserted(&topic_key(&root), &event_id, event_ts);
+                    }
                     last_active.update(|m| {
                         let ts = m.entry(cid).or_insert(0);
                         if event_ts > *ts {
@@ -1068,12 +1074,18 @@ impl ChannelStore {
             let event_ts = event.created_at;
             let event_id = event.id.clone();
             let inserted = InsertedMessage::of(&cid, &event);
+            let topic = reply_topic(&event);
             channel_msgs.update(|m| {
                 let events = m.entry(cid.clone()).or_insert_with(Vec::new);
                 newly_added = insert_message(events, event);
             });
             if newly_added {
                 store.note_inserted(&cid, &event_id, event_ts);
+                // A live reply grows its topic's total too (seeded by the
+                // section stats or a COUNT), so the row's count moves.
+                if let Some(root) = topic {
+                    store.note_inserted(&topic_key(&root), &event_id, event_ts);
+                }
                 last_active.update(|m| {
                     let ts = m.entry(cid).or_insert(0);
                     if event_ts > *ts {
@@ -1222,7 +1234,7 @@ impl ChannelStore {
             for (cid, ev) in events {
                 let ts = ev.created_at;
                 let id = ev.id.clone();
-                let topic = nostr_bbs_core::sealed::reply_root_of(&ev).map(str::to_lowercase);
+                let topic = reply_topic(&ev);
                 let meta = InsertedMessage::of(&cid, &ev);
                 if insert_message(m.entry(cid.clone()).or_default(), ev) {
                     inserted.push((cid.clone(), id, ts, topic));
@@ -1695,6 +1707,20 @@ impl ChannelStore {
             .flatten();
         if current != Some(gen) {
             return;
+        }
+        if let Some(stats) = state.stats() {
+            let as_of = stats.as_of;
+            let seeds = section_stats_totals(stats);
+            let _ = self.totals.try_update(|m| {
+                for (key, n) in seeds {
+                    // A COUNT already asked for (or answered) keeps its own.
+                    m.entry(key).or_insert_with(|| ChannelTotal {
+                        counted: Some(n),
+                        as_of,
+                        newer_ids: HashSet::new(),
+                    });
+                }
+            });
         }
         let _ = self.section_stats.try_update(|m| {
             if let Some(slot) = m.get_mut(cid).filter(|s| !s.settled()) {
@@ -2790,6 +2816,36 @@ impl ChannelTotal {
 /// client's own send pacing (`relay.rs` MAX_SENDS_PER_SECOND, 8/s) never
 /// holds a reader's REQ behind more than a second of stats frames.
 pub const TOPIC_STATS_BATCH: usize = 5;
+
+/// The topic a message is a reply to, lower-case, when it is one: its
+/// `reply`-marked `e` tag, and not an edit (`classify_topics`: an edit is
+/// neither a reply nor activity).
+pub fn reply_topic(ev: &NostrEvent) -> Option<String> {
+    if crate::topics::thread::edit_target_of(ev).is_some() {
+        return None;
+    }
+    nostr_bbs_core::sealed::reply_root_of(ev).map(str::to_lowercase)
+}
+
+/// The topic totals a section stats answer seeds (ADR-2038): for each topic
+/// with an exact reply count, its list key and, for a sealed root, its
+/// original's, each with the count as of the answer. A live reply then adds
+/// to it ([`ChannelStore::note_inserted`]), so a row's count follows new
+/// replies during the visit.
+pub fn section_stats_totals(
+    stats: &crate::topics::section_stats::SectionStats,
+) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for t in &stats.topics {
+        if let Some(n) = t.replies {
+            out.push((topic_key(&t.id), n as u64));
+            if let Some(o) = &t.original {
+                out.push((topic_key(o), n as u64));
+            }
+        }
+    }
+    out
+}
 
 /// The list key of channel `cid`'s topic roots.
 pub fn roots_key(cid: &str) -> String {
@@ -4288,5 +4344,69 @@ mod tests {
         let json = serde_json::to_value(pinned.cache_form()).unwrap();
         assert_eq!(json["section"], "open-agents");
         assert_eq!(json["section_tag"], "open-agents");
+    }
+}
+
+#[cfg(test)]
+mod section_stats_total_tests {
+    //! PR #134 review finding 3: a live reply must move a row whose count
+    //! came from the section stats.
+    use super::*;
+    use crate::topics::section_stats::SectionStats;
+
+    fn reply_ev(id: &str, root: &str, ts: u64, edit: Option<&str>) -> NostrEvent {
+        let mut tags = crate::topics::thread::topic_reply_tags("chan", root, "", None);
+        if let Some(t) = edit {
+            tags.push(vec!["e".into(), t.into(), String::new(), "edit".into()]);
+        }
+        NostrEvent {
+            id: id.into(),
+            pubkey: "p".into(),
+            created_at: ts,
+            kind: 42,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        }
+    }
+
+    #[test]
+    fn stats_seed_a_total_that_live_replies_then_grow() {
+        let stats = SectionStats::parse(&serde_json::json!({
+            "channel": "chan", "as_of": 1_000,
+            "fields": ["id", "created_at", "last_at", "last_pubkey", "replies", "original"],
+            "topics": [["ROOT", 5, 900, "p", 50, null], ["env", 5, 800, null, 3, "orig"],
+                       ["big", 5, 700, null, null, null]]
+        }))
+        .unwrap();
+        let seeds = section_stats_totals(&stats);
+        assert_eq!(
+            seeds,
+            vec![
+                ("topic:root".to_string(), 50),
+                ("topic:env".to_string(), 3),
+                ("topic:orig".to_string(), 3)
+            ],
+            "no seed for an unknown count"
+        );
+        // The store's total for a seeded topic, then a live reply after the
+        // answer, then the same reply again and an older one: 51.
+        let mut t = ChannelTotal {
+            counted: Some(50),
+            as_of: stats.as_of,
+            newer_ids: HashSet::new(),
+        };
+        for (id, ts) in [("r1", 1_005), ("r1", 1_005), ("r0", 990)] {
+            if ts > t.as_of {
+                t.newer_ids.insert(id.to_string());
+            }
+        }
+        assert_eq!(t.total(), Some(51));
+        // Which topic a live message grows: a reply's, never an edit's.
+        assert_eq!(
+            reply_topic(&reply_ev("r1", "ROOT", 1, None)).as_deref(),
+            Some("root")
+        );
+        assert_eq!(reply_topic(&reply_ev("e1", "ROOT", 1, Some("r1"))), None);
     }
 }
