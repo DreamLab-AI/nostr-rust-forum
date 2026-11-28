@@ -173,6 +173,20 @@ impl SectionStatsState {
         !matches!(self, Self::Pending)
     }
 
+    /// The state a request for `channel` settles in from the relay's
+    /// reply: an answer for that channel, or a failure (a refusal, any
+    /// `CLOSED` reason, a payload that does not parse or names another
+    /// channel). A refusal is never an empty list (ADR-2034).
+    pub fn from_answer(channel: &str, reply: Result<serde_json::Value, String>) -> Self {
+        match reply {
+            Ok(payload) => SectionStats::parse(&payload)
+                .filter(|s| s.channel == channel)
+                .map(|s| Self::Answered(std::sync::Arc::new(s)))
+                .unwrap_or_else(|| Self::Failed("malformed answer".into())),
+            Err(reason) => Self::Failed(reason),
+        }
+    }
+
     /// The answer, if there is one.
     pub fn stats(&self) -> Option<&std::sync::Arc<SectionStats>> {
         match self {
@@ -264,7 +278,10 @@ mod tests {
             "topics": [[4, "y", "a", 1]]
         });
         let s = SectionStats::parse(&p).unwrap();
-        assert_eq!((s.topics[0].id.as_str(), s.topics[0].replies), ("a", Some(4)));
+        assert_eq!(
+            (s.topics[0].id.as_str(), s.topics[0].replies),
+            ("a", Some(4))
+        );
         assert_eq!(s.topics[0].last_at, None);
         for bad in [
             serde_json::json!({}),
@@ -292,17 +309,31 @@ mod tests {
         assert_eq!(orig.last_pubkey, "op", "a sealed last author is unknown");
         let b = &out[2];
         assert_eq!((b.last_activity, b.reply_count), (850, 9), "never lowered");
-        assert_eq!(fold_section_stats(vec![summary("x", 1, 2, 0)], None)[0].last_activity, 2);
+        assert_eq!(
+            fold_section_stats(vec![summary("x", 1, 2, 0)], None)[0].last_activity,
+            2
+        );
     }
 
     #[test]
     fn advertised_needs_the_verb_and_a_known_version() {
         let doc = |v: serde_json::Value| serde_json::json!({ "nostr_bbs": { "section_stats": v } });
-        assert!(advertised(&doc(serde_json::json!({"verb": "SECTION-STATS", "version": 1}))));
-        assert!(advertised(&doc(serde_json::json!({"verb": "SECTION-STATS", "version": 2}))));
-        assert!(!advertised(&doc(serde_json::json!({"verb": "SECTION-STATS"}))));
-        assert!(!advertised(&doc(serde_json::json!({"verb": "OTHER", "version": 1}))));
-        assert!(!advertised(&serde_json::json!({ "supported_nips": [1] })), "an old relay");
+        assert!(advertised(&doc(
+            serde_json::json!({"verb": "SECTION-STATS", "version": 1})
+        )));
+        assert!(advertised(&doc(
+            serde_json::json!({"verb": "SECTION-STATS", "version": 2})
+        )));
+        assert!(!advertised(&doc(
+            serde_json::json!({"verb": "SECTION-STATS"})
+        )));
+        assert!(!advertised(&doc(
+            serde_json::json!({"verb": "OTHER", "version": 1})
+        )));
+        assert!(
+            !advertised(&serde_json::json!({ "supported_nips": [1] })),
+            "an old relay"
+        );
     }
 
     #[test]
@@ -319,6 +350,25 @@ mod tests {
         assert!(freeze_ready(true, true, true, false));
         assert!(!freeze_ready(false, true, true, false));
         assert!(freeze_ready(false, false, false, true));
+    }
+
+    #[test]
+    fn a_reply_settles_as_an_answer_only_for_its_channel() {
+        let ok = SectionStatsState::from_answer("c", Ok(payload()));
+        assert_eq!(ok.stats().map(|s| s.topics.len()), Some(3));
+        let other = SectionStatsState::from_answer("d", Ok(payload()));
+        assert_eq!(other, SectionStatsState::Failed("malformed answer".into()));
+        let refused = SectionStatsState::from_answer("c", Err("auth-required: x".into()));
+        assert_eq!(
+            refused,
+            SectionStatsState::Failed("auth-required: x".into())
+        );
+        assert!(
+            refused.stats().is_none(),
+            "a refusal is never an empty list"
+        );
+        let junk = SectionStatsState::from_answer("c", Ok(serde_json::json!({"count": 0})));
+        assert!(matches!(junk, SectionStatsState::Failed(_)));
     }
 
     #[test]

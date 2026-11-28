@@ -372,15 +372,33 @@ pub fn SectionPage() -> impl IntoView {
     // reply total and newest reply where they are in. A separate Memo, so a
     // stats answer re-folds the summaries without re-classifying the window.
     let classified = topics_memo;
+    // ADR-2038: the relay's section stats give every marked topic its true
+    // last activity and reply count in one answer. Folded into the structure
+    // the board orders by (the per-topic stats below never are), so the list
+    // is in true order when it freezes.
+    let section_stats = Memo::new(move |_| channel_id.get().and_then(|c| store.section_stats(&c)));
+    let section_stats_settled = Memo::new(move |_| {
+        channel_id
+            .get()
+            .is_some_and(|c| store.section_stats_settled(&c))
+    });
+    let structured = Memo::new(move |_| {
+        crate::topics::section_stats::fold_section_stats(
+            classified.get(),
+            section_stats.get().as_deref(),
+        )
+    });
     let topics_memo = Memo::new(move |_| {
-        with_topic_stats(classified.get(), |t| {
+        with_topic_stats(structured.get(), |t| {
             let total = store.total_for(&crate::stores::channels::topic_key(&t.id));
             (total, store.topic_latest(&t.id))
         })
     });
 
     // Ask for those stats for the listed topics (top of the list first),
-    // in batches, once per topic per session.
+    // in batches, once per topic per session: once the section stats have
+    // answered or failed, and only for figures they do not carry (all of
+    // them when they failed, an old relay included).
     {
         let relay_for_stats = expect_context::<RelayConnection>();
         Effect::new(move |_| {
@@ -388,10 +406,16 @@ pub fn SectionPage() -> impl IntoView {
                 return;
             };
             let gated = zone_is_gated(&category_slug(), &load_zones());
-            if !store.history_receipt(&cid).settles(gated) {
+            if !store.history_receipt(&cid).settles(gated) || !section_stats_settled.get() {
                 return;
             }
-            let ids: Vec<String> = topics_memo.with(|ts| ts.iter().map(|t| t.id.clone()).collect());
+            let stats = section_stats.get();
+            let ids: Vec<String> = topics_memo.with(|ts| {
+                ts.iter()
+                    .filter(|t| stats.as_ref().is_none_or(|s| s.needs_pump(&t.id)))
+                    .map(|t| t.id.clone())
+                    .collect()
+            });
             store.request_topic_stats(&relay_for_stats, &cid, &ids, gated);
         });
     }
@@ -409,6 +433,7 @@ pub fn SectionPage() -> impl IntoView {
             if let Some(cid) = current.as_deref() {
                 if prev.flatten().as_deref() != Some(cid) {
                     store.rearm_topic_roots(cid);
+                    store.rearm_section_stats(cid);
                 }
                 // Sent alongside the history REQ rather than after its
                 // answer (one round trip less before first paint). A gated
@@ -421,6 +446,9 @@ pub fn SectionPage() -> impl IntoView {
                 let _ = store.history_receipt(cid);
                 if !gated || relay_for_roots.authenticated().get() {
                     store.request_topic_roots(&relay_for_roots, cid, gated);
+                    // ADR-2038: the section's topic stats, in the same
+                    // round trip and under the same AUTH rule.
+                    store.request_section_stats(&relay_for_roots, cid);
                 }
             }
             current
@@ -511,10 +539,12 @@ pub fn SectionPage() -> impl IntoView {
 
     // First paint (cause: a list painted on its first topic, then filled in
     // by the root list under the reader). A found list is held as skeleton
-    // rows until the history window has its settled answer and the root list
-    // has answered (or failed), or FIRST_PAINT_TIMEOUT_MS after it was found.
-    // Stats are not waited for: they never move a painted row. A store that
-    // already holds both paints at once.
+    // rows until the history window has its settled answer, the root list
+    // has answered (or failed) and the section stats (ADR-2038) have
+    // answered (or failed), or FIRST_PAINT_TIMEOUT_MS after it was found:
+    // the section stats never hold the paint past that same timeout. The
+    // per-topic stats are not waited for. A store that already holds all
+    // three paints at once.
     let roots_answered = Memo::new(move |_| {
         channel_id
             .get()
@@ -563,6 +593,7 @@ pub fn SectionPage() -> impl IntoView {
             first_paint_ready(
                 window_settled,
                 roots_answered.get() || roots_failed.get(),
+                section_stats_settled.get(),
                 hold_expired_here.get(),
             )
         })
@@ -570,11 +601,13 @@ pub fn SectionPage() -> impl IntoView {
 
     // Display order (cause: every stats answer re-sorted the painted list).
     // `FrozenBoard`: provisional while the section loads, in the true order
-    // from structure only (the window's activity, then root creation; stats
+    // from structure and the section stats (the window's activity, the
+    // relay's per-section answer, then root creation; the per-topic stats
     // never enter it), then frozen once, for the visit, when the window has
-    // settled and the root list has answered or failed (or FREEZE_CAP_MS
-    // after rows first show). After that no row moves; "↻ N updated" offers
-    // real activity newer than the freeze. Navigating away and back starts
+    // settled and the root list and the section stats have each answered or
+    // failed (or FREEZE_CAP_MS after rows first show). After that no row
+    // moves; "↻ N updated" offers real activity newer than the freeze, and
+    // a row that arrived late below a row of lower known activity. Navigating away and back starts
     // afresh. Every input is a Memo, so the board does not re-run on other
     // channels' traffic.
     // The board's rows, stamped with the visit they belong to; only rows of
@@ -660,7 +693,12 @@ pub fn SectionPage() -> impl IntoView {
     }
     let ready_to_freeze = Memo::new(move |_| {
         let capped = visit.with(|v| cap_expired.with(|c| c.as_ref() == Some(v)));
-        capped || (window_settled.get() && (roots_answered.get() || roots_failed.get()))
+        crate::topics::section_stats::freeze_ready(
+            window_settled.get(),
+            roots_answered.get() || roots_failed.get(),
+            section_stats_settled.get(),
+            capped,
+        )
     });
     // The newest activity known: every topic's (stats included) and the
     // window's newest message (an edit can come back as a newest reply).
@@ -690,7 +728,10 @@ pub fn SectionPage() -> impl IntoView {
         let newest = newest_known.get();
         let me_now = me.get();
         let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-        let next = classified.with(|structure| {
+        let stats = section_stats.get();
+        let baseline_settled = window_settled.get() || stats.is_some();
+        let known = |id: &str| stats.as_ref().is_some_and(|s| s.activity_known(id));
+        let next = structured.with(|structure| {
             board.try_update_value(|(for_visit, b)| {
                 if *for_visit != this {
                     *for_visit = this.clone();
@@ -711,6 +752,8 @@ pub fn SectionPage() -> impl IntoView {
                         newest_known: newest,
                         now_secs,
                         deleted: &is_deleted,
+                        baseline_settled,
+                        activity_known: &known,
                     },
                 );
                 b.shown().to_vec()

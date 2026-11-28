@@ -246,10 +246,7 @@ const MIGRATOR: &str = "99999999999999999999999999999999999999999999999999999999
 /// The oracle: the clients' `classify_topics` over what the client store
 /// would file under `channel` (events whose own channel it is), minus
 /// expired events. Deleted events are simply absent.
-fn oracle(
-    channel: &str,
-    all: &[NostrEvent],
-) -> Vec<nostr_bbs_client_core::topics::TopicSummary> {
+fn oracle(channel: &str, all: &[NostrEvent]) -> Vec<nostr_bbs_client_core::topics::TopicSummary> {
     let filed: Vec<NostrEvent> = all
         .iter()
         .filter(|e| nostr_bbs_core::sealed::channel_of(e) == Some(channel))
@@ -273,7 +270,12 @@ fn assert_matches_oracle(a: &SectionAnswer, channel: &str, all: &[NostrEvent]) {
         let o = by_id
             .get(t.id.as_str())
             .unwrap_or_else(|| panic!("relay lists {} which classify_topics does not", t.id));
-        assert_eq!(t.last_at, Some(o.last_activity), "last activity of {}", t.id);
+        assert_eq!(
+            t.last_at,
+            Some(o.last_activity),
+            "last activity of {}",
+            t.id
+        );
         assert_eq!(t.replies, Some(o.reply_count as u64), "replies of {}", t.id);
         if let Some(pk) = &t.last_pubkey {
             assert_eq!(pk, &o.last_pubkey, "last author of {}", t.id);
@@ -288,7 +290,11 @@ fn assert_matches_oracle(a: &SectionAnswer, channel: &str, all: &[NostrEvent]) {
                 .any(|t| t.len() >= 2 && t[0] == "t" && t[1] == "topic")
         });
         if marked {
-            assert!(listed.contains(o.id.as_str()), "marked topic {} missing", o.id);
+            assert!(
+                listed.contains(o.id.as_str()),
+                "marked topic {} missing",
+                o.id
+            );
         }
     }
     // Board order: newest activity first, ties by id.
@@ -342,7 +348,13 @@ fn seeded(c: &Connection, seed: u64) -> Vec<NostrEvent> {
         let mut last_reply: Option<String> = None;
         for k in 0..n {
             let r = id();
-            all.push(reply(&r, C, &rid, &pk(rng.below(7)), base + 10 + k * 7 + rng.below(5)));
+            all.push(reply(
+                &r,
+                C,
+                &rid,
+                &pk(rng.below(7)),
+                base + 10 + k * 7 + rng.below(5),
+            ));
             last_reply = Some(r);
         }
         // An edit newer than everything: never activity.
@@ -356,7 +368,13 @@ fn seeded(c: &Connection, seed: u64) -> Vec<NostrEvent> {
         }
         // Reactions to the root (kind 7) and an expired reply.
         for _ in 0..rng.below(4) {
-            all.push(ev(&id(), &pk(3), base + 7_000, 7, vec![tag(&["e", &rid]), tag(&["p", &pk(0)])]));
+            all.push(ev(
+                &id(),
+                &pk(3),
+                base + 7_000,
+                7,
+                vec![tag(&["e", &rid]), tag(&["p", &pk(0)])],
+            ));
         }
         if rng.below(3) == 0 {
             let mut x = reply(&id(), C, &rid, &pk(2), base + 8_000);
@@ -387,7 +405,13 @@ fn seeded(c: &Connection, seed: u64) -> Vec<NostrEvent> {
     all.push(reply(&id(), C, &orig, &pk(3), 1_050_010));
     all.push(reply(&id(), C, &env, &pk(4), 1_050_020));
     // A legacy root without the marker (classify lists it; the relay cannot).
-    all.push(ev(&id(), &pk(1), 1_000_500, 42, vec![tag(&["e", C, "", "root"])]));
+    all.push(ev(
+        &id(),
+        &pk(1),
+        1_000_500,
+        42,
+        vec![tag(&["e", C, "", "root"])],
+    ));
     // Crafted: a reply filed in D naming a C root, and a marked root of D
     // that also e-tags C without the root marker.
     all.push(reply(&id(), D, &roots[0], &pk(5), 1_999_000));
@@ -396,7 +420,11 @@ fn seeded(c: &Connection, seed: u64) -> Vec<NostrEvent> {
         &pk(5),
         1_999_001,
         42,
-        vec![tag(&["e", D, "", "root"]), tag(&["e", C]), tag(&["t", "topic"])],
+        vec![
+            tag(&["e", D, "", "root"]),
+            tag(&["e", C]),
+            tag(&["t", "topic"]),
+        ],
     ));
     // A reply whose `reply` marker precedes a quote of the root.
     let quoted = id();
@@ -476,7 +504,10 @@ fn deleted_root_and_newest_reply_are_not_counted() {
     let after = answer(&c, C);
     assert_eq!(after.topics[0].last_at, Some(110));
     assert_eq!(after.topics[0].replies, Some(1));
-    assert_eq!(after.topics[0].last_pubkey.as_deref(), Some(hex(8).as_str()));
+    assert_eq!(
+        after.topics[0].last_pubkey.as_deref(),
+        Some(hex(8).as_str())
+    );
     delete(&c, &r);
     assert!(answer(&c, C).topics.is_empty());
 }
@@ -498,7 +529,10 @@ fn sealed_root_reports_envelope_id_with_original_and_hides_the_migrator() {
     assert_eq!(t.id, env);
     assert_eq!(t.original.as_deref(), Some(inner.as_str()));
     assert_eq!((t.last_at, t.replies), (Some(150), Some(1)));
-    assert_eq!(t.last_pubkey, None, "a sealed reply's outer author is the migrator");
+    assert_eq!(
+        t.last_pubkey, None,
+        "a sealed reply's outer author is the migrator"
+    );
     // A live reply naming the original is newer: its author is shown.
     store(&c, &[reply(&hex(5), C, &inner, &hex(6), 160)]);
     let t = answer(&c, C).topics[0].clone();
@@ -523,7 +557,10 @@ fn dual_present_original_is_the_topic_and_counts_replies_to_either_id() {
     let a = answer(&c, C);
     assert_eq!(a.topics.len(), 1);
     let t = &a.topics[0];
-    assert_eq!((t.id.as_str(), t.original.as_deref()), (orig.as_str(), None));
+    assert_eq!(
+        (t.id.as_str(), t.original.as_deref()),
+        (orig.as_str(), None)
+    );
     assert_eq!((t.last_at, t.replies), (Some(130), Some(2)));
 }
 
@@ -543,13 +580,20 @@ fn crafted_cross_channel_events_leak_nothing() {
                 &hex(8),
                 600,
                 42,
-                vec![tag(&["e", D, "", "root"]), tag(&["e", C]), tag(&["t", "topic"])],
+                vec![
+                    tag(&["e", D, "", "root"]),
+                    tag(&["e", C]),
+                    tag(&["t", "topic"]),
+                ],
             ),
         ],
     );
     let a = answer(&c, C);
     assert_eq!(a.topics.len(), 1);
-    assert_eq!((a.topics[0].last_at, a.topics[0].replies), (Some(100), Some(0)));
+    assert_eq!(
+        (a.topics[0].last_at, a.topics[0].replies),
+        (Some(100), Some(0))
+    );
 }
 
 #[test]
@@ -576,15 +620,27 @@ fn expired_roots_and_replies_are_not_counted() {
     let r = hex(1);
     let gone = hex(2);
     let mut exp_root = root(&gone, C, &hex(7), 200);
-    exp_root.tags.push(tag(&["expiration", &(NOW - 5).to_string()]));
+    exp_root
+        .tags
+        .push(tag(&["expiration", &(NOW - 5).to_string()]));
     let mut exp_reply = reply(&hex(3), C, &r, &hex(8), 300);
-    exp_reply.tags.push(tag(&["expiration", &(NOW - 5).to_string()]));
+    exp_reply
+        .tags
+        .push(tag(&["expiration", &(NOW - 5).to_string()]));
     let mut live_reply = reply(&hex(4), C, &r, &hex(9), 250);
-    live_reply.tags.push(tag(&["expiration", &(NOW + 5).to_string()]));
-    store(&c, &[root(&r, C, &hex(7), 100), exp_root, exp_reply, live_reply]);
+    live_reply
+        .tags
+        .push(tag(&["expiration", &(NOW + 5).to_string()]));
+    store(
+        &c,
+        &[root(&r, C, &hex(7), 100), exp_root, exp_reply, live_reply],
+    );
     let a = answer(&c, C);
     assert_eq!(a.topics.len(), 1);
-    assert_eq!((a.topics[0].last_at, a.topics[0].replies), (Some(250), Some(1)));
+    assert_eq!(
+        (a.topics[0].last_at, a.topics[0].replies),
+        (Some(250), Some(1))
+    );
 }
 
 #[test]
@@ -639,7 +695,10 @@ fn counting_stops_at_the_budget_in_activity_order() {
     let a = answer(&c, C);
     let counted: Vec<bool> = a.topics.iter().map(|t| t.replies.is_some()).collect();
     let k = counted.iter().take_while(|x| **x).count();
-    assert!(counted[k..].iter().all(|x| !x), "counted is a prefix: {counted:?}");
+    assert!(
+        counted[k..].iter().all(|x| !x),
+        "counted is a prefix: {counted:?}"
+    );
     assert_eq!(k as u64, COUNT_BUDGET / 1_000, "{counted:?}");
     assert!(a.topics[..k].iter().all(|t| t.replies == Some(1_000)));
 }
@@ -648,9 +707,18 @@ fn counting_stops_at_the_budget_in_activity_order() {
 fn a_walk_that_runs_out_reports_unknown_activity_not_a_wrong_one() {
     let c = db();
     let r = hex(1);
-    let mut events = vec![root(&r, C, &hex(7), 100), reply(&hex(2), C, &r, &hex(8), 110)];
+    let mut events = vec![
+        root(&r, C, &hex(7), 100),
+        reply(&hex(2), C, &r, &hex(8), 110),
+    ];
     for n in 0..ACTIVITY_WALK_ROWS as u64 {
-        events.push(ev(&hex(100 + n), &hex(6), 200 + n, 7, vec![tag(&["e", &r])]));
+        events.push(ev(
+            &hex(100 + n),
+            &hex(6),
+            200 + n,
+            7,
+            vec![tag(&["e", &r])],
+        ));
     }
     store(&c, &events);
     let t = answer(&c, C).topics[0].clone();
@@ -735,7 +803,18 @@ fn count_and_activity_cost_stop_growing_with_topic_size() {
 /// Aliases of the base tables in the statements: a `SCAN` of any of them is
 /// a full table scan. (`SCAN x` reads the bounded walk subquery, `SCAN jv`
 /// / `jt` / `js` the JSON table-valued functions.)
-const TABLE_ALIASES: [&str; 10] = ["events", "event_tags", "ev", "r", "t", "c", "d", "w", "xt", "s"];
+const TABLE_ALIASES: [&str; 10] = [
+    "events",
+    "event_tags",
+    "ev",
+    "r",
+    "t",
+    "c",
+    "d",
+    "w",
+    "xt",
+    "s",
+];
 
 #[test]
 fn no_statement_scans_events_or_the_channel() {
@@ -781,11 +860,15 @@ fn no_statement_scans_events_or_the_channel() {
             let mut words = line.split_whitespace();
             if words.next() == Some("SCAN") {
                 let alias = words.next().unwrap_or("");
-                assert!(!TABLE_ALIASES.contains(&alias), "full scan in plan: {plan:?}");
+                assert!(
+                    !TABLE_ALIASES.contains(&alias),
+                    "full scan in plan: {plan:?}"
+                );
             }
         }
         assert!(
-            plan.iter().any(|l| l.contains("idx_event_tags_time") || l.contains("idx_event_tags_lookup")),
+            plan.iter()
+                .any(|l| l.contains("idx_event_tags_time") || l.contains("idx_event_tags_lookup")),
             "plan: {plan:?}"
         );
     }
@@ -824,7 +907,9 @@ fn zone_of(
     channel: &str,
     d1: Result<Option<String>, ZoneLookupError>,
 ) -> Result<Option<String>, ZoneLookupError> {
-    block_on(resolve_channel_zone(&zones(), channel, || std::future::ready(d1)))
+    block_on(resolve_channel_zone(&zones(), channel, || {
+        std::future::ready(d1)
+    }))
 }
 
 #[test]
@@ -843,18 +928,63 @@ fn admission_matrix_matches_the_channel_read_rule() {
     let admin = viewer(&[], true, true);
 
     let cases = [
-        ("unauthenticated, gated zone", &members, &anon, Admission::Refuse(REFUSE_AUTH)),
-        ("wrong cohort", &members, &outsider, Admission::Refuse(REFUSE_RESTRICTED)),
-        ("right cohort, encrypted zone", &members, &member, Admission::Admit),
+        (
+            "unauthenticated, gated zone",
+            &members,
+            &anon,
+            Admission::Refuse(REFUSE_AUTH),
+        ),
+        (
+            "wrong cohort",
+            &members,
+            &outsider,
+            Admission::Refuse(REFUSE_RESTRICTED),
+        ),
+        (
+            "right cohort, encrypted zone",
+            &members,
+            &member,
+            Admission::Admit,
+        ),
         ("admin bypass", &members, &admin, Admission::Admit),
-        ("public zone, unauthenticated", &lobby, &anon, Admission::Admit),
-        ("unscoped channel, unauthenticated", &unscoped, &anon, Admission::Admit),
-        ("zone lookup failed: closed", &failed, &member, Admission::Refuse(REFUSE_RESTRICTED)),
-        ("zone lookup failed, admin", &failed, &admin, Admission::Refuse(REFUSE_RESTRICTED)),
-        ("pinned: old-zone member", &pinned, &member, Admission::Refuse(REFUSE_RESTRICTED)),
+        (
+            "public zone, unauthenticated",
+            &lobby,
+            &anon,
+            Admission::Admit,
+        ),
+        (
+            "unscoped channel, unauthenticated",
+            &unscoped,
+            &anon,
+            Admission::Admit,
+        ),
+        (
+            "zone lookup failed: closed",
+            &failed,
+            &member,
+            Admission::Refuse(REFUSE_RESTRICTED),
+        ),
+        (
+            "zone lookup failed, admin",
+            &failed,
+            &admin,
+            Admission::Refuse(REFUSE_RESTRICTED),
+        ),
+        (
+            "pinned: old-zone member",
+            &pinned,
+            &member,
+            Admission::Refuse(REFUSE_RESTRICTED),
+        ),
         ("pinned: new-zone member", &pinned, &staff, Admission::Admit),
         ("pinned: admin", &pinned, &admin, Admission::Admit),
-        ("pinned: unauthenticated", &pinned, &anon, Admission::Refuse(REFUSE_AUTH)),
+        (
+            "pinned: unauthenticated",
+            &pinned,
+            &anon,
+            Admission::Refuse(REFUSE_AUTH),
+        ),
     ];
     for (name, lookup, ctx, want) in cases {
         assert_eq!(admission(lookup, &z, ctx), want, "{name}");
@@ -865,7 +995,11 @@ fn admission_matrix_matches_the_channel_read_rule() {
         );
         assert_eq!(delivered, want == Admission::Admit, "{name}: REQ parity");
     }
-    assert_eq!(pinned, Ok(Some("staff".to_string())), "the pin decides before D1");
+    assert_eq!(
+        pinned,
+        Ok(Some("staff".to_string())),
+        "the pin decides before D1"
+    );
 }
 
 #[test]
@@ -876,8 +1010,10 @@ fn a_missing_section_is_refused_like_an_unreadable_one() {
     assert_eq!(refusal_for(&viewer(&["x"], true, false)), REFUSE_RESTRICTED);
     let c = db();
     let hits = |id: &str| -> i64 {
-        c.query_row(&format!("SELECT COUNT(*) FROM ({EXISTS_SQL})"), [id], |r| r.get(0))
-            .unwrap()
+        c.query_row(&format!("SELECT COUNT(*) FROM ({EXISTS_SQL})"), [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
     };
     assert_eq!(hits(C), 0);
     store(&c, &[ev(C, &hex(7), 1, 40, vec![])]);
@@ -912,4 +1048,3 @@ fn nip11_advertises_the_verb_and_caps() {
     assert_eq!(a["version"], VERSION);
     assert_eq!(a["max_topics"], MAX_TOPICS);
 }
-

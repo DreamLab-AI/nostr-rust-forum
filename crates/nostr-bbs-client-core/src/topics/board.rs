@@ -470,10 +470,7 @@ impl FrozenBoard {
         // A cap freeze before the window or the section stats: the first of
         // them to land sets the baseline, once (the order does not move).
         if self.baseline_provisional && inputs.baseline_settled {
-            self.baseline = self
-                .baseline
-                .max(inputs.newest_known)
-                .max(structure_newest);
+            self.baseline = self.baseline.max(inputs.newest_known).max(structure_newest);
             self.baseline_provisional = false;
         }
         let listed: HashSet<&str> = structure.iter().map(|t| t.id.as_str()).collect();
@@ -1499,13 +1496,20 @@ mod tests {
         // control must offer the re-sort.
         let ts = vec![topic("a", "x", 10, 500), topic("b", "x", 5, 100)];
         let mut board = FrozenBoard::new();
-        board.update(&sorted(ts.clone()), &inputs_with(true, 500, 10, true, &always_known));
+        board.update(
+            &sorted(ts.clone()),
+            &inputs_with(true, 500, 10, true, &always_known),
+        );
         let mut now = ts.clone();
         now.push(topic("late", "x", 1, 300)); // 300 <= baseline 500, above b
         let now = sorted(now);
         board.update(&now, &inputs_with(true, 500, 11, true, &always_known));
         assert_eq!(board.shown(), &ids(&["a", "b", "late"])[..]);
-        assert_eq!(board.updated(&now, None), 1, "late sits below b (100 < 300)");
+        assert_eq!(
+            board.updated(&now, None),
+            1,
+            "late sits below b (100 < 300)"
+        );
         board.repaint(&now, 500, 12, &never_deleted);
         assert_eq!(board.shown(), &ids(&["a", "late", "b"])[..]);
         assert_eq!(board.updated(&now, None), 0);
@@ -1516,7 +1520,10 @@ mod tests {
         let ts = vec![topic("a", "x", 10, 500), topic("b", "x", 5, 100)];
         // An older page appends a topic older than every row: quiet.
         let mut board = FrozenBoard::new();
-        board.update(&sorted(ts.clone()), &inputs_with(true, 500, 10, true, &always_known));
+        board.update(
+            &sorted(ts.clone()),
+            &inputs_with(true, 500, 10, true, &always_known),
+        );
         let mut now = ts.clone();
         now.push(topic("older", "x", 1, 50));
         let now = sorted(now);
@@ -1525,7 +1532,10 @@ mod tests {
         // Without section stats (activity not known) a late row's activity
         // is a lower bound: it is never counted on that basis.
         let mut board = FrozenBoard::new();
-        board.update(&sorted(ts.clone()), &inputs_with(true, 500, 10, true, &never_known));
+        board.update(
+            &sorted(ts.clone()),
+            &inputs_with(true, 500, 10, true, &never_known),
+        );
         let mut now = ts.clone();
         now.push(topic("late", "x", 1, 300));
         let now = sorted(now);
@@ -1539,19 +1549,34 @@ mod tests {
         // (creation times), the window then lands on a quiet section.
         let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
         let mut board = FrozenBoard::new();
-        board.update(&roots_only, &inputs_with(true, 10, 100, false, &never_known));
+        board.update(
+            &roots_only,
+            &inputs_with(true, 10, 100, false, &never_known),
+        );
         assert!(board.is_frozen());
         assert_eq!(board.baseline(), 10);
         // Pump figures arriving before either: nothing counts yet.
         let pumped = sorted(vec![topic("a", "x", 10, 40), topic("b", "x", 5, 400)]);
         board.update(&pumped, &inputs_with(true, 400, 101, false, &never_known));
-        assert_eq!(board.updated(&pumped, None), 0, "baseline still provisional");
+        assert_eq!(
+            board.updated(&pumped, None),
+            0,
+            "baseline still provisional"
+        );
         // The window lands: activity from before the freeze is not new.
         let landed = sorted(vec![topic("a", "x", 10, 40), topic("b", "x", 5, 400)]);
         board.update(&landed, &inputs_with(true, 400, 102, true, &never_known));
         assert_eq!(board.baseline(), 400);
-        assert_eq!(board.shown(), &ids(&["a", "b"])[..], "the order does not move");
-        assert_eq!(board.updated(&landed, None), 0, "a quiet section shows nothing");
+        assert_eq!(
+            board.shown(),
+            &ids(&["a", "b"])[..],
+            "the order does not move"
+        );
+        assert_eq!(
+            board.updated(&landed, None),
+            0,
+            "a quiet section shows nothing"
+        );
         // Re-taken once only: real activity afterwards counts.
         let later = sorted(vec![topic("a", "x", 10, 450), topic("b", "x", 5, 400)]);
         board.update(&later, &inputs_with(true, 450, 103, true, &never_known));
@@ -1568,7 +1593,10 @@ mod tests {
         // board gets already carries their activity.
         let with_stats = sorted(vec![topic("a", "x", 10, 900), topic("b", "x", 5, 700)]);
         let mut board = FrozenBoard::new();
-        board.update(&with_stats, &inputs_with(true, 900, 100, true, &always_known));
+        board.update(
+            &with_stats,
+            &inputs_with(true, 900, 100, true, &always_known),
+        );
         assert_eq!(board.baseline(), 900);
         assert_eq!(board.shown(), &ids(&["a", "b"])[..]);
         assert_eq!(board.updated(&with_stats, None), 0);
@@ -1613,8 +1641,8 @@ mod tests {
     #[test]
     fn section_stats_freeze_the_true_order_and_nothing_moves_after() {
         const W: u64 = 10_000; // the window's oldest message
-        // Coverage: cap freezes taken before the window or the stats, and
-        // late rows the control counted, must both occur.
+                               // Coverage: cap freezes taken before the window or the stats, and
+                               // late rows the control counted, must both occur.
         let (mut unsettled_caps, mut late_counted) = (0, 0);
         for seed in 1..=300u64 {
             let mut rng = XorShift(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
@@ -1643,7 +1671,11 @@ mod tests {
                     .iter()
                     .filter(|t| (roots && t.marked && t.in_roots) || (window && t.last >= W))
                     .map(|t| {
-                        let seen = if window && t.last >= W { t.last } else { t.created };
+                        let seen = if window && t.last >= W {
+                            t.last
+                        } else {
+                            t.created
+                        };
                         topic(&t.id, "a", t.created, seen)
                     })
                     .collect();
@@ -1789,13 +1821,19 @@ mod tests {
                 let known = |id: &str| known_set.contains(id);
                 board.update(&st, &inputs_with(true, newest(&fl), now, true, &known));
                 let shown = board.shown().to_vec();
-                assert_eq!(&shown[..frozen.len()], &frozen[..], "seed {seed}: a frozen row moved");
+                assert_eq!(
+                    &shown[..frozen.len()],
+                    &frozen[..],
+                    "seed {seed}: a frozen row moved"
+                );
                 let unique: HashSet<&String> = shown.iter().collect();
                 assert_eq!(unique.len(), shown.len(), "seed {seed}");
                 if quiet {
                     // Independent count: late rows below a known lower row.
-                    let act: HashMap<&str, u64> =
-                        fl.iter().map(|t| (t.id.as_str(), t.last_activity)).collect();
+                    let act: HashMap<&str, u64> = fl
+                        .iter()
+                        .map(|t| (t.id.as_str(), t.last_activity))
+                        .collect();
                     let mut low: Option<u64> = None;
                     let mut expect = 0;
                     for (i, id) in shown.iter().enumerate() {
@@ -1818,8 +1856,14 @@ mod tests {
                 }
             }
         }
-        assert!(unsettled_caps > 5, "cap freezes before window/stats: {unsettled_caps}");
-        assert!(late_counted > 20, "rounds with late rows counted: {late_counted}");
+        assert!(
+            unsettled_caps > 5,
+            "cap freezes before window/stats: {unsettled_caps}"
+        );
+        assert!(
+            late_counted > 20,
+            "rounds with late rows counted: {late_counted}"
+        );
     }
 
     #[test]

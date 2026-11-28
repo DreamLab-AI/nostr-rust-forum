@@ -171,6 +171,10 @@ pub(crate) fn refusal_for(ctx: &ViewerContext) -> &'static str {
 
 /// The value of the first `e` tag of `alias.tags` whose marker (4th element)
 /// is `marker`, in tag order.
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "SQL is run through D1 only")
+)]
 fn marked_e(alias: &str, marker: &str) -> String {
     format!(
         "(SELECT json_extract(jt.value, '$[1]') FROM json_each({alias}.tags) jt \
@@ -181,6 +185,10 @@ fn marked_e(alias: &str, marker: &str) -> String {
 
 /// The channel an event is filed in: its first `root`-marked `e` tag, else
 /// its first `e` tag (`filter::channel_tag`, `sealed::channel_of`).
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "SQL is run through D1 only")
+)]
 fn own_channel(alias: &str) -> String {
     format!(
         "COALESCE({}, (SELECT json_extract(jt.value, '$[1]') FROM json_each({alias}.tags) jt \
@@ -191,6 +199,10 @@ fn own_channel(alias: &str) -> String {
 }
 
 /// Whether the event is an edit (`["e", <target>, _, "edit"]`).
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "SQL is run through D1 only")
+)]
 fn is_edit(alias: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM json_each({alias}.tags) jt \
@@ -200,6 +212,10 @@ fn is_edit(alias: &str) -> String {
 }
 
 /// Whether the event carries any `sealed` tag (well formed or not).
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "SQL is run through D1 only")
+)]
 fn has_sealed(alias: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM json_each({alias}.tags) jt \
@@ -212,6 +228,10 @@ fn has_sealed(alias: &str) -> String {
 /// decimal value strictly before now). Read from the row's own tags, like
 /// `filter::SQL_HAS_EXPIRATION`: an `event_tags` probe on `name =
 /// 'expiration'` let the planner walk every expiring row on the relay.
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "SQL is run through D1 only")
+)]
 fn expired(alias: &str, now_ph: &str) -> String {
     format!(
         "COALESCE((SELECT CASE WHEN json_type(jt.value, '$[1]') = 'text' \
@@ -226,6 +246,10 @@ fn expired(alias: &str, now_ph: &str) -> String {
 }
 
 /// Whether `r` is a reply to `value` in channel `?1` at time `?2`.
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "SQL is run through D1 only")
+)]
 fn qualifies(value: &str) -> String {
     format!(
         "r.kind = 42 AND {} = ?1 AND {} = {value} AND NOT {} AND NOT {}",
@@ -241,6 +265,10 @@ fn qualifies(value: &str) -> String {
 /// event's `sealed` tags). Driven from `t = topic` through
 /// `idx_event_tags_time`, newest root first; each candidate is probed for
 /// the channel through `idx_event_tags_lookup` and checked by its own tags.
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "SQL is run through D1 only")
+)]
 pub(crate) fn roots_sql() -> String {
     format!(
         "SELECT ev.id AS id, ev.created_at AS created_at, ev.pubkey AS pubkey, \
@@ -266,6 +294,10 @@ pub(crate) fn roots_sql() -> String {
 /// NULL: how many tag rows there were, at most `?4`, so the caller can tell
 /// "no reply" from "walk ran out"). The walk reads `idx_event_tags_time`
 /// newest first as a co-routine and stops at the first reply.
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "SQL is run through D1 only")
+)]
 pub(crate) fn activity_sql() -> String {
     let walk = "SELECT w.event_id AS eid, w.created_at AS wat FROM event_tags w \
                 WHERE w.name = 'e' AND w.value = a.v \
@@ -286,6 +318,10 @@ pub(crate) fn activity_sql() -> String {
 
 /// Each id's reply count, capped: `?1` channel, `?2` now, `?3` JSON array of
 /// ids, `?4` cap + 1. Columns `v` and `n` (at most `?4`).
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "SQL is run through D1 only")
+)]
 pub(crate) fn counts_sql() -> String {
     format!(
         "SELECT jv.value AS v, \
@@ -298,6 +334,10 @@ pub(crate) fn counts_sql() -> String {
 }
 
 /// Whether the section exists: a stored kind-40 or a creator row. `?1`.
+#[cfg_attr(
+    not(any(test, target_arch = "wasm32")),
+    allow(dead_code, reason = "read through D1 only")
+)]
 pub(crate) const EXISTS_SQL: &str = "SELECT 1 AS x FROM events WHERE id = ?1 AND kind = 40 \
      UNION ALL SELECT 1 AS x FROM channel_creators WHERE channel_id = ?1 LIMIT 1";
 
@@ -344,8 +384,12 @@ pub(crate) trait StatsDb {
         ids: &[String],
     ) -> Result<Vec<ActivityRow>, String>;
     /// [`counts_sql`].
-    async fn counts(&self, channel: &str, now: u64, ids: &[String])
-        -> Result<Vec<CountRow>, String>;
+    async fn counts(
+        &self,
+        channel: &str,
+        now: u64,
+        ids: &[String],
+    ) -> Result<Vec<CountRow>, String>;
 }
 
 /// One listed topic.
@@ -462,8 +506,11 @@ fn board_order(a: &TopicStat, b: &TopicStat) -> std::cmp::Ordering {
     kb.cmp(&ka).then_with(|| a.id.cmp(&b.id))
 }
 
-/// A reply as [`activity_sql`] reports it: (created_at, pubkey, sealed).
-fn parse_last(s: &str) -> Option<(u64, String, bool)> {
+/// A newest reply: (created_at, pubkey, sealed).
+type Newest = (u64, String, bool);
+
+/// A reply as [`activity_sql`] reports it.
+fn parse_last(s: &str) -> Option<Newest> {
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
     let ts = v.get(0)?.as_f64()?.max(0.0) as u64;
     let pk = v.get(1)?.as_str()?.to_string();
@@ -492,7 +539,7 @@ pub(crate) async fn compute<D: StatsDb>(
 
     // Last activity for every id.
     let keys: Vec<String> = topics.iter().flat_map(|t| t.keys.clone()).collect();
-    let mut activity: HashMap<String, (bool, Option<(u64, String, bool)>)> = HashMap::new();
+    let mut activity: HashMap<String, (bool, Option<Newest>)> = HashMap::new();
     for chunk in keys.chunks(BATCH) {
         for row in db.activity(channel, now, chunk).await? {
             let exhausted = row.walked as i64 >= ACTIVITY_WALK_ROWS;
@@ -501,7 +548,7 @@ pub(crate) async fn compute<D: StatsDb>(
         }
     }
     for t in &mut topics {
-        let mut newest: Option<(u64, String, bool)> = None;
+        let mut newest: Option<Newest> = None;
         let mut unknown = false;
         for k in &t.keys {
             match activity.get(k) {
@@ -660,6 +707,23 @@ mod d1 {
     }
 }
 
+/// A native build's stand-in for D1: every statement fails.
+#[cfg(not(target_arch = "wasm32"))]
+struct NoD1;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl StatsDb for NoD1 {
+    async fn roots(&self, _: &str, _: u64, _: usize) -> Result<Vec<RootRow>, String> {
+        Err("no D1 binding in a native build".into())
+    }
+    async fn activity(&self, _: &str, _: u64, _: &[String]) -> Result<Vec<ActivityRow>, String> {
+        Err("no D1 binding in a native build".into())
+    }
+    async fn counts(&self, _: &str, _: u64, _: &[String]) -> Result<Vec<CountRow>, String> {
+        Err("no D1 binding in a native build".into())
+    }
+}
+
 impl super::NostrRelayDO {
     /// Answer one `SECTION-STATS` frame (see the module docs). Never holds a
     /// subscription, so it does not count against the 20-subscription cap.
@@ -702,7 +766,8 @@ impl super::NostrRelayDO {
         match self.compute_section_stats(&channel, now).await {
             Ok(Some(answer)) => {
                 let payload = answer.payload();
-                self.section_stats_cache.insert(&channel, payload.clone(), now);
+                self.section_stats_cache
+                    .insert(&channel, payload.clone(), now);
                 Self::send_section_stats(ws, id, &payload);
             }
             // No such section: the same refusal as an unreadable one.
@@ -743,14 +808,15 @@ impl super::NostrRelayDO {
         compute(&d1::D1Stats(&db), channel, now).await.map(Some)
     }
 
-    /// Native builds have no D1: every request is answered busy.
+    /// Native builds have no D1: the pipeline runs against [`NoD1`], so
+    /// every request is answered busy.
     #[cfg(not(target_arch = "wasm32"))]
     async fn compute_section_stats(
         &self,
-        _channel: &str,
-        _now: u64,
+        channel: &str,
+        now: u64,
     ) -> Result<Option<SectionAnswer>, String> {
-        Err("no D1 binding in a native build".into())
+        compute(&NoD1, channel, now).await.map(Some)
     }
 
     fn send_section_stats(ws: &worker::WebSocket, id: &str, payload: &serde_json::Value) {
