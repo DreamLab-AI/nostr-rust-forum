@@ -1470,3 +1470,20 @@ select:focus {
 @media (hover: none) and (pointer: coarse) {
     .kbd-hint { display: none; }
 }
+
+/* -- Page frame: hold one viewport while content loads ---------------------
+   `#main-content` (app.rs) carries `min-h-[calc(100vh-64px)]`: the viewport
+   less the 64px sticky header, so the footer starts at the fold and is not
+   pushed down when a page's data arrives. Re-based here on `100dvh` so iOS
+   Safari's collapsing URL bar does not make it too tall (`100vh` is the large
+   viewport), with the `100vh` declaration kept first for browsers without
+   `dvh`. On mobile `main` has bottom padding for the nav (see its rule above);
+   the box is `border-box`, so that padding sits inside this minimum and the
+   content box ends up at `100dvh - 64px - nav - inset`, exactly the chat
+   views' `h-[calc(100vh-64px)]` height from the mobile block above: no dead
+   band below the composer. The id selector outranks the utility whatever the
+   link order. */
+#main-content {
+    min-height: calc(100vh - 64px);
+    min-height: calc(100dvh - 64px);
+}

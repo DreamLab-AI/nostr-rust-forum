@@ -1483,11 +1483,12 @@ fn Layout(children: Children) -> impl IntoView {
                 </Show>
             </header>
 
-            // `min-h-screen` holds the content area at one viewport of height
-            // while pages load their data, so the footer starts below the fold
-            // instead of sitting in view and being pushed down (a large
-            // cumulative layout shift) when posts or topics arrive.
-            <main id="main-content" class="flex-1 min-h-screen" role="main">
+            // The min-height holds the content area at the viewport minus the
+            // 64px sticky header (`h-16` nav above) while pages load their
+            // data, so the footer starts at the fold instead of sitting in
+            // view and being pushed down (a large cumulative layout shift)
+            // when posts or topics arrive. style.css re-bases it on `100dvh`.
+            <main id="main-content" class="flex-1 min-h-[calc(100vh-64px)]" role="main">
                 {children()}
             </main>
 

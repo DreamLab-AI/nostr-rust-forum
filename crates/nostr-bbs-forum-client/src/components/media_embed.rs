@@ -125,14 +125,9 @@ pub(crate) fn MediaEmbed(
 
                 view! {
                 <div class="mt-2 max-w-lg">
-                    // Reserved box shown while loading: a 4:3 placeholder at the
-                    // embed's width (`max-w-lg`, so at most 384px tall, inside the
-                    // image's own 400px cap). It is released on load, so the image
-                    // appears at its natural aspect with no letterboxing; an
-                    // error swaps it for the one-line notice below, so a broken
-                    // image never leaves an empty box behind.
+                    // Skeleton shown while loading
                     <Show when=move || !loaded.get() && !errored.get()>
-                        <div class="skeleton aspect-[4/3] max-h-[400px] w-full rounded-lg"></div>
+                        <div class="skeleton h-48 w-full rounded-lg"></div>
                     </Show>
 
                     // Error state
