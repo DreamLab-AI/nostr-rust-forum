@@ -219,19 +219,6 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         // A new visit may ask a root list that failed earlier again at
         // once (its backoff otherwise holds).
         channels.rearm_topic_roots(&cid.get_value());
-        // Topics whose stats failed are asked again on this visit and
-        // whenever the relay is back (connected, past AUTH when gated).
-        {
-            let relay = relay.clone();
-            Effect::new(move |_| {
-                let connected = relay.connection_state().get()
-                    == nostr_bbs_client_core::relay::ConnectionState::Connected;
-                let authed = relay.authenticated().get();
-                if connected && (authed || !gated) {
-                    channels.requeue_given_up_stats(&relay, &cid.get_value());
-                }
-            });
-        }
         Effect::new(move |_| {
             let cid = cid.get_value();
             channels.ensure_subscribed(&relay, &cid);
@@ -272,6 +259,24 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             }
             let ids: Vec<String> = topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect());
             channels.request_topic_stats(&relay, &cid, &ids, gated);
+        });
+    }
+
+    // Topics whose stats failed are asked again once on this visit and once
+    // each time the relay is back (connected, past AUTH when gated), never
+    // on traffic.
+    {
+        let relay = relay.clone();
+        Effect::new(move |was_ready: Option<bool>| {
+            let connected = relay.connection_state().get()
+                == nostr_bbs_client_core::relay::ConnectionState::Connected;
+            let ready = connected && (!gated || relay.authenticated().get());
+            if ready && was_ready != Some(true) {
+                let roots =
+                    topics.with_untracked(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>());
+                channels.requeue_given_up_stats(&relay, &cid.get_value(), &roots, gated);
+            }
+            ready
         });
     }
 
