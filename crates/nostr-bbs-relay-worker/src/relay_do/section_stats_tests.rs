@@ -678,7 +678,7 @@ fn a_topic_past_the_reply_cap_reports_an_unknown_count() {
 
 #[test]
 fn counting_stops_at_the_budget_in_activity_order() {
-    // 25 topics of 1,000 replies: the budget (20,000) covers the 20 most
+    // 25 topics of 1,000 replies: the budget (10,000) covers the 10 most
     // active and leaves the rest unknown.
     let c = db();
     let mut events = Vec::new();
@@ -1047,4 +1047,50 @@ fn nip11_advertises_the_verb_and_caps() {
     assert_eq!(a["verb"], "SECTION-STATS");
     assert_eq!(a["version"], VERSION);
     assert_eq!(a["max_topics"], MAX_TOPICS);
+}
+
+/// Measurement for ADR-2038 (not a gate; run with `--ignored --nocapture`):
+/// statement VM steps and native wall time for sections of growing size,
+/// with other channels' traffic on the relay. SQLite here, not D1.
+#[test]
+#[ignore = "measurement, minutes of seeding; run by hand"]
+fn measure_section_stats_cost() {
+    for (topics, replies, noise_roots) in [
+        (168u64, 20u64, 0u64),
+        (168, 600, 0),
+        (1_000, 100, 2_000),
+        (2_000, 50, 5_000),
+    ] {
+        let c = db();
+        let mut events = Vec::new();
+        let mut n = 10_000_000u64;
+        for t in 0..topics {
+            let r = hex(1 + t);
+            events.push(root(&r, C, &hex(7), 100 + t));
+            for k in 0..replies {
+                n += 1;
+                events.push(reply(&hex(n), C, &r, &hex(8), 1_000 + t * replies + k));
+            }
+        }
+        for k in 0..noise_roots {
+            n += 1;
+            events.push(root(&hex(n), D, &hex(7), 50 + k));
+        }
+        store(&c, &events);
+        let s = Sqlite::new(&c);
+        let t0 = std::time::Instant::now();
+        let a = block_on(compute(&s, C, NOW)).unwrap();
+        let ms = t0.elapsed().as_millis();
+        println!(
+            "topics {topics:>5} x replies {replies:>4} = {:>7} msgs in C, {noise_roots:>5} other roots: \
+             listed {:>4} truncated {:<5} counted {:>4} | steps roots {:>9} activity {:>9} counts {:>9} | {ms} ms",
+            topics * (replies + 1),
+            a.topics.len(),
+            a.truncated,
+            a.topics.iter().filter(|t| t.replies.is_some()).count(),
+            s.steps("roots"),
+            s.steps("activity"),
+            s.steps("counts"),
+        );
+    }
 }

@@ -89,7 +89,7 @@ pub(crate) const REPLY_COUNT_CAP: u64 = 1_000;
 
 /// Replies counted per answer, across topics, before counting stops. Topics
 /// are counted in activity order, so the top of the list has its figures.
-pub(crate) const COUNT_BUDGET: u64 = 20_000;
+pub(crate) const COUNT_BUDGET: u64 = 10_000;
 
 /// Ids per activity statement (bound as one JSON array).
 pub(crate) const BATCH: usize = 100;
