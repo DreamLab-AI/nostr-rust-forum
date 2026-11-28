@@ -502,6 +502,10 @@ pub fn App() -> impl IntoView {
     // Zone end-to-end encryption (ADR-2016): keys load from IndexedDB now,
     // before channel sync, so held keys decrypt the first messages to arrive.
     crate::zone_crypto::store::provide_zone_key_store(use_channel_store());
+    // Topic subscriptions (unread counts, private cross-device copy). After
+    // the relay, channel and zone-key stores it reads; before the bell's
+    // `init_sync`, which raises notices for subscribed topics.
+    crate::stores::thread_subs::provide_thread_subs();
     // Encrypted-zone search loads at sign-in, not at the first search, and
     // its worker lives as long as the page (in-app navigation keeps it).
     crate::utils::sealed_search::autoload();
