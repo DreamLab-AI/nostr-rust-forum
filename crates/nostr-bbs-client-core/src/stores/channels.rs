@@ -1508,11 +1508,24 @@ impl ChannelStore {
         }
     }
 
-    /// Whether a deletion (kind-5) this store holds names `id`, whoever
-    /// asked for it. A topic list uses it to tell a deleted topic from one
-    /// merely evicted from the history window. Read-only, not tracked.
-    pub fn tombstone_names(&self, id: &str) -> bool {
-        self.tombstones.with_untracked(|t| t.names(id))
+    /// Whether a deletion of message `id` by `author` is honoured: the
+    /// store's own admission decision ([`tombstones::admits`]), with `id`
+    /// judged as a restored sealed original when the zone cache says it is
+    /// one. A topic list uses it to tell a deleted topic from one merely
+    /// evicted from the history window. Read-only, not tracked.
+    pub fn deletion_honoured(
+        &self,
+        zone_keys: Option<ZoneKeyStore>,
+        id: &str,
+        author: &str,
+    ) -> bool {
+        let sealed = is_restored_original(zone_keys, id);
+        let admin = self.signer_admin;
+        self.tombstones.with_untracked(|t| {
+            deletion_honoured_by(t, id, sealed.then_some(author), |d| {
+                admin.is_admin_untracked(d)
+            })
+        })
     }
 
     /// Topic `root`'s newest reply as the relay answered it, as
@@ -2293,6 +2306,47 @@ mod roots_backoff_tests {
         assert!(b.may_ask(1.0));
         b.failed(10.0);
         assert_eq!(b.retry_at, 10.0 + 80_000.0, "third failure: 4x");
+    }
+}
+
+/// Whether `tombstones` hide message `id`: [`tombstones::admits`] refuses
+/// it, as a restored sealed original of `sealed_author` when given, else
+/// as an ordinary message.
+fn deletion_honoured_by(
+    tombstones: &Tombstones,
+    id: &str,
+    sealed_author: Option<&str>,
+    is_admin: impl Fn(&str) -> bool,
+) -> bool {
+    let target = match sealed_author {
+        Some(author) => Target::SealedOriginal { author },
+        None => Target::Ordinary,
+    };
+    !tombstones::admits(tombstones, id, target, is_admin)
+}
+
+#[cfg(test)]
+mod deletion_honoured_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_honoured_deletion_hides_a_topic() {
+        let mut t = Tombstones::default();
+        assert!(!deletion_honoured_by(&t, "x", None, |_| false), "no kind-5");
+        // A kind-5 by someone who is neither the author nor an admin, on a
+        // restored sealed original: recorded, not honoured.
+        t.record("sealed", "mallory");
+        assert!(!deletion_honoured_by(&t, "sealed", Some("alice"), |_| {
+            false
+        }));
+        // By the author, or by a relay-vouched admin: honoured.
+        assert!(deletion_honoured_by(&t, "sealed", Some("mallory"), |_| {
+            false
+        }));
+        assert!(deletion_honoured_by(&t, "sealed", Some("alice"), |d| d == "mallory"));
+        // An ordinary message: the relay gated the deletion.
+        t.record("plain", "bob");
+        assert!(deletion_honoured_by(&t, "plain", None, |_| false));
     }
 }
 

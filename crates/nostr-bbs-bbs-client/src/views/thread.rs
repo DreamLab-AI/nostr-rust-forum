@@ -33,11 +33,11 @@ use nostr_bbs_client_core::stores::read_position::use_read_positions;
 use nostr_bbs_client_core::stores::zones::{load_zones, resolve_zone_param};
 use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
 use nostr_bbs_client_core::topics::{
-    board_events, classify_topics, edit_tags, find_topic_root, first_paint_ready,
-    first_row_in_full_view, history_settled, landing_target, latest_post, latest_version,
-    post_anchor_id, sealed_aliases, thread_events, thread_replies, topic_reply_tags,
-    topic_root_tags, topic_title, updated_accessible_name, updated_label, with_topic_stats,
-    BoardInputs, FrozenBoard, Landing, ReplyView, TopicSummary, FIRST_PAINT_TIMEOUT_MS,
+    board_events, classify_topics, edit_tags, find_topic_root, first_paint_ready, history_settled,
+    landing_target, latest_post, latest_version, post_anchor_id, sealed_aliases, thread_events,
+    thread_replies, topic_reply_tags, topic_root_tags, topic_title, updated_accessible_name,
+    updated_label, with_topic_stats, BoardInputs, FrozenBoard, Landing, ReplyView, TopicSummary,
+    FIRST_PAINT_TIMEOUT_MS, FREEZE_CAP_MS,
 };
 use nostr_bbs_client_core::utils::lookup::zone_is_gated;
 use nostr_bbs_client_core::utils::scroll_anchor;
@@ -127,27 +127,6 @@ fn main_pane() -> Option<web_sys::HtmlElement> {
         .get_element_by_id(MAIN_PANE_ID)?
         .dyn_into::<web_sys::HtmlElement>()
         .ok()
-}
-
-/// Whether the reader is at the top of the board: the content pane is not
-/// scrolled, or row `id` (the first shown, by its `data-anchor-id`) lies
-/// wholly inside the pane.
-fn at_board_top(id: &str) -> bool {
-    let Some(pane) = main_pane() else {
-        return false;
-    };
-    if pane.scroll_top() <= 1 {
-        return true;
-    }
-    let id: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
-    let view = pane.get_bounding_client_rect();
-    pane.query_selector(&format!("[data-anchor-id=\"{id}\"]"))
-        .ok()
-        .flatten()
-        .is_some_and(|el| {
-            let r = el.get_bounding_client_rect();
-            first_row_in_full_view(r.top(), r.bottom(), view.top(), view.bottom())
-        })
 }
 
 /// Page `key`'s list one step (`older`, else newer) keeping the reader's
@@ -340,18 +319,15 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         })
     });
 
-    // Display order: painted in the true order of what is known then, then
-    // frozen (`FrozenBoard`): stats, counts and decrypts change a row's
-    // figures, never its place; a sealed root swaps in place; the reader's
-    // own new topic goes on top; other new activity waits for "↻ N
-    // updated". Leaving the board and coming back paints afresh.
-    let true_ids =
-        Memo::new(move |_| topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>()));
-    let order = RwSignal::new(if painted.get_untracked() {
-        true_ids.get_untracked()
-    } else {
-        Vec::new()
-    });
+    // Display order (`FrozenBoard`): provisional while the board loads, in
+    // the true order from structure only (the window's activity, then root
+    // creation; stats never enter it), then frozen once, for the visit, when
+    // the window has settled and the root list has answered or failed (or
+    // FREEZE_CAP_MS after rows first show). After that no row moves; "↻ N
+    // updated" offers real activity newer than the freeze. Leaving the board
+    // and coming back starts afresh. Every input is a Memo, so the board
+    // does not re-run on other channels' traffic.
+    let order = RwSignal::new(Vec::<String>::new());
     // A row still shown whose topic left the lists (evicted from the
     // window, kept in place by the board) keeps its last known figures.
     let by_id = Memo::new(move |prev: Option<&HashMap<String, TopicSummary>>| {
@@ -373,83 +349,104 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         }
         map
     });
-    let board = StoredValue::new(None::<FrozenBoard>);
+    // The window counts once it has its settled answer and still holds the
+    // channel's newest messages.
+    let window_settled = Memo::new(move |_| {
+        let cid = cid.get_value();
+        channels.history_receipt(&cid).settles(gated)
+            && channels.history_cursor(&cid).newer_from.is_none()
+    });
+    let roots_settled = Memo::new(move |_| {
+        let cid = cid.get_value();
+        channels.topic_roots_answered(&cid) || channels.topic_roots_failed(&cid)
+    });
+    // The freeze cap: FREEZE_CAP_MS after the board first shows rows.
+    let cap_expired = RwSignal::new(false);
     {
-        let me = auth.pubkey();
+        let armed = StoredValue::new(false);
         Effect::new(move |_| {
-            let shown = painted.get();
-            let cid_now = cid.get_value();
-            // The window counts once it has its settled answer and still
-            // holds the channel's newest messages.
-            let window_settled = channels.history_receipt(&cid_now).settles(gated)
-                && channels.history_cursor(&cid_now).newer_from.is_none();
-            let window_oldest = channels.channel_messages.with(|m| {
-                m.get(&cid_now)
-                    .and_then(|v| v.iter().map(|e| e.created_at).min())
-            });
-            let me_now = me.get_untracked();
-            let deleted = |id: &str| channels.tombstone_names(id);
-            let next = topics.with(|sorted| {
-                board.try_update_value(|frozen| {
-                    if !shown {
-                        return (false, Vec::new());
-                    }
-                    let b =
-                        frozen.get_or_insert_with(|| FrozenBoard::paint(sorted, window_settled));
-                    sealed_pairs.with(|pairs| b.note_aliases(pairs.iter().cloned()));
-                    // An original opened as it arrived never had its
-                    // envelope in a list: the zone cache knows the pair.
-                    b.note_aliases(sorted.iter().filter_map(|t| {
-                        restored_envelope_of(zk_store, &t.id).map(|env| (env, t.id.clone()))
-                    }));
-                    // The one permitted re-order (a paint before the window
-                    // settled) happens only while the reader is at the top.
-                    let may_reorder = b.shown().first().is_none_or(|id| at_board_top(id));
-                    b.update(
-                        sorted,
-                        &BoardInputs {
-                            me: me_now.as_deref(),
-                            window_settled,
-                            window_oldest,
-                            may_reorder,
-                            deleted: &deleted,
-                        },
-                    );
-                    (true, b.shown().to_vec())
-                })
-            });
-            let Some((frozen, next)) = next else {
+            let showing = painted.get() && !topics.with(Vec::is_empty);
+            if !showing || armed.get_value() {
                 return;
-            };
-            if order.with_untracked(|current| *current != next) {
-                // Keep the row on screen where it is, unless the reader is
-                // at the top of the board, where their new topic is seen.
-                let at_top = order.with_untracked(|o| o.first().is_some_and(|id| at_board_top(id)));
-                let anchor = if frozen && !at_top {
-                    scroll_anchor::capture(main_pane().as_deref())
-                } else {
-                    None
-                };
-                order.set(next);
-                if let Some(a) = anchor {
-                    scroll_anchor::restore(a, main_pane());
-                }
             }
+            armed.set_value(true);
+            set_timeout_once(
+                move || {
+                    let _ = cap_expired.try_set(true);
+                },
+                FREEZE_CAP_MS,
+            );
         });
     }
-    // Real activity newer than the paint, not late stats.
-    let updated = {
-        let me = auth.pubkey();
-        Memo::new(move |_| {
-            order.track();
-            let me = me.get();
-            topics.with(|sorted| {
-                board
-                    .try_with_value(|b| b.as_ref().map_or(0, |b| b.updated(sorted, me.as_deref())))
-                    .unwrap_or(0)
+    let ready_to_freeze =
+        Memo::new(move |_| cap_expired.get() || (window_settled.get() && roots_settled.get()));
+    // The newest activity known: every topic's (stats included) and the
+    // window's newest message (an edit can come back as a newest reply).
+    let newest_known = Memo::new(move |_| {
+        let cid = cid.get_value();
+        let topics_newest = topics.with(|ts| ts.iter().map(|t| t.last_activity).max().unwrap_or(0));
+        let window_newest = channels
+            .channel_messages
+            .with(|m| m.get(&cid).and_then(|evs| latest_post(evs)))
+            .map_or(0, |(_, ts)| ts);
+        topics_newest.max(window_newest)
+    });
+    let me = auth.pubkey();
+    let board = StoredValue::new(FrozenBoard::new());
+    Effect::new(move |_| {
+        let shown = painted.get();
+        let ready = ready_to_freeze.get();
+        let newest = newest_known.get();
+        let me_now = me.get();
+        let now_secs = (js_sys::Date::now() / 1000.0) as u64;
+        // The author of a row, from its last known figures, for the store's
+        // deletion decision (a sealed original's author matters).
+        let deleted = |id: &str| {
+            let author = by_id.with_untracked(|m| m.get(id).map(|t| t.pubkey.clone()));
+            channels.deletion_honoured(zk_store, id, author.as_deref().unwrap_or(""))
+        };
+        let next = classified.with(|structure| {
+            board.try_update_value(|b| {
+                sealed_pairs.with(|pairs| b.note_aliases(pairs.iter().cloned()));
+                // An original opened as it arrived never had its envelope in
+                // a list: the zone cache knows the pair.
+                b.note_aliases(structure.iter().filter_map(|t| {
+                    restored_envelope_of(zk_store, &t.id).map(|env| (env, t.id.clone()))
+                }));
+                b.update(
+                    structure,
+                    &BoardInputs {
+                        me: me_now.as_deref(),
+                        ready_to_freeze: ready,
+                        newest_known: newest,
+                        now_secs,
+                        deleted: &deleted,
+                    },
+                );
+                // Rows show once the board has painted (its loading card
+                // until then).
+                if shown {
+                    b.shown().to_vec()
+                } else {
+                    Vec::new()
+                }
             })
+        });
+        if let Some(next) = next {
+            if order.with_untracked(|current| *current != next) {
+                order.set(next);
+            }
+        }
+    });
+    let updated = Memo::new(move |_| {
+        order.track();
+        let me = me.get();
+        topics.with(|sorted| {
+            board
+                .try_with_value(|b| b.updated(sorted, me.as_deref()))
+                .unwrap_or(0)
         })
-    };
+    });
     // Older history adds topics only while the root list is incomplete.
     let can_load_older = Memo::new(move |_| {
         let cid = cid.get_value();
@@ -515,16 +512,15 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                         aria-label=move || updated_accessible_name(updated.try_get().unwrap_or(0))
                         title="Re-sort by latest activity"
                         on:click=move |_| {
+                            let newest = newest_known.get_untracked();
+                            let now_secs = (js_sys::Date::now() / 1000.0) as u64;
                             let Some(shown) = topics
                                 .try_with_untracked(|sorted| {
                                     board.try_update_value(|b| {
-                                        b.as_mut().map(|b| {
-                                            b.repaint(sorted);
-                                            b.shown().to_vec()
-                                        })
+                                        b.repaint(sorted, newest, now_secs);
+                                        b.shown().to_vec()
                                     })
                                 })
-                                .flatten()
                                 .flatten()
                             else {
                                 return;

@@ -159,7 +159,8 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
     // When the original is listed too (opened, while the envelope is still
     // held), the original is the topic and the envelope is not listed.
     let mut sealed_root: HashMap<String, String> = HashMap::new();
-    let mut shadowed: HashSet<String> = HashSet::new();
+    // Envelope id -> its listed original (the envelope is not listed).
+    let mut shadowed: HashMap<String, String> = HashMap::new();
     for t in roots.values() {
         let env = t.id.to_lowercase();
         if let Some(r) = by_id
@@ -167,15 +168,19 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
             .and_then(|e| nostr_bbs_core::sealed::parse_sealed(&e.tags))
         {
             if root_lower.contains(&r.inner_id) {
-                shadowed.insert(env);
+                shadowed.insert(env, r.inner_id);
             } else {
                 sealed_root.insert(r.inner_id, env);
             }
         }
     }
-    // Only a key that is not itself a listed root is redirected.
+    // A reply naming a shadowed envelope counts for its original; one naming
+    // an original listed only as its envelope counts for the envelope; any
+    // other listed root is itself.
     let resolve = |k: String| {
-        if root_lower.contains(&k) {
+        if let Some(inner) = shadowed.get(&k) {
+            inner.clone()
+        } else if root_lower.contains(&k) {
             k
         } else {
             sealed_root.get(&k).cloned().unwrap_or(k)
@@ -228,7 +233,7 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
     // Newest activity first — the BBS convention (bumped threads rise).
     let mut out: Vec<TopicSummary> = root_order
         .into_iter()
-        .filter(|id| !shadowed.contains(&id.to_lowercase()))
+        .filter(|id| !shadowed.contains_key(&id.to_lowercase()))
         .filter_map(|id| roots.remove(&id))
         .collect();
     out.sort_by(board_order);
@@ -314,91 +319,79 @@ pub fn sealed_aliases(events: &[NostrEvent]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// How long after a list first shows rows it freezes whatever has or has
+/// not arrived, in milliseconds (see [`FrozenBoard`]).
+pub const FREEZE_CAP_MS: i32 = 20_000;
+
+/// How recent the reader's own topic must be (seconds before the freeze,
+/// on the same device clock) to go on top rather than at the bottom.
+pub const OWN_TOPIC_GRACE_SECS: u64 = 120;
+
 /// What a board knows at each update besides the topics themselves.
 pub struct BoardInputs<'a> {
-    /// The reader's pubkey, for their own new topic.
+    /// The reader's pubkey, for their own just-posted topic.
     pub me: Option<&'a str>,
-    /// Whether the history window has its settled answer and holds the
-    /// channel's newest messages (not detached by older paging).
-    pub window_settled: bool,
-    /// The oldest message of that window, when it is settled: a topic
-    /// active since then has its exact last activity.
-    pub window_oldest: Option<u64>,
-    /// Whether the board may be re-painted once now (see
-    /// [`FrozenBoard::update`]): the reader is at the top of the list and
-    /// has not scrolled.
-    pub may_reorder: bool,
-    /// Whether a topic id is deleted (a kind-5 names it). A topic that is
-    /// missing but not deleted was only evicted from the window and keeps
-    /// its row.
+    /// Whether the board may freeze now: its history window has settled
+    /// (and holds the channel's newest messages) and its root list has
+    /// answered or failed, or [`FREEZE_CAP_MS`] has passed since the list
+    /// first showed rows.
+    pub ready_to_freeze: bool,
+    /// The newest activity known now: the newest last activity of every
+    /// topic (stats included) and the newest message in the window (edits
+    /// included, which can come back as a topic's newest reply).
+    pub newest_known: u64,
+    /// The wall clock, in seconds.
+    pub now_secs: u64,
+    /// Whether a topic's deletion is honoured (the store's admission
+    /// decision). A topic that is missing but not deleted keeps its row.
     pub deleted: &'a dyn Fn(&str) -> bool,
 }
 
-/// A board's display order, frozen when it paints.
+/// A board's display order: provisional while it loads, then frozen once
+/// for the visit.
 ///
-/// It paints in the true order ([`board_order`] over what is known then).
-/// After that no row changes place on its own: stats, reply counts and
-/// decrypted titles change a row's figures only. What can change the list:
+/// **Provisional** until the history window has settled and the root list
+/// has answered or failed (or [`FREEZE_CAP_MS`] after rows first show). Its
+/// order is the true order from structure only, the list the caller passes
+/// to [`FrozenBoard::update`]: topics with activity in the window by that
+/// activity, the rest below by root creation, ties by id. Stats never enter
+/// it, so it moves only when the window or the root list lands. Nothing is
+/// counted as updated, and an empty list never freezes.
 ///
-/// - nothing is frozen while there is nothing to show: an empty paint
-///   follows the true order until the first topic arrives;
-/// - a board painted before its history window settled (the paint hold
-///   expired) is re-painted once in the true order when it settles, if the
-///   reader is still at the top; otherwise it keeps its order and takes the
-///   settled window's newest activity as its baseline, so nothing reads as
-///   new that is not;
-/// - a sealed root that opens (or reverts) swaps in place, by the pairs of
+/// **Frozen** at the first update that may freeze: the order is the
+/// provisional order then, the baseline the newest activity known, the
+/// paint time the wall clock. From then on no row moves:
+///
+/// - stats, counts and decrypts change a row's figures only;
+/// - a sealed root swaps in place, by the pairs of
 ///   [`FrozenBoard::note_aliases`];
-/// - a topic that is deleted is dropped; one that is merely missing (evicted
-///   from the window by older paging, or between two halves of a swap)
-///   keeps its row;
-/// - a topic not shown yet whose activity is no newer than the baseline (a
-///   late root list, an older page) is appended at the bottom;
-/// - the reader's own topic, not known at paint, goes on top;
-/// - any other activity newer than the baseline is not shown: it is counted
-///   by [`FrozenBoard::updated`] until the reader asks for it
-///   ([`FrozenBoard::repaint`]).
+/// - a row leaves only when its deletion is honoured; one merely missing
+///   (evicted from the window, or between two halves of a swap) stays;
+/// - a topic not shown goes on top only if it is the reader's own and was
+///   created at most [`OWN_TOPIC_GRACE_SECS`] before the paint (or after);
+///   otherwise it is appended at the bottom, always shown.
+///
+/// [`FrozenBoard::updated`] counts real activity newer than the baseline;
+/// [`FrozenBoard::repaint`] (the reader pressing the control) re-sorts by
+/// the full true order and stays frozen.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FrozenBoard {
     shown: Vec<String>,
-    newest: u64,
+    frozen: bool,
+    baseline: u64,
+    painted_at: u64,
     aliases: HashMap<String, String>,
-    settled: bool,
-    known_at_paint: HashSet<String>,
-    appended: HashSet<String>,
-    window_oldest: Option<u64>,
 }
 
 impl FrozenBoard {
-    /// Paint `sorted` (the true order, by [`board_order`]) as it is now;
-    /// `window_settled` as in [`BoardInputs`].
-    pub fn paint(sorted: &[TopicSummary], window_settled: bool) -> Self {
-        let mut seen = HashSet::new();
-        let shown: Vec<String> = sorted
-            .iter()
-            .filter(|t| seen.insert(t.id.as_str()))
-            .map(|t| t.id.clone())
-            .collect();
-        FrozenBoard {
-            known_at_paint: shown.iter().cloned().collect(),
-            shown,
-            newest: sorted.iter().map(|t| t.last_activity).max().unwrap_or(0),
-            aliases: HashMap::new(),
-            settled: window_settled,
-            appended: HashSet::new(),
-            window_oldest: None,
-        }
+    /// A provisional board with nothing shown.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Paint again (the reader asked for the true order), keeping the
-    /// sealed pairs already seen.
-    pub fn repaint(&mut self, sorted: &[TopicSummary]) {
-        let aliases = std::mem::take(&mut self.aliases);
-        let settled = self.settled;
-        let window_oldest = self.window_oldest;
-        *self = FrozenBoard::paint(sorted, settled);
-        self.aliases = aliases;
-        self.window_oldest = window_oldest;
+    /// Whether the board has frozen.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
     }
 
     /// The topic ids shown, in order.
@@ -406,9 +399,9 @@ impl FrozenBoard {
         &self.shown
     }
 
-    /// The newest activity of the baseline: anything newer is new.
-    pub fn newest_at_paint(&self) -> u64 {
-        self.newest
+    /// The baseline: activity newer than this is new.
+    pub fn baseline(&self) -> u64 {
+        self.baseline
     }
 
     /// Record sealed (envelope, original) pairs, both ways. An envelope
@@ -420,65 +413,55 @@ impl FrozenBoard {
         }
     }
 
-    /// Follow the true list `sorted` (see the type's docs). Returns whether
-    /// the shown list changed.
-    pub fn update(&mut self, sorted: &[TopicSummary], inputs: &BoardInputs<'_>) -> bool {
-        let before = self.shown.clone();
-        if inputs.window_settled {
-            self.window_oldest = inputs.window_oldest;
-        }
-        if self.shown.is_empty() {
-            // Nothing painted yet: never freeze an empty board.
-            self.repaint(sorted);
-            self.settled = inputs.window_settled;
+    /// Follow `structure`, the true order from structure only (see the
+    /// type's docs). Returns whether the shown list changed.
+    pub fn update(&mut self, structure: &[TopicSummary], inputs: &BoardInputs<'_>) -> bool {
+        let before = std::mem::take(&mut self.shown);
+        if !self.frozen {
+            let mut seen = HashSet::new();
+            self.shown = structure
+                .iter()
+                .filter(|t| seen.insert(t.id.as_str()))
+                .map(|t| t.id.clone())
+                .collect();
+            if inputs.ready_to_freeze && !self.shown.is_empty() {
+                self.frozen = true;
+                self.baseline = inputs
+                    .newest_known
+                    .max(structure.iter().map(|t| t.last_activity).max().unwrap_or(0));
+                self.painted_at = inputs.now_secs;
+            }
             return self.shown != before;
         }
-        if !self.settled && inputs.window_settled {
-            // The paint hold expired before the window settled: re-base once.
-            self.settled = true;
-            if inputs.may_reorder {
-                self.repaint(sorted);
-                return self.shown != before;
-            }
-            self.newest = self
-                .newest
-                .max(sorted.iter().map(|t| t.last_activity).max().unwrap_or(0));
-        }
-        let listed: HashMap<&str, &TopicSummary> =
-            sorted.iter().map(|t| (t.id.as_str(), t)).collect();
-        let shown_set: HashSet<&str> = self.shown.iter().map(String::as_str).collect();
-        let mut seen: HashSet<String> = HashSet::with_capacity(sorted.len());
-        let mut kept: Vec<String> = Vec::with_capacity(self.shown.len());
-        for id in &self.shown {
-            let id = if listed.contains_key(id.as_str()) {
-                id.as_str()
+        let listed: HashSet<&str> = structure.iter().map(|t| t.id.as_str()).collect();
+        let shown_set: HashSet<&str> = before.iter().map(String::as_str).collect();
+        let mut seen: HashSet<String> = HashSet::with_capacity(structure.len());
+        let mut kept: Vec<String> = Vec::with_capacity(before.len());
+        for id in &before {
+            let alias = self.aliases.get(id);
+            let id = if listed.contains(id.as_str()) {
+                id.clone()
+            } else if let Some(a) =
+                alias.filter(|a| listed.contains(a.as_str()) && !shown_set.contains(a.as_str()))
+            {
+                a.clone()
+            } else if (inputs.deleted)(id) || alias.is_some_and(|a| (inputs.deleted)(a)) {
+                continue;
             } else {
-                match self.aliases.get(id).map(String::as_str) {
-                    Some(a) if listed.contains_key(a) && !shown_set.contains(a) => a,
-                    // Gone: dropped only when deleted; an evicted topic (or
-                    // one between two halves of a swap) keeps its row.
-                    _ if (inputs.deleted)(id) => continue,
-                    _ => id.as_str(),
-                }
+                id.clone()
             };
-            if seen.insert(id.to_string()) {
-                kept.push(id.to_string());
+            if seen.insert(id.clone()) {
+                kept.push(id);
             }
         }
         let mut top = Vec::new();
-        for t in sorted {
-            if seen.contains(&t.id) {
-                continue;
-            }
-            let own_new =
-                inputs.me.is_some_and(|m| t.pubkey == m) && !self.known_at_paint.contains(&t.id);
-            if own_new {
-                seen.insert(t.id.clone());
-                top.push(t.id.clone());
-            } else if t.last_activity <= self.newest {
-                seen.insert(t.id.clone());
-                self.appended.insert(t.id.clone());
-                kept.push(t.id.clone());
+        for t in structure {
+            if seen.insert(t.id.clone()) {
+                if self.just_posted_by(t, inputs.me) {
+                    top.push(t.id.clone());
+                } else {
+                    kept.push(t.id.clone());
+                }
             }
         }
         top.extend(kept);
@@ -486,22 +469,30 @@ impl FrozenBoard {
         self.shown != before
     }
 
-    /// How many topics the "↻ N updated" control offers: those with
-    /// activity newer than the baseline that are not already, in order, at
-    /// the top of the list, plus topics appended at the bottom after paint
-    /// (a late root list, an older page) that are active within the settled
-    /// window, so belong higher. The reader's own topics never count. Stats
-    /// that arrive late never count: a topic's activity outside the window
-    /// is older than the window.
+    /// The reader's own topic, created at most [`OWN_TOPIC_GRACE_SECS`]
+    /// before the paint.
+    fn just_posted_by(&self, t: &TopicSummary, me: Option<&str>) -> bool {
+        me.is_some_and(|m| t.pubkey == m)
+            && t.created_at.saturating_add(OWN_TOPIC_GRACE_SECS) >= self.painted_at
+    }
+
+    /// "↻ N updated": the topics of `sorted` (the full true order, stats
+    /// included) with activity newer than the baseline that are not already
+    /// in place as the top of the list, leaving out only the reader's own
+    /// just-posted topic. Any author's activity counts, other people's
+    /// replies to the reader's topics included. Zero while provisional.
     pub fn updated(&self, sorted: &[TopicSummary], me: Option<&str>) -> usize {
-        let own: HashSet<&str> = sorted
+        if !self.frozen {
+            return 0;
+        }
+        let mine: HashSet<&str> = sorted
             .iter()
-            .filter(|t| me.is_some_and(|m| t.pubkey == m))
+            .filter(|t| self.just_posted_by(t, me))
             .map(|t| t.id.as_str())
             .collect();
-        let others = || sorted.iter().filter(|t| !own.contains(t.id.as_str()));
-        let fresh: Vec<&str> = others()
-            .filter(|t| t.last_activity > self.newest)
+        let fresh: Vec<&str> = sorted
+            .iter()
+            .filter(|t| t.last_activity > self.baseline && !mine.contains(t.id.as_str()))
             .map(|t| t.id.as_str())
             .collect();
         let in_place = fresh
@@ -510,34 +501,27 @@ impl FrozenBoard {
                 self.shown
                     .iter()
                     .map(String::as_str)
-                    .filter(|id| !own.contains(id)),
+                    .filter(|id| !mine.contains(id)),
             )
             .take_while(|(f, s)| **f == *s)
             .count();
-        let misplaced = self.window_oldest.map_or(0, |oldest| {
-            others()
-                .filter(|t| {
-                    self.appended.contains(&t.id)
-                        && t.last_activity >= oldest
-                        && t.last_activity <= self.newest
-                })
-                .count()
-        });
-        fresh.len() - in_place + misplaced
+        fresh.len() - in_place
     }
-}
 
-/// Whether the reader is at the top of a list: the list's first row lies
-/// wholly inside the viewport (`row_*` and `view_*` are top and bottom
-/// edges in the same coordinates). A new topic is then inserted in view
-/// rather than above it; a reader further down keeps their place.
-pub fn first_row_in_full_view(
-    row_top: f64,
-    row_bottom: f64,
-    view_top: f64,
-    view_bottom: f64,
-) -> bool {
-    row_top >= view_top - 0.5 && row_bottom <= view_bottom + 0.5
+    /// The reader pressed the control: show `sorted` (the full true order,
+    /// stats included), take `newest_known` as the new baseline, stay
+    /// frozen. Sealed pairs are kept.
+    pub fn repaint(&mut self, sorted: &[TopicSummary], newest_known: u64, now_secs: u64) {
+        let mut seen = HashSet::new();
+        self.shown = sorted
+            .iter()
+            .filter(|t| seen.insert(t.id.as_str()))
+            .map(|t| t.id.clone())
+            .collect();
+        self.frozen = true;
+        self.baseline = newest_known.max(sorted.iter().map(|t| t.last_activity).max().unwrap_or(0));
+        self.painted_at = now_secs;
+    }
 }
 
 /// Text of the control that re-sorts a board shown out of order: "↻ N
@@ -980,14 +964,24 @@ mod tests {
         false
     }
 
-    /// Inputs for a settled window whose oldest message is `oldest`.
-    fn settled<'a>(me: Option<&'a str>, oldest: u64) -> BoardInputs<'a> {
+    fn newest(ts: &[TopicSummary]) -> u64 {
+        ts.iter().map(|t| t.last_activity).max().unwrap_or(0)
+    }
+
+    /// Inputs for an update at wall clock `now`.
+    fn inputs<'a>(
+        me: Option<&'a str>,
+        ready: bool,
+        newest_known: u64,
+        now: u64,
+        deleted: &'a dyn Fn(&str) -> bool,
+    ) -> BoardInputs<'a> {
         BoardInputs {
             me,
-            window_settled: true,
-            window_oldest: Some(oldest),
-            may_reorder: true,
-            deleted: &never_deleted,
+            ready_to_freeze: ready,
+            newest_known,
+            now_secs: now,
+            deleted,
         }
     }
 
@@ -1006,68 +1000,163 @@ mod tests {
         }
     }
 
-    /// The invariant: once a board is painted from a settled window (or
-    /// has been re-based when its window settled after a paint from the
-    /// root list alone, or first frozen after an empty paint), whatever
-    /// arrives (stats raising a tail topic's activity up to the window's
-    /// oldest message, COUNTs including 0 then the real count, sealed swaps
-    /// both ways, late roots no newer than the paint, figure-only changes),
-    /// the shown order is the frozen order (sealed pairs read as one) with
-    /// rows only appended at the end, and nothing counts as updated.
+    /// One topic of the seeded model: what the root list knows (`created`),
+    /// what the window knows (`window_last`, for topics active in it) and
+    /// what stats would add (`stats_last`, never past the window's oldest
+    /// message for a topic outside it).
+    #[derive(Clone)]
+    struct Model {
+        id: String,
+        author: &'static str,
+        created: u64,
+        window_last: Option<u64>,
+        stats_last: Option<u64>,
+        replies: u32,
+        in_window_list: bool,
+        evicted: bool,
+    }
+
+    /// The invariant, over 300 seeds:
+    /// - provisional: the order changes only when the window or the root
+    ///   list lands, never on stats, and nothing counts as updated;
+    /// - frozen: under any mix of stats, COUNTs (0 then real), decrypts,
+    ///   sealed swaps, evictions and their return, late roots, older
+    ///   pages and the reader's old topics arriving late, no frozen row
+    ///   changes place, rows are only appended at the end, and a quiet
+    ///   section counts nothing as updated.
     #[test]
-    fn nothing_after_paint_moves_a_row_or_counts_as_updated() {
-        const WINDOW_OLDEST: u64 = 1_000;
+    fn provisional_moves_only_on_window_or_roots_and_frozen_never_moves() {
+        const W: u64 = 1_000; // the window's oldest message
+        const ME: &str = "me";
         for seed in 1..=300u64 {
             let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-            let mut topics: Vec<TopicSummary> = Vec::new();
-            // In-window topics: exact activity newer than the window's
-            // oldest message; the root list alone only knows their start.
-            let mut window_last = Vec::new();
+            let mut model: Vec<Model> = Vec::new();
             for i in 0..8 {
-                let created = rng.below(WINDOW_OLDEST);
-                window_last.push(WINDOW_OLDEST + 1 + rng.below(500));
-                topics.push(topic(&format!("w{i}"), "a", created, created));
+                model.push(Model {
+                    id: format!("w{i}"),
+                    author: "a",
+                    created: rng.below(W),
+                    window_last: Some(W + 1 + rng.below(500)),
+                    stats_last: None,
+                    replies: 0,
+                    in_window_list: true,
+                    evicted: false,
+                });
             }
             for i in 0..20 {
-                let created = rng.below(WINDOW_OLDEST);
-                topics.push(topic(&format!("t{i}"), "b", created, created));
+                let created = rng.below(W);
+                model.push(Model {
+                    id: format!("t{i}"),
+                    author: if i < 3 { ME } else { "b" },
+                    created,
+                    window_last: None,
+                    stats_last: Some(created + rng.below(W - created)),
+                    replies: 0,
+                    in_window_list: false,
+                    evicted: false,
+                });
             }
-            topics.push(topic("env", "m", 400, 400));
-            let apply_window = |ts: &mut Vec<TopicSummary>| {
-                for (i, last) in window_last.iter().enumerate() {
-                    if let Some(t) = ts.iter_mut().find(|t| t.id == format!("w{i}")) {
-                        t.last_activity = *last;
-                    }
-                }
+            model.push(Model {
+                id: "env".into(),
+                author: "m",
+                created: 400,
+                window_last: None,
+                stats_last: None,
+                replies: 0,
+                in_window_list: false,
+                evicted: false,
+            });
+            let (mut window, mut roots, mut stats_in) = (false, false, false);
+            // Structure only (no stats), and the full list (with the stats
+            // that are in), as a page derives them.
+            let structure = |m: &[Model], window: bool, roots: bool| -> Vec<TopicSummary> {
+                sorted(
+                    m.iter()
+                        .filter(|t| !t.evicted)
+                        .filter(|t| roots || (window && t.in_window_list))
+                        .map(|t| {
+                            let last = window
+                                .then_some(t.window_last)
+                                .flatten()
+                                .unwrap_or(t.created);
+                            let mut s = topic(&t.id, t.author, t.created, last);
+                            s.reply_count = t.replies;
+                            s
+                        })
+                        .collect(),
+                )
             };
-            // Three ways to paint: from the settled window, from the root
-            // list alone (the hold expired), or with nothing at all.
-            let mode = seed % 3;
-            let mut board = match mode {
-                0 => {
-                    apply_window(&mut topics);
-                    FrozenBoard::paint(&sorted(topics.clone()), true)
-                }
-                1 => FrozenBoard::paint(&sorted(topics.clone()), false),
-                _ => FrozenBoard::paint(&[], false),
+            let full = |m: &[Model], window: bool, roots: bool, stats_in: bool| {
+                sorted(
+                    structure(m, window, roots)
+                        .into_iter()
+                        .map(|mut s| {
+                            if stats_in {
+                                if let Some(st) =
+                                    m.iter().find(|t| t.id == s.id).and_then(|t| t.stats_last)
+                                {
+                                    s.last_activity = s.last_activity.max(st);
+                                }
+                            }
+                            s
+                        })
+                        .collect(),
+                )
             };
+            let cap_freeze = seed % 5 == 0;
+            let mut board = FrozenBoard::new();
             board.note_aliases([("env".to_string(), "orig".to_string())]);
-            if mode != 0 {
-                // The window settles: re-based (the reader is at the top),
-                // or first frozen after the empty paint.
-                apply_window(&mut topics);
-                board.update(
-                    &sorted(topics.clone()),
-                    &settled(Some("reader"), WINDOW_OLDEST),
+            let window_first = rng.below(2) == 0;
+            let mut now = 2_000u64;
+            // Provisional phase: arrivals interleaved with stats answers.
+            for step in 0..6 {
+                let before = board.shown().to_vec();
+                let landing = match step {
+                    1 if window_first => {
+                        window = true;
+                        true
+                    }
+                    1 => {
+                        roots = true;
+                        true
+                    }
+                    3 if window_first => {
+                        roots = true;
+                        true
+                    }
+                    3 => {
+                        window = true;
+                        true
+                    }
+                    _ => {
+                        stats_in = true;
+                        false
+                    }
+                };
+                let ready = (window && roots && step == 5) || (cap_freeze && step == 2);
+                let st = structure(&model, window, roots);
+                let fl = full(&model, window, roots, stats_in);
+                let changed = board.update(
+                    &st,
+                    &inputs(Some(ME), ready, newest(&fl), now, &never_deleted),
                 );
+                if !landing && !board.is_frozen() {
+                    assert!(
+                        !changed,
+                        "seed {seed} step {step}: stats moved a provisional row"
+                    );
+                    assert_eq!(board.shown(), &before[..]);
+                }
+                if !board.is_frozen() {
+                    assert_eq!(
+                        board.updated(&fl, Some(ME)),
+                        0,
+                        "seed {seed}: hidden while provisional"
+                    );
+                }
             }
+            assert!(board.is_frozen(), "seed {seed}");
             let frozen: Vec<String> = board.shown().to_vec();
-            assert_eq!(frozen.len(), topics.len(), "seed {seed}: nothing hidden");
-            assert_eq!(
-                board.updated(&sorted(topics.clone()), Some("reader")),
-                0,
-                "seed {seed}: no phantom updates after the window settles"
-            );
             let canon = |id: &str| {
                 if id == "orig" {
                     "env".to_string()
@@ -1076,26 +1165,21 @@ mod tests {
                 }
             };
             let mut late = 0;
-            for _ in 0..60 {
-                let n = topics.len() as u64;
-                match rng.below(5) {
-                    0 => {
-                        let t = &mut topics[rng.below(n) as usize];
-                        if t.last_activity <= WINDOW_OLDEST {
-                            t.last_activity = t.last_activity.max(rng.below(WINDOW_OLDEST));
-                            t.last_pubkey = "z".into();
-                        }
-                    }
+            for _ in 0..80 {
+                now += 1;
+                let n = model.len() as u64;
+                match rng.below(7) {
+                    0 => stats_in = true,
                     1 => {
-                        let t = &mut topics[rng.below(n) as usize];
-                        t.reply_count = if rng.below(2) == 0 {
+                        let t = &mut model[rng.below(n) as usize];
+                        t.replies = if rng.below(2) == 0 {
                             0
                         } else {
                             1 + rng.below(30) as u32
                         };
                     }
                     2 => {
-                        for t in topics.iter_mut() {
+                        for t in model.iter_mut() {
                             if t.id == "env" {
                                 t.id = "orig".into();
                             } else if t.id == "orig" {
@@ -1104,114 +1188,102 @@ mod tests {
                         }
                     }
                     3 => {
-                        let created = rng.below(WINDOW_OLDEST);
-                        topics.push(topic(&format!("late{late}"), "c", created, created));
+                        // Eviction by older paging, or its return.
+                        let t = &mut model[rng.below(n) as usize];
+                        t.evicted = !t.evicted;
+                    }
+                    4 => {
+                        // A late root or an older page: old, quiet.
+                        let created = rng.below(W);
+                        model.push(Model {
+                            id: format!("late{late}"),
+                            author: if rng.below(3) == 0 { ME } else { "c" },
+                            created,
+                            window_last: None,
+                            stats_last: Some(created),
+                            replies: 0,
+                            in_window_list: false,
+                            evicted: false,
+                        });
                         late += 1;
                     }
-                    _ => {
-                        let t = &mut topics[rng.below(n) as usize];
-                        t.content.push('!');
+                    5 => {
+                        // A decrypt: figures only.
+                        let t = &mut model[rng.below(n) as usize];
+                        t.replies = t.replies.saturating_add(0);
                     }
+                    _ => {}
                 }
-                let now = sorted(topics.clone());
-                board.update(&now, &settled(Some("reader"), WINDOW_OLDEST));
+                // Window and roots stay landed (a cap freeze lands them now).
+                window = true;
+                roots = true;
+                let st = structure(&model, window, roots);
+                let fl = full(&model, window, roots, stats_in);
+                board.update(
+                    &st,
+                    &inputs(Some(ME), true, newest(&fl), now, &never_deleted),
+                );
                 let shown: Vec<String> = board.shown().iter().map(|id| canon(id)).collect();
-                assert_eq!(&shown[..frozen.len()], &frozen[..], "seed {seed}");
+                assert_eq!(
+                    &shown[..frozen.len()],
+                    &frozen[..],
+                    "seed {seed}: a frozen row moved"
+                );
                 assert!(
                     shown[frozen.len()..]
                         .iter()
                         .all(|id| id.starts_with("late")),
                     "seed {seed}: only late roots are appended"
                 );
-                assert_eq!(board.updated(&now, Some("reader")), 0, "seed {seed}");
                 let unique: HashSet<&String> = board.shown().iter().collect();
                 assert_eq!(unique.len(), board.shown().len(), "seed {seed}");
+                if !cap_freeze {
+                    assert_eq!(
+                        board.updated(&fl, Some(ME)),
+                        0,
+                        "seed {seed}: quiet section"
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn a_paint_before_the_window_settled_is_re_based_once() {
-        // Painted from the root list alone (creation order) on the hold.
-        let mut ts = vec![
-            topic("old-busy", "x", 5, 5),
-            topic("new-quiet", "x", 50, 50),
-        ];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), false);
-        assert_eq!(board.shown(), &ids(&["new-quiet", "old-busy"])[..]);
-        // The window settles: old-busy had a reply at 900.
-        ts[0].last_activity = 900;
-        ts.push(topic("window-only", "x", 3, 800));
-        let now = sorted(ts.clone());
-        assert!(board.update(&now, &settled(None, 700)));
-        assert_eq!(
-            board.shown(),
-            &ids(&["old-busy", "window-only", "new-quiet"])[..]
-        );
-        assert_eq!(board.updated(&now, None), 0);
-        // Only once: later activity is counted, not re-sorted.
-        ts[2].last_activity = 950;
-        let now = sorted(ts.clone());
-        assert!(!board.update(&now, &settled(None, 700)));
-        assert_eq!(board.updated(&now, None), 1);
-    }
-
-    #[test]
-    fn a_scrolled_reader_keeps_the_order_and_sees_no_phantom_updates() {
-        let mut ts = vec![
-            topic("old-busy", "x", 5, 5),
-            topic("new-quiet", "x", 50, 50),
-        ];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), false);
-        ts[0].last_activity = 900;
-        ts.push(topic("window-only", "x", 3, 800));
-        let now = sorted(ts.clone());
-        let scrolled = BoardInputs {
-            may_reorder: false,
-            ..settled(None, 700)
-        };
-        board.update(&now, &scrolled);
-        assert_eq!(
-            board.shown(),
-            &ids(&["new-quiet", "old-busy", "window-only"])[..]
-        );
-        // Nothing was posted: the baseline is the settled window. The
-        // window-only topic belongs higher and is offered by the control.
-        assert_eq!(board.updated(&now, None), 1);
-    }
-
-    #[test]
-    fn an_empty_paint_is_never_frozen() {
-        let mut board = FrozenBoard::paint(&[], false);
+    fn an_empty_list_is_never_frozen() {
+        let mut board = FrozenBoard::new();
+        board.update(&[], &inputs(None, true, 0, 10, &never_deleted));
+        assert!(!board.is_frozen());
         let ts = sorted(vec![topic("a", "x", 10, 50), topic("b", "x", 5, 40)]);
-        assert!(board.update(&ts, &settled(None, 30)));
+        board.update(&ts, &inputs(None, true, 50, 10, &never_deleted));
+        assert!(board.is_frozen());
         assert_eq!(board.shown(), &ids(&["a", "b"])[..]);
         assert_eq!(board.updated(&ts, None), 0);
     }
 
     #[test]
-    fn an_evicted_topic_keeps_its_row_and_a_deleted_one_is_dropped() {
-        let ts = vec![
-            topic("a", "x", 10, 50),
-            topic("b", "x", 5, 40),
-            topic("c", "x", 1, 30),
-        ];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), true);
-        // b paged out of the window: still shown, in place.
-        let without_b = sorted(vec![ts[0].clone(), ts[2].clone()]);
-        assert!(!board.update(&without_b, &settled(None, 20)));
-        assert_eq!(board.shown(), &ids(&["a", "b", "c"])[..]);
-        // Paged back in: same place, not appended.
-        assert!(!board.update(&sorted(ts.clone()), &settled(None, 20)));
-        assert_eq!(board.shown(), &ids(&["a", "b", "c"])[..]);
-        // Deleted (a kind-5 names it): dropped.
-        let deleted = |id: &str| id == "b";
-        let inputs = BoardInputs {
-            deleted: &deleted,
-            ..settled(None, 20)
-        };
-        assert!(board.update(&without_b, &inputs));
-        assert_eq!(board.shown(), &ids(&["a", "c"])[..]);
+    fn provisional_follows_structure_and_freezes_once() {
+        let mut board = FrozenBoard::new();
+        // Root list first: creation order.
+        let roots_only = sorted(vec![topic("busy", "x", 5, 5), topic("quiet", "x", 50, 50)]);
+        board.update(&roots_only, &inputs(None, false, 50, 10, &never_deleted));
+        assert_eq!(board.shown(), &ids(&["quiet", "busy"])[..]);
+        // The window lands (busy replied at 900) and the board may freeze.
+        let settled = sorted(vec![
+            topic("busy", "x", 5, 900),
+            topic("quiet", "x", 50, 50),
+        ]);
+        board.update(&settled, &inputs(None, true, 900, 10, &never_deleted));
+        assert!(board.is_frozen());
+        assert_eq!(board.shown(), &ids(&["busy", "quiet"])[..]);
+        assert_eq!(board.baseline(), 900);
+        // Frozen: a later structure change does not re-order.
+        let later = sorted(vec![
+            topic("busy", "x", 5, 900),
+            topic("quiet", "x", 50, 950),
+        ]);
+        assert!(!board.update(&later, &inputs(None, true, 950, 11, &never_deleted)));
+        assert_eq!(board.shown(), &ids(&["busy", "quiet"])[..]);
+        assert_eq!(board.updated(&later, None), 1);
     }
 
     #[test]
@@ -1221,83 +1293,135 @@ mod tests {
             topic("b", "x", 5, 40),
             topic("c", "x", 1, 1),
         ];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), true);
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs(None, true, 50, 10, &never_deleted),
+        );
         let painted = board.shown().to_vec();
         for count in [0, 25, 0, 3] {
             ts[2].reply_count = count;
             let now = sorted(ts.clone());
-            assert!(!board.update(&now, &settled(None, 20)));
+            assert!(!board.update(&now, &inputs(None, true, 50, 11, &never_deleted)));
             assert_eq!(board.shown(), &painted[..]);
             assert_eq!(board.updated(&now, None), 0);
         }
     }
 
     #[test]
-    fn one_reply_newer_than_the_paint_counts_one_and_moves_nothing() {
-        let mut ts = vec![
-            topic("a", "x", 10, 50),
-            topic("b", "x", 5, 40),
-            topic("c", "x", 1, 30),
-        ];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), true);
-        ts[2].last_activity = 60;
+    fn another_user_s_reply_to_the_reader_s_topic_counts() {
+        // The reader's old topic sits below b; someone replies to it.
+        let mut ts = vec![topic("b", "x", 5, 60), topic("mine", "me", 10, 50)];
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs(Some("me"), true, 60, 1_000, &never_deleted),
+        );
+        ts[1].last_activity = 70;
         let now = sorted(ts.clone());
-        board.update(&now, &settled(None, 20));
-        assert_eq!(board.shown(), &ids(&["a", "b", "c"])[..]);
-        assert_eq!(board.updated(&now, None), 1);
-        // A new reply in the topic already at the top is already in place.
-        let mut ts = vec![topic("a", "x", 10, 50), topic("b", "x", 5, 40)];
-        let board = FrozenBoard::paint(&sorted(ts.clone()), true);
-        ts[0].last_activity = 70;
-        assert_eq!(board.updated(&sorted(ts), None), 0);
+        board.update(&now, &inputs(Some("me"), true, 70, 1_001, &never_deleted));
+        assert_eq!(
+            board.updated(&now, Some("me")),
+            1,
+            "a reply to the reader's topic counts"
+        );
     }
 
     #[test]
-    fn someone_else_s_new_topic_waits_for_the_control() {
+    fn the_reader_s_dormant_topic_arriving_late_goes_to_the_bottom() {
         let mut ts = vec![topic("a", "x", 10, 50), topic("b", "x", 5, 40)];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), true);
-        ts.push(topic("n", "other", 80, 80));
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs(Some("me"), true, 50, 1_000, &never_deleted),
+        );
+        ts.push(topic("old-mine", "me", 20, 45));
         let now = sorted(ts.clone());
-        assert!(!board.update(&now, &settled(Some("me"), 20)));
-        assert_eq!(board.shown(), &ids(&["a", "b"])[..]);
-        assert_eq!(board.updated(&now, Some("me")), 1);
-    }
-
-    #[test]
-    fn the_reader_s_own_new_topic_goes_on_top_whatever_its_clock() {
-        let mut ts = vec![topic("a", "x", 10, 50), topic("b", "x", 5, 40)];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), true);
-        // Their clock is behind: created_at older than the newest at paint.
-        ts.push(topic("mine", "me", 30, 30));
-        let now = sorted(ts.clone());
-        assert!(board.update(&now, &settled(Some("me"), 20)));
-        assert_eq!(board.shown(), &ids(&["mine", "a", "b"])[..]);
-        assert_eq!(board.updated(&now, Some("me")), 0, "own topics never count");
-        // And a newer one of theirs does not count either.
-        ts.push(topic("mine2", "me", 90, 90));
-        let now = sorted(ts.clone());
-        board.update(&now, &settled(Some("me"), 20));
-        assert_eq!(board.shown()[0], "mine2");
+        board.update(&now, &inputs(Some("me"), true, 50, 1_001, &never_deleted));
+        assert_eq!(board.shown(), &ids(&["a", "b", "old-mine"])[..]);
         assert_eq!(board.updated(&now, Some("me")), 0);
     }
 
     #[test]
-    fn the_control_paints_the_true_order() {
+    fn the_reader_s_just_posted_topic_goes_on_top_and_does_not_count() {
+        let mut ts = vec![topic("a", "x", 10, 50), topic("b", "x", 5, 40)];
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs(Some("me"), true, 50, 1_000, &never_deleted),
+        );
+        // Posted just now on the same device clock.
+        ts.push(topic("mine", "me", 1_010, 1_010));
+        let now = sorted(ts.clone());
+        board.update(
+            &now,
+            &inputs(Some("me"), true, 1_010, 1_010, &never_deleted),
+        );
+        assert_eq!(board.shown(), &ids(&["mine", "a", "b"])[..]);
+        assert_eq!(board.updated(&now, Some("me")), 0);
+        // Someone else's new topic is appended at the bottom, shown, counted.
+        ts.push(topic("theirs", "x", 1_020, 1_020));
+        let now = sorted(ts.clone());
+        board.update(
+            &now,
+            &inputs(Some("me"), true, 1_020, 1_020, &never_deleted),
+        );
+        assert_eq!(board.shown(), &ids(&["mine", "a", "b", "theirs"])[..]);
+        assert_eq!(board.updated(&now, Some("me")), 1);
+    }
+
+    #[test]
+    fn rows_leave_only_on_an_honoured_deletion() {
+        let ts = vec![
+            topic("a", "x", 10, 50),
+            topic("b", "x", 5, 40),
+            topic("orig", "x", 1, 30),
+        ];
+        let mut board = FrozenBoard::new();
+        board.note_aliases([("env".to_string(), "orig".to_string())]);
+        board.update(
+            &sorted(ts.clone()),
+            &inputs(None, true, 50, 10, &never_deleted),
+        );
+        let without = |gone: &str| sorted(ts.iter().filter(|t| t.id != gone).cloned().collect());
+        // Evicted, or named by an unhonoured kind-5: the row stays.
+        assert!(!board.update(&without("b"), &inputs(None, true, 50, 11, &never_deleted)));
+        assert_eq!(board.shown(), &ids(&["a", "b", "orig"])[..]);
+        // Honoured: it leaves.
+        let honoured = |id: &str| id == "b";
+        assert!(board.update(&without("b"), &inputs(None, true, 50, 12, &honoured)));
+        assert_eq!(board.shown(), &ids(&["a", "orig"])[..]);
+        // A moderator's honoured deletion of the envelope removes the
+        // restored original's row once the original is gone too.
+        let envelope_deleted = |id: &str| id == "env";
+        let rest = sorted(vec![ts[0].clone()]);
+        assert!(board.update(&rest, &inputs(None, true, 50, 13, &envelope_deleted)));
+        assert_eq!(board.shown(), &ids(&["a"])[..]);
+    }
+
+    #[test]
+    fn the_control_paints_the_full_true_order() {
         let mut ts = vec![
             topic("a", "x", 10, 50),
             topic("b", "x", 5, 40),
             topic("c", "x", 1, 30),
         ];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), true);
+        let mut board = FrozenBoard::new();
         board.note_aliases([("e".to_string(), "o".to_string())]);
+        board.update(
+            &sorted(ts.clone()),
+            &inputs(None, true, 50, 10, &never_deleted),
+        );
         ts[2].last_activity = 60;
         ts.push(topic("n", "other", 80, 80));
         let now = sorted(ts.clone());
-        board.update(&now, &settled(None, 20));
-        board.repaint(&now);
+        board.update(&now, &inputs(None, true, 80, 11, &never_deleted));
+        assert_eq!(board.updated(&now, None), 2);
+        board.repaint(&now, 80, 12);
         assert_eq!(board.shown(), &ids(&["n", "c", "a", "b"])[..]);
+        assert!(board.is_frozen());
         assert_eq!(board.updated(&now, None), 0);
-        assert_eq!(board.newest_at_paint(), 80);
+        assert_eq!(board.baseline(), 80);
         assert_eq!(
             board.aliases.get("e").map(String::as_str),
             Some("o"),
@@ -1306,29 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn a_late_root_active_in_the_window_is_offered_by_the_control() {
-        let mut ts = vec![topic("a", "x", 10, 900), topic("b", "x", 5, 40)];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), true);
-        // A late root with a reply at 800, inside the window (oldest 700):
-        // appended at the bottom, but it belongs higher.
-        ts.push(topic("late", "x", 3, 800));
-        let now = sorted(ts.clone());
-        board.update(&now, &settled(None, 700));
-        assert_eq!(board.shown(), &ids(&["a", "b", "late"])[..]);
-        assert_eq!(board.updated(&now, None), 1);
-        // A late root known only by its start is where it belongs.
-        let mut ts = vec![topic("a", "x", 10, 900), topic("b", "x", 5, 40)];
-        let mut board = FrozenBoard::paint(&sorted(ts.clone()), true);
-        ts.push(topic("late", "x", 3, 3));
-        let now = sorted(ts.clone());
-        board.update(&now, &settled(None, 700));
-        assert_eq!(board.updated(&now, None), 0);
-    }
-
-    #[test]
     fn an_envelope_and_its_opened_original_are_one_row() {
-        // Classification: E (sealed, naming O) and O both listed. One row,
-        // O; replies to O are credited to O.
         let cid = "chan";
         let inner = "ab".repeat(32);
         let envelope = ev(
@@ -1350,8 +1452,8 @@ mod tests {
             42,
             vec![vec!["e", cid, "", "root"]],
         );
-        let reply = ev(
-            "r",
+        let to_original = ev(
+            "r1",
             "bob",
             "reply",
             50,
@@ -1361,38 +1463,26 @@ mod tests {
                 vec!["e", inner.as_str(), "", "reply"],
             ],
         );
-        let topics = classify_topics(cid, &[envelope.clone(), original.clone(), reply.clone()]);
+        // A reply naming the (shadowed) envelope id counts for the original.
+        let to_envelope = ev(
+            "r2",
+            "cat",
+            "reply",
+            60,
+            42,
+            vec![vec!["e", cid, "", "root"], vec!["e", "env", "", "reply"]],
+        );
+        let topics = classify_topics(cid, &[envelope, original, to_original, to_envelope]);
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].id, inner);
-        assert_eq!((topics[0].reply_count, topics[0].last_activity), (1, 50));
-        // The board showed E: it swaps to O in place, with no duplicate,
-        // and keeps the row when E's copy then goes.
-        let before = classify_topics(cid, &[envelope, reply.clone()]);
-        let mut rest = vec![topic("a", "x", 10, 100), topic("b", "x", 1, 1)];
-        rest.extend(before);
-        let mut board = FrozenBoard::paint(&sorted(rest.clone()), true);
-        board.note_aliases([("env".to_string(), inner.clone())]);
-        let shown_before = board.shown().to_vec();
-        let mut after: Vec<TopicSummary> = rest.into_iter().filter(|t| t.id != "env").collect();
-        after.extend(topics);
-        board.update(&sorted(after.clone()), &settled(None, 20));
-        let swapped: Vec<String> = shown_before
-            .iter()
-            .map(|id| {
-                if id == "env" {
-                    inner.clone()
-                } else {
-                    id.clone()
-                }
-            })
-            .collect();
-        assert_eq!(board.shown(), &swapped[..]);
-        // A tick with neither copy listed keeps the row in place.
-        let neither: Vec<TopicSummary> = after.iter().filter(|t| t.id != inner).cloned().collect();
-        board.update(&sorted(neither), &settled(None, 20));
-        assert_eq!(board.shown(), &swapped[..]);
-        board.update(&sorted(after), &settled(None, 20));
-        assert_eq!(board.shown(), &swapped[..]);
+        assert_eq!(
+            (
+                topics[0].reply_count,
+                topics[0].last_activity,
+                topics[0].last_pubkey.as_str()
+            ),
+            (2, 60, "cat")
+        );
     }
 
     #[test]
@@ -1502,19 +1592,5 @@ mod tests {
         // A failed root list or an expired hold never leaves paging off.
         assert!(older_paging_armed(false, false, true, false));
         assert!(older_paging_armed(false, false, false, true));
-    }
-
-    #[test]
-    fn at_top_only_when_the_first_row_is_wholly_in_view() {
-        // Viewport 0..800.
-        assert!(first_row_in_full_view(10.0, 90.0, 0.0, 800.0));
-        assert!(first_row_in_full_view(0.0, 80.0, 0.0, 800.0));
-        // Partly scrolled off the top: the reader is further down.
-        assert!(!first_row_in_full_view(-20.0, 60.0, 0.0, 800.0));
-        // Wholly above.
-        assert!(!first_row_in_full_view(-200.0, -120.0, 0.0, 800.0));
-        // A pane whose top is at 64 px.
-        assert!(!first_row_in_full_view(40.0, 120.0, 64.0, 700.0));
-        assert!(first_row_in_full_view(64.0, 140.0, 64.0, 700.0));
     }
 }
