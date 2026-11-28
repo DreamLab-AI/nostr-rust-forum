@@ -3208,14 +3208,14 @@ impl NostrRelayDO {
         Ok(channels)
     }
 
-    /// The channel(s) a reply's topic `root` lives in, for the F2 placement
-    /// check: every stored match must be a kind-42 (a live root, or a sealed
-    /// envelope wrapping it). `Err` otherwise.
-    /// Whether `channel_id` is a stored kind-40 with exactly that id. A hit in
-    /// the positive target memo answers at once; otherwise D1 is asked, and
-    /// neither absence nor failure is memoised, so a D1 failure is never
-    /// replayed as "not a known channel".
+    /// Whether `channel_id` is a stored kind-40 with exactly that id, for the
+    /// kind-41 gate. A hit in the positive target memo answers at once;
+    /// otherwise one D1 read (kind 40 by id: a sealed envelope never stands in
+    /// for a channel definition). A found channel is memoised as the kind-42
+    /// path memoises it (`[channel_id]`); absence and failure never are, so a
+    /// D1 failure is never replayed as "not a known channel".
     async fn stored_channel_known(&self, channel_id: &str) -> Result<(), TargetLookupError> {
+        use TargetLookupError::Unavailable as U;
         let now = auth::js_now_secs();
         if let Some(hit) = self.ref_target_cache.get(channel_id, now) {
             return if hit.len() == 1 && hit[0] == channel_id {
@@ -3224,9 +3224,24 @@ impl NostrRelayDO {
                 Err(TargetLookupError::Missing)
             };
         }
-        let targets = self.lookup_target_events_detailed(channel_id).await?;
-        match targets.as_slice() {
-            [t] if t.kind == 40 && t.id == channel_id => Ok(()),
+        #[derive(serde::Deserialize)]
+        struct Row {
+            id: String,
+        }
+        let db = self.env.d1("DB").map_err(|_| U)?;
+        let row: Option<Row> = db
+            .prepare("SELECT id FROM events WHERE id = ?1 AND kind = 40 LIMIT 1")
+            .bind(&[JsValue::from_str(channel_id)])
+            .map_err(|_| U)?
+            .first::<Row>(None)
+            .await
+            .map_err(|_| U)?;
+        match row {
+            Some(r) if r.id == channel_id => {
+                self.ref_target_cache
+                    .insert(channel_id, vec![channel_id.to_string()], now);
+                Ok(())
+            }
             _ => Err(TargetLookupError::Missing),
         }
     }
@@ -3248,6 +3263,9 @@ impl NostrRelayDO {
         Ok(channels)
     }
 
+    /// The channel(s) a reply's topic `root` lives in, for the F2 placement
+    /// check: every stored match must be a kind-42 (a live root, or a sealed
+    /// envelope wrapping it). `Err` otherwise.
     async fn reply_topic_channels(&self, root: &str) -> Result<Vec<String>, ()> {
         let targets = self.lookup_target_events(root).await?;
         if targets.iter().any(|t| t.kind != 42) {

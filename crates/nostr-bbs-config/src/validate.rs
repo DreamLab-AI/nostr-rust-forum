@@ -558,6 +558,18 @@ pub fn validate_zone_config_json(raw: &str) -> Result<(), String> {
                     .join(", ")
             ));
         }
+        // The clients deserialise `section_order` as a list of section ids; any
+        // other shape would fail the whole client-side ZONE_CONFIG parse.
+        if let Some(order) = obj.get("section_order") {
+            let ok = order
+                .as_array()
+                .is_some_and(|a| a.iter().all(serde_json::Value::is_string));
+            if !ok {
+                return Err(format!(
+                    "zone '{id}' section_order must be an array of strings (got {order})"
+                ));
+            }
+        }
     }
     let zones: Vec<crate::schema::Zone> = value
         .as_array()
@@ -1654,7 +1666,31 @@ bot_profile = "tag"
             search: Some(SearchMode::Sealed),
             channels: vec![PIN_A.into()],
         };
+        // Every field is set to a non-default value above, so no
+        // `skip_serializing_if` can hide one, and this exhaustive pattern (no
+        // `..`) stops compiling when the schema gains a field.
+        let Zone {
+            id: _,
+            slug: _,
+            display_name: _,
+            required_cohorts: _,
+            write_cohorts: _,
+            banner_image_url: _,
+            accent_hex: _,
+            visibility: _,
+            encrypted: _,
+            agent_keys: _,
+            history_from_epoch: _,
+            group_pubkey: _,
+            auto_approve: _,
+            kanban: _,
+            search: _,
+            channels: _,
+        } = full.clone();
+        const SCHEMA_FIELDS: usize = 16;
         let json = serde_json::to_value(&full).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), SCHEMA_FIELDS);
+        assert_eq!(ZONE_SCHEMA_KEYS.len(), SCHEMA_FIELDS);
         let mut got: Vec<&str> = json
             .as_object()
             .unwrap()
@@ -1689,5 +1725,10 @@ bot_profile = "tag"
             validate_zone_config_json(r#"[{"id":"open","section_order":["open-a"]}]"#),
             Ok(())
         );
+        for bad in [r#""open-a""#, "[1]", "null", r#"{"a":"b"}"#] {
+            let raw = format!(r#"[{{"id":"open","section_order":{bad}}}]"#);
+            let err = validate_zone_config_json(&raw).unwrap_err();
+            assert!(err.contains("section_order"), "{bad}: {err}");
+        }
     }
 }

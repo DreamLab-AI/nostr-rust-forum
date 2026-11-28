@@ -115,30 +115,42 @@ const PIN_WALK_MAX_DEPTH: usize = 16;
 /// The most ids [`hex_ids_in`] collects from one value.
 const PIN_WALK_MAX_IDS: usize = 1024;
 
-/// Every 64-hex string anywhere in `v` (strings, and the elements and object
-/// values of arrays and objects, recursively), lowercased: the ids a
-/// malformed pin value meant to pin, so they can fail closed. Bounded in
-/// depth and count; beyond either bound the rest is not searched.
-fn hex_ids_in(v: &serde_json::Value) -> Vec<String> {
-    fn walk(v: &serde_json::Value, depth: usize, out: &mut Vec<String>) {
-        if depth > PIN_WALK_MAX_DEPTH || out.len() >= PIN_WALK_MAX_IDS {
+/// Every 64-hex string anywhere in `v`, lowercased: strings, array
+/// elements, and both the keys and the values of objects, recursively. These
+/// are the ids a malformed pin value meant to pin, so they can fail closed.
+/// Bounded in depth ([`PIN_WALK_MAX_DEPTH`]) and count
+/// ([`PIN_WALK_MAX_IDS`]); the second element is `true` when either bound
+/// was hit, in which case ids beyond it were not collected.
+fn hex_ids_in(v: &serde_json::Value) -> (Vec<String>, bool) {
+    fn push(s: &str, out: &mut Vec<String>, capped: &mut bool) {
+        let t = s.trim();
+        if is_hex64(t) {
+            if out.len() >= PIN_WALK_MAX_IDS {
+                *capped = true;
+            } else {
+                out.push(t.to_ascii_lowercase());
+            }
+        }
+    }
+    fn walk(v: &serde_json::Value, depth: usize, out: &mut Vec<String>, capped: &mut bool) {
+        if depth > PIN_WALK_MAX_DEPTH {
+            *capped = true;
             return;
         }
         match v {
-            serde_json::Value::String(s) => {
-                let t = s.trim();
-                if is_hex64(t) {
-                    out.push(t.to_ascii_lowercase());
-                }
-            }
-            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, depth + 1, out)),
-            serde_json::Value::Object(o) => o.values().for_each(|x| walk(x, depth + 1, out)),
+            serde_json::Value::String(s) => push(s, out, capped),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, depth + 1, out, capped)),
+            serde_json::Value::Object(o) => o.iter().for_each(|(k, x)| {
+                push(k, out, capped);
+                walk(x, depth + 1, out, capped);
+            }),
             _ => {}
         }
     }
     let mut out = Vec::new();
-    walk(v, 0, &mut out);
-    out
+    let mut capped = false;
+    walk(v, 0, &mut out, &mut capped);
+    (out, capped)
 }
 
 /// The full set of zone definitions parsed from `ZONE_CONFIG`.
@@ -193,6 +205,22 @@ impl ZoneConfig {
         cfg
     }
 
+    /// Fail closed every id a malformed pin value under zone `zone_id` names
+    /// (see [`hex_ids_in`]), recording a distinct error when the walk's depth
+    /// or count bound cut it short: ids beyond the bound keep whatever zone
+    /// `channel_zones` gives them, and only config validation catches that.
+    fn quarantine(&mut self, zone_id: &str, val: &serde_json::Value) {
+        let (ids, capped) = hex_ids_in(val);
+        self.quarantined.extend(ids);
+        if capped {
+            self.pin_errors.push(format!(
+                "zone {zone_id}: malformed pin value exceeds the scan bounds (depth \
+                 {PIN_WALK_MAX_DEPTH}, {PIN_WALK_MAX_IDS} ids); ids beyond them were not \
+                 quarantined and keep their channel_zones zone"
+            ));
+        }
+    }
+
     /// ADR-2037 pin configuration errors found when parsing (empty when the
     /// pins are well formed).
     pub fn pin_errors(&self) -> &[String] {
@@ -233,8 +261,13 @@ impl ZoneConfig {
                         .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
                 });
                 if !well_typed {
+                    let zid = obj
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("?")
+                        .to_string();
                     if let Some(c) = obj.remove("channels") {
-                        out.quarantined.extend(hex_ids_in(&c));
+                        out.quarantine(&zid, &c);
                         bad_channels = Some(c.to_string());
                     }
                 }
@@ -255,7 +288,7 @@ impl ZoneConfig {
                         "zone {} has unknown key {key:?} (did you mean \"channels\"?)",
                         zone.id
                     ));
-                    out.quarantined.extend(hex_ids_in(val));
+                    out.quarantine(&zone.id, val);
                     out.broken_pin_zones.push(zone.id.clone());
                 }
             }
@@ -849,13 +882,43 @@ mod tests {
         for _ in 0..(PIN_WALK_MAX_DEPTH + 4) {
             deep = serde_json::Value::Array(vec![deep]);
         }
-        assert!(hex_ids_in(&deep).is_empty());
+        assert_eq!(hex_ids_in(&deep), (Vec::new(), true));
         // Many ids: collection stops at the cap.
         let many = serde_json::Value::Array(
             (0..PIN_WALK_MAX_IDS + 10)
                 .map(|_| serde_json::Value::String(PINNED.to_string()))
                 .collect(),
         );
-        assert_eq!(hex_ids_in(&many).len(), PIN_WALK_MAX_IDS);
+        let (ids, capped) = hex_ids_in(&many);
+        assert_eq!(ids.len(), PIN_WALK_MAX_IDS);
+        assert!(capped);
+        // Hitting a bound is recorded as its own error.
+        let raw = format!(
+            r#"[{{"id":"staff","required_cohorts":["s"],"channels":{}}}]"#,
+            serde_json::to_string(&many)
+                .unwrap()
+                .replacen('"', "1,\"", 1)
+        );
+        let c = ZoneConfig::from_json(&raw);
+        assert_eq!(c.pinned_zone(PINNED), ChannelPin::Conflict);
+        assert!(
+            c.pin_errors()
+                .iter()
+                .any(|e| e.contains("exceeds the scan bounds")),
+            "{:?}",
+            c.pin_errors()
+        );
+    }
+
+    #[test]
+    fn ids_used_as_object_keys_fail_closed() {
+        let c = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"staff","required_cohorts":["s"],"channels":{{"{PINNED}":"admin only"}}}}]"#
+        ));
+        assert_eq!(c.pinned_zone(PINNED), ChannelPin::Conflict);
+        assert_eq!(c.pin_errors().len(), 1);
+        let (ids, capped) = hex_ids_in(&serde_json::json!({ OTHER: { PINNED: 1 } }));
+        assert_eq!(ids.len(), 2);
+        assert!(!capped);
     }
 }
