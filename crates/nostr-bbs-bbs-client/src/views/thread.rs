@@ -392,6 +392,12 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         topics_newest.max(window_newest)
     });
     let me = auth.pubkey();
+    // The store's deletion decision for a row, from its last known author
+    // (a sealed original's author matters).
+    let is_deleted = move |id: &str| {
+        let author = by_id.with_untracked(|m| m.get(id).map(|t| t.pubkey.clone()));
+        channels.deletion_honoured(zk_store, id, author.as_deref().unwrap_or(""))
+    };
     let board = StoredValue::new(FrozenBoard::new());
     Effect::new(move |_| {
         let shown = painted.get();
@@ -399,12 +405,6 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         let newest = newest_known.get();
         let me_now = me.get();
         let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-        // The author of a row, from its last known figures, for the store's
-        // deletion decision (a sealed original's author matters).
-        let deleted = |id: &str| {
-            let author = by_id.with_untracked(|m| m.get(id).map(|t| t.pubkey.clone()));
-            channels.deletion_honoured(zk_store, id, author.as_deref().unwrap_or(""))
-        };
         let next = classified.with(|structure| {
             board.try_update_value(|b| {
                 sealed_pairs.with(|pairs| b.note_aliases(pairs.iter().cloned()));
@@ -420,7 +420,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                         ready_to_freeze: ready,
                         newest_known: newest,
                         now_secs,
-                        deleted: &deleted,
+                        deleted: &is_deleted,
                     },
                 );
                 // Rows show once the board has painted (its loading card
@@ -517,7 +517,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                             let Some(shown) = topics
                                 .try_with_untracked(|sorted| {
                                     board.try_update_value(|b| {
-                                        b.repaint(sorted, newest, now_secs);
+                                        b.repaint(sorted, newest, now_secs, &is_deleted);
                                         b.shown().to_vec()
                                     })
                                 })
