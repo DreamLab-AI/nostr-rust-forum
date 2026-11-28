@@ -4313,7 +4313,10 @@ mod section_stats_total_tests {
         }
         assert_eq!(t.total(), Some(51));
         // Which topic a live message grows: a reply's, never an edit's.
-        assert_eq!(reply_topic(&reply_ev("r1", "ROOT", 1, None)).as_deref(), Some("root"));
+        assert_eq!(
+            reply_topic(&reply_ev("r1", "ROOT", 1, None)).as_deref(),
+            Some("root")
+        );
         assert_eq!(reply_topic(&reply_ev("e1", "ROOT", 1, Some("r1"))), None);
     }
 }

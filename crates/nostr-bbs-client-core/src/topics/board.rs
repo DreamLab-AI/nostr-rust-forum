@@ -1602,15 +1602,28 @@ mod tests {
         // at 1030. The reply came after the paint, so it stays new.
         let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
         let mut board = FrozenBoard::new();
-        board.update(&roots_only, &inputs_with(true, 10, 1_020, false, &never_known));
+        board.update(
+            &roots_only,
+            &inputs_with(true, 10, 1_020, false, &never_known),
+        );
         let replied = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 1_025)]);
-        board.update(&replied, &inputs_with(true, 1_025, 1_025, false, &never_known));
+        board.update(
+            &replied,
+            &inputs_with(true, 1_025, 1_025, false, &never_known),
+        );
         // The window: a's older activity (before the paint) and b's reply.
         let landed = sorted(vec![topic("a", "x", 10, 900), topic("b", "x", 5, 1_025)]);
-        board.update(&landed, &inputs_with(true, 1_025, 1_030, true, &never_known));
+        board.update(
+            &landed,
+            &inputs_with(true, 1_025, 1_030, true, &never_known),
+        );
         assert_eq!(board.baseline(), 1_020, "never past the paint");
         assert_eq!(board.shown(), &ids(&["a", "b"])[..]);
-        assert_eq!(board.updated(&landed, None), 1, "b's reply is offered, a's is not");
+        assert_eq!(
+            board.updated(&landed, None),
+            1,
+            "b's reply is offered, a's is not"
+        );
     }
 
     #[test]
@@ -1619,12 +1632,21 @@ mod tests {
         // paging detached the window): the control must not stay hidden.
         let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
         let mut board = FrozenBoard::new();
-        board.update(&roots_only, &inputs_with(true, 10, 1_000, false, &never_known));
+        board.update(
+            &roots_only,
+            &inputs_with(true, 10, 1_000, false, &never_known),
+        );
         let cap = (FREEZE_CAP_MS / 1_000) as u64;
         let replied = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 1_010)]);
-        board.update(&replied, &inputs_with(true, 1_010, 1_000 + cap - 1, false, &never_known));
+        board.update(
+            &replied,
+            &inputs_with(true, 1_010, 1_000 + cap - 1, false, &never_known),
+        );
         assert_eq!(board.updated(&replied, None), 0, "still provisional");
-        board.update(&replied, &inputs_with(true, 1_010, 1_000 + cap, false, &never_known));
+        board.update(
+            &replied,
+            &inputs_with(true, 1_010, 1_000 + cap, false, &never_known),
+        );
         assert_eq!(board.baseline(), 1_000);
         assert_eq!(board.updated(&replied, None), 1);
     }

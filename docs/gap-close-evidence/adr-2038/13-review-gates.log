@@ -1,0 +1,119 @@
+# 2026-11-28T15:49:54Z HEAD beed008d43624782e2acd1cc56ee81bec1f1abb0 (review-fix gate pass)
+Diff in /home/devuser/workspace/wt/nostr-rust-forum-section-stats/crates/nostr-bbs-client-core/src/stores/channels.rs:4313:
+         }
+         assert_eq!(t.total(), Some(51));
+         // Which topic a live message grows: a reply's, never an edit's.
+[31m-        assert_eq!(reply_topic(&reply_ev("r1", "ROOT", 1, None)).as_deref(), Some("root"));
+[0m[32m+        assert_eq!(
+[0m[32m+            reply_topic(&reply_ev("r1", "ROOT", 1, None)).as_deref(),
+[0m[32m+            Some("root")
+[0m[32m+        );
+[0m         assert_eq!(reply_topic(&reply_ev("e1", "ROOT", 1, Some("r1"))), None);
+     }
+ }
+Diff in /home/devuser/workspace/wt/nostr-rust-forum-section-stats/crates/nostr-bbs-client-core/src/topics/board.rs:1602:
+         // at 1030. The reply came after the paint, so it stays new.
+         let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
+         let mut board = FrozenBoard::new();
+[31m-        board.update(&roots_only, &inputs_with(true, 10, 1_020, false, &never_known));
+[0m[32m+        board.update(
+[0m[32m+            &roots_only,
+[0m[32m+            &inputs_with(true, 10, 1_020, false, &never_known),
+[0m[32m+        );
+[0m         let replied = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 1_025)]);
+[31m-        board.update(&replied, &inputs_with(true, 1_025, 1_025, false, &never_known));
+[0m[32m+        board.update(
+[0m[32m+            &replied,
+[0m[32m+            &inputs_with(true, 1_025, 1_025, false, &never_known),
+[0m[32m+        );
+[0m         // The window: a's older activity (before the paint) and b's reply.
+         let landed = sorted(vec![topic("a", "x", 10, 900), topic("b", "x", 5, 1_025)]);
+[31m-        board.update(&landed, &inputs_with(true, 1_025, 1_030, true, &never_known));
+[0m[32m+        board.update(
+[0m[32m+            &landed,
+[0m[32m+            &inputs_with(true, 1_025, 1_030, true, &never_known),
+[0m[32m+        );
+[0m         assert_eq!(board.baseline(), 1_020, "never past the paint");
+         assert_eq!(board.shown(), &ids(&["a", "b"])[..]);
+[31m-        assert_eq!(board.updated(&landed, None), 1, "b's reply is offered, a's is not");
+[0m[32m+        assert_eq!(
+[0m[32m+            board.updated(&landed, None),
+[0m[32m+            1,
+[0m[32m+            "b's reply is offered, a's is not"
+[0m[32m+        );
+[0m     }
+ 
+     #[test]
+Diff in /home/devuser/workspace/wt/nostr-rust-forum-section-stats/crates/nostr-bbs-client-core/src/topics/board.rs:1619:
+         // paging detached the window): the control must not stay hidden.
+         let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
+         let mut board = FrozenBoard::new();
+[31m-        board.update(&roots_only, &inputs_with(true, 10, 1_000, false, &never_known));
+[0m[32m+        board.update(
+[0m[32m+            &roots_only,
+[0m[32m+            &inputs_with(true, 10, 1_000, false, &never_known),
+[0m[32m+        );
+[0m         let cap = (FREEZE_CAP_MS / 1_000) as u64;
+         let replied = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 1_010)]);
+[31m-        board.update(&replied, &inputs_with(true, 1_010, 1_000 + cap - 1, false, &never_known));
+[0m[32m+        board.update(
+[0m[32m+            &replied,
+[0m[32m+            &inputs_with(true, 1_010, 1_000 + cap - 1, false, &never_known),
+[0m[32m+        );
+[0m         assert_eq!(board.updated(&replied, None), 0, "still provisional");
+[31m-        board.update(&replied, &inputs_with(true, 1_010, 1_000 + cap, false, &never_known));
+[0m[32m+        board.update(
+[0m[32m+            &replied,
+[0m[32m+            &inputs_with(true, 1_010, 1_000 + cap, false, &never_known),
+[0m[32m+        );
+[0m         assert_eq!(board.baseline(), 1_000);
+         assert_eq!(board.updated(&replied, None), 1);
+     }
+Diff in /home/devuser/workspace/wt/nostr-rust-forum-section-stats/crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs:1386:
+     };
+     let (ch, now) = (quote(C), NOW.to_string());
+     let stmts = [
+[31m-        ("q_roots_indexed", inline(&roots_indexed_sql(), &[ch.clone(), now.clone(), "1001".into()])),
+[0m         (
+[32m+            "q_roots_indexed",
+[0m[32m+            inline(
+[0m[32m+                &roots_indexed_sql(),
+[0m[32m+                &[ch.clone(), now.clone(), "1001".into()],
+[0m[32m+            ),
+[0m[32m+        ),
+[0m[32m+        (
+[0m             "q_roots_walk",
+[31m-            inline(&roots_walk_sql(), &[ch.clone(), now.clone(), "1001".into(), ROOTS_VISIT_CAP.to_string()]),
+[0m[32m+            inline(
+[0m[32m+                &roots_walk_sql(),
+[0m[32m+                &[
+[0m[32m+                    ch.clone(),
+[0m[32m+                    now.clone(),
+[0m[32m+                    "1001".into(),
+[0m[32m+                    ROOTS_VISIT_CAP.to_string(),
+[0m[32m+                ],
+[0m[32m+            ),
+[0m         ),
+         (
+             "q_stats",
+Diff in /home/devuser/workspace/wt/nostr-rust-forum-section-stats/crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs:1430:
+             .collect();
+         expected.insert(name.to_string(), serde_json::Value::Array(rows));
+     }
+[31m-    std::fs::write(dir.join("expected.json"), serde_json::Value::Object(expected).to_string()).unwrap();
+[0m[32m+    std::fs::write(
+[0m[32m+        dir.join("expected.json"),
+[0m[32m+        serde_json::Value::Object(expected).to_string(),
+[0m[32m+    )
+[0m[32m+    .unwrap();
+[0m }
+ 
+fmt exit 1
+clippy exit 0
+wasm exit 0
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+   Generated /home/devuser/workspace/.tmp/section-stats-target/doc/nostr_bbs_ascii/index.html and 28 other files
+doc exit 0
+ok: 37 ADR(s) valid (--check, README not written)
+adr exit 0

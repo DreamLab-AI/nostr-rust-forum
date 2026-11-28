@@ -1386,10 +1386,24 @@ fn emit_local_d1_check() {
     };
     let (ch, now) = (quote(C), NOW.to_string());
     let stmts = [
-        ("q_roots_indexed", inline(&roots_indexed_sql(), &[ch.clone(), now.clone(), "1001".into()])),
+        (
+            "q_roots_indexed",
+            inline(
+                &roots_indexed_sql(),
+                &[ch.clone(), now.clone(), "1001".into()],
+            ),
+        ),
         (
             "q_roots_walk",
-            inline(&roots_walk_sql(), &[ch.clone(), now.clone(), "1001".into(), ROOTS_VISIT_CAP.to_string()]),
+            inline(
+                &roots_walk_sql(),
+                &[
+                    ch.clone(),
+                    now.clone(),
+                    "1001".into(),
+                    ROOTS_VISIT_CAP.to_string(),
+                ],
+            ),
         ),
         (
             "q_stats",
@@ -1430,5 +1444,9 @@ fn emit_local_d1_check() {
             .collect();
         expected.insert(name.to_string(), serde_json::Value::Array(rows));
     }
-    std::fs::write(dir.join("expected.json"), serde_json::Value::Object(expected).to_string()).unwrap();
+    std::fs::write(
+        dir.join("expected.json"),
+        serde_json::Value::Object(expected).to_string(),
+    )
+    .unwrap();
 }
