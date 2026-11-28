@@ -188,6 +188,20 @@ enum ListBranch {
     },
 }
 
+/// One visit to a section: its channel id and a counter that moves on
+/// every change of channel.
+type Visit = (Option<String>, u64);
+
+/// The visit after `prev` for channel `cid`: the same while the channel
+/// stays, the next counter when it changes.
+fn next_visit(prev: Option<&Visit>, cid: Option<String>) -> Visit {
+    match prev {
+        Some((p, n)) if *p == cid => (cid, *n),
+        Some((_, n)) => (cid, n + 1),
+        None => (cid, 0),
+    }
+}
+
 /// The branch for lookup `state` of channel `cid`. Once a channel's list is
 /// painted it stays painted (`prev`) while its lookup holds; until then a
 /// found list is held as skeleton rows until `ready` says it may paint.
@@ -511,31 +525,33 @@ pub fn SectionPage() -> impl IntoView {
             .get()
             .is_some_and(|cid| store.topic_roots_failed(&cid))
     });
-    let hold_expired = RwSignal::new(Option::<String>::None);
+    // This visit: the channel and a counter that moves on every change of
+    // channel (A -> B -> A is three visits), derived synchronously. Timers
+    // and the board are tied to it, so nothing from an earlier visit lands
+    // in a later one.
+    let visit = Memo::new(move |prev: Option<&Visit>| next_visit(prev, channel_id.get()));
+    let hold_expired = RwSignal::new(Option::<Visit>::None);
     {
-        let armed = StoredValue::new(Option::<String>::None);
+        let armed = StoredValue::new(Option::<Visit>::None);
         Effect::new(move |_| {
-            let Some(cid) = channel_id.get() else {
-                return;
-            };
-            if !matches!(topics_lookup.get(), Lookup::Found | Lookup::NotFound)
-                || armed.with_value(|a| a.as_deref() == Some(cid.as_str()))
+            let this = visit.get();
+            if this.0.is_none()
+                || !matches!(topics_lookup.get(), Lookup::Found | Lookup::NotFound)
+                || armed.with_value(|a| a.as_ref() == Some(&this))
             {
                 return;
             }
-            armed.set_value(Some(cid.clone()));
+            armed.set_value(Some(this.clone()));
             crate::utils::set_timeout_once(
                 move || {
-                    let _ = hold_expired.try_set(Some(cid));
+                    let _ = hold_expired.try_set(Some(this));
                 },
                 FIRST_PAINT_TIMEOUT_MS,
             );
         });
     }
-    let hold_expired_here = Memo::new(move |_| {
-        let cid = channel_id.get();
-        hold_expired.with(|e| e.is_some() && *e == cid)
-    });
+    let hold_expired_here =
+        Memo::new(move |_| visit.with(|v| hold_expired.with(|e| e.as_ref() == Some(v))));
     let branch = Memo::new(move |prev: Option<&ListBranch>| {
         let cid = channel_id.get();
         list_branch(prev, topics_lookup.get(), cid.clone(), || {
@@ -561,7 +577,21 @@ pub fn SectionPage() -> impl IntoView {
     // real activity newer than the freeze. Navigating away and back starts
     // afresh. Every input is a Memo, so the board does not re-run on other
     // channels' traffic.
-    let order = RwSignal::new(Vec::<String>::new());
+    // The board's rows, stamped with the visit they belong to; only rows of
+    // this visit are rendered (a section switch shows nothing of the last
+    // section's rows while the board catches up).
+    let order = RwSignal::new((Option::<Visit>::None, Vec::<String>::new()));
+    let shown_order = Memo::new(move |_| {
+        visit.with(|v| {
+            order.with(|(for_visit, ids)| {
+                if for_visit.as_ref() == Some(v) {
+                    ids.clone()
+                } else {
+                    Vec::new()
+                }
+            })
+        })
+    });
     // A row still shown whose topic left the lists (evicted from the
     // window, kept in place by the board) keeps its last known figures.
     let by_id = Memo::new(move |prev: Option<&HashMap<String, TopicSummary>>| {
@@ -571,7 +601,7 @@ pub fn SectionPage() -> impl IntoView {
                 .collect::<HashMap<_, _>>()
         });
         if let Some(prev) = prev {
-            order.with(|shown| {
+            shown_order.with(|shown| {
                 for id in shown {
                     if !map.contains_key(id) {
                         if let Some(t) = prev.get(id) {
@@ -609,29 +639,27 @@ pub fn SectionPage() -> impl IntoView {
         })
     });
     // The freeze cap: FREEZE_CAP_MS after the list first shows rows.
-    let cap_expired = RwSignal::new(Option::<String>::None);
+    let cap_expired = RwSignal::new(Option::<Visit>::None);
     {
-        let armed = StoredValue::new(Option::<String>::None);
+        let armed = StoredValue::new(Option::<Visit>::None);
         Effect::new(move |_| {
-            let Some(cid) = channel_id.get() else {
-                return;
-            };
+            let this = visit.get();
             let showing =
                 matches!(branch.get(), ListBranch::List(_)) && !topics.with(Vec::is_empty);
-            if !showing || armed.with_value(|a| a.as_deref() == Some(cid.as_str())) {
+            if this.0.is_none() || !showing || armed.with_value(|a| a.as_ref() == Some(&this)) {
                 return;
             }
-            armed.set_value(Some(cid.clone()));
+            armed.set_value(Some(this.clone()));
             crate::utils::set_timeout_once(
                 move || {
-                    let _ = cap_expired.try_set(Some(cid));
+                    let _ = cap_expired.try_set(Some(this));
                 },
                 FREEZE_CAP_MS,
             );
         });
     }
     let ready_to_freeze = Memo::new(move |_| {
-        let capped = cap_expired.with(|c| c.is_some() && *c == channel_id.get());
+        let capped = visit.with(|v| cap_expired.with(|c| c.as_ref() == Some(v)));
         capped || (window_settled.get() && (roots_answered.get() || roots_failed.get()))
     });
     // The newest activity known: every topic's (stats included) and the
@@ -648,23 +676,24 @@ pub fn SectionPage() -> impl IntoView {
     });
     let me = auth.pubkey();
     // (channel, its board)
-    let board = StoredValue::new((channel_id.get_untracked(), FrozenBoard::new()));
+    // The store's deletion decision for a row, from its last known author
+    // (a sealed original's author matters).
+    let is_deleted = move |id: &str| {
+        let author = by_id.with_untracked(|m| m.get(id).map(|t| t.pubkey.clone()));
+        store.deletion_honoured(zone_keys, id, author.as_deref().unwrap_or(""))
+    };
+    // (visit, its board)
+    let board = StoredValue::new((visit.get_untracked(), FrozenBoard::new()));
     Effect::new(move |_| {
-        let cid = channel_id.get();
+        let this = visit.get();
         let ready = ready_to_freeze.get();
         let newest = newest_known.get();
         let me_now = me.get();
         let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-        // The author of a row, from its last known figures, for the
-        // store's deletion decision (a sealed original's author matters).
-        let deleted = |id: &str| {
-            let author = by_id.with_untracked(|m| m.get(id).map(|t| t.pubkey.clone()));
-            store.deletion_honoured(zone_keys, id, author.as_deref().unwrap_or(""))
-        };
         let next = classified.with(|structure| {
-            board.try_update_value(|(for_cid, b)| {
-                if *for_cid != cid {
-                    *for_cid = cid.clone();
+            board.try_update_value(|(for_visit, b)| {
+                if *for_visit != this {
+                    *for_visit = this.clone();
                     *b = FrozenBoard::new();
                 }
                 sealed_pairs.with(|pairs| b.note_aliases(pairs.iter().cloned()));
@@ -681,24 +710,32 @@ pub fn SectionPage() -> impl IntoView {
                         ready_to_freeze: ready,
                         newest_known: newest,
                         now_secs,
-                        deleted: &deleted,
+                        deleted: &is_deleted,
                     },
                 );
                 b.shown().to_vec()
             })
         });
         if let Some(next) = next {
-            if order.with_untracked(|shown| *shown != next) {
-                order.set(next);
+            let stamped = (Some(this), next);
+            if order.with_untracked(|current| *current != stamped) {
+                order.set(stamped);
             }
         }
     });
     let updated = Memo::new(move |_| {
-        order.track();
+        shown_order.track();
+        let this = visit.get();
         let me = me.get();
         topics.with(|sorted| {
             board
-                .try_with_value(|(_, b)| b.updated(sorted, me.as_deref()))
+                .try_with_value(|(for_visit, b)| {
+                    if *for_visit == this {
+                        b.updated(sorted, me.as_deref())
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
         })
     });
@@ -845,7 +882,7 @@ pub fn SectionPage() -> impl IntoView {
                         // page, and a store write in between re-runs them
                         // (see `history_loader::read_cursor`).
                         {move || {
-                            let n = topics.try_with(Vec::len).unwrap_or_default();
+                            let n = shown_order.try_with(Vec::len).unwrap_or_default();
                             if n == 1 { "1 topic".to_string() } else { format!("{n} topics") }
                         }}
                     </span>
@@ -864,18 +901,24 @@ pub fn SectionPage() -> impl IntoView {
                         on:click=move |_| {
                             let newest = newest_known.get_untracked();
                             let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-                            let Some(shown) = topics
+                            let Some(this) = visit.try_get_untracked() else {
+                                return;
+                            };
+                            // Only this visit's board (never the last section's).
+                            let Some(Some(shown)) = topics
                                 .try_with_untracked(|sorted| {
-                                    board.try_update_value(|(_, b)| {
-                                        b.repaint(sorted, newest, now_secs);
-                                        b.shown().to_vec()
+                                    board.try_update_value(|(for_visit, b)| {
+                                        (*for_visit == this).then(|| {
+                                            b.repaint(sorted, newest, now_secs, &is_deleted);
+                                            b.shown().to_vec()
+                                        })
                                     })
                                 })
                                 .flatten()
                             else {
                                 return;
                             };
-                            order.set(shown);
+                            order.set((Some(this), shown));
                         }
                     >
                         {move || updated_label(updated.try_get().unwrap_or(0))}
@@ -1024,7 +1067,7 @@ pub fn SectionPage() -> impl IntoView {
                             <TopicList
                                 channel_id=cid
                                 category=category_for_topics.get_untracked()
-                                order=order.into()
+                                order=shown_order.into()
                                 topics=by_id
                             />
                             <crate::components::history_loader::HistoryLoader
@@ -1139,6 +1182,24 @@ async fn publish_topic_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_return_to_a_section_is_a_new_visit() {
+        let a = || Some("a".to_string());
+        let first = next_visit(None, a());
+        assert_eq!(
+            next_visit(Some(&first), a()),
+            first,
+            "same channel, same visit"
+        );
+        let b = next_visit(Some(&first), Some("b".to_string()));
+        let again = next_visit(Some(&b), a());
+        assert_eq!(again.0, a());
+        assert_ne!(
+            again, first,
+            "A -> B -> A: a stale timer from the first visit is ignored"
+        );
+    }
 
     #[test]
     fn loading_shows_skeleton_rows() {
