@@ -34,7 +34,7 @@ use worker::{D1Database, Env, Request, Response, Result};
 use crate::auth;
 use crate::cors::json_response as cors_json_response;
 use crate::trust;
-use crate::zone_config::ZoneConfig;
+use crate::zone_config::{ChannelPin, ZoneConfig};
 
 /// Kinds counted as authored posts: NIP-01 notes, kind-9 chat, NIP-28
 /// channel messages and NIP-22 comments.
@@ -298,9 +298,18 @@ pub async fn handle_profile_stats(req: &Request, env: &Env) -> Result<Response> 
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let Ok(channel_zone) = load_channel_zones(&db, &channel_ids).await else {
+    // ADR-2037: a zone-config pin decides first; D1 is asked only about the
+    // channels no zone pins, so pinned channels resolve while D1 is down.
+    let zones = ZoneConfig::load(env);
+    let Ok((mut channel_zone, unpinned)) = pinned_channel_zones(&zones, &channel_ids) else {
         return cors_json_response(env, &json!({ "error": "Zone lookup failed" }), 503);
     };
+    if !unpinned.is_empty() {
+        let Ok(bound) = load_channel_zones(&db, &unpinned).await else {
+            return cors_json_response(env, &json!({ "error": "Zone lookup failed" }), 503);
+        };
+        channel_zone.extend(bound);
+    }
 
     // Viewer scope.
     let viewer = resolve_viewer(req, env).await;
@@ -308,7 +317,6 @@ pub async fn handle_profile_stats(req: &Request, env: &Env) -> Result<Response> 
         Some(pk) => trust::get_viewer_cohorts(pk, env).await,
         None => (Vec::new(), false),
     };
-    let zones = ZoneConfig::load(env);
     let activity = aggregate(
         &rows,
         &channel_zone,
@@ -348,6 +356,29 @@ pub async fn handle_profile_stats(req: &Request, env: &Env) -> Result<Response> 
         }),
         200,
     )
+}
+
+/// Split `ids` by zone-config pin (ADR-2037): the pinned channels with their
+/// zone, and the rest, whose zone comes from `channel_zones`. `Err` when a
+/// channel is pinned by two zones (its zone is unknown; the caller fails
+/// closed, as for a D1 error). With no pins configured every id is returned
+/// unpinned, in order.
+pub fn pinned_channel_zones(
+    zones: &ZoneConfig,
+    ids: &[String],
+) -> Result<(HashMap<String, String>, Vec<String>), ()> {
+    let mut pinned = HashMap::new();
+    let mut unpinned = Vec::new();
+    for id in ids {
+        match zones.pinned_zone(id) {
+            ChannelPin::Pinned(zone) => {
+                pinned.insert(id.clone(), zone.to_string());
+            }
+            ChannelPin::Conflict => return Err(()),
+            ChannelPin::Unpinned => unpinned.push(id.clone()),
+        }
+    }
+    Ok((pinned, unpinned))
 }
 
 /// Zone bindings for `ids`. `Err` if any chunk could not be read: the caller
@@ -595,5 +626,76 @@ mod tests {
         assert_eq!(channel_name(r#"{"name":""}"#), None);
         assert_eq!(channel_name("{}"), None);
         assert_eq!(channel_name("nope"), None);
+    }
+
+    // -- ADR-2037: pinned channels in profile stats -------------------------
+
+    const PIN: &str = "6666666666666666666666666666666666666666666666666666666666666666";
+
+    fn pinned_zones() -> ZoneConfig {
+        ZoneConfig::from_json(&format!(
+            r#"[{{"id":"business","required_cohorts":["business"],"visibility":"locked"}},
+                {{"id":"staff","required_cohorts":["staff"],"visibility":"hidden","channels":["{PIN}"]}}]"#
+        ))
+    }
+
+    #[test]
+    fn pins_decide_first_and_only_unpinned_ids_go_to_d1() {
+        let ids = vec![PIN.to_string(), "biz".to_string()];
+        let (pinned, unpinned) = pinned_channel_zones(&pinned_zones(), &ids).unwrap();
+        assert_eq!(pinned.get(PIN).map(String::as_str), Some("staff"));
+        assert_eq!(unpinned, vec!["biz".to_string()]);
+        // No pins configured: every id is left to D1, in order.
+        let (pinned, unpinned) = pinned_channel_zones(&ZoneConfig::from_json(ZONES), &ids).unwrap();
+        assert!(pinned.is_empty());
+        assert_eq!(unpinned, ids);
+    }
+
+    #[test]
+    fn a_pinned_channel_is_left_out_for_a_member_of_its_old_zone() {
+        let zones = pinned_zones();
+        let ids = vec![PIN.to_string(), "biz".to_string()];
+        let (mut map, _) = pinned_channel_zones(&zones, &ids).unwrap();
+        // D1 still binds the pinned channel to "business"; the pin wins
+        // because D1 is never asked about it.
+        map.extend([("biz".to_string(), "business".to_string())]);
+        let rows = vec![msg(PIN, 10), msg(PIN, 11), msg("biz", 20)];
+        let member = vec!["business".to_string()];
+        let a = aggregate(
+            &rows,
+            &map,
+            |z| viewer_can_read(&zones, z, &member, false),
+            5,
+        );
+        let top: Vec<&str> = a.top_channels.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            top,
+            vec!["biz"],
+            "the pinned channel's id (and so its name) is not listed"
+        );
+        assert_eq!(a.post_count, 1);
+        // A holder of the pinned zone's cohort and an admin do see it.
+        let staff = vec!["staff".to_string()];
+        let a = aggregate(
+            &rows,
+            &map,
+            |z| viewer_can_read(&zones, z, &staff, false),
+            5,
+        );
+        assert_eq!(a.top_channels[0].id, PIN);
+        let a = aggregate(&rows, &map, |z| viewer_can_read(&zones, z, &[], true), 5);
+        assert_eq!(a.post_count, 3);
+        // Anonymous: nothing from either channel.
+        let a = aggregate(&rows, &map, |z| viewer_can_read(&zones, z, &[], false), 5);
+        assert_eq!(a.post_count, 0);
+    }
+
+    #[test]
+    fn a_double_pin_fails_the_lookup() {
+        let zones = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"a","required_cohorts":["a"],"channels":["{PIN}"]}},
+                {{"id":"b","required_cohorts":["b"],"channels":["{PIN}"]}}]"#
+        ));
+        assert!(pinned_channel_zones(&zones, &[PIN.to_string()]).is_err());
     }
 }

@@ -475,6 +475,7 @@ mod tests {
             section_order: Vec::new(),
             kanban: false,
             search: None,
+            channels: Vec::new(),
         }
     }
 
@@ -494,6 +495,7 @@ mod tests {
             section_order: Vec::new(),
             kanban: false,
             search: None,
+            channels: Vec::new(),
         }
     }
 

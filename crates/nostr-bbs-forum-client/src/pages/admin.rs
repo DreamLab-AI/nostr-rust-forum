@@ -506,9 +506,24 @@ fn ChannelsTab() -> impl IntoView {
                                     let section = if ch.section.is_empty() { "none".to_string() } else { ch.section.clone() };
                                     let section_dot_class = section_color_dot(&section);
                                     let id_short = format!("ID: {}...{}", &ch.id[..8], &ch.id[ch.id.len().saturating_sub(4)..]);
+                                    // ADR-2037: a channel pinned in ZONE_CONFIG is
+                                    // never bound (the pin decides its zone, and a
+                                    // row written now would outlive the pin); it
+                                    // shows the pin instead.
+                                    let pinned_to = zones.as_ref().and_then(|z| {
+                                        crate::stores::zones::pinned_zone_for(&ch.id, z)
+                                            .map(|p| p.id.clone())
+                                    });
+                                    let pin_row = pinned_to.map(|zone_id| view! {
+                                        <div class="flex items-center gap-2 mt-2 flex-wrap">
+                                            <span class="text-xs text-sky-400">
+                                                {format!("Pinned to zone {zone_id} by zone config")}
+                                            </span>
+                                        </div>
+                                    });
                                     // Strict: a section that names no configured zone is not bindable.
                                     let bind_zone = zones.as_ref().and_then(|z| {
-                                        crate::stores::zones::zone_id_for_section(&ch.section, z)
+                                        crate::stores::zones::bind_zone_for(&ch.id, &ch.section, z)
                                     });
                                     let bind_row = bind_zone.map(|zone_id| {
                                         let ch_id = ch.id.clone();
@@ -569,6 +584,7 @@ fn ChannelsTab() -> impl IntoView {
                                                 </span>
                                                 <span class="text-xs text-gray-600">{id_short}</span>
                                             </div>
+                                            {pin_row}
                                             {bind_row}
                                         </div>
                                     }

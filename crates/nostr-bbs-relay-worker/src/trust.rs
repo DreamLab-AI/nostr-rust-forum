@@ -14,7 +14,7 @@ use wasm_bindgen::JsValue;
 use worker::Env;
 
 use crate::auth;
-use crate::zone_config::ZoneConfig;
+use crate::zone_config::{ChannelPin, ZoneConfig};
 
 // ---------------------------------------------------------------------------
 // Trust level enum
@@ -585,16 +585,48 @@ pub async fn check_suspension(pubkey: &str, env: &Env) -> (bool, bool) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZoneLookupError;
 
-/// Look up the zone a channel is bound to in the `channel_zones` table.
+/// Resolve a channel's zone: the zone-config pin first (ADR-2037), then
+/// `lookup` (the `channel_zones` row).
 ///
-/// `Ok(None)`: the query ran and the channel has no row (unscoped).
+/// `lookup` is never called for a pinned channel, so a pinned channel
+/// resolves even while D1 is failing. A channel pinned by two zones is
+/// [`ZoneLookupError`]: its zone is unknown and callers fail closed. With no
+/// pins configured this is exactly `lookup().await`.
+pub async fn resolve_channel_zone<F, Fut>(
+    zones: &ZoneConfig,
+    channel_id: &str,
+    lookup: F,
+) -> Result<Option<String>, ZoneLookupError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, ZoneLookupError>>,
+{
+    match zones.pinned_zone(channel_id) {
+        ChannelPin::Pinned(zone) => Ok(Some(zone.to_string())),
+        ChannelPin::Conflict => Err(ZoneLookupError),
+        ChannelPin::Unpinned => lookup().await,
+    }
+}
+
+/// The zone a channel belongs to: its zone-config pin if it has one
+/// (ADR-2037), else its row in the `channel_zones` table.
+///
+/// `Ok(None)`: not pinned, and the query ran and the channel has no row
+/// (unscoped).
 /// `Err(ZoneLookupError)`: the answer is unknown. Previously every error was
 /// folded into `None`, so a D1 failure on a cold cache read a zone channel
-/// as public (security review F3).
+/// as public (security review F3). A pinned channel never reaches D1.
 pub async fn get_channel_zone(
     channel_id: &str,
     env: &Env,
 ) -> Result<Option<String>, ZoneLookupError> {
+    let zones = ZoneConfig::load(env);
+    resolve_channel_zone(&zones, channel_id, || channel_zone_row(channel_id, env)).await
+}
+
+/// The `channel_zones` row for `channel_id`, ignoring pins. Only
+/// [`get_channel_zone`] calls it, after the pin check.
+async fn channel_zone_row(channel_id: &str, env: &Env) -> Result<Option<String>, ZoneLookupError> {
     let db = env.d1("DB").map_err(|_| ZoneLookupError)?;
 
     #[derive(Deserialize)]
@@ -825,5 +857,95 @@ mod tests {
             let tl = TrustLevel::from_i32(v);
             assert_eq!(tl.as_i32(), v);
         }
+    }
+
+    // -- ADR-2037: the zone-config pin decides before D1 -------------------
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    const PINNED: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const LOOSE: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+
+    fn zones_with_pin() -> ZoneConfig {
+        ZoneConfig::from_json(&format!(
+            r#"[{{"id":"open","required_cohorts":["members"]}},
+                {{"id":"staff","required_cohorts":["staff"],"visibility":"hidden","channels":["{PINNED}"]}}]"#
+        ))
+    }
+
+    /// Resolve with a stubbed D1 answer, reporting whether D1 was asked.
+    fn resolve(
+        zones: &ZoneConfig,
+        id: &str,
+        d1: Result<Option<String>, ZoneLookupError>,
+    ) -> (Result<Option<String>, ZoneLookupError>, bool) {
+        let asked = std::cell::Cell::new(false);
+        let out = block_on(resolve_channel_zone(zones, id, || {
+            asked.set(true);
+            std::future::ready(d1)
+        }));
+        (out, asked.get())
+    }
+
+    #[test]
+    fn the_pin_beats_the_channel_zones_row_and_d1_is_not_asked() {
+        let zones = zones_with_pin();
+        for d1 in [Ok(Some("open".to_string())), Ok(None), Err(ZoneLookupError)] {
+            let (out, asked) = resolve(&zones, PINNED, d1);
+            assert_eq!(out, Ok(Some("staff".to_string())));
+            assert!(!asked, "a pinned channel never reaches D1");
+        }
+    }
+
+    #[test]
+    fn a_pinned_channel_resolves_while_d1_is_failing() {
+        let (out, _) = resolve(&zones_with_pin(), PINNED, Err(ZoneLookupError));
+        assert_eq!(out, Ok(Some("staff".to_string())));
+    }
+
+    #[test]
+    fn an_unpinned_channel_gets_exactly_the_d1_answer() {
+        let zones = zones_with_pin();
+        for d1 in [Ok(Some("open".to_string())), Ok(None), Err(ZoneLookupError)] {
+            let (out, asked) = resolve(&zones, LOOSE, d1.clone());
+            assert_eq!(out, d1);
+            assert!(asked);
+        }
+    }
+
+    #[test]
+    fn with_no_pins_configured_resolution_is_the_d1_answer() {
+        // Behaviour neutrality: a config without `channels` (and an empty or
+        // malformed config) passes every D1 answer through unchanged.
+        for zones in [
+            ZoneConfig::from_json(r#"[{"id":"open","required_cohorts":["members"]}]"#),
+            ZoneConfig::default(),
+            ZoneConfig::from_json("not json"),
+        ] {
+            for d1 in [Ok(Some("open".to_string())), Ok(None), Err(ZoneLookupError)] {
+                let (out, asked) = resolve(&zones, PINNED, d1.clone());
+                assert_eq!(out, d1);
+                assert!(asked);
+            }
+        }
+    }
+
+    #[test]
+    fn a_channel_pinned_by_two_zones_is_an_unanswered_lookup() {
+        let zones = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"a","required_cohorts":["a"],"channels":["{PINNED}"]}},
+                {{"id":"b","required_cohorts":["b"],"channels":["{PINNED}"]}}]"#
+        ));
+        let (out, asked) = resolve(&zones, PINNED, Ok(None));
+        assert_eq!(out, Err(ZoneLookupError));
+        assert!(!asked);
     }
 }

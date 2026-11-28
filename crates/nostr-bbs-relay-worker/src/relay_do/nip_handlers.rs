@@ -1315,6 +1315,29 @@ impl NostrRelayDO {
                     );
                     return;
                 }
+                // ADR-2037 review: the channel must be a stored kind-40 with
+                // exactly this id, as for kind-42 (a mixed-case alias would
+                // miss its channel_zones row and skip the zone gate).
+                // A D1 failure is retryable and is not remembered as "unknown".
+                let known = self.stored_channel_known(&channel_id).await;
+                if let Some(reason) = channel_known_rejection(&known) {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+                // ADR-2037 review: a channel's metadata (name, about,
+                // picture, pin/unpin control) is written only by those who may
+                // write its zone, as its kind-42 posts are. A zone-config pin
+                // decides the zone first; an unanswered lookup refuses.
+                let zone_cfg = ZoneConfig::load(&self.env);
+                let zone = zone_for_write(self.cached_channel_zone(&channel_id, &zone_cfg).await);
+                let may_write = match &zone {
+                    Ok(Some(z)) => trust::has_zone_write_access(&principal, z, &self.env).await,
+                    _ => false,
+                };
+                if let Some(reason) = channel_metadata_zone_rejection(&zone, may_write) {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
             }
 
             // kind-1984 (report): TL1+ required
@@ -1495,14 +1518,12 @@ impl NostrRelayDO {
             // Ids are matched EXACTLY (stored ids are lowercase hex): a
             // mixed-case alias of a zone channel would miss its channel_zones
             // row and read as unscoped (review finding 3).
+            //
+            // The reply-topic and edit-target placement checks run after the
+            // zone write gate below, so an author who may not write here
+            // learns nothing about which messages exist in the channel.
             let channel_known = self.reference_target_channels(&channel_id, 0).await;
-            let reply_target = match nostr_bbs_core::sealed::reply_root_of(&event) {
-                Some(root) => Some(self.reply_topic_channels(root).await),
-                None => None,
-            };
-            if let Some(reason) =
-                channel_write_rejection(&channel_id, &channel_known, reply_target.as_ref())
-            {
+            if let Some(reason) = channel_write_rejection(&channel_id, &channel_known, None) {
                 Self::send_ok(ws, &event.id, false, reason);
                 return;
             }
@@ -1523,13 +1544,25 @@ impl NostrRelayDO {
             // (write_cohorts ?? required_cohorts) so a public zone can still be
             // read-by-all yet write-restricted.
             // F3: an unanswered lookup refuses the write (fail closed).
-            let zone = match zone_for_write(self.cached_channel_zone(&channel_id).await) {
+            let zone_cfg = ZoneConfig::load(&self.env);
+            let zone = match zone_for_write(self.cached_channel_zone(&channel_id, &zone_cfg).await)
+            {
                 Ok(zone) => zone,
                 Err(reason) => {
                     Self::send_ok(ws, &event.id, false, reason);
                     return;
                 }
             };
+            // ADR-2037: a post into a pinned channel encrypted to any other
+            // zone's key is refused, encrypted pinned zone or not.
+            if let crate::zone_config::ChannelPin::Pinned(pinned) =
+                zone_cfg.pinned_zone(&channel_id)
+            {
+                if crate::zone_config::zk_names_other_zone(pinned, &event.tags) {
+                    Self::send_ok(ws, &event.id, false, PINNED_FOREIGN_ZK_REASON);
+                    return;
+                }
+            }
             // ADR-2017: sealed originals are admin-only and belong to encrypted
             // zones. They are exempt from the drift check in `validate_event`,
             // so this gate must reject every other shape, including a sealed
@@ -1563,13 +1596,46 @@ impl NostrRelayDO {
                     return;
                 }
             }
+            // F2: a reply's topic must be a stored message in this channel.
+            if let Some(root) = nostr_bbs_core::sealed::reply_root_of(&event) {
+                let reply_target = self.reply_topic_channels(root).await;
+                if let Some(reason) =
+                    channel_write_rejection(&channel_id, &channel_known, Some(&reply_target))
+                {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+            }
+            // ADR-2037 review: an edit's target must be a message in this
+            // same channel, as a reply's topic must. Clients fold an edit
+            // into its target wherever the edit was posted, so an edit filed
+            // in another channel (another zone) could otherwise rewrite a
+            // post the author can no longer write to.
+            if let Some(target) = edit_target_of(&event) {
+                let target_channels = self.edit_target_channels(&target).await;
+                if let Some(reason) = edit_target_rejection(&channel_id, &target_channels) {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+            }
         }
 
         // F4 (write side): a reaction, comment or report on a message needs
         // write access to that message's zone, and an encrypted zone takes no
         // plaintext comment. The target is resolved from D1.
         if is_reference_kind(event.kind) {
-            let scope = self.resolve_reference_scope(&event).await;
+            let cfg = ZoneConfig::load(&self.env);
+            let scope = self.resolve_reference_scope(&event, &cfg).await;
+            // ADR-2037: a comment (or any reference kind) on a message in a
+            // pinned channel that names another zone in a `zk` tag was
+            // encrypted for the zone the channel left; refuse it.
+            if event.tags.iter().any(|t| t.len() >= 2 && t[0] == "zk") {
+                let pinned = self.reference_pinned_zones(&event, &cfg).await;
+                if pinned_foreign_zk(&pinned, &event.tags) {
+                    Self::send_ok(ws, &event.id, false, PINNED_FOREIGN_ZK_REASON);
+                    return;
+                }
+            }
             let mut writable: Vec<String> = Vec::new();
             if let RefScope::Zones(zs) = &scope {
                 for z in zs {
@@ -1578,7 +1644,6 @@ impl NostrRelayDO {
                     }
                 }
             }
-            let cfg = ZoneConfig::load(&self.env);
             let (author_cohorts, author_cohort_admin) =
                 self.cached_viewer_cohorts(&principal).await;
             if let Some(reason) = reference_write_rejection(
@@ -1726,7 +1791,10 @@ impl NostrRelayDO {
         {
             let bound: Option<String> = if event.kind == 42 {
                 match filter::channel_tag(&event) {
-                    Some(cid) => match zone_for_write(self.cached_channel_zone(&cid).await) {
+                    Some(cid) => match zone_for_write(
+                        self.cached_channel_zone(&cid, &ZoneConfig::load(&self.env))
+                            .await,
+                    ) {
                         Ok(zone) => zone,
                         Err(reason) => {
                             Self::send_ok(ws, &event.id, false, reason);
@@ -2672,6 +2740,82 @@ pub(crate) fn channel_write_rejection(
     }
 }
 
+/// The post a kind-42 edits: its first `e` tag marked `edit`
+/// (`["e", <target>, <relay>, "edit"]`), lowercased.
+pub(crate) fn edit_target_of(event: &NostrEvent) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "edit")
+        .map(|t| t[1].to_ascii_lowercase())
+}
+
+/// Refusal for a kind-41 whose channel is not a stored kind-40 with exactly
+/// that id; a lookup that could not be answered is retryable.
+pub(crate) fn channel_known_rejection(
+    known: &Result<(), TargetLookupError>,
+) -> Option<&'static str> {
+    match known {
+        Ok(()) => None,
+        Err(TargetLookupError::Unavailable) => Some("error: channel lookup failed, try again"),
+        Err(TargetLookupError::Missing) => Some("invalid: channel is not a known channel"),
+    }
+}
+
+/// Why a stored-target lookup returned nothing usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetLookupError {
+    /// Nothing usable is stored under the id (absent, ambiguous, or not a
+    /// channel message).
+    Missing,
+    /// D1 could not answer.
+    Unavailable,
+}
+
+/// Refusal for a kind-42 edit whose target is not a stored message of
+/// `channel_id`. Channel values compare case-insensitively (the channel id
+/// itself was already matched exactly), so a legacy post whose root tag is
+/// upper-case is still editable. A failed lookup refuses with a retryable
+/// reason.
+pub(crate) fn edit_target_rejection(
+    channel_id: &str,
+    target_channels: &Result<Vec<String>, TargetLookupError>,
+) -> Option<&'static str> {
+    match target_channels {
+        Ok(cs) if !cs.is_empty() && cs.iter().all(|c| c.eq_ignore_ascii_case(channel_id)) => None,
+        Err(TargetLookupError::Unavailable) => Some("error: edit target lookup failed, try again"),
+        _ => Some("invalid: edit target is not a message in this channel"),
+    }
+}
+
+/// ADR-2037: whether an event targeting messages in channels pinned to
+/// `pinned` zones carries a `zk` tag naming any other zone.
+pub(crate) fn pinned_foreign_zk(pinned: &[String], tags: &[Vec<String>]) -> bool {
+    pinned
+        .iter()
+        .any(|p| crate::zone_config::zk_names_other_zone(p, tags))
+}
+
+/// The zone gate on a non-admin's kind-41 (channel metadata) once the
+/// channel's zone is resolved: refused when the lookup failed, or when the
+/// channel has a zone the author may not write. An unscoped channel (no pin,
+/// no `channel_zones` row) is gated by trust level alone, as before.
+pub(crate) fn channel_metadata_zone_rejection(
+    zone: &Result<Option<String>, &'static str>,
+    may_write: bool,
+) -> Option<&'static str> {
+    match zone {
+        Err(reason) => Some(reason),
+        Ok(Some(_)) if !may_write => Some("zone access denied"),
+        Ok(_) => None,
+    }
+}
+
+/// OK reason for a kind-42 into a pinned channel whose `zk` names another
+/// zone (ADR-2037): the client encrypted for the zone the channel used to be in.
+pub(crate) const PINNED_FOREIGN_ZK_REASON: &str =
+    "blocked: this channel belongs to another zone now; reload and post again";
+
 /// The zone a write is gated by, or the rejection when the lookup could not
 /// be answered (F3: a write is never treated as going to an unscoped channel
 /// because D1 failed).
@@ -2828,7 +2972,25 @@ impl NostrRelayDO {
     /// The zone `channel_id` is bound to, through the 60 s per-DO memo
     /// (bound channels only). `Err` when D1 could not answer: callers fail
     /// closed (see [`trust::ZoneLookupError`]).
+    ///
+    /// ADR-2037: the zone-config pin in `zones` (the caller's snapshot of
+    /// `ZONE_CONFIG`, taken once per REQ, COUNT, broadcast or EVENT) is
+    /// consulted first, ahead of both memos, so a pin is never shadowed by a
+    /// remembered `channel_zones` answer and a pinned channel resolves while
+    /// D1 is down. Pinned answers are not memoised; they cost a scan of the
+    /// pin lists and no D1 or JS call.
     pub(crate) async fn cached_channel_zone(
+        &self,
+        channel_id: &str,
+        zones: &ZoneConfig,
+    ) -> Result<Option<String>, trust::ZoneLookupError> {
+        trust::resolve_channel_zone(zones, channel_id, || self.memoised_channel_zone(channel_id))
+            .await
+    }
+
+    /// [`Self::cached_channel_zone`] once the pin check found no pin: the
+    /// memos, then D1 through [`trust::get_channel_zone`].
+    async fn memoised_channel_zone(
         &self,
         channel_id: &str,
     ) -> Result<Option<String>, trust::ZoneLookupError> {
@@ -2853,7 +3015,11 @@ impl NostrRelayDO {
     /// Where a reference-kind event's targets live (see [`RefScope`]). Each
     /// target is resolved from D1, never from tags the event mirrors (see
     /// [`Self::reference_target_channels`]). Lookups fail closed.
-    pub(crate) async fn resolve_reference_scope(&self, event: &NostrEvent) -> RefScope {
+    pub(crate) async fn resolve_reference_scope(
+        &self,
+        event: &NostrEvent,
+        zone_cfg: &ZoneConfig,
+    ) -> RefScope {
         let targets = reference_targets(event);
         if targets.is_empty() {
             return RefScope::Unscoped;
@@ -2867,7 +3033,7 @@ impl NostrRelayDO {
                 return RefScope::Unknown;
             };
             for channel in channels {
-                match self.cached_channel_zone(&channel).await {
+                match self.cached_channel_zone(&channel, zone_cfg).await {
                     Ok(Some(zone)) => {
                         if !zones.contains(&zone) {
                             zones.push(zone);
@@ -2885,6 +3051,31 @@ impl NostrRelayDO {
         }
     }
 
+    /// The pinned zones (ADR-2037) of the channels a reference-kind event's
+    /// targets live in, through the same memoised target lookup as
+    /// [`Self::resolve_reference_scope`]. A target that cannot be resolved
+    /// contributes nothing here; the scope check refuses it separately.
+    async fn reference_pinned_zones(
+        &self,
+        event: &NostrEvent,
+        zone_cfg: &ZoneConfig,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for target in reference_targets(event).iter().take(MAX_REFERENCE_TARGETS) {
+            let Ok(channels) = self.reference_target_channels(target, 1).await else {
+                continue;
+            };
+            for channel in channels {
+                if let crate::zone_config::ChannelPin::Pinned(z) = zone_cfg.pinned_zone(&channel) {
+                    if !out.iter().any(|o| o == z) {
+                        out.push(z.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The stored event(s) id `id` names: the event with that id if stored;
     /// otherwise the sealed envelopes wrapping an original of that id, matched
     /// on the whole envelope shape and an admin author (never a bare `sealed`
@@ -2892,18 +3083,28 @@ impl NostrRelayDO {
     /// is stored, on a D1 failure, or for more than `MAX_REFERENCE_TARGETS`
     /// envelope matches.
     async fn lookup_target_events(&self, id: &str) -> Result<Vec<NostrEvent>, ()> {
-        let db = self.env.d1("DB").map_err(|_| ())?;
+        self.lookup_target_events_detailed(id).await.map_err(|_| ())
+    }
+
+    /// [`Self::lookup_target_events`], telling "nothing (or too much) is
+    /// stored" from "D1 could not answer".
+    async fn lookup_target_events_detailed(
+        &self,
+        id: &str,
+    ) -> Result<Vec<NostrEvent>, TargetLookupError> {
+        use TargetLookupError::Unavailable as U;
+        let db = self.env.d1("DB").map_err(|_| U)?;
         let by_id: Vec<super::storage::EventRow> = db
             .prepare(
                 "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1",
             )
             .bind(&[JsValue::from_str(id)])
-            .map_err(|_| ())?
+            .map_err(|_| U)?
             .all()
             .await
-            .map_err(|_| ())?
+            .map_err(|_| U)?
             .results()
-            .map_err(|_| ())?;
+            .map_err(|_| U)?;
         let found: Vec<NostrEvent> = by_id
             .into_iter()
             .filter_map(super::storage::EventRow::into_nostr_event)
@@ -2918,25 +3119,25 @@ impl NostrRelayDO {
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
         ))
-        .map_err(|_| ())?;
+        .map_err(|_| U)?;
         let sealed: Vec<super::storage::EventRow> = db
             .prepare(format!(
                 "{SEALED_TARGET_SQL} LIMIT {}",
                 MAX_REFERENCE_TARGETS + 1
             ))
             .bind(&[JsValue::from_str(id), JsValue::from_str(&trusted)])
-            .map_err(|_| ())?
+            .map_err(|_| U)?
             .all()
             .await
-            .map_err(|_| ())?
+            .map_err(|_| U)?
             .results()
-            .map_err(|_| ())?;
+            .map_err(|_| U)?;
         let found: Vec<NostrEvent> = sealed
             .into_iter()
             .filter_map(super::storage::EventRow::into_nostr_event)
             .collect();
         if found.is_empty() || found.len() > MAX_REFERENCE_TARGETS {
-            return Err(());
+            return Err(TargetLookupError::Missing);
         }
         Ok(found)
     }
@@ -3003,6 +3204,61 @@ impl NostrRelayDO {
         }
         if direct {
             self.ref_target_cache.insert(id, channels.clone(), now);
+        }
+        Ok(channels)
+    }
+
+    /// Whether `channel_id` is a stored kind-40 with exactly that id, for the
+    /// kind-41 gate. A hit in the positive target memo answers at once;
+    /// otherwise one D1 read (kind 40 by id: a sealed envelope never stands in
+    /// for a channel definition). A found channel is memoised as the kind-42
+    /// path memoises it (`[channel_id]`); absence and failure never are, so a
+    /// D1 failure is never replayed as "not a known channel".
+    async fn stored_channel_known(&self, channel_id: &str) -> Result<(), TargetLookupError> {
+        use TargetLookupError::Unavailable as U;
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.ref_target_cache.get(channel_id, now) {
+            return if hit.len() == 1 && hit[0] == channel_id {
+                Ok(())
+            } else {
+                Err(TargetLookupError::Missing)
+            };
+        }
+        #[derive(serde::Deserialize)]
+        struct Row {
+            id: String,
+        }
+        let db = self.env.d1("DB").map_err(|_| U)?;
+        let row: Option<Row> = db
+            .prepare("SELECT id FROM events WHERE id = ?1 AND kind = 40 LIMIT 1")
+            .bind(&[JsValue::from_str(channel_id)])
+            .map_err(|_| U)?
+            .first::<Row>(None)
+            .await
+            .map_err(|_| U)?;
+        match row {
+            Some(r) if r.id == channel_id => {
+                self.ref_target_cache
+                    .insert(channel_id, vec![channel_id.to_string()], now);
+                Ok(())
+            }
+            _ => Err(TargetLookupError::Missing),
+        }
+    }
+
+    /// The channels the post an edit targets lives in (stored kind-42 or a
+    /// sealed original), with lookup failures kept apart from absence.
+    async fn edit_target_channels(&self, target: &str) -> Result<Vec<String>, TargetLookupError> {
+        let targets = self.lookup_target_events_detailed(target).await?;
+        let mut channels: Vec<String> = Vec::new();
+        for t in &targets {
+            if t.kind != 42 {
+                return Err(TargetLookupError::Missing);
+            }
+            let c = stored_target_channel(t).ok_or(TargetLookupError::Missing)?;
+            if !channels.contains(&c) {
+                channels.push(c);
+            }
         }
         Ok(channels)
     }
@@ -3401,7 +3657,7 @@ impl NostrRelayDO {
         // Reactions, comments and reports follow the message they reference
         // (F4), resolved from D1 by the target's own channel.
         if is_reference_kind(event.kind) {
-            let scope = self.resolve_reference_scope(event).await;
+            let scope = self.resolve_reference_scope(event, zones).await;
             let is_author = ctx.access_pubkey.as_deref() == Some(event.pubkey.as_str())
                 || ctx.session_pubkey.as_deref() == Some(event.pubkey.as_str());
             return reference_read_decision(&scope, zones, ctx, is_author);
@@ -3427,7 +3683,7 @@ impl NostrRelayDO {
             // `trust::has_zone_access` applies (public read, or whitelist
             // admin, or a required cohort); `ctx.viewer_is_admin` carries the
             // whitelist admin flag that function used to re-read.
-            let zone = self.cached_channel_zone(&cid).await;
+            let zone = self.cached_channel_zone(&cid, zones).await;
             return channel_read_decision_for(event.kind, &zone, zones, ctx);
         }
 
@@ -3561,7 +3817,7 @@ impl NostrRelayDO {
             {
                 let mut count = 0u64;
                 for (channel, n) in groups {
-                    let zone = self.cached_channel_zone(&channel).await;
+                    let zone = self.cached_channel_zone(&channel, &zones).await;
                     if matches!(
                         channel_read_decision_for(42, &zone, &zones, &ctx),
                         ReadDecision::Deliver
@@ -9528,6 +9784,285 @@ mod sealed_target_sql_tests {
         assert_eq!(
             super::parse_trusted_sealers(&many).len(),
             super::MAX_TRUSTED_SEALERS
+        );
+    }
+}
+
+#[cfg(test)]
+mod channel_pin_gate_tests {
+    //! ADR-2037: a channel pinned to a zone in `ZONE_CONFIG` is read-gated by
+    //! that zone, whatever its `channel_zones` row says and whether or not D1
+    //! answers. Every read path (REQ, COUNT, live broadcast, push) decides
+    //! through `channel_read_decision_for` on the `cached_channel_zone`
+    //! answer, which these tests reproduce with a stubbed D1.
+    use super::*;
+    use crate::trust::{resolve_channel_zone, ZoneLookupError};
+    use crate::zone_config::ZoneConfig;
+
+    const PINNED: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    /// "members" read the zone the channel is bound to in D1; "staff" is a
+    /// hidden, encrypted zone that pins the channel.
+    fn zones() -> ZoneConfig {
+        ZoneConfig::from_json(&format!(
+            r#"[{{"id":"open","required_cohorts":["members"],"visibility":"locked","encrypted":true}},
+                {{"id":"staff","required_cohorts":["staff"],"visibility":"hidden","encrypted":true,
+                  "channels":["{PINNED}"]}}]"#
+        ))
+        .with_encryption(true)
+    }
+
+    fn viewer(cohorts: &[&str], authed: bool, admin: bool) -> ViewerContext {
+        ViewerContext {
+            session_pubkey: authed.then(|| "s".repeat(64)),
+            access_pubkey: authed.then(|| "s".repeat(64)),
+            is_admin: admin,
+            viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
+            viewer_is_admin: admin,
+            recipient_keys: vec![],
+        }
+    }
+
+    /// The zone a gate sees for `PINNED` when D1 answers `d1`.
+    fn zone_seen(
+        zones: &ZoneConfig,
+        d1: Result<Option<String>, ZoneLookupError>,
+    ) -> Result<Option<String>, ZoneLookupError> {
+        block_on(resolve_channel_zone(zones, PINNED, || {
+            std::future::ready(d1)
+        }))
+    }
+
+    fn delivered(
+        kind: u64,
+        zone: &Result<Option<String>, ZoneLookupError>,
+        ctx: &ViewerContext,
+    ) -> bool {
+        matches!(
+            channel_read_decision_for(kind, zone, &zones(), ctx),
+            ReadDecision::Deliver
+        )
+    }
+
+    #[test]
+    fn a_pinned_channel_is_read_by_admins_and_pinned_zone_members_only() {
+        let zones = zones();
+        // D1 still binds the channel to "open", or has no row, or is down.
+        for d1 in [Ok(Some("open".to_string())), Ok(None), Err(ZoneLookupError)] {
+            let zone = zone_seen(&zones, d1);
+            assert_eq!(zone, Ok(Some("staff".to_string())));
+            for kind in [40, 41, 42] {
+                assert!(
+                    delivered(kind, &zone, &viewer(&[], true, true)),
+                    "admin, kind {kind}"
+                );
+                assert!(
+                    delivered(kind, &zone, &viewer(&["staff"], true, false)),
+                    "staff, kind {kind}"
+                );
+                // A member of the zone the channel used to be in: nothing, not
+                // even the definition (the pinned zone is hidden).
+                assert!(
+                    !delivered(kind, &zone, &viewer(&["members"], true, false)),
+                    "member, kind {kind}"
+                );
+                assert!(
+                    !delivered(kind, &zone, &viewer(&[], false, false)),
+                    "anonymous, kind {kind}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn without_the_pin_the_same_channel_follows_its_d1_row() {
+        // Behaviour neutrality: drop `channels` and the members read again.
+        let unpinned = ZoneConfig::from_json(
+            r#"[{"id":"open","required_cohorts":["members"],"visibility":"locked","encrypted":true},
+                {"id":"staff","required_cohorts":["staff"],"visibility":"hidden","encrypted":true}]"#,
+        )
+        .with_encryption(true);
+        let zone = block_on(resolve_channel_zone(&unpinned, PINNED, || {
+            std::future::ready(Ok(Some("open".to_string())))
+        }));
+        assert_eq!(zone, Ok(Some("open".to_string())));
+        assert!(matches!(
+            channel_read_decision_for(42, &zone, &unpinned, &viewer(&["members"], true, false)),
+            ReadDecision::Deliver
+        ));
+    }
+
+    #[test]
+    fn writes_into_a_pinned_channel_follow_the_pinned_zone() {
+        let zones = zones();
+        let zone = zone_for_write(zone_seen(&zones, Ok(Some("open".to_string()))));
+        assert_eq!(zone, Ok(Some("staff".to_string())));
+        let zone = zone.unwrap().unwrap();
+        assert!(!zones.cohorts_can_write(&zone, &["members".to_string()]));
+        assert!(zones.cohorts_can_write(&zone, &["staff".to_string()]));
+        // A double pin makes the zone unknown: the write is refused.
+        let doubled = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"a","required_cohorts":["a"],"channels":["{PINNED}"]}},
+                {{"id":"b","required_cohorts":["b"],"channels":["{PINNED}"]}}]"#
+        ));
+        assert!(zone_for_write(zone_seen(&doubled, Ok(None))).is_err());
+    }
+
+    #[test]
+    fn a_double_pin_withholds_the_channel_from_everyone() {
+        let doubled = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"a","required_cohorts":["a"],"channels":["{PINNED}"]}},
+                {{"id":"b","required_cohorts":["b"],"channels":["{PINNED}"]}}]"#
+        ));
+        let zone = zone_seen(&doubled, Ok(None));
+        for ctx in [viewer(&["a"], true, false), viewer(&[], true, true)] {
+            assert!(matches!(
+                channel_read_decision_for(42, &zone, &doubled, &ctx),
+                ReadDecision::Withhold
+            ));
+        }
+    }
+
+    // -- Review fixes: metadata, edits, comments, locked target zones -----------
+
+    #[test]
+    fn channel_metadata_needs_write_access_to_the_resolved_zone() {
+        let zones = zones();
+        // Pinned channel: an old-zone member (even the creator at TL2/TL3)
+        // may not rename it, set its picture or post pin control events.
+        let zone = zone_for_write(zone_seen(&zones, Ok(Some("open".to_string()))));
+        let member_may = zones.cohorts_can_write("staff", &["members".to_string()]);
+        assert_eq!(
+            channel_metadata_zone_rejection(&zone, member_may),
+            Some("zone access denied")
+        );
+        let staff_may = zones.cohorts_can_write("staff", &["staff".to_string()]);
+        assert_eq!(channel_metadata_zone_rejection(&zone, staff_may), None);
+        // A lookup that could not be answered refuses.
+        assert!(channel_metadata_zone_rejection(&Err("error: zone lookup failed"), true).is_some());
+        // An unscoped channel stays gated by trust level alone.
+        assert_eq!(channel_metadata_zone_rejection(&Ok(None), false), None);
+    }
+
+    #[test]
+    fn an_edit_must_target_a_message_in_its_own_channel() {
+        assert_eq!(
+            edit_target_rejection(PINNED, &Ok(vec![PINNED.to_string()])),
+            None
+        );
+        // A legacy target whose root tag is upper-case is still this channel.
+        assert_eq!(
+            edit_target_rejection(PINNED, &Ok(vec![PINNED.to_uppercase()])),
+            None
+        );
+        for bad in [
+            Ok(vec!["other".to_string()]),
+            Ok(vec![]),
+            Err(TargetLookupError::Missing),
+        ] {
+            assert_eq!(
+                edit_target_rejection(PINNED, &bad),
+                Some("invalid: edit target is not a message in this channel"),
+                "{bad:?}"
+            );
+        }
+        // D1 down: retryable, not "invalid".
+        assert_eq!(
+            edit_target_rejection(PINNED, &Err(TargetLookupError::Unavailable)),
+            Some("error: edit target lookup failed, try again")
+        );
+        assert!(
+            edit_target_rejection(PINNED, &Ok(vec![PINNED.to_string(), "other".to_string()]))
+                .is_some()
+        );
+        let edit = NostrEvent {
+            id: "x".into(),
+            pubkey: "p".into(),
+            created_at: 1,
+            kind: 42,
+            tags: vec![
+                vec!["e".into(), "chan".into(), "".into(), "root".into()],
+                vec!["e".into(), "ABCD".into(), "".into(), "edit".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        assert_eq!(edit_target_of(&edit).as_deref(), Some("abcd"));
+    }
+
+    #[test]
+    fn a_comment_on_a_pinned_message_under_another_zone_key_is_refused() {
+        let zk = |zone: &str| {
+            vec![
+                vec!["e".to_string(), "target".into()],
+                vec!["zk".to_string(), zone.into(), "1".into(), "ab".repeat(32)],
+            ]
+        };
+        let pinned = vec!["staff".to_string()];
+        assert!(pinned_foreign_zk(&pinned, &zk("open")));
+        assert!(!pinned_foreign_zk(&pinned, &zk("staff")));
+        // No pinned target: nothing changes.
+        assert!(!pinned_foreign_zk(&[], &zk("open")));
+    }
+
+    /// The pinned zone is `locked` rather than `hidden`: definitions and
+    /// metadata stay visible to everyone (the tile renders), content does not.
+    fn locked_zones() -> ZoneConfig {
+        ZoneConfig::from_json(&format!(
+            r#"[{{"id":"open","required_cohorts":["members"],"visibility":"locked","encrypted":true}},
+                {{"id":"staff","required_cohorts":["staff"],"visibility":"locked","encrypted":true,
+                  "channels":["{PINNED}"]}}]"#
+        ))
+        .with_encryption(true)
+    }
+
+    #[test]
+    fn a_channel_pinned_to_a_locked_zone_exposes_its_definition_not_its_posts() {
+        let zones = locked_zones();
+        let zone = block_on(resolve_channel_zone(&zones, PINNED, || {
+            std::future::ready(Ok(Some("open".to_string())))
+        }));
+        assert_eq!(zone, Ok(Some("staff".to_string())));
+        let decide = |kind, ctx: &ViewerContext| {
+            matches!(
+                channel_read_decision_for(kind, &zone, &zones, ctx),
+                ReadDecision::Deliver
+            )
+        };
+        for ctx in [viewer(&["members"], true, false), viewer(&[], false, false)] {
+            // kind-40 and kind-41 (name, about, picture, creator, raw
+            // section tag, rename history) are served to non-members.
+            assert!(decide(40, &ctx));
+            assert!(decide(41, &ctx));
+            assert!(!decide(42, &ctx));
+        }
+        for ctx in [viewer(&["staff"], true, false), viewer(&[], true, true)] {
+            for kind in [40, 41, 42] {
+                assert!(decide(kind, &ctx));
+            }
+        }
+    }
+
+    #[test]
+    fn a_kind_41_channel_lookup_failure_is_retryable() {
+        assert_eq!(channel_known_rejection(&Ok(())), None);
+        assert_eq!(
+            channel_known_rejection(&Err(TargetLookupError::Missing)),
+            Some("invalid: channel is not a known channel")
+        );
+        assert_eq!(
+            channel_known_rejection(&Err(TargetLookupError::Unavailable)),
+            Some("error: channel lookup failed, try again")
         );
     }
 }

@@ -198,6 +198,26 @@ pub fn eligible_zone_ids(zones: &crate::zone_config::ZoneConfig) -> Vec<String> 
         .collect()
 }
 
+/// The zone a candidate row is triaged under, or `None` to skip it. The
+/// candidate query joins `channel_zones`, so a zone-config pin (ADR-2037)
+/// overrides the row's zone here: a channel pinned to a zone that is not
+/// eligible (private or encrypted) is never sent to the model, whatever D1
+/// says, and one pinned by two zones is skipped. With no pins this is the
+/// row's own zone, which the query already limited to `eligible`.
+pub fn triage_zone(
+    zones: &crate::zone_config::ZoneConfig,
+    eligible: &[String],
+    channel_id: &str,
+    row_zone: &str,
+) -> Option<String> {
+    let zone = match zones.pinned_zone(channel_id) {
+        crate::zone_config::ChannelPin::Pinned(z) => z,
+        crate::zone_config::ChannelPin::Conflict => return None,
+        crate::zone_config::ChannelPin::Unpinned => row_zone,
+    };
+    eligible.iter().any(|e| e == zone).then(|| zone.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Worker-side runner (D1 + HTTP). Everything above is natively testable.
 // ---------------------------------------------------------------------------
@@ -317,9 +337,12 @@ pub async fn run_sweep(env: &Env) {
 
     let mut cands = Vec::new();
     for r in rows {
+        let Some(zone) = triage_zone(&zones, &zone_ids, &r.channel_id, &r.zone) else {
+            continue;
+        };
         let tags = parse_tags(&r.tags);
         // Defence in depth: never send zone ciphertext, whatever the config says.
-        if is_zone_ciphertext(&r.zone, &tags, &r.content) {
+        if is_zone_ciphertext(&zone, &tags, &r.content) {
             continue;
         }
         let parent = match reply_target(&tags) {
@@ -329,7 +352,7 @@ pub async fn run_sweep(env: &Env) {
         cands.push(Candidate {
             event_id: r.id,
             channel_id: r.channel_id,
-            zone: r.zone,
+            zone,
             text: r.content,
             parent,
         });
@@ -703,5 +726,37 @@ mod tests {
                 "{bad} must not be eligible"
             );
         }
+    }
+
+    // -- ADR-2037: pins override the candidate query's zone ----------------
+
+    #[test]
+    fn a_channel_pinned_to_a_private_zone_is_never_triaged() {
+        let pin = "7".repeat(64);
+        let zones = crate::zone_config::ZoneConfig::from_json(&format!(
+            r#"[{{"id":"zone1","required_cohorts":[],"visibility":"public"}},
+                {{"id":"staff","required_cohorts":["staff"],"visibility":"hidden","channels":["{pin}"]}}]"#
+        ));
+        let eligible = eligible_zone_ids(&zones);
+        assert_eq!(eligible, vec!["zone1".to_string()]);
+        // D1 binds the channel to the public zone; the pin moves it out.
+        assert_eq!(triage_zone(&zones, &eligible, &pin, "zone1"), None);
+        // An unpinned channel keeps its row's zone.
+        assert_eq!(
+            triage_zone(&zones, &eligible, "pub", "zone1"),
+            Some("zone1".to_string())
+        );
+    }
+
+    #[test]
+    fn with_no_pins_the_row_zone_is_used() {
+        let zones = crate::zone_config::ZoneConfig::from_json(
+            r#"[{"id":"zone1","required_cohorts":[],"visibility":"public"}]"#,
+        );
+        let eligible = eligible_zone_ids(&zones);
+        assert_eq!(
+            triage_zone(&zones, &eligible, &"8".repeat(64), "zone1"),
+            Some("zone1".to_string())
+        );
     }
 }

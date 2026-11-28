@@ -33,6 +33,10 @@
 #   NBSS_MODERATORS     comma-separated admin/moderator pubkeys whose kind-5 deletes
 #                       any post (default: none; authors still delete their own)
 #   NBSS_WORKERS        embedding threads (default: the builder's, half the CPUs)
+#   NBSS_ZONE_CONFIG    the deployment's ZONE_CONFIG JSON (a file). With it, posts of a
+#                       channel the config pins to another zone (ADR-2037) are left out
+#                       of this zone's index, and already-indexed ones the relay still
+#                       serves the indexer are excluded (default: no pins honoured)
 #
 # Exit codes:
 #   0  done (published, or nothing new)
@@ -157,6 +161,9 @@ if [ -n "${NBSS_MODERATORS:-}" ]; then
 fi
 if [ -n "${NBSS_WORKERS:-}" ]; then
   common+=(--workers "$NBSS_WORKERS")
+fi
+if [ -n "${NBSS_ZONE_CONFIG:-}" ]; then
+  common+=(--zone-config "$NBSS_ZONE_CONFIG")
 fi
 
 # Run the builder within what is left of the budget; its JSON report goes to

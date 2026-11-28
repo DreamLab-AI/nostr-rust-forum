@@ -2403,13 +2403,23 @@ pub fn channel_zone(
             .map(|c| c.section.clone())
     })?;
     let zones = crate::stores::zones::load_zones();
-    let zone_id = crate::stores::zones::section_to_zone(&section, &zones)?;
-    let zone = zones.iter().find(|z| z.id == zone_id)?;
+    let zone = zone_for_channel_section(&section, &zones)?;
     Some((
         zone.id.clone(),
         zone.display_name.clone(),
         super::zone_is_encrypted(super::encryption_enabled(), zone.encrypted),
     ))
+}
+
+/// The zone whose key a channel's posts use, from the channel's routed
+/// `section` (`ChannelMeta::section`, which already reflects any ADR-2037
+/// zone pin). Pure half of [`channel_zone`].
+pub fn zone_for_channel_section<'a>(
+    section: &str,
+    zones: &'a [crate::stores::zones::Zone],
+) -> Option<&'a crate::stores::zones::Zone> {
+    let zone_id = crate::stores::zones::section_to_zone(section, zones)?;
+    zones.iter().find(|z| z.id == zone_id)
 }
 
 /// Apply the zone write rules to an outgoing kind-42 for `channel_id`:

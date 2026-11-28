@@ -120,6 +120,9 @@ pub struct Job<'a, P> {
     pub now: u64,
     /// Hex pubkeys whose kind-5 deletes any post (admins and moderators).
     pub moderators: &'a [String],
+    /// Channels the zone config pins to a zone (ADR-2037); posts in a
+    /// channel pinned elsewhere are left out of this zone's index.
+    pub channel_pins: &'a crate::harvest::ChannelPins,
     /// Most excluded ids a manifest this job publishes may list.
     pub max_excluded: usize,
     /// Seconds an object a manifest stopped listing is kept before deletion.
@@ -249,6 +252,9 @@ pub struct Report {
     pub superseded: usize,
     /// Posts already indexed.
     pub already_indexed: usize,
+    /// Posts left out because their channel is pinned to another zone
+    /// (ADR-2037).
+    pub pinned_elsewhere: usize,
     /// Events that do not verify.
     pub invalid: usize,
     /// Events under a held key that do not open.
@@ -290,6 +296,7 @@ impl Report {
         self.deleted = h.deleted;
         self.superseded = h.superseded;
         self.already_indexed = h.already_indexed;
+        self.pinned_elsewhere = h.pinned_elsewhere;
         self.invalid = h.invalid;
         self.undecryptable = h.undecryptable;
         self.missing_key = h.missing_key;
@@ -850,6 +857,7 @@ pub async fn run_update<P: Pod, R: Relay, E: Embedder>(
     let rules = Rules {
         now: job.now,
         moderators: job.moderators,
+        channel_pins: job.channel_pins,
     };
     let h = harvest(relay, job.zone, job.ring, since, &indexed, &rules, book).await?;
     report.harvested(&h);
