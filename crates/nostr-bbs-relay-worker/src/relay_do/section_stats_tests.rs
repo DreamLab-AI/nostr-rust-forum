@@ -1346,3 +1346,89 @@ fn computations_are_capped_across_channels_and_released_on_drop() {
     assert!(matches!(sf.begin("c"), Role::Lead(_)), "slot released");
     drop(b);
 }
+
+/// Emit the statements, a seeded section and SQLite's own results to the
+/// directory in `SECTION_STATS_D1_DIR`, so the same SQL can be run on a
+/// local D1 (`wrangler d1 execute --local`) and compared (not a gate).
+#[test]
+#[ignore = "emits files for a local D1 check; run by hand"]
+fn emit_local_d1_check() {
+    let Ok(dir) = std::env::var("SECTION_STATS_D1_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    let c = db();
+    let all = seeded(&c, 7);
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut seed = String::new();
+    for e in &all {
+        seed.push_str(&format!(
+            "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES ({}, {}, {}, {}, {}, {}, {});\n",
+            quote(&e.id),
+            quote(&e.pubkey),
+            e.created_at,
+            e.kind,
+            quote(&serde_json::to_string(&e.tags).unwrap()),
+            quote(&e.content),
+            quote(&e.sig)
+        ));
+    }
+    std::fs::write(dir.join("02-seed.sql"), seed).unwrap();
+    std::fs::write(dir.join("01-0017.sql"), MIGRATION_0017).unwrap();
+    let a = answer(&c, C);
+    let keys: Vec<String> = a.topics.iter().map(|t| t.id.clone()).collect();
+    let inline = |sql: &str, params: &[String]| {
+        let mut out = sql.to_string();
+        for (i, p) in params.iter().enumerate().rev() {
+            out = out.replace(&format!("?{}", i + 1), p);
+        }
+        out
+    };
+    let (ch, now) = (quote(C), NOW.to_string());
+    let stmts = [
+        ("q_roots_indexed", inline(&roots_indexed_sql(), &[ch.clone(), now.clone(), "1001".into()])),
+        (
+            "q_roots_walk",
+            inline(&roots_walk_sql(), &[ch.clone(), now.clone(), "1001".into(), ROOTS_VISIT_CAP.to_string()]),
+        ),
+        (
+            "q_stats",
+            inline(
+                &stats_sql(true),
+                &[
+                    ch.clone(),
+                    now.clone(),
+                    quote(&serde_json::to_string(&keys).unwrap()),
+                    ACTIVITY_WALK_ROWS.to_string(),
+                    COUNT_VISIT_CAP.to_string(),
+                ],
+            ),
+        ),
+    ];
+    let mut expected = serde_json::Map::new();
+    for (name, sql) in &stmts {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql};\n")).unwrap();
+        let mut s = c.prepare(sql).unwrap();
+        let cols: Vec<String> = s.column_names().map(|n| n.to_string()).collect();
+        let rows: Vec<serde_json::Value> = s
+            .query_map([], |r| {
+                let mut m = serde_json::Map::new();
+                for (i, n) in cols.iter().enumerate() {
+                    let v = match r.get::<_, Value>(i)? {
+                        Value::Null => serde_json::Value::Null,
+                        Value::Integer(n) => serde_json::json!(n),
+                        Value::Real(f) => serde_json::json!(f),
+                        Value::Text(t) => serde_json::Value::String(t),
+                        Value::Blob(_) => serde_json::Value::Null,
+                    };
+                    m.insert(n.clone(), v);
+                }
+                Ok(serde_json::Value::Object(m))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        expected.insert(name.to_string(), serde_json::Value::Array(rows));
+    }
+    std::fs::write(dir.join("expected.json"), serde_json::Value::Object(expected).to_string()).unwrap();
+}

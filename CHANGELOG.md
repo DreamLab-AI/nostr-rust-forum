@@ -39,6 +39,12 @@ No D1 schema or data change. Not exercised against D1, a live relay or in a brow
 - **"↻ N updated".** Also counts a topic that arrived after the freeze below a topic of lower known activity (never an
   older page's older topics), and after a freeze forced by the 20 s cap before the window or the section stats arrived, the
   baseline is taken again when the first of them lands, so a quiet section no longer shows a count.
+- **Review fixes (PR #134).** One computation per section at a time, shared by every reader asking meanwhile, and at most two
+  at once; every query walk is capped by rows visited, so a topic buried in reactions or a small section on a big relay stays
+  cheap (a 300-topic section now costs 4 statements, was 34). Topic roots are read through a new partial index,
+  **migration 0017 (`idx_events_topic_root_channel`, additive, applied by the operator; `DROP INDEX` to roll back)**; until it
+  exists the relay walks at most 20,000 topic roots and says `truncated`. Expiry is read exactly as REQ reads it. A live
+  reply now raises its row's reply count, and a reply arriving after a capped freeze is offered by "↻ N updated".
 
 ### Zones: pin a section to a zone from config (2026-11-28)
 

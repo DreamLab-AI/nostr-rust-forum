@@ -286,10 +286,13 @@ sequenceDiagram
     R->>R: admission = channel_read_decision_for(42) on cached_channel_zone (pin first)
     alt refused, or no such section
         R-->>C: CLOSED auth-required / restricted (never an empty list)
-    else admitted, memo older than 30 s
-        R->>D: roots (t=topic, idx_event_tags_time), activity walks (at most 256 rows each), capped counts
+    else admitted, memo older than 30 s, no computation running for this section
+        R->>D: roots (index idx_events_topic_root_channel, migration 0017)
+        R->>D: one statement per 100 topics: activity and counts, every walk capped by rows visited
         D-->>R: rows
         R-->>C: SECTION-STATS {topics in board order, truncated}
+    else admitted, the same section being computed
+        R-->>C: SECTION-STATS (the one computation's answer, shared)
     else admitted, memo fresh
         R-->>C: SECTION-STATS (memoised payload)
     end

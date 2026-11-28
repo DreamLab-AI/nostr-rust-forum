@@ -33,9 +33,11 @@ active in the newest-100-message window were in true order.
 | TL-7 | Access to the figures is exactly access to the section by REQ: zone cohorts, admin bypass, encrypted zones, the ADR-2037 pin, AUTH state. An unauthenticated or unauthorised reader learns nothing (no counts, ids or timestamps) and never sees "0 topics" for a refusal. | Admission through `channel_read_decision_for(42, …)`; refusals are `CLOSED`; a missing section is refused with the same text. | relay `admission_matrix_matches_the_channel_read_rule`, `a_missing_section_is_refused_like_an_unreadable_one` |
 | TL-8 | Deleted roots and replies are not counted; edits are not activity; another channel's events never count. | Relay rules (ADR-2038 §5). | relay oracle and targeted tests |
 | TL-9 | Encrypted zones: the relay never needs plaintext; sealed roots are reported under their envelope id with the original id, and the client folds both. | ADR-2038 §6; `SectionStats::get`. | `sealed_root_reports_envelope_id_with_original_and_hides_the_migrator`, `dual_present_original_is_the_topic_and_counts_replies_to_either_id` |
-| TL-10 | Holds at message scale: sections of thousands of topics, channels of 10^5–10^6 messages; bounded work per request; an explicit truncation signal; no full scans; no D1 schema change. | Capped index walks, count budget, `truncated`, 30 s memo (ADR-2038 §7). | cost and plan tests; `measure_section_stats_cost` (native SQLite, not D1) |
+| TL-10 | Holds at message scale: sections of thousands of topics, channels of 10^5–10^6 messages; bounded work per request, counted in rows visited (reactions and other references included); independent of other channels' size; an explicit truncation signal; no full scans; a few statements for a common section. | Visit-capped index walks, count budget, `truncated`, 30 s memo, single flight per channel and a cap of two computations, migration 0017's partial index for roots (ADR-2038 §7). | cost, plan and single-flight tests; `measure_review_scenarios` (native SQLite); local D1 check |
 | TL-11 | Old client with new relay and new client with old relay both work; the client never hangs on an absent or refusing relay. | NIP-11 advertisement; any refusal, `NOTICE` or 8 s timeout falls back to the PR #130 behaviour. | client `relay::section_stats_tests`, `advertised` tests |
 | TL-12 | The per-topic pump is a fallback and fills only figures the answer lacks; it never reorders. | Pump waits for the section stats and skips topics they cover. | page wiring (both clients) |
+| TL-13 | A reply that arrives during the visit raises its row's count. | Section stats seed each topic's total; a live reply (not an edit) adds to it. | `stats_seed_a_total_that_live_replies_then_grow` |
+| TL-14 | After a freeze forced by the 20 s cap, a reply that arrives after the paint is offered by "↻ N updated". | The re-taken baseline never passes the paint time, and settles one cap later if nothing lands. | `a_reply_after_a_cap_freeze_is_offered_when_the_window_lands`, `a_provisional_baseline_settles_one_cap_after_the_freeze_anyway` |
 
 ## Out of scope / follow-up
 
@@ -43,10 +45,12 @@ active in the newest-100-message window were in true order.
   ADR-2038, not built.
 - Legacy roots without the topic marker are listed from the window only (ADR-2038 limits).
 - Pagination past 1,000 marked roots per section.
+- Re-asking after an `auth-required:` refusal within the same visit (ADR-2038, review item 6).
 
 ## Acceptance (rollout)
 
-On a deployment with the relay and both clients at this change: the relay's NIP-11 advertises `nostr_bbs.section_stats`; a
+The operator applies migration 0017 (`CREATE INDEX IF NOT EXISTS idx_events_topic_root_channel …`, ADR-2038 §7) to the relay
+database; until then the relay uses a bounded walk. On a deployment with the relay and both clients at this change: the relay's NIP-11 advertises `nostr_bbs.section_stats`; a
 member opening the 168-topic section sees every row in true order at first paint, with no reorder after; first paint at or
 under the previous 3.4–4.5 s; a non-member gets no figures; signed out, nothing for a gated section; D1 rows read per section
 open within the ADR-2038 estimate.

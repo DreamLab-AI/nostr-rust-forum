@@ -1,0 +1,12 @@
+# RED finding 4: 2026-11-28T15:41:46Z at 08cd174 + new board tests
+test topics::board::tests::a_provisional_baseline_settles_one_cap_after_the_freeze_anyway ... FAILED
+test topics::board::tests::a_reply_after_a_cap_freeze_is_offered_when_the_window_lands ... FAILED
+thread 'topics::board::tests::a_provisional_baseline_settles_one_cap_after_the_freeze_anyway' (2093602) panicked at crates/nostr-bbs-client-core/src/topics/board.rs:1620:9:
+assertion `left == right` failed
+  left: 10
+ right: 1000
+thread 'topics::board::tests::a_reply_after_a_cap_freeze_is_offered_when_the_window_lands' (2093604) panicked at crates/nostr-bbs-client-core/src/topics/board.rs:1603:9:
+assertion `left == right` failed: never past the paint
+  left: 1025
+ right: 1020
+test result: FAILED. 35 passed; 2 failed; 0 ignored; 0 measured; 1222 filtered out; finished in 6.42s

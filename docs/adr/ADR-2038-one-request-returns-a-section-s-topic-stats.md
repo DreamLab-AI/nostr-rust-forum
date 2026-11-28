@@ -8,13 +8,13 @@ activation_status: inactive
 supersedes: []
 superseded_by: []
 verified_commit: 34fa898 (branch feat/section-topic-stats, stacked on fix/topic-list-stability ef41392); later commits on the branch touch docs and evidence only
-verified_paths: [crates/nostr-bbs-relay-worker/src/relay_do/section_stats.rs, crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs, crates/nostr-bbs-relay-worker/src/relay_do/mod.rs, crates/nostr-bbs-relay-worker/src/nip11.rs, crates/nostr-bbs-client-core/src/topics/section_stats.rs, crates/nostr-bbs-client-core/src/topics/board.rs, crates/nostr-bbs-client-core/src/relay.rs, crates/nostr-bbs-client-core/src/relay/info.rs, crates/nostr-bbs-client-core/src/stores/channels.rs, crates/nostr-bbs-client-core/src/zone_crypto/tickets.rs, crates/nostr-bbs-forum-client/src/pages/section.rs, crates/nostr-bbs-bbs-client/src/views/thread.rs]
+verified_paths: [crates/nostr-bbs-relay-worker/migrations/0017_topic_root_channel_index.sql, crates/nostr-bbs-relay-worker/src/relay_do/section_stats.rs, crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs, crates/nostr-bbs-relay-worker/src/relay_do/mod.rs, crates/nostr-bbs-relay-worker/src/nip11.rs, crates/nostr-bbs-client-core/src/topics/section_stats.rs, crates/nostr-bbs-client-core/src/topics/board.rs, crates/nostr-bbs-client-core/src/relay.rs, crates/nostr-bbs-client-core/src/relay/info.rs, crates/nostr-bbs-client-core/src/stores/channels.rs, crates/nostr-bbs-client-core/src/zone_crypto/tickets.rs, crates/nostr-bbs-forum-client/src/pages/section.rs, crates/nostr-bbs-bbs-client/src/views/thread.rs]
 owner: jjohare
 review_trigger: the first deployment of a relay carrying it; any change to the channel read rule (channel_read_decision_for), to the topic, reply, edit or sealed tag shapes, to event_tags or its indexes; the subscriptions feature (kit PR #131) asking for cross-section unread counts
 repo: nostr-rust-forum
 domain: BASELINE-architecture.md
 evidence_class: source+test
-acceptance_boundary: Established by native tests on the branch - the relay's exact SQL run against SQLite with the relay schema and indexes and compared with the clients' own classify_topics over 12 seeded sections (deletions, edits, reactions, quotes, expired events, sealed and dual-present roots, a legacy unmarked root, crafted cross-channel events), the caps and truncation, query-plan and VM-step cost assertions, the admission matrix against channel_read_decision_for, the client's frame routing (answer, CLOSED, an old relay's NOTICE, a cancelled request), the fold and parse, and a 300-seed FrozenBoard invariant with section stats answered, failed and capped; plus cargo fmt, clippy -D warnings, the wasm32 workspace check, the workspace test suite and rustdoc -D warnings. Not established - behaviour on Cloudflare D1 (its SQLite version, planner and timing), in a Durable Object, against the live relay or its data, in a browser (first paint, layout), or with old client builds; costs are measured on native SQLite only. activation_status stays inactive until a relay carrying this is deployed and both clients are repinned.
+acceptance_boundary: Established by native tests on the branch - the relay's exact SQL run against SQLite with the relay schema and indexes and compared with the clients' own classify_topics over 12 seeded sections (deletions, edits, reactions, quotes, expired events, sealed and dual-present roots, a legacy unmarked root, crafted cross-channel events), the caps and truncation, query-plan and VM-step cost assertions, the admission matrix against channel_read_decision_for, the client's frame routing (answer, CLOSED, an old relay's NOTICE, a cancelled request), the fold and parse, and a 300-seed FrozenBoard invariant with section stats answered, failed and capped; plus cargo fmt, clippy -D warnings, the wasm32 workspace check, the workspace test suite and rustdoc -D warnings. Amended after the PR #134 review: single flight and a concurrency cap, visit-bounded walks, migration 0017 (a partial index, run on local SQLite and a local D1 via wrangler/miniflare with identical results), the REQ expiry rule, a live reply growing its topic's count, and a cap-freeze baseline clamped at the paint time, each with tests (cost and baseline tests run failing first). Not established - behaviour on the hosted Cloudflare D1 (timing, the index build on the live table), in a deployed Durable Object, against the live relay or its data, in a browser (first paint, layout), or with old client builds; costs are measured on native SQLite only. activation_status stays inactive until a relay carrying this is deployed and both clients are repinned.
 ---
 
 # ADR-2038 — One SECTION-STATS request returns every topic's last activity and reply count for a section
@@ -56,7 +56,7 @@ without one request per topic, and without breaking the stored message database.
    activity's author, `null` when unknown or when the newest reply is a sealed envelope (its outer author is the migrator).
    `replies` is exact, `null` past the caps below. `original` is a sealed root's original id. `truncated` is true when the
    section has more marked roots than the answer lists. NIP-11 advertises it:
-   `"nostr_bbs": {"section_stats": {"verb": "SECTION-STATS", "version": 1, "max_topics": 1000, "reply_count_cap": 1000,
+   `"nostr_bbs": {"section_stats": {"verb": "SECTION-STATS", "version": 1, "max_topics": 1000, "count_visit_cap": 1000,
    "memo_secs": 30}}` (`relay_do/mod.rs` `section_stats_advert`, `nip11.rs`).
 
 3. **Admission is the REQ/COUNT rule, not a copy of it.** The answer describes the channel's kind-42 messages, so it is
@@ -87,18 +87,38 @@ without one request per topic, and without breaking the stored message database.
    naming the envelope count for the original. Clients index each row under both ids (`SectionStats::get`), so the stats
    follow the row whether it is shown under its envelope or, once opened, its original.
 
-7. **Bounded cost, no D1 schema change.** Three statements, all on existing indexes (`relay_do/section_stats.rs`):
-   - roots: driven from `t = topic` on `idx_event_tags_time`, newest first, `LIMIT 1001`; each candidate probed for the
-     channel on `idx_event_tags_lookup` and checked by its own tags;
-   - last activity, per listed id in batches of 100 (ids bound as one JSON array): a walk of at most 256 `e`-tag rows naming
-     the id, newest first on `idx_event_tags_time`, run as a co-routine that stops at the first reply; a walk that meets 256
-     rows without a reply reports `last_at: null`;
-   - reply counts, per 10 topics in activity order, each capped at 1,001 rows, until 10,000 replies have been counted;
-     topics past the cap or the budget report `replies: null`.
+7. **Bounded cost, one additive index.** All statements bound the rows they *visit*, not only the rows that qualify
+   (`relay_do/section_stats.rs`; amended after the PR #134 review, below):
+   - roots: through migration 0017's partial expression index `idx_events_topic_root_channel` (topic roots only, keyed by
+     the first tag's value, the channel for every root the forum and the migrator write), so only this channel's roots are
+     read. Until 0017 is applied the index is missing (`no such index`), the relay remembers that for 10 minutes and walks at
+     most 20,000 topic-marked tag rows newest first instead, setting `truncated` when the walk stops at its cap;
+   - one statement per 100 ids (bound as one JSON array) gives each id its last activity (a walk of at most 256 `e`-tag rows
+     naming it, newest first on `idx_event_tags_time`, stopping at the first reply; `last_at: null` when the walk runs out)
+     and its reply count (a walk of at most 1,000 `e`-tag rows naming it, reactions and other references included;
+     `replies: null` when the walk reaches the cap). Once 20,000 count rows have been visited the remaining statements carry
+     activity only (`replies: null`);
+   - the existence check (`events` kind-40 or `channel_creators`) runs only when no root was found.
 
-   Nothing scans a channel's messages: the cost is set by the relay's marked roots, the listed topics and the budget, not by
-   messages per channel. The payload is memoised per channel for 30 s in the Durable Object (`section_stats_cache`) and
-   shared by every admitted reader (admission is per channel and all-or-nothing for kind-42s).
+   A section of 300 topics costs 4 statements per uncached answer (was 34). The payload is memoised per channel for 30 s
+   in the Durable Object (`section_stats_cache`) and shared by every admitted reader (admission is per channel and
+   all-or-nothing for kind-42s). One computation per channel runs at a time and every concurrent reader of that channel
+   waits for its answer after its own admission (`SingleFlight`); at most two computations run at once in the isolate,
+   and a third channel is answered `error: … try again` (the client falls back).
+
+   **Migration 0017** (`crates/nostr-bbs-relay-worker/migrations/0017_topic_root_channel_index.sql`, additive and
+   idempotent, not in `ensure_schema`, applied by the operator):
+
+   ```sql
+   CREATE INDEX IF NOT EXISTS idx_events_topic_root_channel
+     ON events (json_extract(tags, '$[0][1]'), created_at)
+     WHERE kind = 42 AND instr(tags, '["t","topic"]') > 0;
+   -- rollback: DROP INDEX IF EXISTS idx_events_topic_root_channel;
+   ```
+
+   It holds one entry per topic root only; every insert evaluates the partial predicate (an `instr` over the tags text);
+   building it is one pass over `events`. The relay stores tags as compact JSON (`storage.rs`, `serde_json::to_string`), so
+   the marker test matches every root it stored; a row written with spaced JSON by another tool is not found through it.
 
 8. **Clients** (shared in client-core; forum `pages/section.rs`, BBS `views/thread.rs`):
    - ask once per visit, with the root list and under its AUTH rule (after AUTH in a gated zone), only when the relay's NIP-11
@@ -114,7 +134,12 @@ without one request per topic, and without breaking the stored message database.
    - `FrozenBoard` (coordinator review of PR #130): "↻ N updated" also counts a row appended after the freeze that sits below
      a row of strictly lower activity when both rows' activity is known from section stats (an older page's genuinely older
      topic never counts); a freeze forced by the cap before the window or the section stats answered takes a provisional
-     baseline, re-taken once when the first of them lands, and the control stays hidden until then.
+     baseline, re-taken once when the first of them lands (or one more 20 s cap later if neither ever does), never past
+     the paint time, so a reply that arrives after the paint is still offered (PR #134 review finding 4); the control stays
+     hidden until then;
+   - a section stats answer seeds each counted topic's total (`section_stats_totals`, as of the answer), and a live reply,
+     never an edit, adds to its topic's total (`reply_topic`, `ChannelStore::note_inserted`), so a row's count follows new
+     replies during the visit (PR #134 review finding 3).
 
 ## Consequences
 
@@ -129,20 +154,23 @@ without one request per topic, and without breaking the stored message database.
 on window and root list as before (the 20 s cap is unchanged), and the per-topic pump fills every figure. A late answer
 after the timeout is dropped (`cancel_section_stats`, request generations in the store).
 
-**Scale.** Measured on native SQLite (bundled with `rusqlite`, release build, in-memory), not D1
-(`docs/gap-close-evidence/adr-2038/02-scale-measurement.log`):
+**Scale.** Measured on native SQLite (bundled with `rusqlite`, release build, in-memory), not D1. PR #134 review scenarios,
+before (b2d2c7d) and after (`08-review-before.log`, `12-review-after.log`):
 
-| Section | Other marked roots | Listed | Counted | Roots / activity / counts VM steps | Wall |
-|---|---|---|---|---|---|
-| 168 topics × 20 replies (3.5 k messages) | 0 | 168 | 168 | 31 k / 72 k / 573 k | 56 ms |
-| 168 × 600 (101 k) | 0 | 168 | 20 | 31 k / 72 k / 2.0 M | 131 ms |
-| 1,000 × 100 (101 k) | 2,000 | 1,000 | 100 | 296 k / 430 k / 1.7 M | 166 ms |
-| 2,000 × 50 (102 k) | 5,000 | 1,000 (truncated) | 200 | 404 k / 430 k / 1.7 M | 177 ms |
+| Scenario | Statements before → after | VM steps before → after | Wall before → after |
+|---|---|---|---|
+| Common: 300 topics × 30 replies, 2,000 roots elsewhere | 34 → 4 | 1.82 M → 1.82 M | 130 → 123 ms |
+| Worst: 20 topics, one with 3 replies and 50,000 reactions | 4 → 2 | 382 k → 56 k | 32 → 5 ms |
+| Worst: 10-topic section, 50,000 topic roots elsewhere | 3 → 2 | 2.76 M → 16 k | 171 → 3 ms |
 
-Doubling every topic past the caps leaves the work unchanged (asserted by test). On D1, by the relay's own measurement of
-about 40 ms per 2,000 index-plus-row reads (`relay_do/read_cache.rs`, `COUNT_WINDOW_ROWS`), a full uncached answer is
-estimated at roughly 0.1–0.5 s of D1 time and of the order of 10^4 rows read (10^5 on a relay with tens of thousands of
-marked roots), at most once per channel per 30 s; this is an estimate, not a measurement. Today's pump for the 168-topic section is 168 COUNTs and 34 REQs.
+The common case's work is counting its ~9,000 replies, now in 4 statements instead of 34; several members opening the same
+section within 30 s cost one computation. In the second case the reacted topic reports `replies` and `last_at` as `null`
+(the client's pump fills them) and the rest stay exact. Tests assert the bounds: doubling every topic's replies past the caps,
+quadrupling a topic's reactions and multiplying other channels' roots leave the work unchanged. The earlier table
+(`02-scale-measurement.log`) predates the review. On D1, by the relay's own measurement of about 40 ms per 2,000
+index-plus-row reads (`relay_do/read_cache.rs`, `COUNT_WINDOW_ROWS`), the common uncached answer is estimated at roughly
+0.1–0.3 s of D1 time; this is an estimate, not a measurement. The same statements and migration ran on a local D1
+(wrangler/miniflare) with results identical to SQLite (`11-local-d1-check.log`).
 
 **Limits (honest).**
 - Legacy roots without the `["t","topic"]` marker are not listed (the root list has the same gap); they keep the window's
@@ -153,18 +181,32 @@ marked roots), at most once per channel per 30 s; this is an estimate, not a mea
   `classify_topics` while locked.
 - Replies naming a root in a case other than the stored id's, or only through an unmarked `e` tag (legacy), are not counted;
   the relay is a lower bound and the fold never lowers a figure.
-- The roots statement walks every marked root on the relay (thousands to tens of thousands of index entries); a section
-  with more than 1,000 marked roots lists the 1,000 most recently created (`truncated`).
+- A section with more than 1,000 marked roots lists the 1,000 most recently created (`truncated`). Without migration 0017 a
+  section whose roots are older than the relay's newest 20,000 topic roots gets `truncated` and may list fewer topics.
+- Reply counts in a batch past the 20,000-row budget are `null` even for small topics; batches go in root-creation order,
+  not activity order.
 - `last_at` relies on `event_tags.created_at` mirroring `events.created_at` (migration 0015 backfill), as paging does.
 - The answer may be up to 30 s old; the window's newest messages are folded in by the client anyway.
-- No single-flight: two readers missing the memo at once both compute.
-- D1 compatibility is not verified. Binding the ids as one JSON array to `json_each(?)` with correlated scalar sub-queries
-  is already deployed (the member deletion gate's statement in `lib.rs`); the bounded walk's outer reference from inside a
-  FROM sub-query is used nowhere else and was run on SQLite 3.53 only. If D1 refuses it, every answer is `CLOSED error:`
-  and both clients fall back to the PR #130 behaviour: safe, but the feature would be inert until the SQL is changed.
+- D1: the statements and migration 0017 ran on a local D1 (wrangler/miniflare) with results identical to SQLite, and
+  the missing-index error text matched; not run on the hosted D1. If it refuses them, every answer is `CLOSED error:` and
+  both clients fall back to the PR #130 behaviour.
+
+**Accepted, recorded from the PR #134 review (not fixed).**
+- (5, fixed) Expiry now parses as the REQ path's `u64::parse` does (`+1`, long zero-padded values).
+- (6) A refusal is never asked again in the visit, including an `auth-required:` that the relay says the client re-asks
+  after AUTH. Clients send in gated zones only after AUTH, so this needs client and relay to disagree about gating; the
+  next visit asks again. Follow-up.
+- (7a) For an authenticated reader admitted to an unscoped id with no roots, a missing section costs one more D1
+  statement than a gated one; the timing difference is accepted.
+- (7b) `last_at: null` tells an admitted reader that 256 or more `e`-tag references to that topic exist, some of which
+  (in other channels) it may not be able to read. Accepted: a count of references, no ids or times.
+- (7c) `activity_known` treats the relay's figure as exact, but the relay ignores kind-1111 comments, reply-to-reply
+  chains and replies without a `reply` marker that `classify_topics` follows; the worst effect is a wrong "1 updated"
+  on a row whose true activity is higher than the relay knows. Accepted.
 
 **Rollback.** Revert the relay change: NIP-11 drops the block, new clients stop asking and behave as before. Reverting a
-client alone is equally safe. No stored data or schema is touched, so there is nothing to undo in D1.
+client alone is equally safe. Migration 0017 adds one index and rewrites no data: `DROP INDEX IF EXISTS
+idx_events_topic_root_channel;` removes it, and the relay falls back to the bounded walk.
 
 **Alternatives rejected.**
 - *NIP-98 HTTP endpoint.* AUTH is already established on the socket; HTTP would need a signature per request (a prompt for
@@ -172,9 +214,9 @@ client alone is equally safe. No stored data or schema is touched, so there is n
   HTTP caching. The socket form reuses the DO's memos and limiter and holds no subscription slot.
 - *Extend NIP-45 COUNT.* COUNT answers one number; a new filter key would reach an old relay's COUNT fast path as
   `{"kinds":[42],"#e":[cid]}` and start a full windowed count of the channel, then answer a misleading number.
-- *A materialised `topic_stats` table maintained by triggers on `events`.* Exact at O(page), but a schema change, a trigger
-  on the hot write path that can fail writes, and a backfill over every message: contrary to "don't break the message
-  database", and not needed at the measured cost.
+- *A materialised `topic_stats` table maintained by triggers on `events`* (reconsidered once database changes were
+  allowed). Exact at O(page), but a trigger on the hot write path that can fail writes and a backfill over every message;
+  the operator asked for the smallest change that bounds the worst case, which the 0017 index and visit caps are.
 - *A per-channel snapshot in DO storage* (as message counts do). Deletions would drift the counts (ADR-2033 requires they
   are not counted) and seven deletion paths would need hooks.
 
@@ -187,21 +229,27 @@ request. Recorded as follow-up; not implemented here.
 
 ## Verification
 
-From the worktree root at `34fa898` (workspace test suite run at `6ba03ed`; the later NIP-11 prefetch commit re-ran the client-core suite, the CI security-crates job and all other gates):
+From the worktree root at the head of the PR #134 review fixes (see the report and `07`/`13` gate logs):
 
-- `cargo test -p nostr-bbs-relay-worker --lib section_stats` (19 tests: oracle against `classify_topics` over 12 seeds,
-  deletion, sealed and dual-present, cross-channel leak, edits and reactions, expiry, truncation, reply cap, budget, walk
-  exhaustion, payload, cost and plan, admission matrix with pin, missing section, request validation, NIP-11);
-  `cargo test --release -p nostr-bbs-relay-worker --lib measure_section_stats_cost -- --ignored --nocapture` for the table.
-- `cargo test -p nostr-bbs-client-core --lib` (section-stats parse, fold, freeze readiness, answer mapping, frame routing in
-  `relay::section_stats_tests`, the FrozenBoard tests for the late-row count and the cap baseline, and the 300-seed
-  `section_stats_freeze_the_true_order_and_nothing_moves_after`). The board tests for the two coordinator gaps were run
-  failing before the fix (`docs/gap-close-evidence/adr-2038/01-board-gaps-red.log`).
+- `cargo test -p nostr-bbs-relay-worker --lib section_stats`: oracle against `classify_topics` over 12 seeds on the index
+  path and the fallback walk, deletion, sealed and dual-present, cross-channel leak, edits and reactions, expiry (including
+  `+1` and zero-padded values), truncation, the count visit cap, the budget, walk exhaustion, the missing-index fallback,
+  bounded cost under reactions and under other channels' roots, plan assertions, the admission matrix with pin, missing
+  section, request validation, NIP-11, and single flight (shared answer, cap, abandoned leader). The three cost and expiry
+  tests were run failing before the fix (`09-review-relay-red.log`).
+- `cargo test --release -p nostr-bbs-relay-worker --lib measure_review_scenarios -- --ignored --nocapture` for the table.
+- Local D1: `emit_local_d1_check` writes the statements, a seeded section and SQLite's results; run with
+  `wrangler d1 execute --local` (`11-local-d1-check.log`).
+- `cargo test -p nostr-bbs-client-core --lib`: section-stats parse, fold, freeze readiness, answer mapping, frame routing,
+  seeded totals and `reply_topic`, the FrozenBoard tests (late rows, cap baseline, a reply after a cap freeze, a baseline
+  that settles one cap later; the last two run failing first, `10-review-board-red.log`) and the 300-seed invariant.
 - `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
   `cargo check --workspace --target wasm32-unknown-unknown`, `cargo test --workspace --all-targets --all-features`,
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`, `node scripts/adr-index-gen.js docs/adr --check`.
 
-Not verified: D1, a deployed Durable Object, the live relay, a browser, old client builds. Rollout checks: the relay's NIP-11
-shows `nostr_bbs.section_stats`; a member opening a large section sees the whole list in true order at first paint and no
-row moves; a non-member's frame is refused with `restricted:`; signed out, a gated section's frame gets `auth-required:`;
-first paint is not slower than before (3.4–4.5 s); D1 rows read per section open, from the D1 dashboard.
+Not verified: hosted D1, a deployed Durable Object (the handler's single-flight wiring is read, not run), the live relay, a
+browser, old client builds; the store's live-reply total and timeout paths run only in wasm. Rollout checks: apply 0017 and
+see `SEARCH ev USING INDEX idx_events_topic_root_channel` in its plan; the relay's NIP-11 shows `nostr_bbs.section_stats`; a
+member opening a large section sees the whole list in true order at first paint and no row moves; a live reply bumps its row's
+count; a non-member's frame is refused with `restricted:`; signed out, a gated section's frame gets `auth-required:`; first
+paint is not slower than before (3.4–4.5 s); D1 rows read per section open, from the D1 dashboard.

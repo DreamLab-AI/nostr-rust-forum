@@ -355,7 +355,8 @@ pub struct BoardInputs<'a> {
     /// baseline: the history window has settled, or the section stats
     /// (ADR-2038) have answered. A freeze forced by [`FREEZE_CAP_MS`]
     /// before either takes a provisional baseline and re-takes it once,
-    /// when the first of them lands.
+    /// when the first of them lands (or one more cap later), never past the
+    /// paint time.
     pub baseline_settled: bool,
     /// Whether a topic's true last activity is known: the section stats
     /// answered for it (ADR-2038). Lets [`FrozenBoard::updated`] count a
@@ -468,9 +469,16 @@ impl FrozenBoard {
             return self.shown != before;
         }
         // A cap freeze before the window or the section stats: the first of
-        // them to land sets the baseline, once (the order does not move).
-        if self.baseline_provisional && inputs.baseline_settled {
-            self.baseline = self.baseline.max(inputs.newest_known).max(structure_newest);
+        // them to land sets the baseline, once (the order does not move),
+        // or one more cap after the freeze if neither ever does. It never
+        // passes the paint time, so activity after the paint stays new.
+        let cap_secs = (FREEZE_CAP_MS / 1_000) as u64;
+        if self.baseline_provisional
+            && (inputs.baseline_settled
+                || inputs.now_secs >= self.painted_at.saturating_add(cap_secs))
+        {
+            let known = inputs.newest_known.max(structure_newest);
+            self.baseline = self.baseline.max(known.min(self.painted_at));
             self.baseline_provisional = false;
         }
         let listed: HashSet<&str> = structure.iter().map(|t| t.id.as_str()).collect();
@@ -1551,13 +1559,13 @@ mod tests {
         let mut board = FrozenBoard::new();
         board.update(
             &roots_only,
-            &inputs_with(true, 10, 100, false, &never_known),
+            &inputs_with(true, 10, 1_000, false, &never_known),
         );
         assert!(board.is_frozen());
         assert_eq!(board.baseline(), 10);
         // Pump figures arriving before either: nothing counts yet.
         let pumped = sorted(vec![topic("a", "x", 10, 40), topic("b", "x", 5, 400)]);
-        board.update(&pumped, &inputs_with(true, 400, 101, false, &never_known));
+        board.update(&pumped, &inputs_with(true, 400, 1_001, false, &never_known));
         assert_eq!(
             board.updated(&pumped, None),
             0,
@@ -1565,7 +1573,7 @@ mod tests {
         );
         // The window lands: activity from before the freeze is not new.
         let landed = sorted(vec![topic("a", "x", 10, 40), topic("b", "x", 5, 400)]);
-        board.update(&landed, &inputs_with(true, 400, 102, true, &never_known));
+        board.update(&landed, &inputs_with(true, 400, 1_002, true, &never_known));
         assert_eq!(board.baseline(), 400);
         assert_eq!(
             board.shown(),
@@ -1578,13 +1586,47 @@ mod tests {
             "a quiet section shows nothing"
         );
         // Re-taken once only: real activity afterwards counts.
-        let later = sorted(vec![topic("a", "x", 10, 450), topic("b", "x", 5, 400)]);
-        board.update(&later, &inputs_with(true, 450, 103, true, &never_known));
+        let later = sorted(vec![topic("a", "x", 10, 1_050), topic("b", "x", 5, 400)]);
+        board.update(&later, &inputs_with(true, 1_050, 1_003, true, &never_known));
         assert_eq!(board.baseline(), 400);
         assert_eq!(board.updated(&later, None), 0, "a is on top: in place");
-        let later = sorted(vec![topic("a", "x", 10, 450), topic("b", "x", 5, 460)]);
-        board.update(&later, &inputs_with(true, 460, 104, true, &never_known));
+        let later = sorted(vec![topic("a", "x", 10, 1_050), topic("b", "x", 5, 1_060)]);
+        board.update(&later, &inputs_with(true, 1_060, 1_004, true, &never_known));
         assert_eq!(board.updated(&later, None), 2);
+    }
+
+    #[test]
+    fn a_reply_after_a_cap_freeze_is_offered_when_the_window_lands() {
+        // PR #134 review finding 4: cap freeze at 1020 from the root list
+        // alone; a live reply to the bottom row at 1025; the window settles
+        // at 1030. The reply came after the paint, so it stays new.
+        let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
+        let mut board = FrozenBoard::new();
+        board.update(&roots_only, &inputs_with(true, 10, 1_020, false, &never_known));
+        let replied = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 1_025)]);
+        board.update(&replied, &inputs_with(true, 1_025, 1_025, false, &never_known));
+        // The window: a's older activity (before the paint) and b's reply.
+        let landed = sorted(vec![topic("a", "x", 10, 900), topic("b", "x", 5, 1_025)]);
+        board.update(&landed, &inputs_with(true, 1_025, 1_030, true, &never_known));
+        assert_eq!(board.baseline(), 1_020, "never past the paint");
+        assert_eq!(board.shown(), &ids(&["a", "b"])[..]);
+        assert_eq!(board.updated(&landed, None), 1, "b's reply is offered, a's is not");
+    }
+
+    #[test]
+    fn a_provisional_baseline_settles_one_cap_after_the_freeze_anyway() {
+        // Neither the window nor the stats ever answer (no EOSE, or older
+        // paging detached the window): the control must not stay hidden.
+        let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
+        let mut board = FrozenBoard::new();
+        board.update(&roots_only, &inputs_with(true, 10, 1_000, false, &never_known));
+        let cap = (FREEZE_CAP_MS / 1_000) as u64;
+        let replied = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 1_010)]);
+        board.update(&replied, &inputs_with(true, 1_010, 1_000 + cap - 1, false, &never_known));
+        assert_eq!(board.updated(&replied, None), 0, "still provisional");
+        board.update(&replied, &inputs_with(true, 1_010, 1_000 + cap, false, &never_known));
+        assert_eq!(board.baseline(), 1_000);
+        assert_eq!(board.updated(&replied, None), 1);
     }
 
     #[test]
@@ -1698,7 +1740,8 @@ mod tests {
             for i in (1..landing_order.len()).rev() {
                 landing_order.swap(i, rng.below(i as u64 + 1) as usize);
             }
-            let mut now = 1_000u64;
+            // The wall clock is after every seeded activity, as in life.
+            let mut now = 100_000u64;
             let mut froze_settled = false;
             let mut at_freeze: Vec<String> = Vec::new();
             for step in 0..7u64 {
