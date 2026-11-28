@@ -6,3 +6,4 @@ schema: reviewer's d1test/schema.sql (relay schema incl. v3 tag writer and pagin
 - q_roots_indexed: 28 rows, identical to rusqlite
 - q_stats: 27 rows, identical to rusqlite
 - q_roots_walk: 28 rows identical except walked 31 vs 29: the reviewer's schema file inserts 2 extra topic roots in another channel (ids ..0101, ..0102), counted relay-wide by the walk
+q_stats 27 27 IDENTICAL

@@ -104,7 +104,11 @@ without one request per topic, and without breaking the stored message database.
    in the Durable Object (`section_stats_cache`) and shared by every admitted reader (admission is per channel and
    all-or-nothing for kind-42s). One computation per channel runs at a time and every concurrent reader of that channel
    waits for its answer after its own admission (`SingleFlight`); at most two computations run at once in the isolate,
-   and a third channel is answered `error: … try again` (the client falls back).
+   and a third channel is answered `error: … try again` (the client falls back) if it exists, or with the reader's
+   missing-section refusal if it does not (`busy_answer`), so filling the slots does not make the refusal an existence
+   oracle (re-review). Counts are as of the answer's `as_of` (`created_at <= now` on the count walk, like COUNT's
+   `until`), so a reply dated ahead of the relay's clock is not counted twice with the client's own additions. An
+   `INDEXED BY` failure reading "no such index" or "no query solution" falls back to the walk.
 
    **Migration 0017** (`crates/nostr-bbs-relay-worker/migrations/0017_topic_root_channel_index.sql`, additive and
    idempotent, not in `ensure_schema`, applied by the operator):
@@ -184,7 +188,9 @@ index-plus-row reads (`relay_do/read_cache.rs`, `COUNT_WINDOW_ROWS`), the common
 - A section with more than 1,000 marked roots lists the 1,000 most recently created (`truncated`). Without migration 0017 a
   section whose roots are older than the relay's newest 20,000 topic roots gets `truncated` and may list fewer topics.
 - Reply counts in a batch past the 20,000-row budget are `null` even for small topics; batches go in root-creation order,
-  not activity order.
+  not activity order. The budget is checked between statements, so one answer can overshoot it by up to one statement's
+  count walks (100 ids × 1,000 rows; the reviewer's worst-case estimate is about 120,000 rows visited). Accepted.
+- An unknown id holds a computation slot only for an empty indexed roots lookup and the existence check.
 - `last_at` relies on `event_tags.created_at` mirroring `events.created_at` (migration 0015 backfill), as paging does.
 - The answer may be up to 30 s old; the window's newest messages are folded in by the client anyway.
 - D1: the statements and migration 0017 ran on a local D1 (wrangler/miniflare) with results identical to SQLite, and

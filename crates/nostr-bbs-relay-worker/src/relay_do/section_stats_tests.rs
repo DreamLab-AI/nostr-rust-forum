@@ -1450,3 +1450,43 @@ fn emit_local_d1_check() {
     )
     .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// PR #134 re-review
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_reply_dated_after_the_answer_is_not_counted() {
+    // The client adds replies newer than `as_of` to the count itself; one
+    // dated ahead of the relay clock must not be in the relay's count too.
+    let c = db();
+    let r = hex(1);
+    store(
+        &c,
+        &[
+            root(&r, C, &hex(7), 100),
+            reply(&hex(2), C, &r, &hex(8), 110),
+            reply(&hex(3), C, &r, &hex(8), NOW + 100),
+        ],
+    );
+    assert_eq!(answer(&c, C).topics[0].replies, Some(1));
+}
+
+#[test]
+fn a_planner_refusing_the_index_falls_back_too() {
+    assert!(index_missing(
+        "no such index: idx_events_topic_root_channel: SQLITE_ERROR"
+    ));
+    assert!(index_missing("no query solution: SQLITE_ERROR"));
+    assert!(!index_missing("D1_ERROR: database is overloaded"));
+}
+
+#[test]
+fn a_busy_relay_answers_a_missing_section_like_a_gated_one() {
+    // Under load a section not known to exist gets the missing-section
+    // answer (the reader's refusal), not the busy text, so filling the
+    // computation slots does not turn the refusal into an existence oracle.
+    assert_eq!(busy_answer(Ok(false)), Ok(None));
+    assert!(busy_answer(Ok(true)).is_err());
+    assert!(busy_answer(Err("d1".into())).is_err());
+}

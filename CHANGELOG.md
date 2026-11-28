@@ -173,7 +173,8 @@ No D1 schema or data change. Not exercised against D1, a live relay or in a brow
   cheap (a 300-topic section now costs 4 statements, was 34). Topic roots are read through a new partial index,
   **migration 0017 (`idx_events_topic_root_channel`, additive, applied by the operator; `DROP INDEX` to roll back)**; until it
   exists the relay walks at most 20,000 topic roots and says `truncated`. Expiry is read exactly as REQ reads it. A live
-  reply now raises its row's reply count, and a reply arriving after a capped freeze is offered by "↻ N updated".
+  reply now raises its row's reply count, and a reply arriving after a capped freeze is offered by "↻ N updated". Re-review: a busy relay answers a missing section like a gated one (no
+  existence oracle), counts exclude replies dated after the answer, and a planner refusing the index falls back to the walk.
 
 ### Zones: pin a section to a zone from config (2026-11-28)
 
