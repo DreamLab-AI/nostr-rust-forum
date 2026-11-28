@@ -2637,11 +2637,19 @@ pub fn topic_key(root: &str) -> String {
     format!("topic:{}", root.to_lowercase())
 }
 
+/// The list holding roots of subscribed topics fetched by id for their
+/// titles (`stores::thread_subs`), per channel. Kept apart from
+/// [`roots_key`] so they never enter a section's topic board.
+pub fn followed_roots_key(cid: &str) -> String {
+    format!("followed:{cid}")
+}
+
 /// Whether `key` of [`ChannelStore::channel_messages`] is a channel's own
-/// list, as opposed to a topic's paged list ([`topic_key`]) or a section's
-/// root list ([`roots_key`]), which repeat posts the channel list may hold.
+/// list, as opposed to a topic's paged list ([`topic_key`]), a section's
+/// root list ([`roots_key`]) or the subscribed-topic roots
+/// ([`followed_roots_key`]), which repeat posts the channel list may hold.
 pub fn is_channel_key(key: &str) -> bool {
-    !key.starts_with("topic:") && !key.starts_with("roots:")
+    !key.starts_with("topic:") && !key.starts_with("roots:") && !key.starts_with("followed:")
 }
 
 /// Every post the store holds, once each (by event id, case-insensitively),
@@ -3115,6 +3123,7 @@ mod tests {
         assert!(is_channel_key(&"c".repeat(64)));
         assert!(!is_channel_key(&topic_key("R")));
         assert!(!is_channel_key(&roots_key("c")));
+        assert!(!is_channel_key(&followed_roots_key("c")));
     }
     use super::*;
 

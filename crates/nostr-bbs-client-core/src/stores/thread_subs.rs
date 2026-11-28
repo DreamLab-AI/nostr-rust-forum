@@ -66,8 +66,8 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{use_auth, AuthStore};
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::channels::{
-    roots_key, topic_key, use_channel_store, ChannelStore, InsertedMessage, PAGE_TIMEOUT_MS,
-    RELAY_MAX_FILTERS,
+    followed_roots_key, roots_key, topic_key, use_channel_store, ChannelStore, InsertedMessage,
+    PAGE_TIMEOUT_MS, RELAY_MAX_FILTERS,
 };
 use crate::stores::thread_subs_sync::{
     self as sync, LocalOnlyReason, Plan, PlanInput, RemoteSeen, SyncStatus, Trigger,
@@ -205,6 +205,17 @@ pub struct SubscribedTopic {
     pub unread: usize,
     /// See [`UnreadCount::capped`].
     pub capped: bool,
+}
+
+impl SubscribedTopic {
+    /// The forum's canonical path to the topic (inside the router base), or
+    /// `None` while the zone is unknown. The BBS links with its own
+    /// `Thread { zone, channel_id: channel, root_id: root }` route instead.
+    pub fn forum_path(&self) -> Option<String> {
+        self.zone_slug
+            .as_deref()
+            .map(|z| crate::utils::section_url::topic_path(z, &self.channel, &self.root))
+    }
 }
 
 /// Why [`ThreadSubsStore::subscribe`] refused.
@@ -606,28 +617,41 @@ impl Unseen {
     }
 
     /// The member saw `root` up to `upto` (unclamped): those posts go, and
-    /// stay gone this session.
-    pub fn dismiss_upto(&mut self, root: &str, upto: u64) {
+    /// stay gone this session. Returns their ids.
+    pub fn dismiss_upto(&mut self, root: &str, upto: u64) -> Vec<String> {
+        let mut gone: Vec<String> = Vec::new();
         if let Some(ids) = self.by_root.get_mut(root) {
-            let gone: Vec<String> = ids
+            gone = ids
                 .iter()
                 .filter(|(_, p)| p.created_at <= upto)
                 .map(|(id, _)| id.clone())
                 .collect();
-            for id in gone {
-                ids.remove(&id);
-                self.dismissed.insert(id);
+            for id in &gone {
+                ids.remove(id);
+                self.dismissed.insert(id.clone());
             }
         }
         self.tidy();
+        gone
     }
 
-    /// Every post of `root` goes, and stays gone this session.
-    pub fn dismiss_root(&mut self, root: &str) {
+    /// Whether [`Self::dismiss_upto`] would remove anything.
+    pub fn would_dismiss(&self, root: &str, upto: u64) -> bool {
+        self.by_root
+            .get(root)
+            .is_some_and(|ids| ids.values().any(|p| p.created_at <= upto))
+    }
+
+    /// Every post of `root` goes, and stays gone this session. Returns their
+    /// ids.
+    pub fn dismiss_root(&mut self, root: &str) -> Vec<String> {
+        let mut gone = Vec::new();
         if let Some(ids) = self.by_root.remove(root) {
-            self.dismissed.extend(ids.into_keys());
+            gone = ids.into_keys().collect();
+            self.dismissed.extend(gone.iter().cloned());
         }
         self.tidy();
+        gone
     }
 
     /// Forget posts `ids` (deleted).
@@ -818,6 +842,7 @@ pub(crate) fn resolve_titles(
     };
     for (channel, roots) in &by_channel {
         scan(&roots_key(channel), roots, &mut out);
+        scan(&followed_roots_key(channel), roots, &mut out);
         scan(channel, roots, &mut out);
     }
     for (root, _) in wanted {
@@ -849,6 +874,40 @@ pub(crate) fn newest_held_reply(
         .max()
 }
 
+/// Ids of replies to `root` held in list `key`, at or before `upto`.
+pub(crate) fn replies_upto(
+    lists: &HashMap<String, Vec<NostrEvent>>,
+    key: &str,
+    root: &str,
+    upto: u64,
+) -> Vec<String> {
+    lists
+        .get(key)
+        .into_iter()
+        .flat_map(|v| v.iter())
+        .filter(|e| {
+            e.created_at <= upto
+                && nostr_bbs_core::sealed::reply_root_of(e)
+                    .is_some_and(|r| r.eq_ignore_ascii_case(root))
+        })
+        .map(|e| e.id.to_ascii_lowercase())
+        .collect()
+}
+
+/// Mark the bell notices of posts `ids` read (`post:<id>`).
+fn clear_post_notices(ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    if let Some(n) = crate::stores::notifications::global_notification_store() {
+        let keys: HashSet<String> = ids
+            .iter()
+            .map(|id| format!("post:{}", id.to_ascii_lowercase()))
+            .collect();
+        n.mark_read_ids(&keys);
+    }
+}
+
 /// The held event `id` (from `created_at`) and the list holding it.
 fn find_held(channels: ChannelStore, id: &str, created_at: u64) -> Option<(String, NostrEvent)> {
     channels.channel_messages.with_untracked(|m| {
@@ -877,13 +936,18 @@ pub(crate) fn root_held(
     root: &str,
     channel: &str,
 ) -> bool {
-    [roots_key(channel), channel.to_string(), topic_key(root)]
-        .iter()
-        .any(|k| {
-            lists
-                .get(k)
-                .is_some_and(|v| v.iter().any(|e| e.id.eq_ignore_ascii_case(root)))
-        })
+    [
+        roots_key(channel),
+        followed_roots_key(channel),
+        channel.to_string(),
+        topic_key(root),
+    ]
+    .iter()
+    .any(|k| {
+        lists
+            .get(k)
+            .is_some_and(|v| v.iter().any(|e| e.id.eq_ignore_ascii_case(root)))
+    })
 }
 
 /// Sort for the panel: alphabetical by title, case-insensitive, ties by root
@@ -1325,14 +1389,56 @@ impl ThreadSubsStore {
         self.ensure_owner();
         let root = root.to_ascii_lowercase();
         let now = now_secs();
+        if !self.owned.with_untracked(|o| o.subs.is_active(&root)) {
+            return;
+        }
         let mut changed = false;
         self.owned.update(|o| {
             changed = o.subs.mark_read(&root, upto, now);
         });
-        self.unseen.update(|u| u.dismiss_upto(&root, upto));
+        let mut seen: Vec<String> = Vec::new();
+        if self.unseen.with_untracked(|u| u.would_dismiss(&root, upto)) {
+            self.unseen.update(|u| seen = u.dismiss_upto(&root, upto));
+        }
+        // The bell notices for the same posts clear with the count.
+        let held = self.deps.with_value(|d| {
+            d.channels
+                .channel_messages
+                .with_untracked(|m| replies_upto(m, &topic_key(&root), &root, upto))
+        });
+        seen.extend(held);
+        clear_post_notices(&seen);
         if changed {
             self.after_change();
         }
+    }
+
+    /// While a view shows a thread, keep its read marker at the newest post
+    /// shown: call once when the thread view mounts. `root` and `newest`
+    /// (the newest shown post's `created_at`) are read reactively; whenever
+    /// either changes and the topic is followed, [`Self::mark_read`] runs, so
+    /// the panel count and the matching bell notices clear (and the change
+    /// reaches other tabs and devices through the usual save and sync).
+    pub fn mark_read_while_viewing(
+        &self,
+        root: impl Fn() -> Option<String> + 'static,
+        newest: impl Fn() -> Option<u64> + 'static,
+    ) {
+        let store = *self;
+        Effect::new(move |_| {
+            let (Some(root), Some(newest)) = (root(), newest()) else {
+                return;
+            };
+            if store.is_subscribed(&root) {
+                store.mark_read(&root, newest);
+            }
+        });
+    }
+
+    /// Whether a member is signed in, so the subscribe controls and the panel
+    /// may be shown. Reactive.
+    pub fn available(&self) -> bool {
+        self.pubkey.get().is_some()
     }
 
     /// Mark every followed topic read: each marker moves to now and every
@@ -1349,11 +1455,13 @@ impl ThreadSubsStore {
                 changed |= o.subs.mark_read(root, now, now);
             }
         });
+        let mut seen: Vec<String> = Vec::new();
         self.unseen.update(|u| {
             for root in &roots {
-                u.dismiss_root(root);
+                seen.extend(u.dismiss_root(root));
             }
         });
+        clear_post_notices(&seen);
         if changed {
             self.after_change();
         }
@@ -1989,7 +2097,7 @@ impl ThreadSubsStore {
 
     /// Send the next root fetch unless one is in flight: up to
     /// [`ROOT_FETCH_BATCH`] ids, closed on its answer, re-sent with backoff if
-    /// refused. Each root enters the channel store's root list for its
+    /// refused. Each root enters the channel store's subscribed-roots list for its
     /// channel through the usual admission and decrypt path, so a root still
     /// locked becomes readable when its zone key arrives.
     fn fetch_next(&self) {
@@ -2633,7 +2741,8 @@ impl ThreadSubsStore {
     }
 }
 
-/// Take a fetched root into the channel store's root list for its channel if
+/// Take a fetched root into the channel store's subscribed-roots list for its
+/// channel ([`followed_roots_key`], never the section's root list) if
 /// it is one of `wanted` and shaped as a topic root (or a still-locked sealed
 /// root carrying the topic marker); otherwise drop its decrypt state.
 fn accept_root(deps: &Deps, wanted: &HashSet<String>, ev: NostrEvent) {
@@ -2651,7 +2760,9 @@ fn accept_root(deps: &Deps, wanted: &HashSet<String>, ev: NostrEvent) {
             .any(|t| t.len() == 2 && t[0] == "t" && t[1] == nostr_bbs_core::sealed::TOPIC_MARKER);
     let rooty = nostr_bbs_core::sealed::is_topic_root(&ev) || marked;
     if named && rooty {
-        deps.channels.apply_page(vec![(roots_key(&cid), ev)]);
+        // Never into the section's root list: the topic board must not see it.
+        deps.channels
+            .apply_page(vec![(followed_roots_key(&cid), ev)]);
     } else if let Some(z) = deps.zone_keys {
         z.forget(std::slice::from_ref(&ev.id));
     }
@@ -3473,5 +3584,36 @@ mod tests {
         assert!(persist_allowed(Some(&a.to_uppercase()), &a));
         assert!(!persist_allowed(None, &a), "signed out in another tab");
         assert!(!persist_allowed(Some(&b), &a), "another account signed in");
+    }
+
+    #[test]
+    fn reading_a_thread_finds_the_held_replies_whose_notices_clear() {
+        let reply = |n: u32, root: &str, at: u64| NostrEvent {
+            id: id(900 + n).to_uppercase(),
+            pubkey: "bb".repeat(32),
+            created_at: at,
+            kind: 42,
+            tags: vec![
+                vec!["e".into(), chan(1), "".into(), "root".into()],
+                vec!["e".into(), root.to_string(), "".into(), "reply".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let mut lists: HashMap<String, Vec<NostrEvent>> = HashMap::new();
+        lists.insert(
+            topic_key(&id(1)),
+            vec![
+                reply(1, &id(1), 10),
+                reply(2, &id(1), 30),
+                reply(3, &id(2), 5),
+            ],
+        );
+        let got = replies_upto(&lists, &topic_key(&id(1)), &id(1), 20);
+        assert_eq!(
+            got,
+            vec![id(901)],
+            "lower-cased, only this topic, only up to the mark"
+        );
     }
 }

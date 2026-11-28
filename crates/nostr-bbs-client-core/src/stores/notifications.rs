@@ -309,6 +309,31 @@ impl NotificationStoreV2 {
         self.persist();
     }
 
+    /// Mark the notifications with these ids read (ids compared
+    /// case-insensitively), in one update and one save. Used when a
+    /// subscribed thread is read, so its post notices clear with its unread
+    /// count.
+    pub fn mark_read_ids(&self, ids: &HashSet<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        let hit = self.items.with_untracked(|list| {
+            list.iter()
+                .any(|n| !n.read && ids.contains(&n.id.to_ascii_lowercase()))
+        });
+        if !hit {
+            return;
+        }
+        self.items.update(|list| {
+            for n in list.iter_mut() {
+                if ids.contains(&n.id.to_ascii_lowercase()) {
+                    n.read = true;
+                }
+            }
+        });
+        self.persist();
+    }
+
     /// Mark all notifications as read.
     pub fn mark_all_read(&self) {
         self.items.update(|list| {

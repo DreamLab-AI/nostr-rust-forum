@@ -73,6 +73,8 @@ web-sys = { workspace = true, features = [
     "PageTransitionEvent",
     "DomRect",
     "MediaQueryList",
+    "MouseEvent",
+    "PointerEvent",
     "KeyboardEvent",
     "CssStyleDeclaration",
     "HtmlTextAreaElement",

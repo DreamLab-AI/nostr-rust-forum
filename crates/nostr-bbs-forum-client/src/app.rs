@@ -506,6 +506,8 @@ pub fn App() -> impl IntoView {
     // the relay, channel and zone-key stores it reads; before the bell's
     // `init_sync`, which raises notices for subscribed topics.
     crate::stores::thread_subs::provide_thread_subs();
+    // The subscriptions panel's open/closed state on this device.
+    crate::stores::subs_panel::provide_subs_panel();
     // Encrypted-zone search loads at sign-in, not at the first search, and
     // its worker lives as long as the page (in-app navigation keeps it).
     crate::utils::sealed_search::autoload();

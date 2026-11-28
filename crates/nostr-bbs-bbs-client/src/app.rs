@@ -108,6 +108,8 @@ pub fn App() -> impl IntoView {
     // Topic subscriptions (unread counts, private cross-device copy), shared
     // with the forum on this origin. Before `init_sync` below.
     nostr_bbs_client_core::stores::thread_subs::provide_thread_subs();
+    // The subscriptions panel's open/closed state on this device.
+    nostr_bbs_client_core::stores::subs_panel::provide_subs_panel();
     // Encrypted-zone search loads at sign-in, not at the first search.
     nostr_bbs_client_core::utils::sealed_search::autoload();
     provide_reaction_store();
