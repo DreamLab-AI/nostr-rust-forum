@@ -445,13 +445,37 @@ fn preview_host_problem(host: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Whether a zone key looks like a misspelt `channels` (ADR-2037): any key
-/// other than exactly `channels` that mentions "pin" or "channel",
-/// case-insensitively (`channel`, `Channels`, `pins`, `pinned_channels`, ...).
-/// The relay worker applies the same rule and fails such pins closed.
+/// Keys an operator plausibly writes when meaning `channels` (ADR-2037),
+/// compared case-insensitively.
+const PIN_KEY_MISSPELLINGS: &[&str] = &["channel", "pin", "pins", "pinned", "pinned_channels"];
+
+/// Whether a zone key looks like a misspelt `channels` (ADR-2037): one of a
+/// short list of likely alternatives (`channel`, `pin`, `pins`, `pinned`,
+/// `pinned_channels`), or within edit distance 2 of `channels`, in either
+/// case, but never `channels` itself. Unrelated keys that merely contain
+/// "pin" or "channel" (`mapping`, `channel_order`, `default_channel`) do not
+/// match. The relay worker uses this same rule and fails such pins closed.
 pub fn is_misspelt_pin_key(key: &str) -> bool {
+    if key == "channels" {
+        return false;
+    }
     let k = key.to_ascii_lowercase();
-    key != "channels" && (k.contains("pin") || k.contains("channel"))
+    PIN_KEY_MISSPELLINGS.contains(&k.as_str()) || edit_distance(&k, "channels") <= 2
+}
+
+/// Levenshtein distance over bytes (keys are ASCII in practice).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// Refuse a `zones` array (as JSON: the `[[zones]]` tables of a `forum.toml`,
@@ -1525,5 +1549,39 @@ bot_profile = "tag"
         ));
         assert!(doubled.unwrap_err().contains("pinned by both"));
         assert!(validate_zone_config_json("{}").is_err());
+    }
+
+    #[test]
+    fn unrelated_zone_keys_still_load() {
+        let base = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../forum.example.toml"),
+        )
+        .unwrap();
+        for key in [
+            "mapping",
+            "shipping",
+            "channel_order",
+            "featured_channels",
+            "default_channel",
+        ] {
+            let toml = format!(
+                "{base}\n[[zones]]\nid = \"staff\"\ndisplay_name = \"Staff\"\n{key} = [\"{PIN_A}\"]\n"
+            );
+            assert!(crate::load_from_str(&toml).is_ok(), "{key}");
+            assert!(!is_misspelt_pin_key(key), "{key}");
+        }
+        for key in [
+            "channel",
+            "Channels",
+            "CHANNELS",
+            "chanels",
+            "pin",
+            "pins",
+            "pinned",
+            "pinned_channels",
+        ] {
+            assert!(is_misspelt_pin_key(key), "{key}");
+        }
+        assert!(!is_misspelt_pin_key("channels"));
     }
 }
