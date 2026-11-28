@@ -970,8 +970,12 @@ pub fn HelpView() -> impl IntoView {
                         <div class="bbs-kv-row"><code>"g g"</code><span>"Go to Door Games"</span></div>
                         <div class="bbs-kv-row"><code>"g w"</code><span>"Go to Sidestr Wallet"</span></div>
                         <div class="bbs-kv-row"><code>"g p"</code><span>"Go to Solid Pod"</span></div>
+                        <div class="bbs-kv-row"><code>"s"</code><span>"Subscribe to / unsubscribe from the focused topic row"</span></div>
+                        <div class="bbs-kv-row"><code>"Enter"</code><span>"Open the focused topic row"</span></div>
+                        <div class="bbs-kv-row"><code>"]"</code><span>"Show / hide subscribed topics"</span></div>
+                        <div class="bbs-kv-row"><code>"["</code><span>"Show / hide the sidebar"</span></div>
                         <div class="bbs-kv-row"><code>"?"</code><span>"Open this Help screen"</span></div>
-                        <div class="bbs-kv-row"><code>"Esc"</code><span>"Close drawer / search / command bar"</span></div>
+                        <div class="bbs-kv-row"><code>"Esc"</code><span>"Close drawer / subscriptions drawer / search / command bar"</span></div>
                     </div>
                 </section>
 

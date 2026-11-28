@@ -52,6 +52,7 @@ use crate::ascii_img::{extract_image_urls, is_protected_media, AsciiImg};
 use crate::components::{AuthorChip, EmptyCard, MarkdownBody};
 use crate::config::BbsConfig;
 use crate::router::{use_router, Route};
+use crate::subs::{newest_shown, row_key, RowKey, RowSubs, SubsAnnouncer, SubsRowFrame};
 use crate::views::bookmarks::{is_bookmarked, toggle_bookmark, BookmarkItem};
 
 const BUILTIN_REACTIONS: &[&str] = &["👍", "❤️", "😂", "🔥", "🎉", "👀", "💯", "🙌"];
@@ -456,6 +457,9 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     let loading_older = Memo::new(move |_| channels.history_cursor(&cid.get_value()).loading);
 
     let show_new_topic = RwSignal::new(false);
+    // The rows' subscribe toggle (and its live region); read-only towards
+    // the board: it never touches `order` or the frozen board.
+    let row_subs = RowSubs::new();
     // Render closures here read page-owned values with `try_*`: Leptos 0.7
     // drops a page's nested render effects a task hop after the router has
     // disposed the page, and a store write in between (the next page's
@@ -566,6 +570,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                 view! { <EmptyCard title=title body=body /> }.into_any()
             }}
 
+            <SubsAnnouncer subs=row_subs />
             <div class="tui-stack">
                 // Keyed by topic id alone: a stats answer or a decrypted
                 // title updates a row in place, it never rebuilds it.
@@ -581,6 +586,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                                 channel_id=cid.try_get_value().unwrap_or_default()
                                 last_read_at_open=last_read_at_open
                                 encrypted=is_enc
+                                subs=row_subs
                             />
                         }
                     }
@@ -628,10 +634,16 @@ fn TopicRow(
     /// active since then is NEW.
     last_read_at_open: u64,
     encrypted: bool,
+    /// The board's subscribe toggle: `[ ]`/`[*]` beside the card, a swipe on
+    /// touch, `s` on the focused card.
+    subs: RowSubs,
 ) -> impl IntoView {
     let router = use_router();
     let root_id = id.clone();
     let anchor_id = id.clone();
+    let frame_root = id.clone();
+    let frame_channel = channel_id.clone();
+    let key_ids = StoredValue::new((id.clone(), channel_id.clone()));
     // A topic briefly missing from the map (the row is about to go) keeps
     // showing what it showed.
     let topic = Memo::new(move |prev: Option<&Option<TopicSummary>>| {
@@ -669,18 +681,42 @@ fn TopicRow(
             })
             .unwrap_or(false)
     });
+    let open = StoredValue::new(Route::Thread {
+        zone,
+        channel_id,
+        root_id,
+        focus: None,
+    });
     view! {
+        <SubsRowFrame subs=subs root=frame_root channel=frame_channel>
         <div
             class="tui-card tui-card-interactive tui-stack bbs-topic-row"
             role="button"
             tabindex="0"
             data-anchor-id=anchor_id
-            on:click=move |_| router.go(Route::Thread {
-                zone: zone.clone(),
-                channel_id: channel_id.clone(),
-                root_id: root_id.clone(),
-                focus: None,
-            })
+            on:click=move |_| {
+                if let Some(r) = open.try_get_value() {
+                    router.go(r);
+                }
+            }
+            on:keydown=move |ev| {
+                let modified = ev.ctrl_key() || ev.meta_key() || ev.alt_key();
+                match row_key(&ev.key(), modified, ev.repeat()) {
+                    Some(RowKey::Open) => {
+                        ev.prevent_default();
+                        if let Some(r) = open.try_get_value() {
+                            router.go(r);
+                        }
+                    }
+                    Some(RowKey::ToggleSubscription) if subs.available() => {
+                        ev.prevent_default();
+                        if let Some((root, channel)) = key_ids.try_get_value() {
+                            subs.toggle(&root, &channel, true);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         >
             <div class="tui-row-between bbs-topic-head">
                 <div class="tui-row bbs-topic-title-row">
@@ -709,6 +745,7 @@ fn TopicRow(
                 <span class="tui-muted bbs-topic-time">{move || activity.try_get().unwrap_or_default()}</span>
             </div>
         </div>
+        </SubsRowFrame>
     }
 }
 
@@ -892,6 +929,32 @@ pub fn ThreadView(
             .get()
             .map_or(shown, |key| channels.total_for(&key).max(shown))
     });
+
+    // Reading a followed topic clears its count in the subscriptions panel:
+    // its read marker follows the newest post shown. Asked under the linked
+    // id and under the root's own id, in case they differ (a sealed root
+    // opens under its original); the store ignores a topic not followed.
+    {
+        let thread_subs = nostr_bbs_client_core::stores::thread_subs::use_thread_subs();
+        let newest = move || {
+            let root = root_view
+                .try_with(|r| r.as_ref().map(|r| r.created_at))
+                .flatten();
+            replies
+                .try_with(|rs| newest_shown(root, rs.iter().map(|r| r.created_at)))
+                .flatten()
+        };
+        thread_subs.mark_read_while_viewing(move || wanted_root.try_get_value(), newest);
+        thread_subs.mark_read_while_viewing(
+            move || {
+                topic_root
+                    .try_with(|r| r.as_ref().map(|r| r.id.to_ascii_lowercase()))
+                    .flatten()
+                    .filter(|id| wanted_root.try_get_value().as_deref() != Some(id.as_str()))
+            },
+            newest,
+        );
+    }
 
     // Reading the topic marks its channel read at the newest post held.
     Effect::new(move |_| {

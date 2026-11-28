@@ -3,7 +3,7 @@
 //!   + footer & `/` command bar.
 //! - Mobile: compact top bar + native-scrolling workspace + slide-out drawer +
 //!   sticky 5-tab bottom bar (with unread badges and safe-area padding).
-//! - Power-user keyboard accelerators (`/`, `Cmd/Ctrl+K`, `[`, `T`, `ESC`, `?`)
+//! - Power-user keyboard accelerators (`/`, `Cmd/Ctrl+K`, `[`, `]`, `T`, `ESC`, `?`)
 //!   that yield cleanly to text inputs and never hijack touch scrolling.
 
 use leptos::prelude::*;
@@ -22,6 +22,7 @@ use crate::components::{launch_sentry, BbsToastBar};
 use crate::config::BbsConfig;
 use crate::prefs::use_bbs_prefs;
 use crate::router::{forum_href, parse_slash_command, use_router, CommandAction, Route};
+use crate::subs::{desktop_column_open, SubsPanelHost, SubsTopBarButton, PANEL_KEY};
 
 /// Open state for the global Cmd/Ctrl+K search overlay.
 #[derive(Clone, Copy)]
@@ -62,9 +63,11 @@ pub fn TuiShell(children: Children) -> impl IntoView {
     let prefs = use_bbs_prefs();
     let router = use_router();
     let search = use_search_palette();
+    let subs_panel = nostr_bbs_client_core::stores::subs_panel::use_subs_panel();
+    let thread_subs = nostr_bbs_client_core::stores::thread_subs::use_thread_subs();
 
     #[cfg(target_arch = "wasm32")]
-    install_global_keys(router, prefs, search);
+    install_global_keys(router, prefs, search, subs_panel, thread_subs);
     #[cfg(not(target_arch = "wasm32"))]
     let _ = (router, search);
 
@@ -75,6 +78,7 @@ pub fn TuiShell(children: Children) -> impl IntoView {
                 <div
                     class="tui-body"
                     class:sidebar-collapsed=move || prefs.sidebar_collapsed.get()
+                    class:subs-open=move || desktop_column_open(thread_subs.available(), subs_panel)
                 >
                     <div
                         class="tui-drawer-backdrop"
@@ -85,6 +89,9 @@ pub fn TuiShell(children: Children) -> impl IntoView {
                     <main class="tui-main" id="bbs-main" tabindex="-1">
                         {children()}
                     </main>
+                    // Beside the scrolling pane, never inside it: the thread
+                    // landing and scroll anchoring measure `#bbs-main`.
+                    <SubsPanelHost />
                 </div>
                 <CommandBar />
                 <DesktopFooter />
@@ -188,6 +195,8 @@ fn TopBar() -> impl IntoView {
                     title="Search (⌘K / Ctrl+K)"
                     on:click=move |_| search.open_with(None)
                 >"⌕"</button>
+
+                <SubsTopBarButton />
 
                 <button
                     type="button"
@@ -664,6 +673,8 @@ fn DesktopFooter() -> impl IntoView {
     let router = use_router();
     let prefs = use_bbs_prefs();
     let search = use_search_palette();
+    let subs_panel = nostr_bbs_client_core::stores::subs_panel::use_subs_panel();
+    let thread_subs = nostr_bbs_client_core::stores::thread_subs::use_thread_subs();
 
     view! {
         <footer class="tui-footer">
@@ -683,6 +694,14 @@ fn DesktopFooter() -> impl IntoView {
                     class="bbs-btn bbs-btn-ghost bbs-btn-sm"
                     on:click=move |_| prefs.toggle_sidebar()
                 ><span class="tui-fk">"[[]"</span>" sidebar"</button>
+                {move || thread_subs.available().then(|| view! {
+                    <button
+                        type="button"
+                        class="bbs-btn bbs-btn-ghost bbs-btn-sm"
+                        aria-pressed=move || if subs_panel.is_open() { "true" } else { "false" }
+                        on:click=move |_| subs_panel.toggle()
+                    ><span class="tui-fk">"[" {PANEL_KEY} "]"</span>" subs"</button>
+                })}
                 <button
                     type="button"
                     class="bbs-btn bbs-btn-ghost bbs-btn-sm"
@@ -804,6 +823,8 @@ fn install_global_keys(
     router: crate::router::Router,
     prefs: crate::prefs::BbsPrefs,
     search: SearchPaletteState,
+    subs_panel: nostr_bbs_client_core::stores::subs_panel::SubsPanel,
+    thread_subs: nostr_bbs_client_core::stores::thread_subs::ThreadSubsStore,
 ) {
     use wasm_bindgen::prelude::*;
     let cb =
@@ -849,8 +870,18 @@ fn install_global_keys(
                 }
                 "t" | "T" => prefs.cycle_theme(),
                 "?" => router.go(Route::Help),
+                // Show or hide the subscribed-topics panel (column or drawer).
+                k if k == PANEL_KEY => {
+                    if thread_subs.available() {
+                        ev.prevent_default();
+                        subs_panel.toggle();
+                    }
+                }
                 "Escape" => {
-                    if prefs.mobile_drawer_open.get_untracked() {
+                    if subs_panel.is_mobile() && subs_panel.is_open() {
+                        // The phone drawer first; it returns focus itself.
+                        subs_panel.set_open(false);
+                    } else if prefs.mobile_drawer_open.get_untracked() {
                         prefs.mobile_drawer_open.set(false);
                     } else {
                         router.back();
