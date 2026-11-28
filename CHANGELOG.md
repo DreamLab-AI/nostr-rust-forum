@@ -18,6 +18,11 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Forum client: layout shift and a two-tab notice gap (2026-11-28)
+
+- **Notifications.** A tab that received a "New section" or "New member" notice from another tab (through the storage listener) never recorded its id as announced, so its next sync-state save omitted it and the notice returned after Clear and a reload. That case now records the id. More generally, saving the sync state now merges its id lists (notified posts, announced sections, announced members) with what is already stored, keeping the newest within the existing caps, and the tab adopts the merge, so one tab's save no longer drops ids another tab recorded. The stored format and the baseline are unchanged; Clear still only empties the visible list. Client only. Not seen in a browser.
+- **Page frame.** The main content area has a minimum height of the viewport less the 64px sticky header (`100dvh` where supported), so the footer starts at the fold while a topic, section or channel page loads, rather than being pushed down when its posts arrive (measured CLS 0.53 on a topic page). On mobile the nav padding sits inside that minimum, so chat views gain no dead band. Not seen in a browser.
+
 ### Forum client: cleared notices stay cleared; topic heading (2026-11-27)
 
 - **Notifications.** "New section" and admin "New member" notices came back after Clear and a reload, because only post and DM ids were persisted. Announced section ids and member pubkeys now live in the per-account sync state (bounded at 1,000 each, oldest evicted first; state stored by older builds still loads). Not seen in a browser.
