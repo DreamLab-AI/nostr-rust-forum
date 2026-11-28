@@ -219,6 +219,19 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         // A new visit may ask a root list that failed earlier again at
         // once (its backoff otherwise holds).
         channels.rearm_topic_roots(&cid.get_value());
+        // Topics whose stats failed are asked again on this visit and
+        // whenever the relay is back (connected, past AUTH when gated).
+        {
+            let relay = relay.clone();
+            Effect::new(move |_| {
+                let connected = relay.connection_state().get()
+                    == nostr_bbs_client_core::relay::ConnectionState::Connected;
+                let authed = relay.authenticated().get();
+                if connected && (authed || !gated) {
+                    channels.requeue_given_up_stats(&relay, &cid.get_value());
+                }
+            });
+        }
         Effect::new(move |_| {
             let cid = cid.get_value();
             channels.ensure_subscribed(&relay, &cid);

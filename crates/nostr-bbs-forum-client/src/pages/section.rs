@@ -438,6 +438,25 @@ pub fn SectionPage() -> impl IntoView {
     }
     let topics: Signal<Vec<TopicSummary>> = topics_memo.into();
 
+    // Topics whose stats failed (a refused or unanswered batch) are asked
+    // again on a new visit and whenever the relay is back (connected, and
+    // past AUTH in a gated zone). Tracks only those signals and the channel.
+    {
+        let relay_for_requeue = relay.clone();
+        Effect::new(move |_| {
+            let connected = relay_for_requeue.connection_state().get()
+                == crate::relay::ConnectionState::Connected;
+            let authed = relay_for_requeue.authenticated().get();
+            let Some(cid) = channel_id.get() else {
+                return;
+            };
+            let gated = zone_is_gated(&category_slug(), &load_zones());
+            if connected && (authed || !gated) {
+                store.requeue_given_up_stats(&relay_for_requeue, &cid);
+            }
+        });
+    }
+
     // Fetch the section's topic roots once (decision ii: sealed roots carry
     // ["t","topic"]), so dormant topics are listed without paging the channel.
     // A new visit (the first run, or a switch to another section) may ask a
