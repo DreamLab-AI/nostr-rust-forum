@@ -1315,6 +1315,14 @@ impl NostrRelayDO {
                     );
                     return;
                 }
+                // ADR-2037 review: the channel must be a stored kind-40 with
+                // exactly this id, as for kind-42 (a mixed-case alias would
+                // miss its channel_zones row and skip the zone gate).
+                let channel_known = self.reference_target_channels(&channel_id, 0).await;
+                if let Some(reason) = channel_write_rejection(&channel_id, &channel_known, None) {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
                 // ADR-2037 review: a channel's metadata (name, about,
                 // picture, pin/unpin control) is written only by those who may
                 // write its zone, as its kind-42 posts are. A zone-config pin
@@ -1509,28 +1517,14 @@ impl NostrRelayDO {
             // Ids are matched EXACTLY (stored ids are lowercase hex): a
             // mixed-case alias of a zone channel would miss its channel_zones
             // row and read as unscoped (review finding 3).
+            //
+            // The reply-topic and edit-target placement checks run after the
+            // zone write gate below, so an author who may not write here
+            // learns nothing about which messages exist in the channel.
             let channel_known = self.reference_target_channels(&channel_id, 0).await;
-            let reply_target = match nostr_bbs_core::sealed::reply_root_of(&event) {
-                Some(root) => Some(self.reply_topic_channels(root).await),
-                None => None,
-            };
-            if let Some(reason) =
-                channel_write_rejection(&channel_id, &channel_known, reply_target.as_ref())
-            {
+            if let Some(reason) = channel_write_rejection(&channel_id, &channel_known, None) {
                 Self::send_ok(ws, &event.id, false, reason);
                 return;
-            }
-            // ADR-2037 review: an edit's target must be a message in this
-            // same channel, as a reply's topic must. Clients fold an edit
-            // into its target wherever the edit was posted, so an edit filed
-            // in another channel (another zone) could otherwise rewrite a
-            // post the author can no longer write to.
-            if let Some(target) = edit_target_of(&event) {
-                let target_channels = self.reply_topic_channels(&target).await;
-                if let Some(reason) = edit_target_rejection(&channel_id, &target_channels) {
-                    Self::send_ok(ws, &event.id, false, reason);
-                    return;
-                }
             }
             // Only a channel EXPLICITLY bound to a zone (a `channel_zones` row,
             // written solely by the admin-only /api/admin/channel-zone endpoint)
@@ -1598,6 +1592,28 @@ impl NostrRelayDO {
                         false,
                         "blocked: encrypted zone requires zone-key ciphertext",
                     );
+                    return;
+                }
+            }
+            // F2: a reply's topic must be a stored message in this channel.
+            if let Some(root) = nostr_bbs_core::sealed::reply_root_of(&event) {
+                let reply_target = self.reply_topic_channels(root).await;
+                if let Some(reason) =
+                    channel_write_rejection(&channel_id, &channel_known, Some(&reply_target))
+                {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+            }
+            // ADR-2037 review: an edit's target must be a message in this
+            // same channel, as a reply's topic must. Clients fold an edit
+            // into its target wherever the edit was posted, so an edit filed
+            // in another channel (another zone) could otherwise rewrite a
+            // post the author can no longer write to.
+            if let Some(target) = edit_target_of(&event) {
+                let target_channels = self.edit_target_channels(&target).await;
+                if let Some(reason) = edit_target_rejection(&channel_id, &target_channels) {
+                    Self::send_ok(ws, &event.id, false, reason);
                     return;
                 }
             }
@@ -2733,14 +2749,28 @@ pub(crate) fn edit_target_of(event: &NostrEvent) -> Option<String> {
         .map(|t| t[1].to_ascii_lowercase())
 }
 
+/// Why a stored-target lookup returned nothing usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetLookupError {
+    /// Nothing usable is stored under the id (absent, ambiguous, or not a
+    /// channel message).
+    Missing,
+    /// D1 could not answer.
+    Unavailable,
+}
+
 /// Refusal for a kind-42 edit whose target is not a stored message of
-/// `channel_id` (or could not be looked up: fail closed).
+/// `channel_id`. Channel values compare case-insensitively (the channel id
+/// itself was already matched exactly), so a legacy post whose root tag is
+/// upper-case is still editable. A failed lookup refuses with a retryable
+/// reason.
 pub(crate) fn edit_target_rejection(
     channel_id: &str,
-    target_channels: &Result<Vec<String>, ()>,
+    target_channels: &Result<Vec<String>, TargetLookupError>,
 ) -> Option<&'static str> {
     match target_channels {
-        Ok(cs) if !cs.is_empty() && cs.iter().all(|c| c == channel_id) => None,
+        Ok(cs) if !cs.is_empty() && cs.iter().all(|c| c.eq_ignore_ascii_case(channel_id)) => None,
+        Err(TargetLookupError::Unavailable) => Some("error: edit target lookup failed, try again"),
         _ => Some("invalid: edit target is not a message in this channel"),
     }
 }
@@ -3040,18 +3070,28 @@ impl NostrRelayDO {
     /// is stored, on a D1 failure, or for more than `MAX_REFERENCE_TARGETS`
     /// envelope matches.
     async fn lookup_target_events(&self, id: &str) -> Result<Vec<NostrEvent>, ()> {
-        let db = self.env.d1("DB").map_err(|_| ())?;
+        self.lookup_target_events_detailed(id).await.map_err(|_| ())
+    }
+
+    /// [`Self::lookup_target_events`], telling "nothing (or too much) is
+    /// stored" from "D1 could not answer".
+    async fn lookup_target_events_detailed(
+        &self,
+        id: &str,
+    ) -> Result<Vec<NostrEvent>, TargetLookupError> {
+        use TargetLookupError::Unavailable as U;
+        let db = self.env.d1("DB").map_err(|_| U)?;
         let by_id: Vec<super::storage::EventRow> = db
             .prepare(
                 "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1",
             )
             .bind(&[JsValue::from_str(id)])
-            .map_err(|_| ())?
+            .map_err(|_| U)?
             .all()
             .await
-            .map_err(|_| ())?
+            .map_err(|_| U)?
             .results()
-            .map_err(|_| ())?;
+            .map_err(|_| U)?;
         let found: Vec<NostrEvent> = by_id
             .into_iter()
             .filter_map(super::storage::EventRow::into_nostr_event)
@@ -3066,25 +3106,25 @@ impl NostrRelayDO {
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
         ))
-        .map_err(|_| ())?;
+        .map_err(|_| U)?;
         let sealed: Vec<super::storage::EventRow> = db
             .prepare(format!(
                 "{SEALED_TARGET_SQL} LIMIT {}",
                 MAX_REFERENCE_TARGETS + 1
             ))
             .bind(&[JsValue::from_str(id), JsValue::from_str(&trusted)])
-            .map_err(|_| ())?
+            .map_err(|_| U)?
             .all()
             .await
-            .map_err(|_| ())?
+            .map_err(|_| U)?
             .results()
-            .map_err(|_| ())?;
+            .map_err(|_| U)?;
         let found: Vec<NostrEvent> = sealed
             .into_iter()
             .filter_map(super::storage::EventRow::into_nostr_event)
             .collect();
         if found.is_empty() || found.len() > MAX_REFERENCE_TARGETS {
-            return Err(());
+            return Err(TargetLookupError::Missing);
         }
         Ok(found)
     }
@@ -3158,6 +3198,23 @@ impl NostrRelayDO {
     /// The channel(s) a reply's topic `root` lives in, for the F2 placement
     /// check: every stored match must be a kind-42 (a live root, or a sealed
     /// envelope wrapping it). `Err` otherwise.
+    /// The channels the post an edit targets lives in (stored kind-42 or a
+    /// sealed original), with lookup failures kept apart from absence.
+    async fn edit_target_channels(&self, target: &str) -> Result<Vec<String>, TargetLookupError> {
+        let targets = self.lookup_target_events_detailed(target).await?;
+        let mut channels: Vec<String> = Vec::new();
+        for t in &targets {
+            if t.kind != 42 {
+                return Err(TargetLookupError::Missing);
+            }
+            let c = stored_target_channel(t).ok_or(TargetLookupError::Missing)?;
+            if !channels.contains(&c) {
+                channels.push(c);
+            }
+        }
+        Ok(channels)
+    }
+
     async fn reply_topic_channels(&self, root: &str) -> Result<Vec<String>, ()> {
         let targets = self.lookup_target_events(root).await?;
         if targets.iter().any(|t| t.kind != 42) {
@@ -9852,9 +9909,27 @@ mod channel_pin_gate_tests {
             edit_target_rejection(PINNED, &Ok(vec![PINNED.to_string()])),
             None
         );
-        for bad in [Ok(vec!["other".to_string()]), Ok(vec![]), Err(())] {
-            assert!(edit_target_rejection(PINNED, &bad).is_some(), "{bad:?}");
+        // A legacy target whose root tag is upper-case is still this channel.
+        assert_eq!(
+            edit_target_rejection(PINNED, &Ok(vec![PINNED.to_uppercase()])),
+            None
+        );
+        for bad in [
+            Ok(vec!["other".to_string()]),
+            Ok(vec![]),
+            Err(TargetLookupError::Missing),
+        ] {
+            assert_eq!(
+                edit_target_rejection(PINNED, &bad),
+                Some("invalid: edit target is not a message in this channel"),
+                "{bad:?}"
+            );
         }
+        // D1 down: retryable, not "invalid".
+        assert_eq!(
+            edit_target_rejection(PINNED, &Err(TargetLookupError::Unavailable)),
+            Some("error: edit target lookup failed, try again")
+        );
         assert!(
             edit_target_rejection(PINNED, &Ok(vec![PINNED.to_string(), "other".to_string()]))
                 .is_some()

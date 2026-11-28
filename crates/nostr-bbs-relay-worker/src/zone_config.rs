@@ -104,15 +104,11 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Whether a zone object key looks like a misspelt `channels` (ADR-2037):
-/// any key other than exactly `channels` that mentions "pin" or "channel",
-/// case-insensitively (`channel`, `Channels`, `pins`, `pinned_channels`, ...).
-/// serde would silently ignore such a key, and the channel it meant to pin
-/// would stay in its old zone.
-pub fn is_misspelt_pin_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    key != "channels" && (k.contains("pin") || k.contains("channel"))
-}
+/// Whether a zone object key looks like a misspelt `channels` (ADR-2037);
+/// the config validator's rule, shared so the two never drift. serde would
+/// silently ignore such a key, and the channel it meant to pin would stay in
+/// its old zone.
+pub use nostr_bbs_config::validate::is_misspelt_pin_key;
 
 /// Every 64-hex string in `v` (a string, or an array of strings), lowercased.
 fn hex_ids_in(v: &serde_json::Value) -> Vec<String> {
@@ -206,10 +202,35 @@ impl ZoneConfig {
             return Self::default();
         };
         let mut out = Self::default();
-        for v in values {
+        for mut v in values {
+            // ADR-2037: a `channels` value of the wrong type (a string, an
+            // array holding non-strings) must not make the whole config
+            // unparseable and every zone dark. It breaks only this zone's
+            // pins: any 64-hex ids it holds fail closed, the field is dropped
+            // and the zone loads.
+            let mut bad_channels: Option<String> = None;
+            if let Some(obj) = v.as_object_mut() {
+                let well_typed = obj.get("channels").is_none_or(|c| {
+                    c.as_array()
+                        .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
+                });
+                if !well_typed {
+                    if let Some(c) = obj.remove("channels") {
+                        out.quarantined.extend(hex_ids_in(&c));
+                        bad_channels = Some(c.to_string());
+                    }
+                }
+            }
             let Ok(zone) = serde_json::from_value::<Zone>(v.clone()) else {
                 return Self::default();
             };
+            if let Some(bad) = bad_channels {
+                out.pin_errors.push(format!(
+                    "zone {} has `channels` of the wrong type ({bad}); it must be an array of 64-hex ids",
+                    zone.id
+                ));
+                out.broken_pin_zones.push(zone.id.clone());
+            }
             if let Some(obj) = v.as_object() {
                 for (key, val) in obj.iter().filter(|(k, _)| is_misspelt_pin_key(k)) {
                     out.pin_errors.push(format!(
@@ -680,11 +701,52 @@ mod tests {
             r#"[{{"id":"staff","required_cohorts":["staff"],"channel":"{PINNED}"}}]"#
         ));
         assert_eq!(c.pinned_zone(PINNED), ChannelPin::Conflict);
-        // Other zone keys are not mistaken for pin keys.
-        for key in ["section_order", "kanban", "search"] {
+        // Other zone keys are not mistaken for pin keys, and ids under them
+        // are left alone.
+        for key in [
+            "section_order",
+            "kanban",
+            "search",
+            "mapping",
+            "shipping",
+            "channel_order",
+            "featured_channels",
+            "default_channel",
+        ] {
             assert!(!is_misspelt_pin_key(key), "{key}");
+            let c = ZoneConfig::from_json(&format!(
+                r#"[{{"id":"open","required_cohorts":["m"],"{key}":["{PINNED}"]}}]"#
+            ));
+            assert_eq!(c.pinned_zone(PINNED), ChannelPin::Unpinned, "{key}");
+            assert!(c.pin_errors().is_empty(), "{key}");
         }
         assert!(!is_misspelt_pin_key("channels"));
+        // Near misses of `channels` are caught.
+        for key in ["chanels", "channles", "CHANNELS", "pin", "pinned"] {
+            assert!(is_misspelt_pin_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_typed_channels_field_breaks_only_its_zone() {
+        let c = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"open","required_cohorts":["m"],"visibility":"locked"}},
+                {{"id":"staff","required_cohorts":["staff"],"channels":"{PINNED}"}},
+                {{"id":"odd","required_cohorts":["o"],"channels":[1,"{OTHER}"]}}]"#
+        ));
+        // The rest of the config loads and gates as configured.
+        assert!(c.cohorts_can_read("open", &["m".to_string()]));
+        assert!(c.cohorts_can_read("staff", &["staff".to_string()]));
+        assert!(c.defs_visible_to_nonmember("open"));
+        // The ids those fields name fail closed.
+        assert_eq!(c.pinned_zone(PINNED), ChannelPin::Conflict);
+        assert_eq!(c.pinned_zone(OTHER), ChannelPin::Conflict);
+        assert_eq!(c.pin_errors().len(), 2);
+        // A null `channels` is a typing error too, but names no id.
+        let n =
+            ZoneConfig::from_json(r#"[{"id":"staff","required_cohorts":["s"],"channels":null}]"#);
+        assert!(n.cohorts_can_read("staff", &["s".to_string()]));
+        assert_eq!(n.pin_errors().len(), 1);
     }
 
     #[test]

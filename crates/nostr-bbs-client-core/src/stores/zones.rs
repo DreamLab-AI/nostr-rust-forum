@@ -141,8 +141,24 @@ pub struct Zone {
     /// `nostr_bbs_config::schema::Zone::channels`. A pinned channel belongs to
     /// this zone whatever its signed `section` tag says; see
     /// [`pinned_zone_for`] and [`effective_section`]. Empty (default): no pins.
-    #[serde(default)]
+    /// A value of the wrong type reads as no pins rather than failing the
+    /// whole `ZONE_CONFIG` (which would drop the client to the fallback zone
+    /// list); the relay fails such pins closed.
+    #[serde(default, deserialize_with = "lenient_channels")]
     pub channels: Vec<String>,
+}
+
+/// `channels` as an array of strings; any other shape (a bare string, an
+/// array holding non-strings, `null`) yields no pins.
+fn lenient_channels<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Array(a) if a.iter().all(serde_json::Value::is_string) => a
+            .into_iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 impl Zone {
@@ -970,5 +986,15 @@ mod tests {
         // The built-in fallback list keeps its open public zone.
         let fallback = fallback_zones();
         assert!(fallback[0].is_member(&none));
+    }
+
+    #[test]
+    fn a_wrong_typed_channels_field_does_not_break_the_zone_list() {
+        let zones: Vec<Zone> = serde_json::from_str(&format!(
+            r#"[{{"id":"open"}},{{"id":"staff","channels":"{PIN}"}},{{"id":"odd","channels":[1,2]}}]"#
+        ))
+        .unwrap();
+        assert_eq!(zones.len(), 3);
+        assert!(zones.iter().all(|z| z.channels.is_empty()));
     }
 }
