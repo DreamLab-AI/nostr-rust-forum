@@ -166,6 +166,12 @@ mod native {
         /// and moderators); anyone else deletes only their own posts.
         #[arg(long, global = true)]
         moderators: Option<String>,
+        /// The deployment's ZONE_CONFIG JSON (a file). Its `channels` pins
+        /// (ADR-2037) keep posts of a channel pinned to another zone out of
+        /// this zone's index, and exclude any already indexed. Without it no
+        /// channel is treated as pinned.
+        #[arg(long, global = true)]
+        zone_config: Option<PathBuf>,
         /// Seconds an object a manifest stopped listing stays in the pod
         /// before deletion (browsers may still be loading it).
         #[arg(long, global = true, default_value_t = nostr_bbs_search_build::pipeline::DEFAULT_RETIRE_AFTER_SECS)]
@@ -517,6 +523,15 @@ mod native {
                 .map_err(|e| Fail(format!("--moderators: {e}"), 2))?,
             None => Vec::new(),
         };
+        let channel_pins = match &cli.zone_config {
+            Some(p) => {
+                let raw = std::fs::read_to_string(p)
+                    .map_err(|e| Fail(format!("--zone-config {}: {e}", p.display()), 2))?;
+                nostr_bbs_search_build::harvest::ChannelPins::from_zone_config_json(&raw)
+                    .map_err(|e| Fail(format!("--zone-config: {e}"), 2))?
+            }
+            None => nostr_bbs_search_build::harvest::ChannelPins::default(),
+        };
         let mut job = Job {
             zone,
             relay_url,
@@ -530,6 +545,7 @@ mod native {
             now,
             warnings: Vec::new(),
             moderators: &moderators,
+            channel_pins: &channel_pins,
             max_excluded: nostr_bbs_sealed_search::manifest::MAX_EXCLUDED,
             retire_after_secs: cli.retire_after_secs,
         };
@@ -666,6 +682,7 @@ mod native {
                     let rules = nostr_bbs_search_build::harvest::Rules {
                         now,
                         moderators: &moderators,
+                        channel_pins: &channel_pins,
                     };
                     let mut h = harvest(
                         &mut relay,

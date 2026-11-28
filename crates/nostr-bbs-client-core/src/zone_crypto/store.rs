@@ -2367,6 +2367,17 @@ pub fn is_restored_original(store: Option<ZoneKeyStore>, id: &str) -> bool {
     store.is_some_and(|s| s.cache.with_value(|c| c.envelope_of(id).is_some()))
 }
 
+/// The envelope id sealed original `id` was restored from this session, if
+/// it was (opened on arrival or by a later key). A topic list uses it to
+/// keep the row in place when the original reverts to its envelope's
+/// placeholder. Not reactive. Same restriction as [`is_restored_original`].
+pub fn restored_envelope_of(store: Option<ZoneKeyStore>, id: &str) -> Option<String> {
+    store.and_then(|s| {
+        s.cache
+            .with_value(|c| c.envelope_of(id).map(str::to_string))
+    })
+}
+
 /// The zone-key store, if provided.
 pub fn try_use_zone_key_store() -> Option<ZoneKeyStore> {
     use_context::<ZoneKeyStore>()
@@ -2403,13 +2414,23 @@ pub fn channel_zone(
             .map(|c| c.section.clone())
     })?;
     let zones = crate::stores::zones::load_zones();
-    let zone_id = crate::stores::zones::section_to_zone(&section, &zones)?;
-    let zone = zones.iter().find(|z| z.id == zone_id)?;
+    let zone = zone_for_channel_section(&section, &zones)?;
     Some((
         zone.id.clone(),
         zone.display_name.clone(),
         super::zone_is_encrypted(super::encryption_enabled(), zone.encrypted),
     ))
+}
+
+/// The zone whose key a channel's posts use, from the channel's routed
+/// `section` (`ChannelMeta::section`, which already reflects any ADR-2037
+/// zone pin). Pure half of [`channel_zone`].
+pub fn zone_for_channel_section<'a>(
+    section: &str,
+    zones: &'a [crate::stores::zones::Zone],
+) -> Option<&'a crate::stores::zones::Zone> {
+    let zone_id = crate::stores::zones::section_to_zone(section, zones)?;
+    zones.iter().find(|z| z.id == zone_id)
 }
 
 /// Apply the zone write rules to an outgoing kind-42 for `channel_id`:

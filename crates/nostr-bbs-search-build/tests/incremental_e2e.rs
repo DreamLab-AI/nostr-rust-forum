@@ -165,6 +165,7 @@ fn rules() -> nostr_bbs_search_build::harvest::Rules<'static> {
     nostr_bbs_search_build::harvest::Rules {
         now: 1_900_000_000,
         moderators: &[],
+        channel_pins: &nostr_bbs_search_build::harvest::NO_CHANNEL_PINS,
     }
 }
 
@@ -288,6 +289,7 @@ fn job<'a>(
         now: 1_900_000_000,
         warnings: Vec::new(),
         moderators: &[],
+        channel_pins: &nostr_bbs_search_build::harvest::NO_CHANNEL_PINS,
         max_excluded: nostr_bbs_sealed_search::manifest::MAX_EXCLUDED,
         retire_after_secs: nostr_bbs_search_build::pipeline::DEFAULT_RETIRE_AFTER_SECS,
     }
@@ -993,6 +995,7 @@ fn a_second_the_relay_cannot_page_holds_the_mark_below_it() {
     let soon = nostr_bbs_search_build::harvest::Rules {
         now: s + 3_600,
         moderators: &[],
+        channel_pins: &nostr_bbs_search_build::harvest::NO_CHANNEL_PINS,
     };
     let h = block_on(harvest(
         &mut f.relay,
@@ -1274,4 +1277,99 @@ fn the_author_book_keeps_only_indexed_posts() {
     assert!(r.dropped_rows >= 1);
     assert!(!f.book.authors.contains_key(&live113.id));
     assert!(f.book.authors.len() < 120);
+}
+
+// -- ADR-2037: channels pinned to another zone stay out of this index -------
+
+fn pinned_to(zone: &str) -> nostr_bbs_search_build::harvest::ChannelPins {
+    nostr_bbs_search_build::harvest::ChannelPins::from_zone_config_json(&format!(
+        r#"[{{"id":"{ZONE}"}},{{"id":"{zone}","channels":["{CHANNEL}"]}}]"#
+    ))
+    .unwrap()
+}
+
+#[test]
+fn posts_of_a_channel_pinned_to_another_zone_are_not_indexed() {
+    let mut f = fixture("pinned-away");
+    let pins = pinned_to("staff");
+    let rules = nostr_bbs_search_build::harvest::Rules {
+        channel_pins: &pins,
+        ..rules()
+    };
+    let h = block_on(harvest(
+        &mut f.relay,
+        ZONE,
+        &ring(&[(1, ZONE_E1)]),
+        None,
+        &HashSet::new(),
+        &rules,
+        &mut Default::default(),
+    ))
+    .unwrap();
+    assert!(h.rows.is_empty(), "no row of the pinned channel is indexed");
+    assert_eq!(h.pinned_elsewhere, 115);
+    assert_eq!(
+        h.newest, None,
+        "skipped posts do not move the high-water mark"
+    );
+}
+
+#[test]
+fn a_reconcile_excludes_indexed_rows_of_a_channel_pinned_away() {
+    let mut f = fixture("pinned-reconcile");
+    // Every row the base indexed: imported originals by their original id,
+    // live posts by their own id.
+    let indexed: HashSet<String> = f
+        .originals
+        .values()
+        .map(|(o, _)| o.id.clone())
+        .chain(f.natives.values().map(|e| e.id.clone()))
+        .collect();
+    assert_eq!(indexed.len(), 115);
+    let pins = pinned_to("staff");
+    let rules = nostr_bbs_search_build::harvest::Rules {
+        channel_pins: &pins,
+        ..rules()
+    };
+    let h = block_on(harvest(
+        &mut f.relay,
+        ZONE,
+        &ring(&[(1, ZONE_E1)]),
+        None,
+        &indexed,
+        &rules,
+        &mut f.book,
+    ))
+    .unwrap();
+    let excluded: HashSet<String> = h.exclude.iter().cloned().collect();
+    assert_eq!(
+        excluded, indexed,
+        "envelopes are excluded by their original's id"
+    );
+}
+
+#[test]
+fn a_channel_pinned_to_this_zone_or_no_pins_indexes_as_before() {
+    for pins in [
+        pinned_to(ZONE),
+        nostr_bbs_search_build::harvest::NO_CHANNEL_PINS.clone(),
+    ] {
+        let mut f = fixture("pinned-here");
+        let rules = nostr_bbs_search_build::harvest::Rules {
+            channel_pins: &pins,
+            ..rules()
+        };
+        let h = block_on(harvest(
+            &mut f.relay,
+            ZONE,
+            &ring(&[(1, ZONE_E1)]),
+            None,
+            &HashSet::new(),
+            &rules,
+            &mut Default::default(),
+        ))
+        .unwrap();
+        assert_eq!(h.rows.len(), 115);
+        assert_eq!(h.pinned_elsewhere, 0);
+    }
 }

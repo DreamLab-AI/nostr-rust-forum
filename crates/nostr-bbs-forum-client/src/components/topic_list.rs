@@ -12,6 +12,8 @@
 //! topic/reply classification is client-core's [`crate::topics`], shared with
 //! the BBS client, and this component adds no relay subscriptions of its own.
 
+use std::collections::HashMap;
+
 use leptos::prelude::*;
 use leptos_router::components::A;
 
@@ -26,6 +28,11 @@ use crate::utils::section_url::topic_path;
 pub use crate::topics::{classify_topics, topic_title, with_topic_stats, TopicSummary};
 
 /// Render the section as a list of topic rows.
+///
+/// Rows are keyed by topic id alone and listed in `order`, which the page
+/// freezes once it has painted (client-core
+/// [`FrozenBoard`](crate::topics::FrozenBoard)): a stats answer or a
+/// decrypted title updates a row in place, it never rebuilds or moves it.
 #[component]
 pub fn TopicList(
     /// The resolved kind-40 channel id of the section.
@@ -34,8 +41,10 @@ pub fn TopicList(
     /// The zone (category) slug for building topic hrefs (readable).
     #[prop(into)]
     category: String,
-    /// Reactive topic summaries, newest-activity first.
-    topics: Signal<Vec<TopicSummary>>,
+    /// Topic ids in display order.
+    order: Signal<Vec<String>>,
+    /// Every listed topic by id; each row reads its own entry.
+    topics: Memo<HashMap<String, TopicSummary>>,
 ) -> impl IntoView {
     let category = StoredValue::new(category);
     let channel_id = StoredValue::new(channel_id);
@@ -43,12 +52,12 @@ pub fn TopicList(
     // The outer view tracks only EMPTINESS, so it re-renders when the list
     // becomes empty or non-empty, never per change: re-running it per change
     // built a fresh <For> and re-rendered every row on each page of history.
-    let is_empty = Memo::new(move |_| topics.with(Vec::is_empty));
+    let is_empty = Memo::new(move |_| order.with(Vec::is_empty));
 
     view! {
         <div class="space-y-2">
             {move || {
-                if is_empty.get() {
+                if is_empty.try_get().unwrap_or(false) {
                     view! {
                         <div class="flex flex-col items-center justify-center py-16 text-center">
                             <div class="w-14 h-14 rounded-full bg-gray-800 flex items-center justify-center mb-4 animate-gentle-float">
@@ -61,19 +70,17 @@ pub fn TopicList(
                         </div>
                     }.into_any()
                 } else {
-                    // Keyed: a page of older topics renders only its own
-                    // rows; a row re-renders when what it shows changes.
                     view! {
                         <For
-                            each=move || topics.get()
-                            key=|t| (t.id.clone(), t.reply_count, t.last_activity, t.content.len(), t.last_pubkey.clone())
-                            children=move |t| {
+                            each=move || order.try_get().unwrap_or_default()
+                            key=|id| id.clone()
+                            children=move |id| {
                                 let href = base_href(&topic_path(
                                     &category.get_value(),
                                     &channel_id.get_value(),
-                                    &t.id,
+                                    &id,
                                 ));
-                                view! { <TopicRow topic=t href=href /> }
+                                view! { <TopicRow id=id topics=topics href=href /> }
                             }
                         />
                     }.into_any()
@@ -83,16 +90,77 @@ pub fn TopicList(
     }
 }
 
+/// Skeleton rows shown while a section's topics load: the same row frame,
+/// column classes and line heights as [`TopicRow`], so the list does not
+/// change height when the real rows replace them.
+#[component]
+pub fn TopicListSkeleton(
+    /// What is being waited for, for screen readers (and shown when
+    /// `visible_status`).
+    #[prop(into)]
+    status: String,
+    /// Show `status` as a line above the rows (the zone-key wait, which can
+    /// take a while), rather than to screen readers only.
+    #[prop(optional)]
+    visible_status: bool,
+) -> impl IntoView {
+    view! {
+        <div class="space-y-2" role="status" aria-busy="true" data-topic-skeleton="">
+            <p class=if visible_status { SKELETON_STATUS_CLASS } else { "sr-only" }>{status}</p>
+            {(0..SKELETON_ROWS).map(|_| view! {
+                <div class=ROW_CLASS aria-hidden="true">
+                    <div class=ROW_INNER_CLASS>
+                        <div class=AVATAR_SLOT_CLASS>
+                            <div class=SKELETON_AVATAR_CLASS></div>
+                        </div>
+                        <div class=LEFT_COLUMN_CLASS>
+                            <h3 class=TITLE_CLASS>
+                                <span class=SKELETON_TITLE_CLASS>"\u{00a0}"</span>
+                            </h3>
+                            <div class=BYLINE_ROW_CLASS>
+                                <span class=SKELETON_BYLINE_CLASS></span>
+                            </div>
+                        </div>
+                        <div class=RIGHT_COLUMN_CLASS>
+                            <div class=ACTIVITY_LINE_CLASS>
+                                <span class=SKELETON_ACTIVITY_CLASS></span>
+                            </div>
+                            <div class=STARTED_BY_CLASS></div>
+                        </div>
+                    </div>
+                </div>
+            }).collect_view()}
+        </div>
+    }
+}
+
+/// Skeleton rows: enough to fill a first screen.
+const SKELETON_ROWS: usize = 6;
+
 /// Narrow screens (below `sm`) restack the row: the left column takes the
 /// whole width, the title may wrap to two lines, and the byline reads
 /// `last by {name} {pill} • N replies • {time} ago`; the right-hand column
 /// (activity over "started by") is hidden. From `sm` up the two-column layout
 /// is unchanged. Literal class strings, so the Tailwind scan sees them.
 ///
-/// The row under a topic title. One non-wrapping flex row, so an agent pill
-/// never makes a row taller than one without.
+/// Every line of a row has a fixed height, so fields that arrive late (the
+/// relay's reply total and newest reply, a decrypted title, an agent pill)
+/// never change the row's height.
+///
+/// The row frame ("stretched link" card).
+const ROW_CLASS: &str =
+    "relative block bg-gray-800/60 hover:bg-gray-800 border border-gray-700/60 \
+     hover:border-amber-500/30 rounded-lg p-4 text-inherit transition-colors group";
+/// The row's three columns: avatar, title and byline, right-hand column.
+const ROW_INNER_CLASS: &str = "flex items-start gap-3";
+/// The avatar's slot (`AvatarSize::Md`, 36 px).
+const AVATAR_SLOT_CLASS: &str = "flex-shrink-0 mt-0.5";
+/// Title and byline.
+const LEFT_COLUMN_CLASS: &str = "flex-1 min-w-0";
+/// The row under a topic title. One non-wrapping flex row of fixed height,
+/// so an agent pill never makes a row taller than one without.
 const BYLINE_ROW_CLASS: &str =
-    "flex flex-nowrap items-center gap-2 mt-1 text-xs text-gray-500 min-w-0";
+    "flex flex-nowrap items-center gap-2 mt-1 h-4 text-xs text-gray-500 min-w-0";
 /// "last by", name and pill: the part of the byline that gives way.
 const LAST_BY_CLASS: &str =
     "flex flex-1 items-center gap-1 min-w-0 overflow-hidden whitespace-nowrap";
@@ -107,17 +175,38 @@ const LAST_BY_NAME_CLASS: &str = "text-gray-400 min-w-0 truncate";
 /// copy glyph keeps its size.
 const LAST_BY_PILL_CLASS: &str = "flex items-center gap-1 min-w-0 shrink-[100] overflow-hidden \
      [&>span]:min-w-0 [&>span>span]:block [&>span>span]:truncate [&>button]:flex-shrink-0";
-/// The topic title: up to two lines on a phone, one from `sm`.
+/// The topic title: up to two lines on a phone, one from `sm`. On a phone
+/// it always takes two lines' height (`text-base` is 1.5rem a line), so a
+/// long encrypted-zone placeholder that decrypts to a short title, or the
+/// reverse, does not change the row's height.
 const TITLE_CLASS: &str = "font-semibold text-white group-hover:text-amber-400 \
-     transition-colors line-clamp-2 sm:line-clamp-1";
+     transition-colors line-clamp-2 min-h-[3rem] sm:line-clamp-1 sm:min-h-0";
 /// `• {time} ago` inside the byline, on a phone only (from `sm` the time is
 /// in the right-hand column).
 const BYLINE_ACTIVITY_CLASS: &str = "flex-shrink-0 whitespace-nowrap sm:hidden";
 /// The right-hand column (activity over "started by"): hidden below `sm`,
 /// where "started by" is the least useful field.
 const RIGHT_COLUMN_CLASS: &str = "hidden sm:block flex-shrink-0 text-right text-xs text-gray-500";
+/// The activity line of the right-hand column.
+const ACTIVITY_LINE_CLASS: &str = "flex items-center gap-1 justify-end h-4 whitespace-nowrap";
+/// The "started by" line: always present and of fixed height, empty when the
+/// starter spoke last, so the reply that names someone else does not add a
+/// line.
+const STARTED_BY_CLASS: &str =
+    "mt-1 h-4 text-gray-600 flex items-center gap-1 justify-end whitespace-nowrap";
 /// The reply count keeps its width.
 const REPLIES_CLASS: &str = "flex items-center gap-1 flex-shrink-0 whitespace-nowrap";
+/// Status line above skeleton rows, when shown.
+const SKELETON_STATUS_CLASS: &str = "text-gray-400 text-sm";
+/// Skeleton avatar: the size of `AvatarSize::Md`.
+const SKELETON_AVATAR_CLASS: &str = "w-9 h-9 rounded-full bg-gray-700/60 animate-pulse";
+/// Skeleton title bar: a non-breaking space in a title line, so its height
+/// is the title's line height.
+const SKELETON_TITLE_CLASS: &str = "inline-block w-2/3 rounded bg-gray-700/60 animate-pulse";
+/// Skeleton byline bar.
+const SKELETON_BYLINE_CLASS: &str = "block w-1/2 h-3 rounded bg-gray-700/40 animate-pulse";
+/// Skeleton activity bar.
+const SKELETON_ACTIVITY_CLASS: &str = "block w-12 h-3 rounded bg-gray-700/40 animate-pulse";
 
 /// A single topic row: title line, latest participant, reply count,
 /// last-activity.
@@ -125,83 +214,131 @@ const REPLIES_CLASS: &str = "flex items-center gap-1 flex-shrink-0 whitespace-no
 /// The byline and avatar name the MOST RECENT participant, not the root
 /// author: a reader scanning the list wants to know who spoke last before
 /// opening the topic. `last_pubkey` already falls back to the root author
-/// when there are no replies, and the root author moves to the right-hand
+/// when there are no replies, and the root author shows in the right-hand
 /// column ("started by") only when the two differ.
+///
+/// The row reads its topic from `topics` by id, and each field through its
+/// own memo, so a stats answer re-renders the reply count and time, and a
+/// new last poster re-renders the avatar and name, without rebuilding the
+/// rest of the row.
 #[component]
-fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
-    let author_pk = topic.pubkey.clone();
-    let last_pk = topic.last_pubkey.clone();
-    // Disclosure badges (COM-13/F2): mark the topic's root author and the
-    // most-recent participant as agents, naming their authorising principals.
-    let root_badge_pubkey = topic.pubkey.clone();
-    let last_badge_pubkey = topic.last_pubkey.clone();
-    let title = topic_title(&topic.content);
-    let reply_count = topic.reply_count;
-    let reply_label = if reply_count == 1 {
-        "1 reply".to_string()
-    } else {
-        format!("{reply_count} replies")
+fn TopicRow(
+    id: String,
+    topics: Memo<HashMap<String, TopicSummary>>,
+    href: String,
+) -> impl IntoView {
+    let anchor_id = id.clone();
+    // A topic briefly missing from the map (the row is about to go) keeps
+    // showing what it showed. `try_with`: see `history_loader::read_cursor`.
+    let topic = Memo::new(move |prev: Option<&Option<TopicSummary>>| {
+        topics
+            .try_with(|m| m.get(&id).cloned())
+            .flatten()
+            .or_else(|| prev.cloned().flatten())
+    });
+    let field = move |f: fn(&TopicSummary) -> String| {
+        Memo::new(move |_| {
+            topic
+                .try_with(|t| t.as_ref().map(f))
+                .flatten()
+                .unwrap_or_default()
+        })
     };
-    let activity = format_relative_time(topic.last_activity);
-    let started_by_someone_else = reply_count > 0 && topic.last_pubkey != topic.pubkey;
-    let pk = topic.last_pubkey.clone();
+    let title = field(|t| topic_title(&t.content));
+    let last_pk = field(|t| t.last_pubkey.clone());
+    let author_pk = field(|t| t.pubkey.clone());
+    let reply_label = field(|t| replies_label(t.reply_count));
+    let activity = field(|t| format_relative_time(t.last_activity));
+    let started_by_someone_else = Memo::new(move |_| {
+        topic
+            .try_with(|t| {
+                t.as_ref()
+                    .is_some_and(|t| t.reply_count > 0 && t.last_pubkey != t.pubkey)
+            })
+            .unwrap_or(false)
+    });
 
     // "Stretched link" card: the title link's `::after` covers the whole card,
     // so the card stays one click target, while an author's abridged key (no
     // profile name) sits above that overlay as its own click-to-copy button —
     // never a button nested inside a link.
     // Scroll anchor for history paging (utils/scroll_anchor.rs).
-    let anchor_id = topic.id.clone();
     view! {
-        <div data-anchor-id=anchor_id class="relative block bg-gray-800/60 hover:bg-gray-800 border border-gray-700/60 hover:border-amber-500/30 rounded-lg p-4 text-inherit transition-colors group">
-            <div class="flex items-start gap-3">
-                <div class="flex-shrink-0 mt-0.5">
-                    <Avatar pubkey=pk size=AvatarSize::Md />
+        <div data-anchor-id=anchor_id class=ROW_CLASS>
+            <div class=ROW_INNER_CLASS>
+                <div class=AVATAR_SLOT_CLASS>
+                    {move || view! { <Avatar pubkey=last_pk.try_get().unwrap_or_default() size=AvatarSize::Md /> }}
                 </div>
-                <div class="flex-1 min-w-0">
+                <div class=LEFT_COLUMN_CLASS>
                     <h3 class=TITLE_CLASS>
                         <A href=href attr:class="no-underline text-inherit after:absolute after:inset-0 after:rounded-lg">
-                            {title}
+                            {move || title.try_get().unwrap_or_default()}
                         </A>
                     </h3>
                     <div class=BYLINE_ROW_CLASS>
                         <span class=LAST_BY_CLASS>
                             <span class=LAST_BY_LABEL_CLASS>"last by"</span>
-                            <span class=LAST_BY_NAME_CLASS><KeyName pubkey=last_pk key_class="relative z-10 font-mono" /></span>
-                            <span class=LAST_BY_PILL_CLASS><AgentBadge pubkey=last_badge_pubkey compact=true /></span>
+                            {move || {
+                                let pk = last_pk.try_get().unwrap_or_default();
+                                view! {
+                                    <span class=LAST_BY_NAME_CLASS><KeyName pubkey=pk.clone() key_class="relative z-10 font-mono" /></span>
+                                    <span class=LAST_BY_PILL_CLASS><AgentBadge pubkey=pk compact=true /></span>
+                                }
+                            }}
                         </span>
                         <span class="text-gray-700 flex-shrink-0">"\u{2022}"</span>
                         <span class=REPLIES_CLASS>
                             <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
-                            {reply_label}
+                            {move || reply_label.try_get().unwrap_or_default()}
                         </span>
                         <span class=BYLINE_ACTIVITY_CLASS>
                             <span class="text-gray-700">"\u{2022} "</span>
-                            {activity.clone()}
+                            {move || activity.try_get().unwrap_or_default()}
                         </span>
                     </div>
                 </div>
                 <div class=RIGHT_COLUMN_CLASS>
-                    <div class="flex items-center gap-1 justify-end">
+                    <div class=ACTIVITY_LINE_CLASS>
                         <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <circle cx="12" cy="12" r="10"/>
                             <polyline points="12 6 12 12 16 14"/>
                         </svg>
-                        {activity}
+                        {move || activity.try_get().unwrap_or_default()}
                     </div>
-                    {started_by_someone_else.then(|| view! {
-                        <div class="mt-1 text-gray-600 flex items-center gap-1 justify-end">
-                            "started by "<span class="text-gray-400"><KeyName pubkey=author_pk key_class="relative z-10 font-mono" /></span>
-                            <AgentBadge pubkey=root_badge_pubkey compact=true />
-                        </div>
-                    })}
+                    <div class=STARTED_BY_CLASS>
+                        {move || started_by_someone_else.try_get().unwrap_or(false).then(|| {
+                            let pk = author_pk.try_get().unwrap_or_default();
+                            view! {
+                                "started by "<span class="text-gray-400"><KeyName pubkey=pk.clone() key_class="relative z-10 font-mono" /></span>
+                                <AgentBadge pubkey=pk compact=true />
+                            }
+                        })}
+                    </div>
                 </div>
             </div>
         </div>
     }
 }
+
+/// "1 reply" / "N replies".
+fn replies_label(n: u32) -> String {
+    if n == 1 {
+        "1 reply".to_string()
+    } else {
+        format!("{n} replies")
+    }
+}
+
+/// The "↻ N updated" control beside the topic count: always laid out, so
+/// its appearing never moves the list.
+pub(crate) const UPDATED_CLASS: &str = "inline-block ml-2 mt-2 text-xs whitespace-nowrap \
+     za-text hover:opacity-80 underline underline-offset-2";
+/// The same control at zero: laid out but `invisible` (not seen, focused or
+/// read out). A literal class string, so the Tailwind scan sees it.
+pub(crate) const UPDATED_HIDDEN_CLASS: &str = "inline-block ml-2 mt-2 text-xs whitespace-nowrap \
+     za-text hover:opacity-80 underline underline-offset-2 invisible";
 
 #[cfg(test)]
 mod tests {
@@ -251,5 +388,55 @@ mod tests {
         assert!(classes(LAST_BY_PILL_CLASS).contains(&"shrink-[100]"));
         assert!(!classes(LAST_BY_NAME_CLASS).contains(&"shrink-[100]"));
         assert!(classes(LAST_BY_CLASS).contains(&"flex-1"));
+    }
+
+    #[test]
+    fn late_fields_never_change_a_row_height() {
+        // Every line of the row has a fixed height: the byline, the activity
+        // line and the "started by" line (always present, empty when the
+        // starter spoke last).
+        for line in [BYLINE_ROW_CLASS, ACTIVITY_LINE_CLASS, STARTED_BY_CLASS] {
+            assert!(classes(line).contains(&"h-4"), "{line}");
+        }
+        assert!(classes(STARTED_BY_CLASS).contains(&"whitespace-nowrap"));
+        // On a phone the title always takes two lines' height (text-base,
+        // 1.5rem a line); from `sm` it is one line.
+        let title = classes(TITLE_CLASS);
+        assert!(title.contains(&"min-h-[3rem]") && title.contains(&"sm:min-h-0"));
+    }
+
+    #[test]
+    fn skeleton_rows_are_built_like_real_rows() {
+        // The skeleton uses the row's own frame and line classes, so a real
+        // row replacing it has the same height; its avatar is Md (36 px).
+        assert!(classes(SKELETON_AVATAR_CLASS).contains(&"w-9"));
+        assert!(classes(SKELETON_AVATAR_CLASS).contains(&"h-9"));
+        // The title bar holds a non-breaking space: one title line high.
+        assert!(classes(SKELETON_TITLE_CLASS).contains(&"inline-block"));
+        const { assert!(SKELETON_ROWS >= 4) };
+    }
+
+    #[test]
+    fn updated_control_holds_its_place() {
+        let shown = classes(UPDATED_CLASS);
+        assert!(shown.contains(&"inline-block") && shown.contains(&"whitespace-nowrap"));
+        assert!(!shown.contains(&"block") && !shown.contains(&"flex"));
+        assert!(!shown.contains(&"invisible"));
+        // Hidden is the same box made invisible: never `hidden` (which
+        // would take its space away and move the list when it appears).
+        let hidden = classes(UPDATED_HIDDEN_CLASS);
+        assert!(hidden.contains(&"invisible") && !hidden.contains(&"hidden"));
+        let mut rest: Vec<&str> = hidden.into_iter().filter(|c| *c != "invisible").collect();
+        let mut same = shown.clone();
+        rest.sort_unstable();
+        same.sort_unstable();
+        assert_eq!(rest, same);
+    }
+
+    #[test]
+    fn reply_labels() {
+        assert_eq!(replies_label(0), "0 replies");
+        assert_eq!(replies_label(1), "1 reply");
+        assert_eq!(replies_label(24_013), "24013 replies");
     }
 }

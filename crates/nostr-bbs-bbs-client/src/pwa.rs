@@ -576,6 +576,7 @@ mod tests {
             auto_approve: false,
             kanban: false,
             search: None,
+            channels: Vec::new(),
         }
     }
 

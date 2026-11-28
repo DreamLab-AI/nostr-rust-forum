@@ -78,6 +78,52 @@ None of this has been seen in a browser or against a live relay.
 - New member data kept across a relay change (`relay_scope`), and a row in the kind-30078 `d`-tag table of
   [`docs/BASELINE-architecture.md`](docs/BASELINE-architecture.md).
 
+### Zones: pin a section to a zone from config (2026-11-28)
+
+Decision: [ADR-2037](docs/adr/ADR-2037-pin-a-section-to-a-zone-from-zone-config.md). Relay worker, both clients,
+`nostr-bbs-config` and `nostr-bbs-search-build`. With no pins configured nothing changes, and `ZONE_CONFIG` projects
+byte-for-byte as before. Not exercised against a live relay or in a browser.
+
+- **Config.** `[[zones]] channels = [<kind-40 id>, ...]` pins existing channels to that zone. Validation refuses a malformed
+  id, a channel listed twice or pinned by two zones, and a pinning zone whose id extends another zone's (`<zone>-...`).
+- **Relay.** The pin decides a channel's zone ahead of its `channel_zones` row and ahead of the 60 s memo, for every read
+  and write gate, profile stats and the triage sweep; a pinned channel resolves while D1 is down, and a double pin fails
+  closed. A post into a pinned channel encrypted for another zone is refused.
+- **Clients.** A pinned channel is listed, opened, searched and encrypted under its pinned zone (forum and BBS). The cached
+  channel list heals on load, so adding or removing a pin needs only a reload; caches from older builds load unchanged.
+  The admin Channels tab shows "Pinned to zone X by zone config" instead of "Bind to zone" for a pinned channel.
+- **Tiles.** A non-public zone with no `required_cohorts` (admins only on the relay) is no longer shown to everyone as an
+  open tile. Public zones with no cohorts stay open.
+- **Sealed search.** `nostr-bbs-search-build --zone-config <file>` leaves posts of a channel pinned to another zone out of
+  an index, and a reconcile excludes those already in it.
+- **Security review fixes.** A malformed or misspelt pin list fails closed on the relay (logged), and config loading
+  refuses misspelt pin keys; `validate_zone_config_json` checks a hand-edited `ZONE_CONFIG`. `/api/admin/channel-zone`
+  refuses a pinned channel (409). Comments into a pinned channel encrypted for another zone are refused.
+  `scripts/sealed-search-nightly.sh` passes `NBSS_ZONE_CONFIG` as `--zone-config`.
+  Second pass: the misspelt-key rule is an explicit list plus edit distance 2 from `channels` (unrelated keys such as
+  `channel_order` are no longer refused or quarantined); a wrong-typed `channels` breaks only its own zone's pins instead
+  of the whole `ZONE_CONFIG`; `scripts/validate-zone-config.sh` checks a `ZONE_CONFIG` file; kind-41 must name a stored
+  kind-40 by its exact id; edit-target lookups that fail are retryable, and placement checks run after the zone gate.
+- **Behaviour change, all zone-bound channels.** A non-admin's kind-41 (rename, description, picture, pin/unpin control)
+  now needs write access to the channel's zone, after the existing trust-level rule: a TL3 member or a channel's TL2
+  creator who cannot write the zone can no longer edit its metadata. A kind-42 edit whose target is not a message of the
+  same channel is refused by the relay and ignored by clients. Channels with no zone, admins, and edits this kit's
+  clients publish are unaffected.
+- **Limits.** Posts made before the move stay under the old zone's key, so anyone who synced them or holds that key can
+  still read them; the pinned id is visible in page source; existing images stay under the old zone's media path; a
+  `locked` target zone still shows the channel's name, description, picture and rename history to non-members (use
+  `hidden`); sealed-search rows indexed before the pin persist until a reconcile or rebuild removes them. Removing a pin
+  hands the channel back to its `channel_zones` row; with no row it becomes unscoped, so confirm the row first.
+
+### Forum and BBS clients: topic lists stay put while they load (2026-11-28)
+
+- **Forum section page.** The topic list was rebuilt whenever the channel list was written (a reconnect, an AUTH replay, any channel's rename), because the page's branch read the whole resolved channel. It now reads one memo of the lookup state and the channel id, so the list, its rows and its history loaders survive unrelated writes. The store's channel list also notifies only when a channel is added or pruned, not when the relay re-sends one it already holds.
+- **Rows update in place (both clients).** Topic rows were keyed by their reply count, last activity, content length and last poster, so every stats answer and every decrypt chunk destroyed and rebuilt the row (avatars flashed, the browser lost its scroll anchor). Rows are keyed by topic id and read each field reactively.
+- **Order: provisional, then frozen once (both clients).** While a section loads its list is provisional, in the true order from structure only: topics with activity in the channel's newest 100 messages (the history window) by that activity, the rest below by when they were started, ties by id. Stats never enter that order, so it moves only when the window or the root list lands (none at all when both arrive before the list shows), and "↻ N updated" stays hidden. When the window has settled and the root list has answered or failed (or 20 s after the list first showed rows, whatever has arrived), the order freezes once for the visit, with a baseline of the newest activity known. After that no row moves, above or below the fold: stats, reply counts and decrypted titles change a row's figures only; a sealed topic root swaps in place when it opens or closes; a row leaves only when its deletion is honoured (one evicted by older paging stays); a topic not yet shown goes on top only if it is the reader's own and was posted within two minutes of the freeze, and otherwise is added at the bottom, always shown. "↻ N updated" counts topics with activity newer than the baseline that are not already in place at the top (anyone's, including replies to the reader's own topics; never late stats or counts), and pressing it re-sorts by the full true order. An empty list never freezes. Replies to a sealed root still listed under its envelope, or naming an envelope whose opened original is listed, count towards the right row, and an envelope and its original are one row. The rule is shared in client-core (`topics::FrozenBoard`); the sorts break ties by id (`board_order`).
+- **First paint.** The forum shows skeleton rows, and the BBS its loading card, until the history window has its settled answer and the section's root list has answered (or failed), or 1.5 s after the topics were found; stats are not waited for, and a list the store already holds paints at once. The hold only decides when the skeleton gives way to the list; it does not freeze the order. The root list is now asked alongside the history request (once sign-in is done in a gated zone) instead of after its answer. The forum's older-topics loader waits for the root list to answer, fail, or for that 1.5 s hold to expire, so a slow or refusing relay never switches paging off. A root-list request that times out or is refused may be asked again once a backoff has run out (20 s, doubling to 5 minutes) when a view next asks, or at once on a new visit, instead of never; views that re-ask on every message no longer add requests to a relay that is refusing them. Topic stats are fetched exactly as before.
+- **Fixed row heights.** Forum rows always reserve the "started by" line, and on phones the title always takes two lines' height; skeleton rows match real rows. BBS rows no longer wrap either line; in the 2x phone layout the title clamps to two lines and reserves both. On a desktop the BBS title is one line, with the whole title in its tooltip.
+- Client only; no relay or event-format change. Not seen in a browser.
+
 ### Forum client: layout shift and a two-tab notice gap (2026-11-28)
 
 - **Notifications.** A tab that received a "New section" or "New member" notice from another tab (through the storage listener) never recorded its id as announced, so its next sync-state save omitted it and the notice returned after Clear and a reload. That case now records the id. More generally, saving the sync state now merges its id lists (notified posts, announced sections, announced members) with what is already stored, keeping the newest within the existing caps, and the tab adopts the merge, so one tab's save no longer drops ids another tab recorded. The stored format and the baseline are unchanged; Clear still only empties the visible list. Client only. Not seen in a browser.

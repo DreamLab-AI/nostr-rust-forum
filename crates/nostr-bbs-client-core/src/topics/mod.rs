@@ -14,8 +14,10 @@ pub mod landing;
 pub mod thread;
 
 pub use board::{
-    board_events, classify_topics, latest_post, topic_title, unread_count, with_topic_stats,
-    TopicSummary,
+    board_events, board_order, classify_topics, first_paint_ready, latest_post, older_paging_armed,
+    sealed_aliases, topic_title, unread_count, updated_accessible_name, updated_label,
+    with_topic_stats, BoardInputs, FrozenBoard, TopicSummary, FIRST_PAINT_TIMEOUT_MS,
+    FREEZE_CAP_MS, OWN_TOPIC_GRACE_SECS,
 };
 pub use jump::{channel_events_across, fallback, find_held, parent_of, topic_root_of, Fallback};
 pub use landing::{history_settled, landing_target, post_anchor_id, Landing};
