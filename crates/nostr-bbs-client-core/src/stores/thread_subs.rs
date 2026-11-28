@@ -333,6 +333,8 @@ impl Subs {
         for DocEntry { entry: mut e, rd } in doc.subs {
             e.r = e.r.to_ascii_lowercase();
             e.c = e.c.to_ascii_lowercase();
+            // A change cannot be dated after this device's clock.
+            e.at = e.at.min(now_secs.saturating_mul(1000).saturating_add(999));
             if !is_hex_id(&e.r) || e.z.len() > MAX_ZONE_LEN {
                 continue;
             }
@@ -551,7 +553,24 @@ impl Subs {
 /// The `at` for a new version of an entry: now, but always after the
 /// previous version, so a local change always outranks what it replaces.
 fn next_at(prev: Option<&Entry>, now_ms: u64) -> u64 {
-    prev.map_or(now_ms, |p| now_ms.max(p.at + 1))
+    prev.map_or(now_ms, |p| now_ms.max(p.at.saturating_add(1)))
+}
+
+/// Apply `f` to `sig`, notifying subscribers **only** if `f` reports a
+/// change. `RwSignal::update` notifies whatever happened; an Effect that
+/// reads a signal and calls a method which `update`s it unconditionally
+/// re-runs itself for ever (the thread page's mark-read effect did, freezing
+/// the page). Every write to the store's state goes through here.
+pub(crate) fn write_if<T: Send + Sync + 'static>(
+    sig: RwSignal<T>,
+    f: impl FnOnce(&mut T) -> bool,
+) -> bool {
+    let mut changed = false;
+    sig.maybe_update(|v| {
+        changed = f(v);
+        changed
+    });
+    changed
 }
 
 /// The read marker a new subscription starts at: the newest reply already
@@ -1102,6 +1121,11 @@ pub struct ThreadSubsStore {
     /// Bumped when a followed topic's root is inserted, so titles are
     /// re-resolved then (and on zone-key changes), not on every insert.
     titles_rev: RwSignal<u64>,
+    /// Sealed envelope id → original id, from every sealed post the channel
+    /// store inserts (lower-case).
+    aliases: StoredValue<HashMap<String, String>>,
+    /// Bumped when an alias is learnt, so `is_subscribed` re-evaluates.
+    aliases_rev: RwSignal<u64>,
     pubkey: Memo<Option<String>>,
     generation: StoredValue<u64>,
     topics: Memo<Vec<SubscribedTopic>>,
@@ -1212,6 +1236,8 @@ impl ThreadSubsStore {
             owned,
             unseen,
             titles_rev,
+            aliases: StoredValue::new(HashMap::new()),
+            aliases_rev: RwSignal::new(0),
             pubkey,
             generation: StoredValue::new(0),
             topics,
@@ -1242,9 +1268,23 @@ impl ThreadSubsStore {
         })
     }
 
-    /// Whether the member follows topic `root`. Reactive.
+    /// Whether the member follows topic `root`. Reactive. A sealed root's
+    /// envelope id and its original's id answer alike.
     pub fn is_subscribed(&self, root: &str) -> bool {
-        self.with_current(|s| s.is_active(root))
+        self.aliases_rev.track();
+        let canonical = self.canonical_root(root);
+        self.with_current(|s| s.is_active(&canonical) || s.is_active(root))
+    }
+
+    /// The id a topic is followed under: a still-locked sealed root's
+    /// envelope id maps to the original's id (which its replies name);
+    /// any other id is itself (lower-case).
+    fn canonical_root(&self, root: &str) -> String {
+        let root = root.to_ascii_lowercase();
+        self.aliases
+            .try_with_value(|a| a.get(&root).cloned())
+            .flatten()
+            .unwrap_or(root)
     }
 
     /// How many topics the member follows. Reactive.
@@ -1265,7 +1305,8 @@ impl ThreadSubsStore {
         if self.owned.with(|o| o.owner != pk) {
             return UnreadCount::default();
         }
-        let root = root.to_ascii_lowercase();
+        self.aliases_rev.track();
+        let root = self.canonical_root(root);
         self.unseen.with(|u| u.count(&root))
     }
 
@@ -1328,8 +1369,26 @@ impl ThreadSubsStore {
         });
         let mut result = Ok(false);
         let at = now_ms();
-        self.owned.update(|o| {
-            result = o.subs.subscribe(root, channel, &zone, start, at);
+        // A still-locked sealed root is listed under its envelope's id, but
+        // its replies name the original's: subscribe under the original, and
+        // fold an earlier envelope-id entry into it.
+        let canonical = self.canonical_root(root);
+        let envelope = root.to_ascii_lowercase();
+        write_if(self.owned, |o| {
+            let mut changed = false;
+            if envelope != canonical {
+                changed |= o.subs.unsubscribe(&envelope, at);
+            }
+            match o.subs.subscribe(&canonical, channel, &zone, start, at) {
+                Ok(c) => {
+                    result = Ok(c || changed);
+                    c || changed
+                }
+                Err(e) => {
+                    result = Err(e);
+                    changed
+                }
+            }
         });
         if result? {
             self.lift_refusal();
@@ -1354,11 +1413,17 @@ impl ThreadSubsStore {
     pub fn unsubscribe(&self, root: &str) {
         self.ensure_owner();
         let now = now_ms();
-        let mut changed = false;
-        self.owned.update(|o| {
-            if o.owner.is_some() {
-                changed = o.subs.unsubscribe(root, now);
+        let canonical = self.canonical_root(root);
+        let given = root.to_ascii_lowercase();
+        let changed = write_if(self.owned, |o| {
+            if o.owner.is_none() {
+                return false;
             }
+            // Both ids: an entry stored under a sealed root's envelope id
+            // goes too.
+            let a = o.subs.unsubscribe(&canonical, now);
+            let b = given != canonical && o.subs.unsubscribe(&given, now);
+            a || b
         });
         if changed {
             self.lift_refusal();
@@ -1370,7 +1435,10 @@ impl ThreadSubsStore {
     /// Returns whether the topic is followed afterwards.
     pub fn toggle(&self, root: &str, channel: &str) -> Result<bool, SubscribeError> {
         self.ensure_owner();
-        let on = self.owned.with_untracked(|o| o.subs.is_active(root));
+        let canonical = self.canonical_root(root);
+        let on = self
+            .owned
+            .with_untracked(|o| o.subs.is_active(&canonical) || o.subs.is_active(root));
         if on {
             self.unsubscribe(root);
             Ok(false)
@@ -1387,15 +1455,14 @@ impl ThreadSubsStore {
     /// followed is ignored.
     pub fn mark_read(&self, root: &str, upto: u64) {
         self.ensure_owner();
-        let root = root.to_ascii_lowercase();
+        let root = self.canonical_root(root);
         let now = now_secs();
         if !self.owned.with_untracked(|o| o.subs.is_active(&root)) {
             return;
         }
-        let mut changed = false;
-        self.owned.update(|o| {
-            changed = o.subs.mark_read(&root, upto, now);
-        });
+        // Notifies only when the marker actually moves: this runs from the
+        // thread page's effect, which reads the same signal.
+        let changed = write_if(self.owned, |o| o.subs.mark_read(&root, upto, now));
         let mut seen: Vec<String> = Vec::new();
         if self.unseen.with_untracked(|u| u.would_dismiss(&root, upto)) {
             self.unseen.update(|u| seen = u.dismiss_upto(&root, upto));
@@ -1463,17 +1530,19 @@ impl ThreadSubsStore {
         let roots: Vec<String> = self
             .owned
             .with_untracked(|o| o.subs.active().map(|e| e.r.clone()).collect());
-        let mut changed = false;
-        self.owned.update(|o| {
+        let changed = write_if(self.owned, |o| {
+            let mut changed = false;
             for root in &roots {
                 changed |= o.subs.mark_read(root, now, now);
             }
+            changed
         });
         let mut seen: Vec<String> = Vec::new();
-        self.unseen.update(|u| {
+        write_if(self.unseen, |u| {
             for root in &roots {
                 seen.extend(u.dismiss_root(root));
             }
+            !seen.is_empty()
         });
         clear_post_notices(&seen);
         if changed {
@@ -1536,6 +1605,26 @@ impl ThreadSubsStore {
         if next != memory {
             self.owned.set(next);
             self.reconcile_unseen();
+        }
+    }
+
+    /// Drop the last-relay-copy record here and in storage (a merge with
+    /// what is stored would bring it back).
+    fn forget_remote(&self) {
+        write_if(self.owned, |o| {
+            let had = o.remote.is_some();
+            o.remote = None;
+            had
+        });
+        let Some(owner) = self.me() else {
+            return;
+        };
+        if !persist_allowed(crate::auth::persisted_session_pubkey().as_deref(), &owner) {
+            return;
+        }
+        if let Ok(mut doc) = LocalStorage::get::<LocalDoc>(storage_key(&owner)) {
+            doc.remote = None;
+            let _ = LocalStorage::set(storage_key(&owner), doc);
         }
     }
 
@@ -1608,6 +1697,22 @@ impl ThreadSubsStore {
     /// hold still-locked sealed ones until they open, and re-resolve titles
     /// when a followed root arrived.
     fn on_inserted(&self, batch: &[InsertedMessage]) {
+        let learnt = self
+            .aliases
+            .try_update_value(|a| {
+                let mut learnt = false;
+                for m in batch {
+                    if let Some(inner) = &m.sealed_inner {
+                        let env = m.id.to_ascii_lowercase();
+                        learnt |= a.insert(env, inner.to_ascii_lowercase()).is_none();
+                    }
+                }
+                learnt
+            })
+            .unwrap_or(false);
+        if learnt {
+            self.aliases_rev.update(|r| *r += 1);
+        }
         if !self.owner_ready() {
             return;
         }
@@ -2419,6 +2524,11 @@ impl ThreadSubsStore {
         }
         self.sync.update_value(|c| c.last_fetch_ms = Some(now_ms()));
         let known = self.owned.with_untracked(|o| o.remote.clone());
+        if latest.is_none() && known.is_some() {
+            // The relay answered and holds no copy (it was deleted or lost):
+            // forget the record, so the plan republishes the local list.
+            self.forget_remote();
+        }
         if let Some(ev) = latest.filter(|ev| sync::remote_changed(known.as_ref(), ev)) {
             let mut remote = timed(sync::open(signer, &ev, now_secs()), SIGNER_TIMEOUT_MS).await?;
             if self.generation() != gen {
@@ -3634,6 +3744,56 @@ mod tests {
             got,
             vec![id(901)],
             "lower-cased, only this topic, only up to the mark"
+        );
+    }
+
+    #[test]
+    fn a_write_that_changes_nothing_does_not_wake_readers() {
+        // The page freeze: the thread page's effect read the subscriptions
+        // signal and called `mark_read`, which `update`d it unconditionally,
+        // so the effect re-ran for ever. `write_if` notifies only on change.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let owner = Owner::new();
+        owner.with(|| {
+            let mut subs = Subs::default();
+            subs.subscribe(&id(1), &chan(1), "", NOW, NOW_MS).unwrap();
+            let sig = RwSignal::new(subs);
+            let runs = Arc::new(AtomicUsize::new(0));
+            let counter = runs.clone();
+            let reader = Memo::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                sig.with(|s| s.read_at(&id(1)))
+            });
+            assert_eq!(reader.get(), Some(NOW));
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+            // Marking read at or before the marker: nothing changes, nothing
+            // is woken (as on every re-run of the viewing effect).
+            assert!(!write_if(sig, |s| s.mark_read(&id(1), NOW, NOW + 10)));
+            assert_eq!(reader.get(), Some(NOW));
+            assert_eq!(runs.load(Ordering::SeqCst), 1, "no recompute: no loop");
+            // A real move wakes it once.
+            assert!(write_if(sig, |s| s.mark_read(&id(1), NOW + 5, NOW + 10)));
+            assert_eq!(reader.get(), Some(NOW + 5));
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+            // And the next identical call is quiet again.
+            assert!(!write_if(sig, |s| s.mark_read(&id(1), NOW + 5, NOW + 10)));
+            assert_eq!(reader.get(), Some(NOW + 5));
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn a_change_from_the_future_is_clamped_on_load() {
+        let doc: SubsDoc = serde_json::from_value(serde_json::json!({"subs": [
+            {"r": id(1), "c": chan(1), "on": true, "at": u64::MAX}
+        ]}))
+        .unwrap();
+        let s = Subs::from_doc(doc, NOW);
+        assert!(s.entries[&id(1)].at <= NOW * 1000 + 999);
+        assert_eq!(
+            next_at(Some(&entry(&id(1), true, u64::MAX)), NOW_MS),
+            u64::MAX
         );
     }
 }

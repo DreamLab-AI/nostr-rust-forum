@@ -179,12 +179,16 @@ impl SwipeTracker {
         y: f64,
         viewport_width: f64,
     ) -> bool {
-        if !matches!(self.state, State::Idle) {
-            // A second pointer while one is tracked: leave both alone.
+        if matches!(self.state, State::Dragging { .. }) {
+            // A second pointer while one drags the row: leave it alone.
             return false;
         }
+        // Anything else is stale (a pointer released outside the row never
+        // told it) and gives way to the new press.
+        self.state = State::Idle;
         if !kind.swipes() || in_edge_zone(x, viewport_width) {
-            self.state = State::Ignored { id };
+            // Not recorded: a mouse or an edge press never blocks a later
+            // touch.
             return false;
         }
         self.state = State::Pending { id, x0: x, y0: y };
@@ -357,10 +361,15 @@ pub fn attach_row_swipe(
 
     let down = {
         let tracker = tracker.clone();
+        let swallow = swallow_click.clone();
         EventListener::new(row, "pointerdown", move |e| {
             let Some(e) = e.dyn_ref::<web_sys::PointerEvent>() else {
                 return;
             };
+            // A new press: a click owed to an earlier swipe never came (a
+            // mobile browser sends none after a touch that moved), so this
+            // press's click must not be eaten.
+            swallow.set(false);
             let width = web_sys::window()
                 .and_then(|w| w.inner_width().ok())
                 .and_then(|v| v.as_f64())
@@ -570,11 +579,28 @@ mod tests {
     }
 
     #[test]
-    fn a_second_pointer_is_left_alone() {
+    fn a_second_pointer_is_left_alone_while_dragging() {
         let mut t = tracking();
+        assert_eq!(t.move_to(1, 180.0, 300.0), SwipeMove::Claim { dx: -20.0 });
         assert!(!t.down(PointerKind::Touch, 9, 100.0, 100.0, W));
         assert_eq!(t.move_to(9, 10.0, 100.0), SwipeMove::None);
-        assert_eq!(t.move_to(1, 180.0, 300.0), SwipeMove::Claim { dx: -20.0 });
+        assert_eq!(t.move_to(1, 170.0, 300.0), SwipeMove::Drag { dx: -30.0 });
+    }
+
+    #[test]
+    fn a_press_released_elsewhere_never_blocks_the_next_one() {
+        // A mouse press, or a touch whose release landed outside the row,
+        // leaves no state behind: the next touch is tracked.
+        let mut t = SwipeTracker::default();
+        assert!(!t.down(PointerKind::Mouse, 1, 200.0, 300.0, W));
+        assert!(t.down(PointerKind::Touch, 2, 200.0, 300.0, W));
+        // Pending, released outside (no `up` seen): a new press wins.
+        assert!(t.down(PointerKind::Touch, 3, 200.0, 300.0, W));
+        assert_eq!(t.move_to(3, 180.0, 300.0), SwipeMove::Claim { dx: -20.0 });
+        // A vertical gesture given to the page, released outside: same.
+        let mut t = tracking();
+        t.move_to(1, 200.0, 330.0);
+        assert!(t.down(PointerKind::Touch, 4, 200.0, 300.0, W));
     }
 
     #[test]
