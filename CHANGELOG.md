@@ -40,6 +40,10 @@ byte-for-byte as before. Not exercised against a live relay or in a browser.
   refuses misspelt pin keys; `validate_zone_config_json` checks a hand-edited `ZONE_CONFIG`. `/api/admin/channel-zone`
   refuses a pinned channel (409). Comments into a pinned channel encrypted for another zone are refused.
   `scripts/sealed-search-nightly.sh` passes `NBSS_ZONE_CONFIG` as `--zone-config`.
+  Second pass: the misspelt-key rule is an explicit list plus edit distance 2 from `channels` (unrelated keys such as
+  `channel_order` are no longer refused or quarantined); a wrong-typed `channels` breaks only its own zone's pins instead
+  of the whole `ZONE_CONFIG`; `scripts/validate-zone-config.sh` checks a `ZONE_CONFIG` file; kind-41 must name a stored
+  kind-40 by its exact id; edit-target lookups that fail are retryable, and placement checks run after the zone gate.
 - **Behaviour change, all zone-bound channels.** A non-admin's kind-41 (rename, description, picture, pin/unpin control)
   now needs write access to the channel's zone, after the existing trust-level rule: a TL3 member or a channel's TL2
   creator who cannot write the zone can no longer edit its metadata. A kind-42 edit whose target is not a message of the
