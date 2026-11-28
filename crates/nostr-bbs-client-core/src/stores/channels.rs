@@ -181,18 +181,14 @@ pub struct ChannelStore {
     /// no answer within [`PAGE_TIMEOUT_MS`]): settled for placement, so a
     /// late answer updates the row's figures but never places it.
     topic_stats_given_up: RwSignal<HashSet<String>>,
-    /// Topics whose failed batch has been queued again once (the bound on
-    /// retries).
-    topic_stats_retried: StoredValue<HashSet<String>>,
+    /// Topics of the batch in flight, so a re-queue does not add them again.
+    topic_stats_in_flight: StoredValue<HashSet<String>>,
     /// Stats batches that failed in a row: the next batch waits
     /// [`stats_batch_delay_ms`] of it.
     topic_stats_failures: StoredValue<u32>,
     /// No stats batch is sent before this time (ms since the epoch): the
     /// pause after failed batches, which new topics must not skip.
     topic_stats_paused_until: StoredValue<f64>,
-    /// Given-up topic -> (channel id, gated), to queue it again on a
-    /// reconnect or a new visit ([`Self::requeue_given_up_stats`]).
-    topic_stats_given_up_from: StoredValue<HashMap<String, (String, bool)>>,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -252,10 +248,9 @@ impl ChannelStore {
             topic_stats_queue: StoredValue::new(std::collections::VecDeque::new()),
             topic_stats_busy: StoredValue::new(false),
             topic_stats_given_up: RwSignal::new(HashSet::new()),
-            topic_stats_retried: StoredValue::new(HashSet::new()),
+            topic_stats_in_flight: StoredValue::new(HashSet::new()),
             topic_stats_failures: StoredValue::new(0),
             topic_stats_paused_until: StoredValue::new(0.0),
-            topic_stats_given_up_from: StoredValue::new(HashMap::new()),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -1395,6 +1390,8 @@ impl ChannelStore {
             return;
         }
         self.topic_stats_busy.set_value(true);
+        self.topic_stats_in_flight
+            .set_value(batch.iter().map(|(_, r, _)| r.clone()).collect());
         let wait_auth = batch.iter().any(|(_, _, g)| *g);
         for (_, root, _) in &batch {
             self.request_total_of(relay, &topic_key(root), root);
@@ -1448,34 +1445,22 @@ impl ChannelStore {
                         });
                     }
                     StatsBatchEnd::Failed => {
+                        // A topic's first failure queues it again at the
+                        // back; after that it waits for a reconnect or a
+                        // visit (`requeue_given_up_stats`).
+                        let again = store
+                            .topic_stats_given_up
+                            .try_with_untracked(|g| retry_after_failure(&batch, g))
+                            .unwrap_or_default();
                         let _ = store.topic_stats_given_up.try_update(|s| {
                             s.extend(batch.iter().map(|(_, r, _)| r.clone()));
                         });
-                        let _ = store.topic_stats_given_up_from.try_update_value(|m| {
-                            for (cid, r, g) in batch.iter() {
-                                m.insert(r.clone(), (cid.clone(), *g));
-                            }
-                        });
-                        // Queue each topic again once, at the back.
-                        let again: Vec<(String, String, bool)> = store
-                            .topic_stats_retried
-                            .try_update_value(|retried| {
-                                batch
-                                    .iter()
-                                    .filter(|(_, r, _)| {
-                                        let again = retry_stats_topic(retried.contains(r));
-                                        retried.insert(r.clone());
-                                        again
-                                    })
-                                    .cloned()
-                                    .collect()
-                            })
-                            .unwrap_or_default();
                         let _ = store
                             .topic_stats_queue
                             .try_update_value(|q| q.extend(again));
                     }
                 }
+                let _ = store.topic_stats_in_flight.try_update_value(HashSet::clear);
                 let _ = store.topic_stats_busy.try_set_value(false);
                 let delay = stats_batch_delay_ms(failures);
                 let relay = relay.clone();
@@ -1485,7 +1470,15 @@ impl ChannelStore {
                     let _ = store
                         .topic_stats_paused_until
                         .try_set_value(js_sys::Date::now() + f64::from(delay));
-                    crate::utils::set_timeout_once(move || store.pump_topic_stats(&relay), delay);
+                    crate::utils::set_timeout_once(
+                        move || {
+                            // The pause is over: clear it, or the pump's own
+                            // check (timers can fire a little early) skips.
+                            let _ = store.topic_stats_paused_until.try_set_value(0.0);
+                            store.pump_topic_stats(&relay);
+                        },
+                        delay,
+                    );
                 }
             })
         };
@@ -1518,39 +1511,56 @@ impl ChannelStore {
             .collect();
         let id = relay.subscribe_with_receipt_or_closed(filters, on_event, on_receipt, on_closed);
         *sub.borrow_mut() = Some(id);
-        let ready = stats_relay_ready(relay, wait_auth);
-        arm_stats_timer(relay.clone(), wait_auth, ready, done, finish);
+        arm_stats_timer(
+            relay.clone(),
+            js_sys::Date::now(),
+            stats_relay_connected(relay),
+            done,
+            finish,
+        );
     }
 
-    /// Queue again channel `cid`'s topics whose stats were given up and are
-    /// still not in: on a (re)connect, after AUTH for a gated zone, and on a
-    /// new visit. They stay given up, so whatever arrives updates the row's
-    /// figures (and may count towards "↻ N updated") but never moves it.
-    /// Each gets its one retry again. Call it from a reactive context that
-    /// tracks only the connection state, AUTH and the visited channel.
-    pub fn requeue_given_up_stats(&self, relay: &RelayConnection, cid: &str) {
-        let given_up = self.topic_stats_given_up.with_untracked(|s| s.clone());
-        let queued: HashSet<String> = self
-            .topic_stats_queue
-            .with_value(|q| q.iter().map(|(_, r, _)| r.clone()).collect());
-        let from = self.topic_stats_given_up_from.with_value(|m| m.clone());
-        let again = requeue_given_up(&given_up, &queued, |r| {
-            from.get(r).is_some_and(|(c, _)| c == cid) && !self.topic_stats_answered_untracked(r)
+    /// Queue again the topics among `roots` (a list's topics, of channel
+    /// `cid`, `gated` as the list asks them) whose stats were given up and
+    /// are still not in: on a (re)connect, after AUTH for a gated zone, and
+    /// on a new visit. They stay given up, so whatever arrives updates the
+    /// row's figures (and may count towards "↻ N updated") but never moves
+    /// it. A COUNT that never answered is allowed to go out again. Call it
+    /// once per such transition, not from an effect that re-runs on
+    /// traffic.
+    pub fn requeue_given_up_stats(
+        &self,
+        relay: &RelayConnection,
+        cid: &str,
+        roots: &[String],
+        gated: bool,
+    ) {
+        let pending: HashSet<String> = self.topic_stats_queue.with_value(|q| {
+            q.iter()
+                .map(|(_, r, _)| r.clone())
+                .chain(self.topic_stats_in_flight.with_value(|f| f.clone()))
+                .collect()
+        });
+        let again = self.topic_stats_given_up.with_untracked(|given_up| {
+            requeue_given_up(roots, given_up, &pending, |r| {
+                self.topic_stats_answered_untracked(r)
+            })
         });
         if again.is_empty() {
             return;
         }
-        self.topic_stats_retried.update_value(|retried| {
+        // A COUNT lost to a reconnect is never re-sent by the relay:
+        // forget the unanswered ones so `request_total_of` asks again.
+        self.totals.update(|m| {
             for r in &again {
-                retried.remove(r);
+                let key = topic_key(r);
+                if m.get(&key).is_some_and(|t| t.counted.is_none()) {
+                    m.remove(&key);
+                }
             }
         });
         self.topic_stats_queue.update_value(|q| {
-            for r in again {
-                if let Some((c, g)) = from.get(&r) {
-                    q.push_back((c.clone(), r, *g));
-                }
-            }
+            q.extend(again.into_iter().map(|r| (cid.to_string(), r, gated)));
         });
         self.pump_topic_stats(relay);
     }
@@ -2346,28 +2356,31 @@ fn stats_batch_delay_ms(failures: u32) -> i32 {
     (1_000i32.saturating_mul(1 << doublings)).min(STATS_BACKOFF_CAP_MS)
 }
 
-/// Whether a stats batch's REQ can be answered now: the socket is open and,
-/// for a gated batch, NIP-42 AUTH has completed.
-fn stats_relay_ready(relay: &RelayConnection, wait_auth: bool) -> bool {
+/// Longest a stats batch may wait for its answer, whatever the connection
+/// does meanwhile: then it fails, and a reconnect or a visit asks again.
+const STATS_BATCH_MAX_MS: f64 = 120_000.0;
+
+/// Whether the socket is open. A refused or absent sign-in counts as open:
+/// a gated batch then fails at its next check (and is asked again after a
+/// sign-in), rather than holding the pump, which serves every section.
+fn stats_relay_connected(relay: &RelayConnection) -> bool {
     relay.connection_state().get_untracked() == ConnectionState::Connected
-        && (!wait_auth || relay.authenticated().get_untracked())
 }
 
-/// Whether a stats batch's timeout, at a check every [`PAGE_TIMEOUT_MS`],
-/// is a failure: only when the relay could answer both at the previous
-/// check (or when the REQ was sent) and now. Time spent disconnected or
-/// waiting for AUTH (a signer prompt left open) is not an attempt; the
-/// relay replays the REQ when it is back.
-fn stats_timeout_fails(was_ready: bool, ready_now: bool) -> bool {
-    was_ready && ready_now
+/// Whether a stats batch fails at a check (every [`PAGE_TIMEOUT_MS`]): when
+/// the socket was open at the previous check (or when the REQ was sent) and
+/// still is, so time offline is not an attempt; or once it has waited
+/// [`STATS_BATCH_MAX_MS`] in all.
+fn stats_timeout_fails(was_connected: bool, connected: bool, waited_ms: f64) -> bool {
+    (was_connected && connected) || waited_ms >= STATS_BATCH_MAX_MS
 }
 
 /// Check a stats batch every [`PAGE_TIMEOUT_MS`] until it is done, failing
 /// it per [`stats_timeout_fails`].
 fn arm_stats_timer(
     relay: RelayConnection,
-    wait_auth: bool,
-    was_ready: bool,
+    sent_at: f64,
+    was_connected: bool,
     done: Rc<std::cell::Cell<bool>>,
     finish: Rc<dyn Fn(StatsBatchEnd)>,
 ) {
@@ -2376,36 +2389,46 @@ fn arm_stats_timer(
             if done.get() {
                 return;
             }
-            let ready = stats_relay_ready(&relay, wait_auth);
-            if stats_timeout_fails(was_ready, ready) {
+            let connected = stats_relay_connected(&relay);
+            if stats_timeout_fails(was_connected, connected, js_sys::Date::now() - sent_at) {
                 finish(StatsBatchEnd::Failed);
             } else {
-                arm_stats_timer(relay, wait_auth, ready, done, finish);
+                arm_stats_timer(relay, sent_at, connected, done, finish);
             }
         },
         PAGE_TIMEOUT_MS as i32,
     );
 }
 
-/// The given-up topics to queue again: those `wanted` (of the visited
-/// channel, and still without stats) that are not already queued.
-fn requeue_given_up(
+/// The topics of a failed `batch` to queue again at once: those failing
+/// for the first time (not yet in `given_up`).
+fn retry_after_failure(
+    batch: &[(String, String, bool)],
     given_up: &HashSet<String>,
-    queued: &HashSet<String>,
-    wanted: impl Fn(&str) -> bool,
-) -> Vec<String> {
-    let mut again: Vec<String> = given_up
+) -> Vec<(String, String, bool)> {
+    batch
         .iter()
-        .filter(|r| !queued.contains(*r) && wanted(r))
+        .filter(|(_, r, _)| !given_up.contains(r))
         .cloned()
-        .collect();
-    again.sort();
-    again
+        .collect()
 }
 
-/// Whether a topic of a failed batch is queued again: once only.
-fn retry_stats_topic(already_retried: bool) -> bool {
-    !already_retried
+/// The topics among `roots` to queue again: given up, still without stats
+/// (`answered`), and neither queued nor in flight (`pending`). Lower-case,
+/// each once, in `roots` order.
+fn requeue_given_up(
+    roots: &[String],
+    given_up: &HashSet<String>,
+    pending: &HashSet<String>,
+    answered: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    roots
+        .iter()
+        .map(|r| r.to_lowercase())
+        .filter(|r| given_up.contains(r) && !pending.contains(r) && !answered(r))
+        .filter(|r| seen.insert(r.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2422,30 +2445,42 @@ mod stats_batch_tests {
     }
 
     #[test]
-    fn time_offline_or_waiting_for_auth_is_not_an_attempt() {
-        // Sent while connected and still unanswered a full period later.
-        assert!(stats_timeout_fails(true, true));
-        // Disconnected (or AUTH pending) now: wait.
-        assert!(!stats_timeout_fails(true, false));
-        // Back since the last check: give it a full period.
-        assert!(!stats_timeout_fails(false, true));
-        assert!(!stats_timeout_fails(false, false));
+    fn time_offline_is_not_an_attempt_but_the_wait_is_bounded() {
+        // Sent while connected and unanswered a full period later.
+        assert!(stats_timeout_fails(true, true, 20_000.0));
+        // Offline now, or back only since the last check: wait.
+        assert!(!stats_timeout_fails(true, false, 20_000.0));
+        assert!(!stats_timeout_fails(false, true, 40_000.0));
+        // Whatever the connection does, never longer than the cap: a
+        // gated batch whose sign-in failed cannot hold the pump.
+        assert!(stats_timeout_fails(false, false, STATS_BATCH_MAX_MS));
+        assert!(stats_timeout_fails(false, true, STATS_BATCH_MAX_MS + 1.0));
     }
 
     #[test]
-    fn given_up_topics_without_stats_are_queued_again() {
+    fn a_topic_is_retried_at_once_only_on_its_first_failure() {
+        let batch = vec![
+            ("c".to_string(), "a".to_string(), false),
+            ("c".to_string(), "b".to_string(), false),
+        ];
+        let given_up: HashSet<String> = ["b".to_string()].into_iter().collect();
+        let again = retry_after_failure(&batch, &given_up);
+        assert_eq!(again, vec![batch[0].clone()]);
+    }
+
+    #[test]
+    fn given_up_topics_without_stats_are_queued_again_once() {
         let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        let roots: Vec<String> = ["A", "b", "c", "d", "e", "a"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let given_up = set(&["a", "b", "c", "d"]);
-        // b is already queued, c has its stats now, d is another channel.
-        let again = requeue_given_up(&given_up, &set(&["b"]), |r| r == "a" || r == "b");
-        assert_eq!(again, vec!["a".to_string()]);
-        assert!(requeue_given_up(&HashSet::new(), &HashSet::new(), |_| true).is_empty());
-    }
-
-    #[test]
-    fn a_failed_topic_is_retried_once() {
-        assert!(retry_stats_topic(false));
-        assert!(!retry_stats_topic(true));
+        // b is queued or in flight, c has its stats now, e never failed;
+        // "A" and "a" are one topic.
+        let again = requeue_given_up(&roots, &given_up, &set(&["b"]), |r| r == "c");
+        assert_eq!(again, vec!["a".to_string(), "d".to_string()]);
+        assert!(requeue_given_up(&[], &given_up, &HashSet::new(), |_| false).is_empty());
     }
 }
 
