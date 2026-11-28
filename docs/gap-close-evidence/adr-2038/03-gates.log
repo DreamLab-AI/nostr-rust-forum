@@ -1,0 +1,24 @@
+# 2026-11-28T14:52:05Z HEAD 6ba03edb92877acf14bd1f30a38c6b0b7f0681f7 clean=1
+++ cargo fmt --all -- --check
+++ echo 'fmt exit 0'
+fmt exit 0
+++ cargo clippy --workspace --all-targets --all-features -- -D warnings
+++ tail -3
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.49s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+++ echo 'clippy exit 0'
+clippy exit 0
+++ cargo check --workspace --target wasm32-unknown-unknown
+++ tail -2
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+++ echo 'wasm exit 0'
+wasm exit 0
+++ RUSTDOCFLAGS='-D warnings'
+++ cargo doc --workspace --no-deps
+++ tail -2
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+   Generated /home/devuser/workspace/.tmp/section-stats-target/doc/nostr_bbs_ascii/index.html and 28 other files
+++ echo 'doc exit 0'
+doc exit 0

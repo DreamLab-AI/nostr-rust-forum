@@ -17,8 +17,8 @@ sequenceDiagram
 
     B->>A: WebAuthn register/login
     A-->>B: Session token + NIP-98 bearer
-    B->>R: WebSocket (NIP-01 REQ/EVENT)
-    R-->>B: Subscribed events
+    B->>R: WebSocket (NIP-01 REQ/EVENT, NIP-45 COUNT, SECTION-STATS)
+    R-->>B: Subscribed events, counts, section stats
     B->>P: PUT/GET pod resources
     P-->>B: LDP containers / ACL
     B->>S: Search query
@@ -262,6 +262,49 @@ records tombstones in D1 (`deleted_events`, `deleted_addresses`) so a deleted ev
 from the report-delete, ADR-2017 purge and user-purge routes; they are never served to clients. Clients fold every `e` tag of a kind-5
 they receive into per-deleter tombstones and fetch kind-5s incrementally from a stored marker. Decision and gaps: ADR-2033;
 operator note: `runbooks/relay-deletion-and-tombstones.md`.
+
+## Section topic list loading
+
+A section page (forum `pages/section.rs`, BBS `views/thread.rs`, shared logic in client-core `topics::board`,
+`topics::section_stats` and `stores::channels`) asks for three things together and freezes its order once
+([ADR-2038](adr/ADR-2038-one-request-returns-a-section-s-topic-stats.md); requirements in
+[`prd/prd-section-topic-lists.md`](prd/prd-section-topic-lists.md)).
+
+```mermaid
+sequenceDiagram
+    participant C as Client (forum or BBS)
+    participant N as relay-worker NIP-11 (HTTP)
+    participant R as relay-worker DO
+    participant D as D1 (events, event_tags)
+
+    C->>N: GET / (Accept: application/nostr+json), once per session
+    N-->>C: nostr_bbs.section_stats {verb, version 1}
+    Note over C,R: in a gated zone the three go out after AUTH OK
+    C->>R: REQ history window (e-tag channel, limit 100)
+    C->>R: REQ root list (t-tag topic, e-tag channel)
+    C->>R: SECTION-STATS {channel}
+    R->>R: admission = channel_read_decision_for(42) on cached_channel_zone (pin first)
+    alt refused, or no such section
+        R-->>C: CLOSED auth-required / restricted (never an empty list)
+    else admitted, memo older than 30 s, no computation running for this section
+        R->>D: roots (index idx_events_topic_root_channel, migration 0017)
+        R->>D: one statement per 100 topics: activity and counts, every walk capped by rows visited
+        D-->>R: rows
+        R-->>C: SECTION-STATS {topics in board order, truncated}
+    else admitted, the same section being computed
+        R-->>C: SECTION-STATS (the one computation's answer, shared)
+    else admitted, memo fresh
+        R-->>C: SECTION-STATS (memoised payload)
+    end
+    R-->>C: EOSE window, EOSE root list
+    Note over C: paint when all three settle, or 1.5 s
+    Note over C: fold stats with max, freeze when all three settle, or 20 s
+    C->>R: per-topic REQ + COUNT only for figures the answer lacks
+    Note over C: frozen: rows never move, "↻ N updated" offers a re-sort
+```
+
+Against a relay without the NIP-11 block, or on any refusal, `NOTICE` or 8 s timeout, the section stats count as failed
+and the page freezes on the window and the root list, with the per-topic pump filling every figure (the PR #130 behaviour).
 
 ## Agent Control Surface Protocol
 

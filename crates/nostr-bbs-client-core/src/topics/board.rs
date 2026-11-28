@@ -276,18 +276,24 @@ pub fn with_topic_stats(
 pub const FIRST_PAINT_TIMEOUT_MS: i32 = 1_500;
 
 /// Whether a board that has found its topics may paint them: once its
-/// history window (the channel's newest messages) has its settled answer
-/// and its root list has answered or failed, or once `timed_out`
-/// ([`FIRST_PAINT_TIMEOUT_MS`] after the topics were found). Stats are not
-/// waited for: they never move a painted row.
+/// history window (the channel's newest messages) has its settled answer,
+/// its root list has answered or failed and its section stats (ADR-2038)
+/// have answered or failed, or once `timed_out` ([`FIRST_PAINT_TIMEOUT_MS`]
+/// after the topics were found). The section stats never hold the paint
+/// past that same timeout; the per-topic stats are not waited for at all.
 ///
 /// The settled window is the complete newest prefix of the channel, so
 /// every topic active since its oldest message has its exact last
-/// activity, and every other topic's last activity is older: the order at
-/// paint already has its final cut between the two, and the rest (topics
-/// whose newest reply lies outside the window) is frozen as painted.
-pub fn first_paint_ready(window_settled: bool, roots_settled: bool, timed_out: bool) -> bool {
-    timed_out || (window_settled && roots_settled)
+/// activity; the section stats give every other marked topic its exact
+/// last activity too, so a list painted with them is in true order from
+/// its first frame.
+pub fn first_paint_ready(
+    window_settled: bool,
+    roots_settled: bool,
+    section_stats_settled: bool,
+    timed_out: bool,
+) -> bool {
+    timed_out || (window_settled && roots_settled && section_stats_settled)
 }
 
 /// Whether a painted board pages older history automatically: not when
@@ -345,6 +351,17 @@ pub struct BoardInputs<'a> {
     /// Whether a topic's deletion is honoured (the store's admission
     /// decision). A topic that is missing but not deleted keeps its row.
     pub deleted: &'a dyn Fn(&str) -> bool,
+    /// Whether the newest activity known now can be trusted as the
+    /// baseline: the history window has settled, or the section stats
+    /// (ADR-2038) have answered. A freeze forced by [`FREEZE_CAP_MS`]
+    /// before either takes a provisional baseline and re-takes it once,
+    /// when the first of them lands (or one more cap later), never past the
+    /// paint time.
+    pub baseline_settled: bool,
+    /// Whether a topic's true last activity is known: the section stats
+    /// answered for it (ADR-2038). Lets [`FrozenBoard::updated`] count a
+    /// row that arrived after the freeze below a row of lower activity.
+    pub activity_known: &'a dyn Fn(&str) -> bool,
 }
 
 /// A board's display order: provisional while it loads, then frozen once
@@ -381,6 +398,13 @@ pub struct FrozenBoard {
     baseline: u64,
     painted_at: u64,
     aliases: HashMap<String, String>,
+    /// Rows appended after the freeze (not the reader's own on top).
+    late: HashSet<String>,
+    /// Rows whose true last activity was known at the last update.
+    known: HashSet<String>,
+    /// The freeze took its baseline before the window or the section stats
+    /// had answered; it is re-taken once when the first of them lands.
+    baseline_provisional: bool,
 }
 
 impl FrozenBoard {
@@ -416,7 +440,19 @@ impl FrozenBoard {
     /// Follow `structure`, the true order from structure only (see the
     /// type's docs). Returns whether the shown list changed.
     pub fn update(&mut self, structure: &[TopicSummary], inputs: &BoardInputs<'_>) -> bool {
+        let changed = self.follow(structure, inputs);
+        self.known = self
+            .shown
+            .iter()
+            .filter(|id| (inputs.activity_known)(id))
+            .cloned()
+            .collect();
+        changed
+    }
+
+    fn follow(&mut self, structure: &[TopicSummary], inputs: &BoardInputs<'_>) -> bool {
         let before = std::mem::take(&mut self.shown);
+        let structure_newest = structure.iter().map(|t| t.last_activity).max().unwrap_or(0);
         if !self.frozen {
             let mut seen = HashSet::new();
             self.shown = structure
@@ -426,12 +462,24 @@ impl FrozenBoard {
                 .collect();
             if inputs.ready_to_freeze && !self.shown.is_empty() {
                 self.frozen = true;
-                self.baseline = inputs
-                    .newest_known
-                    .max(structure.iter().map(|t| t.last_activity).max().unwrap_or(0));
+                self.baseline = inputs.newest_known.max(structure_newest);
+                self.baseline_provisional = !inputs.baseline_settled;
                 self.painted_at = inputs.now_secs;
             }
             return self.shown != before;
+        }
+        // A cap freeze before the window or the section stats: the first of
+        // them to land sets the baseline, once (the order does not move),
+        // or one more cap after the freeze if neither ever does. It never
+        // passes the paint time, so activity after the paint stays new.
+        let cap_secs = (FREEZE_CAP_MS / 1_000) as u64;
+        if self.baseline_provisional
+            && (inputs.baseline_settled
+                || inputs.now_secs >= self.painted_at.saturating_add(cap_secs))
+        {
+            let known = inputs.newest_known.max(structure_newest);
+            self.baseline = self.baseline.max(known.min(self.painted_at));
+            self.baseline_provisional = false;
         }
         let listed: HashSet<&str> = structure.iter().map(|t| t.id.as_str()).collect();
         let shown_set: HashSet<&str> = before.iter().map(String::as_str).collect();
@@ -444,6 +492,10 @@ impl FrozenBoard {
             } else if let Some(a) =
                 alias.filter(|a| listed.contains(a.as_str()) && !shown_set.contains(a.as_str()))
             {
+                // A sealed row swaps in place; a late row stays late.
+                if self.late.remove(id) {
+                    self.late.insert(a.clone());
+                }
                 a.clone()
             } else if (inputs.deleted)(id) || alias.is_some_and(|a| (inputs.deleted)(a)) {
                 continue;
@@ -460,12 +512,15 @@ impl FrozenBoard {
                 if self.just_posted_by(t, inputs.me) {
                     top.push(t.id.clone());
                 } else {
+                    self.late.insert(t.id.clone());
                     kept.push(t.id.clone());
                 }
             }
         }
         top.extend(kept);
         self.shown = top;
+        let shown: HashSet<&str> = self.shown.iter().map(String::as_str).collect();
+        self.late.retain(|id| shown.contains(id.as_str()));
         self.shown != before
     }
 
@@ -480,9 +535,14 @@ impl FrozenBoard {
     /// included) with activity newer than the baseline that are not already
     /// in place as the top of the list, leaving out only the reader's own
     /// just-posted topic. Any author's activity counts, other people's
-    /// replies to the reader's topics included. Zero while provisional.
+    /// replies to the reader's topics included. Also counted: a row
+    /// appended after the freeze that sits below a row of strictly lower
+    /// activity, when the true activity of both is known (section stats,
+    /// ADR-2038); a topic from an older page, older than every row, never
+    /// counts. Zero while provisional, and while the baseline of a cap
+    /// freeze is still provisional.
     pub fn updated(&self, sorted: &[TopicSummary], me: Option<&str>) -> usize {
-        if !self.frozen {
+        if !self.frozen || self.baseline_provisional {
             return 0;
         }
         // The reader's just-posted topic is left out only while its newest
@@ -510,7 +570,26 @@ impl FrozenBoard {
             )
             .take_while(|(f, s)| **f == *s)
             .count();
-        fresh.len() - in_place
+        let mut counted: HashSet<&str> = fresh[in_place..].iter().copied().collect();
+        // Late rows out of order: below a known row of lower activity.
+        let activity: HashMap<&str, u64> = sorted
+            .iter()
+            .map(|t| (t.id.as_str(), t.last_activity))
+            .collect();
+        let mut lowest_above: Option<u64> = None;
+        for id in self.shown.iter().map(String::as_str) {
+            if mine.contains(id) || !self.known.contains(id) {
+                continue;
+            }
+            let Some(&a) = activity.get(id) else {
+                continue;
+            };
+            if self.late.contains(id) && lowest_above.is_some_and(|low| low < a) {
+                counted.insert(id);
+            }
+            lowest_above = Some(lowest_above.map_or(a, |low| low.min(a)));
+        }
+        counted.len()
     }
 
     /// The reader pressed the control: show `sorted` (the full true order,
@@ -540,6 +619,8 @@ impl FrozenBoard {
         }
         self.shown = shown;
         self.frozen = true;
+        self.late.clear();
+        self.baseline_provisional = false;
         // Never lower: a kept (evicted) row's activity is not in `sorted`,
         // and must not read as new when it is paged back in.
         self.baseline = self
@@ -1008,7 +1089,17 @@ mod tests {
             newest_known,
             now_secs: now,
             deleted,
+            baseline_settled: true,
+            activity_known: &never_known,
         }
+    }
+
+    fn never_known(_: &str) -> bool {
+        false
+    }
+
+    fn always_known(_: &str) -> bool {
+        true
     }
 
     /// Small deterministic generator for the invariant test (no new
@@ -1386,6 +1477,460 @@ mod tests {
         assert_eq!(board.updated(&with_roots, None), 0);
     }
 
+    /// Inputs with the ADR-2038 fields set.
+    fn inputs_with<'a>(
+        ready: bool,
+        newest_known: u64,
+        now: u64,
+        baseline_settled: bool,
+        known: &'a dyn Fn(&str) -> bool,
+    ) -> BoardInputs<'a> {
+        BoardInputs {
+            me: None,
+            ready_to_freeze: ready,
+            newest_known,
+            now_secs: now,
+            deleted: &never_deleted,
+            baseline_settled,
+            activity_known: known,
+        }
+    }
+
+    #[test]
+    fn a_late_row_below_a_lower_known_row_counts_as_updated() {
+        // Coordinator gap (a): a topic known only after the freeze, with
+        // activity at or below the baseline, is appended at the bottom; with
+        // true activity known it sits below a row of lower activity, so the
+        // control must offer the re-sort.
+        let ts = vec![topic("a", "x", 10, 500), topic("b", "x", 5, 100)];
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs_with(true, 500, 10, true, &always_known),
+        );
+        let mut now = ts.clone();
+        now.push(topic("late", "x", 1, 300)); // 300 <= baseline 500, above b
+        let now = sorted(now);
+        board.update(&now, &inputs_with(true, 500, 11, true, &always_known));
+        assert_eq!(board.shown(), &ids(&["a", "b", "late"])[..]);
+        assert_eq!(
+            board.updated(&now, None),
+            1,
+            "late sits below b (100 < 300)"
+        );
+        board.repaint(&now, 500, 12, &never_deleted);
+        assert_eq!(board.shown(), &ids(&["a", "late", "b"])[..]);
+        assert_eq!(board.updated(&now, None), 0);
+    }
+
+    #[test]
+    fn genuinely_older_late_rows_and_unknown_activity_count_nothing() {
+        let ts = vec![topic("a", "x", 10, 500), topic("b", "x", 5, 100)];
+        // An older page appends a topic older than every row: quiet.
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs_with(true, 500, 10, true, &always_known),
+        );
+        let mut now = ts.clone();
+        now.push(topic("older", "x", 1, 50));
+        let now = sorted(now);
+        board.update(&now, &inputs_with(true, 500, 11, true, &always_known));
+        assert_eq!(board.updated(&now, None), 0);
+        // Without section stats (activity not known) a late row's activity
+        // is a lower bound: it is never counted on that basis.
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs_with(true, 500, 10, true, &never_known),
+        );
+        let mut now = ts.clone();
+        now.push(topic("late", "x", 1, 300));
+        let now = sorted(now);
+        board.update(&now, &inputs_with(true, 500, 11, true, &never_known));
+        assert_eq!(board.updated(&now, None), 0);
+    }
+
+    #[test]
+    fn a_cap_freeze_before_window_or_stats_retakes_the_baseline_once() {
+        // Coordinator gap (b): frozen by the cap from the root list alone
+        // (creation times), the window then lands on a quiet section.
+        let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
+        let mut board = FrozenBoard::new();
+        board.update(
+            &roots_only,
+            &inputs_with(true, 10, 1_000, false, &never_known),
+        );
+        assert!(board.is_frozen());
+        assert_eq!(board.baseline(), 10);
+        // Pump figures arriving before either: nothing counts yet.
+        let pumped = sorted(vec![topic("a", "x", 10, 40), topic("b", "x", 5, 400)]);
+        board.update(&pumped, &inputs_with(true, 400, 1_001, false, &never_known));
+        assert_eq!(
+            board.updated(&pumped, None),
+            0,
+            "baseline still provisional"
+        );
+        // The window lands: activity from before the freeze is not new.
+        let landed = sorted(vec![topic("a", "x", 10, 40), topic("b", "x", 5, 400)]);
+        board.update(&landed, &inputs_with(true, 400, 1_002, true, &never_known));
+        assert_eq!(board.baseline(), 400);
+        assert_eq!(
+            board.shown(),
+            &ids(&["a", "b"])[..],
+            "the order does not move"
+        );
+        assert_eq!(
+            board.updated(&landed, None),
+            0,
+            "a quiet section shows nothing"
+        );
+        // Re-taken once only: real activity afterwards counts.
+        let later = sorted(vec![topic("a", "x", 10, 1_050), topic("b", "x", 5, 400)]);
+        board.update(&later, &inputs_with(true, 1_050, 1_003, true, &never_known));
+        assert_eq!(board.baseline(), 400);
+        assert_eq!(board.updated(&later, None), 0, "a is on top: in place");
+        let later = sorted(vec![topic("a", "x", 10, 1_050), topic("b", "x", 5, 1_060)]);
+        board.update(&later, &inputs_with(true, 1_060, 1_004, true, &never_known));
+        assert_eq!(board.updated(&later, None), 2);
+    }
+
+    #[test]
+    fn a_reply_after_a_cap_freeze_is_offered_when_the_window_lands() {
+        // PR #134 review finding 4: cap freeze at 1020 from the root list
+        // alone; a live reply to the bottom row at 1025; the window settles
+        // at 1030. The reply came after the paint, so it stays new.
+        let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
+        let mut board = FrozenBoard::new();
+        board.update(
+            &roots_only,
+            &inputs_with(true, 10, 1_020, false, &never_known),
+        );
+        let replied = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 1_025)]);
+        board.update(
+            &replied,
+            &inputs_with(true, 1_025, 1_025, false, &never_known),
+        );
+        // The window: a's older activity (before the paint) and b's reply.
+        let landed = sorted(vec![topic("a", "x", 10, 900), topic("b", "x", 5, 1_025)]);
+        board.update(
+            &landed,
+            &inputs_with(true, 1_025, 1_030, true, &never_known),
+        );
+        assert_eq!(board.baseline(), 1_020, "never past the paint");
+        assert_eq!(board.shown(), &ids(&["a", "b"])[..]);
+        assert_eq!(
+            board.updated(&landed, None),
+            1,
+            "b's reply is offered, a's is not"
+        );
+    }
+
+    #[test]
+    fn a_provisional_baseline_settles_one_cap_after_the_freeze_anyway() {
+        // Neither the window nor the stats ever answer (no EOSE, or older
+        // paging detached the window): the control must not stay hidden.
+        let roots_only = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 5)]);
+        let mut board = FrozenBoard::new();
+        board.update(
+            &roots_only,
+            &inputs_with(true, 10, 1_000, false, &never_known),
+        );
+        let cap = (FREEZE_CAP_MS / 1_000) as u64;
+        let replied = sorted(vec![topic("a", "x", 10, 10), topic("b", "x", 5, 1_010)]);
+        board.update(
+            &replied,
+            &inputs_with(true, 1_010, 1_000 + cap - 1, false, &never_known),
+        );
+        assert_eq!(board.updated(&replied, None), 0, "still provisional");
+        board.update(
+            &replied,
+            &inputs_with(true, 1_010, 1_000 + cap, false, &never_known),
+        );
+        assert_eq!(board.baseline(), 1_000);
+        assert_eq!(board.updated(&replied, None), 1);
+    }
+
+    #[test]
+    fn a_freeze_with_section_stats_answered_takes_their_baseline() {
+        // The window is not in, the section stats are: the structure the
+        // board gets already carries their activity.
+        let with_stats = sorted(vec![topic("a", "x", 10, 900), topic("b", "x", 5, 700)]);
+        let mut board = FrozenBoard::new();
+        board.update(
+            &with_stats,
+            &inputs_with(true, 900, 100, true, &always_known),
+        );
+        assert_eq!(board.baseline(), 900);
+        assert_eq!(board.shown(), &ids(&["a", "b"])[..]);
+        assert_eq!(board.updated(&with_stats, None), 0);
+    }
+
+    /// One topic of the ADR-2038 seeded model.
+    #[derive(Clone)]
+    struct Live {
+        id: String,
+        created: u64,
+        /// True last activity (what the section stats report).
+        last: u64,
+        /// Carries the topic marker: in the root list and the section stats.
+        marked: bool,
+        /// Delivered by the root list (a late root list answer adds more).
+        in_roots: bool,
+    }
+
+    /// The section stats payload the relay would send for `model`.
+    fn stats_for(model: &[Live]) -> crate::topics::SectionStats {
+        let topics: Vec<serde_json::Value> = model
+            .iter()
+            .filter(|t| t.marked)
+            .map(|t| serde_json::json!([t.id, t.created, t.last, "p", 0, null]))
+            .collect();
+        crate::topics::SectionStats::parse(&serde_json::json!({
+            "fields": ["id", "created_at", "last_at", "last_pubkey", "replies", "original"],
+            "topics": topics,
+        }))
+        .unwrap()
+    }
+
+    /// The ADR-2038 invariant, over 300 seeds:
+    /// - provisional: the order moves only when the window, the root list
+    ///   or the section stats land, never on the per-topic pump;
+    /// - with section stats answered, the order at freeze is the true order
+    ///   of every listed topic; with them failed, the order from structure;
+    /// - frozen: no row moves, rows are only appended; on a quiet section
+    ///   "updated" is exactly the late rows that sit below a known row of
+    ///   lower activity (0 for older pages), and a cap freeze before the
+    ///   window and the stats re-takes its baseline (0 once they land).
+    #[test]
+    fn section_stats_freeze_the_true_order_and_nothing_moves_after() {
+        const W: u64 = 10_000; // the window's oldest message
+                               // Coverage: cap freezes taken before the window or the stats, and
+                               // late rows the control counted, must both occur.
+        let (mut unsettled_caps, mut late_counted) = (0, 0);
+        for seed in 1..=300u64 {
+            let mut rng = XorShift(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+            let mut model: Vec<Live> = Vec::new();
+            for i in 0..30 {
+                let created = rng.below(W / 2);
+                let last = if rng.below(4) == 0 {
+                    W + rng.below(5_000) // active in the window
+                } else {
+                    created + rng.below(W - created) // dormant: stats only
+                };
+                model.push(Live {
+                    id: format!("t{i:02}"),
+                    created,
+                    last,
+                    marked: i % 10 != 9, // a few legacy roots
+                    in_roots: rng.below(6) != 0,
+                });
+            }
+            let answers = seed % 4 != 0; // section stats answered or failed
+            let cap_freeze = seed % 5 == 0;
+            let quiet = seed % 3 != 0;
+            let (mut window, mut roots, mut section, mut pump) = (false, false, false, false);
+            let structure = |m: &[Live], window: bool, roots: bool, section: bool| {
+                let listed: Vec<TopicSummary> = m
+                    .iter()
+                    .filter(|t| (roots && t.marked && t.in_roots) || (window && t.last >= W))
+                    .map(|t| {
+                        let seen = if window && t.last >= W {
+                            t.last
+                        } else {
+                            t.created
+                        };
+                        topic(&t.id, "a", t.created, seen)
+                    })
+                    .collect();
+                let st = (section && answers).then(|| stats_for(m));
+                crate::topics::fold_section_stats(sorted(listed), st.as_ref())
+            };
+            let full = |m: &[Live], window: bool, roots: bool, section: bool, pump: bool| {
+                let st = structure(m, window, roots, section);
+                if !pump {
+                    return st;
+                }
+                with_topic_stats(st, |t| {
+                    let last = m.iter().find(|x| x.id == t.id).map_or(0, |x| x.last);
+                    (0, Some((last, "p".to_string())))
+                })
+            };
+            let mut board = FrozenBoard::new();
+            let order = [0u64, 1, 2];
+            let mut landing_order = order.to_vec();
+            for i in (1..landing_order.len()).rev() {
+                landing_order.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            // The wall clock is after every seeded activity, as in life.
+            let mut now = 100_000u64;
+            let mut froze_settled = false;
+            let mut at_freeze: Vec<String> = Vec::new();
+            for step in 0..7u64 {
+                now += 1;
+                let before = board.shown().to_vec();
+                let landing = step % 2 == 1 && step / 2 < 3;
+                if landing {
+                    match landing_order[(step / 2) as usize] {
+                        0 => window = true,
+                        1 => roots = true,
+                        _ => section = true,
+                    }
+                } else {
+                    pump = true;
+                }
+                let capped = cap_freeze && step == 2;
+                let ready = capped || (window && roots && section);
+                let st = structure(&model, window, roots, section);
+                let fl = full(&model, window, roots, section, pump);
+                let known_set: HashSet<String> = model
+                    .iter()
+                    .filter(|t| section && answers && t.marked)
+                    .map(|t| t.id.clone())
+                    .collect();
+                let known = |id: &str| known_set.contains(id);
+                let was_frozen = board.is_frozen();
+                let settled = window || (section && answers);
+                board.update(&st, &inputs_with(ready, newest(&fl), now, settled, &known));
+                if !was_frozen && board.is_frozen() {
+                    froze_settled = settled;
+                    at_freeze = board.shown().to_vec();
+                }
+                if !landing && !was_frozen {
+                    assert_eq!(board.shown(), &before[..], "seed {seed}: pump moved a row");
+                }
+                if !board.is_frozen() {
+                    assert_eq!(board.updated(&fl, None), 0, "seed {seed}");
+                }
+                if board.is_frozen() && !was_frozen && !capped {
+                    // The freeze order is the true order when the stats answered.
+                    let expect: Vec<String> = if answers {
+                        let mut v: Vec<&Live> = model
+                            .iter()
+                            .filter(|t| (t.marked && t.in_roots) || t.last >= W)
+                            .collect();
+                        v.sort_by(|a, b| b.last.cmp(&a.last).then(a.id.cmp(&b.id)));
+                        // A legacy root is listed with its true activity only
+                        // when it is in the window; otherwise it is not listed.
+                        v.into_iter().map(|t| t.id.clone()).collect()
+                    } else {
+                        st.iter().map(|t| t.id.clone()).collect()
+                    };
+                    assert_eq!(board.shown(), &expect[..], "seed {seed}: freeze order");
+                }
+            }
+            assert!(board.is_frozen(), "seed {seed}");
+            // Rows appended after the freeze (during the provisional loop's
+            // later landings too) are late; the rows shown at freeze are not.
+            let frozen = at_freeze;
+            if cap_freeze && !froze_settled {
+                unsettled_caps += 1;
+            }
+            let mut late = 0u64;
+            for round in 0..60u64 {
+                now += 1;
+                match rng.below(5) {
+                    0 => {
+                        // A late root-list answer: a marked root not shown yet.
+                        if let Some(t) = model.iter_mut().find(|t| t.marked && !t.in_roots) {
+                            t.in_roots = true;
+                        }
+                    }
+                    1 => {
+                        // An older page: a legacy topic older than every row.
+                        let floor = model.iter().map(|t| t.last).min().unwrap_or(1);
+                        let at = floor.saturating_sub(1 + rng.below(5)).max(1);
+                        model.push(Live {
+                            id: format!("old{late}"),
+                            created: at.saturating_sub(1),
+                            last: at,
+                            marked: false,
+                            in_roots: false,
+                        });
+                        late += 1;
+                    }
+                    2 if !quiet && round % 7 == 0 => {
+                        // Real activity after the freeze.
+                        let n = model.len() as u64;
+                        let t = &mut model[rng.below(n) as usize];
+                        t.last = W + 6_000 + now;
+                    }
+                    3 => pump = true,
+                    _ => {}
+                }
+                // Everything lands (a cap freeze lands it now).
+                window = true;
+                roots = true;
+                section = true;
+                let st = structure(&model, window, roots, section);
+                // Older pages bring their legacy topics in through the window.
+                let mut st = st;
+                for t in model.iter().filter(|t| t.id.starts_with("old")) {
+                    if !st.iter().any(|s| s.id == t.id) {
+                        st.push(topic(&t.id, "a", t.created, t.last));
+                    }
+                }
+                let st = sorted(st);
+                let mut fl = full(&model, window, roots, section, pump);
+                for t in st.iter().filter(|t| t.id.starts_with("old")) {
+                    if !fl.iter().any(|f| f.id == t.id) {
+                        fl.push(t.clone());
+                    }
+                }
+                let fl = sorted(fl);
+                let known_set: HashSet<String> = model
+                    .iter()
+                    .filter(|t| answers && t.marked)
+                    .map(|t| t.id.clone())
+                    .collect();
+                let known = |id: &str| known_set.contains(id);
+                board.update(&st, &inputs_with(true, newest(&fl), now, true, &known));
+                let shown = board.shown().to_vec();
+                assert_eq!(
+                    &shown[..frozen.len()],
+                    &frozen[..],
+                    "seed {seed}: a frozen row moved"
+                );
+                let unique: HashSet<&String> = shown.iter().collect();
+                assert_eq!(unique.len(), shown.len(), "seed {seed}");
+                if quiet {
+                    // Independent count: late rows below a known lower row.
+                    let act: HashMap<&str, u64> = fl
+                        .iter()
+                        .map(|t| (t.id.as_str(), t.last_activity))
+                        .collect();
+                    let mut low: Option<u64> = None;
+                    let mut expect = 0;
+                    for (i, id) in shown.iter().enumerate() {
+                        if !known(id) {
+                            continue;
+                        }
+                        let a = act[id.as_str()];
+                        if i >= frozen.len() && low.is_some_and(|l| l < a) {
+                            expect += 1;
+                        }
+                        low = Some(low.map_or(a, |l| l.min(a)));
+                    }
+                    assert_eq!(
+                        board.updated(&fl, None),
+                        expect,
+                        "seed {seed} round {round}: baseline {} shown {shown:?}",
+                        board.baseline(),
+                    );
+                    late_counted += usize::from(expect > 0);
+                }
+            }
+        }
+        assert!(
+            unsettled_caps > 5,
+            "cap freezes before window/stats: {unsettled_caps}"
+        );
+        assert!(
+            late_counted > 20,
+            "rounds with late rows counted: {late_counted}"
+        );
+    }
+
     #[test]
     fn an_empty_list_is_never_frozen() {
         let mut board = FrozenBoard::new();
@@ -1692,12 +2237,13 @@ mod tests {
     }
 
     #[test]
-    fn first_paint_waits_for_the_window_and_the_root_list_not_stats() {
-        assert!(!first_paint_ready(false, true, false));
-        assert!(!first_paint_ready(true, false, false));
-        assert!(first_paint_ready(true, true, false));
+    fn first_paint_waits_for_the_window_roots_and_section_stats_within_the_hold() {
+        assert!(!first_paint_ready(false, true, true, false));
+        assert!(!first_paint_ready(true, false, true, false));
+        assert!(!first_paint_ready(true, true, false, false));
+        assert!(first_paint_ready(true, true, true, false));
         assert!(
-            first_paint_ready(false, false, true),
+            first_paint_ready(false, false, false, true),
             "the timeout always paints"
         );
     }

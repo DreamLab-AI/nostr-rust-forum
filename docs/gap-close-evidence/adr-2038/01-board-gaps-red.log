@@ -1,0 +1,102 @@
+# 2026-11-28T14:26:03Z 0369ec685ffa97e82d715173c09861d0b2bae5b8 + uncommitted board tests (before the FrozenBoard fix)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/home/devuser/workspace/.tmp/section-stats-target/debug/deps/nostr_bbs_client_core-3ab17a7dabcd70a6)
+
+running 34 tests
+test topics::board::tests::a_revisit_after_a_failed_root_list_waits_for_the_new_answer ... ok
+test topics::board::tests::a_freeze_with_section_stats_answered_takes_their_baseline ... ok
+test topics::board::tests::a_count_of_zero_then_the_real_count_changes_neither_order_nor_count ... ok
+test topics::board::tests::a_repaint_keeps_rows_of_evicted_topics ... ok
+test topics::board::tests::a_reply_to_the_reader_s_just_posted_topic_counts ... ok
+test topics::board::tests::a_new_reply_brings_its_topic_to_the_top ... ok
+test topics::board::tests::an_empty_list_is_never_frozen ... ok
+test topics::board::tests::another_user_s_reply_to_the_reader_s_topic_counts ... ok
+test topics::board::tests::board_events_dedupe_roots_already_in_the_window ... ok
+test topics::board::tests::an_evicted_row_does_not_break_the_top_of_the_list ... ok
+test topics::board::tests::exact_totals_and_newest_reply_replace_window_figures ... ok
+test topics::board::tests::an_envelope_and_its_opened_original_are_one_row ... ok
+test topics::board::tests::first_paint_waits_for_the_window_and_the_root_list_not_stats ... ok
+test topics::board::tests::genuinely_older_late_rows_and_unknown_activity_count_nothing ... ok
+test topics::board::tests::older_paging_is_armed_by_an_answer_a_failure_or_the_hold ... ok
+test topics::board::tests::nested_replies_reach_the_topic_and_edits_do_not_move_it ... ok
+test topics::board::tests::provisional_follows_structure_and_freezes_once ... ok
+test topics::board::tests::roots_and_replies_classified ... ok
+test topics::board::tests::replies_to_a_sealed_root_fold_into_its_envelope_row ... ok
+test topics::board::tests::stats_not_in_yet_leave_the_window_figures ... ok
+test topics::board::tests::sealed_aliases_pair_envelopes_with_their_originals ... ok
+test topics::board::tests::rows_leave_only_on_an_honoured_deletion ... ok
+test topics::board::tests::the_control_paints_the_full_true_order ... ok
+test topics::board::tests::the_reader_s_dormant_topic_arriving_late_goes_to_the_bottom ... ok
+test topics::board::tests::the_paint_order_puts_every_window_topic_above_every_tail_topic ... ok
+test topics::board::tests::unread_and_latest_post ... ok
+test topics::board::tests::title_is_first_line_clipped ... ok
+test topics::board::tests::the_reader_s_just_posted_topic_goes_on_top_and_does_not_count ... ok
+test topics::board::tests::updated_control_wording ... ok
+test topics::board::tests::ties_in_activity_break_by_id_in_both_sorts ... ok
+test topics::board::tests::window_of_replies_lists_the_roots_from_the_root_list ... ok
+test topics::board::tests::a_cap_freeze_before_window_or_stats_retakes_the_baseline_once ... FAILED
+test topics::board::tests::a_late_row_below_a_lower_known_row_counts_as_updated ... FAILED
+test topics::board::tests::provisional_moves_only_on_window_or_roots_and_frozen_never_moves ... ok
+
+failures:
+
+---- topics::board::tests::a_cap_freeze_before_window_or_stats_retakes_the_baseline_once stdout ----
+
+thread 'topics::board::tests::a_cap_freeze_before_window_or_stats_retakes_the_baseline_once' (1666579) panicked at crates/nostr-bbs-client-core/src/topics/board.rs:1489:9:
+assertion `left == right` failed: baseline still provisional
+  left: 2
+ right: 0
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:679:5
+   1: core::panicking::panic_fmt
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panicking.rs:447:23
+   3: core::panicking::assert_failed::<usize, usize>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panicking.rs:407:5
+   4: nostr_bbs_client_core::topics::board::tests::a_cap_freeze_before_window_or_stats_retakes_the_baseline_once
+             at ./src/topics/board.rs:1489:9
+   5: nostr_bbs_client_core::topics::board::tests::a_cap_freeze_before_window_or_stats_retakes_the_baseline_once::{closure#0}
+             at ./src/topics/board.rs:1478:71
+   6: <nostr_bbs_client_core::topics::board::tests::a_cap_freeze_before_window_or_stats_retakes_the_baseline_once::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /nix/store/qr3bwsb64hi9m01r8gw0iad97wc4bqcm-rust-minimal-1.99.1/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- topics::board::tests::a_late_row_below_a_lower_known_row_counts_as_updated stdout ----
+
+thread 'topics::board::tests::a_late_row_below_a_lower_known_row_counts_as_updated' (1666582) panicked at crates/nostr-bbs-client-core/src/topics/board.rs:1449:9:
+assertion `left == right` failed: late sits below b (100 < 300)
+  left: 0
+ right: 1
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:679:5
+   1: core::panicking::panic_fmt
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panicking.rs:447:23
+   3: core::panicking::assert_failed::<usize, usize>
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panicking.rs:407:5
+   4: nostr_bbs_client_core::topics::board::tests::a_late_row_below_a_lower_known_row_counts_as_updated
+             at ./src/topics/board.rs:1449:9
+   5: nostr_bbs_client_core::topics::board::tests::a_late_row_below_a_lower_known_row_counts_as_updated::{closure#0}
+             at ./src/topics/board.rs:1436:62
+   6: <nostr_bbs_client_core::topics::board::tests::a_late_row_below_a_lower_known_row_counts_as_updated::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /nix/store/qr3bwsb64hi9m01r8gw0iad97wc4bqcm-rust-minimal-1.99.1/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    topics::board::tests::a_cap_freeze_before_window_or_stats_retakes_the_baseline_once
+    topics::board::tests::a_late_row_below_a_lower_known_row_counts_as_updated
+
+test result: FAILED. 32 passed; 2 failed; 0 ignored; 0 measured; 1211 filtered out; finished in 3.70s
+
+error: test failed, to rerun pass `-p nostr-bbs-client-core --lib`

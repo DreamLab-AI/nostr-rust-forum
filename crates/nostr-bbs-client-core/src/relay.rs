@@ -19,6 +19,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::WebSocket;
 
+pub mod info;
 mod receipt;
 mod verified;
 use receipt::{
@@ -139,6 +140,10 @@ pub type CountCallback = Rc<dyn Fn(u64)>;
 /// Callback type for publish acknowledgement (accepted: bool, message: String).
 pub type PublishCallback = Rc<dyn Fn(bool, String)>;
 
+/// Called once with a `SECTION-STATS` answer's payload, or the reason it was
+/// refused (`CLOSED`) or is unsupported (ADR-2038).
+pub type SectionStatsCallback = Rc<dyn Fn(Result<Value, String>)>;
+
 /// Tracks a pending publish awaiting relay OK response.
 struct PendingPublish {
     on_ok: Option<PublishCallback>,
@@ -198,6 +203,9 @@ struct RelayInner {
     ws: Option<WebSocket>,
     subscriptions: HashMap<String, Subscription>,
     counts: HashMap<String, PendingCount>,
+    /// `SECTION-STATS` requests awaiting their answer (ADR-2038), by id.
+    /// Removed on the answer, a `CLOSED`, or the caller's timeout.
+    section_stats: HashMap<String, SectionStatsCallback>,
     pending_publishes: HashMap<String, PendingPublish>,
     sub_counter: u32,
     reconnect_attempts: u32,
@@ -421,6 +429,7 @@ impl RelayConnection {
             ws: None,
             subscriptions: HashMap::new(),
             counts: HashMap::new(),
+            section_stats: HashMap::new(),
             pending_publishes: HashMap::new(),
             sub_counter: 0,
             reconnect_attempts: 0,
@@ -818,6 +827,33 @@ impl RelayConnection {
         id
     }
 
+    /// Ask for one section's topic stats (ADR-2038): `["SECTION-STATS", id,
+    /// {"channel": channel}]`. `on_answer` runs once, with the payload or the
+    /// refusal; the caller owns the timeout ([`Self::cancel_section_stats`]).
+    /// Send only to a relay whose NIP-11 document advertises it
+    /// ([`crate::topics::section_stats::advertised`]). Holds no subscription,
+    /// so it does not count against the relay's subscription cap.
+    pub fn section_stats(&self, channel: &str, on_answer: SectionStatsCallback) -> String {
+        let id = self.with_inner(|rc| {
+            let mut inner = rc.borrow_mut();
+            inner.sub_counter += 1;
+            let id = format!("stats_{}", inner.sub_counter);
+            inner.section_stats.insert(id.clone(), on_answer);
+            id
+        });
+        self.send_raw(&crate::topics::section_stats::section_stats_frame(
+            &id, channel,
+        ));
+        id
+    }
+
+    /// Forget a `SECTION-STATS` request (timed out): a late answer is dropped.
+    pub fn cancel_section_stats(&self, id: &str) {
+        self.with_inner(|rc| {
+            rc.borrow_mut().section_stats.remove(id);
+        });
+    }
+
     /// Forget every verified event id (see `relay/verified.rs`), so the next
     /// identity's deliveries are all verified afresh and the cache's hit
     /// pattern says nothing about what the previous identity fetched.
@@ -845,6 +881,7 @@ impl RelayConnection {
             ("relay.verified_queue", inner.verified.queue_len()),
             ("relay.req_sent_at", inner.req_sent_at.len()),
             ("relay.counts", inner.counts.len()),
+            ("relay.section_stats", inner.section_stats.len()),
             ("relay.pending_publishes", inner.pending_publishes.len()),
         ]
     }
@@ -1548,6 +1585,15 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
             }
         }
         "CLOSED" => {
+            // A refused SECTION-STATS request (ADR-2038) is answered by id.
+            if let Some(id) = arr.get(1).and_then(Value::as_str) {
+                let pending = inner_rc.borrow_mut().section_stats.remove(id);
+                if let Some(cb) = pending {
+                    let reason = arr.get(2).and_then(Value::as_str).unwrap_or("").to_string();
+                    cb(Err(reason));
+                    return;
+                }
+            }
             // A refused REQ is still an answer to one REQ: count it so the
             // ledger is not left waiting forever. It is not a completeness
             // receipt, so no callback fires.
@@ -1585,9 +1631,33 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                 cb(n);
             }
         }
+        crate::topics::section_stats::SECTION_STATS_VERB => {
+            // ["SECTION-STATS", <id>, {payload}] (ADR-2038).
+            let Some(id) = arr.get(1).and_then(Value::as_str) else {
+                return;
+            };
+            let pending = inner_rc.borrow_mut().section_stats.remove(id);
+            if let (Some(cb), Some(payload)) = (pending, arr.get(2)) {
+                cb(Ok(payload.clone()));
+            }
+        }
         "NOTICE" => {
             if arr.len() >= 2 {
                 if let Some(notice) = arr[1].as_str() {
+                    // An old relay sent the verb anyway (a stale NIP-11
+                    // answer): fail every pending request, quietly.
+                    if notice == crate::topics::section_stats::SECTION_STATS_UNKNOWN_NOTICE {
+                        let pending: Vec<SectionStatsCallback> = inner_rc
+                            .borrow_mut()
+                            .section_stats
+                            .drain()
+                            .map(|(_, cb)| cb)
+                            .collect();
+                        for cb in pending {
+                            cb(Err("unsupported: relay does not know SECTION-STATS".into()));
+                        }
+                        return;
+                    }
                     web_sys::console::warn_1(&format!("[Relay] NOTICE: {}", notice).into());
 
                     // Surface to the UI as a warn toast, rate-limiting rapid
@@ -1815,5 +1885,91 @@ mod pacing_tests {
         // The 2026-11-26 sweep: ~127 zone2 + ~25 zone4 wraps.
         assert_eq!(drain_time_ms(152), 19_000);
         assert_eq!(drain_time_ms(usize::MAX), u32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod section_stats_tests {
+    //! ADR-2038: the `SECTION-STATS` request on the client socket: its frame,
+    //! its answer, a refusal, an old relay's NOTICE and a cancelled request.
+    use super::*;
+    use std::cell::RefCell;
+
+    fn conn() -> RelayConnection {
+        RelayConnection::build("ws://relay.test".into(), false)
+    }
+
+    type Seen = Rc<RefCell<Vec<Result<Value, String>>>>;
+
+    fn ask(c: &RelayConnection, channel: &str) -> (String, Seen) {
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let id = c.section_stats(channel, Rc::new(move |r| sink.borrow_mut().push(r)));
+        (id, seen)
+    }
+
+    fn feed(c: &RelayConnection, frame: Value) {
+        handle_relay_message(&c.inner, &frame.to_string());
+    }
+
+    #[test]
+    fn the_request_goes_out_as_one_frame_and_its_answer_comes_back_once() {
+        let c = conn();
+        let (id, seen) = ask(&c, "ab");
+        let queued = c.inner.borrow().pending_messages.clone();
+        assert_eq!(
+            queued,
+            vec![format!(r#"["SECTION-STATS","{id}",{{"channel":"ab"}}]"#)]
+        );
+        feed(&c, serde_json::json!(["SECTION-STATS", id, {"topics": []}]));
+        feed(
+            &c,
+            serde_json::json!(["SECTION-STATS", id, {"topics": [1]}]),
+        );
+        assert_eq!(seen.borrow().len(), 1, "answered once");
+        assert_eq!(seen.borrow()[0], Ok(serde_json::json!({"topics": []})));
+        assert!(c.inner.borrow().section_stats.is_empty());
+        assert!(
+            c.inner.borrow().subscriptions.is_empty(),
+            "no subscription held"
+        );
+    }
+
+    #[test]
+    fn a_closed_refusal_is_the_answer() {
+        let c = conn();
+        let (id, seen) = ask(&c, "ab");
+        feed(
+            &c,
+            serde_json::json!(["CLOSED", id, "restricted: section not readable"]),
+        );
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[Err("restricted: section not readable".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_old_relay_s_unknown_verb_notice_fails_quietly() {
+        let c = conn();
+        let (_, a) = ask(&c, "ab");
+        let (_, b) = ask(&c, "cd");
+        let notices = c.inner.borrow().notice_sink.unwrap();
+        feed(
+            &c,
+            serde_json::json!(["NOTICE", "Unknown message type: SECTION-STATS"]),
+        );
+        assert!(a.borrow()[0].is_err() && b.borrow()[0].is_err());
+        assert_eq!(notices.get_untracked(), None, "no toast for it");
+    }
+
+    #[test]
+    fn a_cancelled_request_ignores_a_late_answer() {
+        let c = conn();
+        let (id, seen) = ask(&c, "ab");
+        c.cancel_section_stats(&id);
+        feed(&c, serde_json::json!(["SECTION-STATS", id, {"topics": []}]));
+        feed(&c, serde_json::json!(["CLOSED", id, "error: late"]));
+        assert!(seen.borrow().is_empty());
     }
 }

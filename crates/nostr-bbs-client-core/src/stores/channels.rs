@@ -19,6 +19,7 @@ use crate::stores::deletion_sync::{self, DeletionProgress, DeletionScope, Source
 use crate::stores::signer_admin::SignerAdminCache;
 use crate::stores::tombstones::{self, Target, Tombstones, LOCAL_DELETER};
 use crate::stores::zones::Zone;
+use crate::topics::section_stats::{SectionStats, SectionStatsState, SECTION_STATS_TIMEOUT_MS};
 use crate::utils::lookup::SyncReceipt;
 use crate::zone_crypto::store::{is_restored_original, ZoneKeyStore};
 
@@ -217,6 +218,13 @@ pub struct ChannelStore {
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
     first_pages: StoredValue<HashMap<String, FirstPageSnapshot>>,
+    /// Section stats (ADR-2038) per channel id: pending, answered or failed
+    /// for this visit (reactive). Cleared per visit by
+    /// [`ChannelStore::rearm_section_stats`].
+    section_stats: RwSignal<HashMap<String, SectionStatsState>>,
+    /// Request generation per channel id, so an answer or timeout of an
+    /// earlier request never settles a later one.
+    section_stats_gen: StoredValue<HashMap<String, u64>>,
 }
 
 /// Deliveries of a channel's `ensure_subscribed` REQ, snapshotted at its
@@ -271,6 +279,8 @@ impl ChannelStore {
             topic_stats_queue: StoredValue::new(std::collections::VecDeque::new()),
             topic_stats_busy: StoredValue::new(false),
             first_pages: StoredValue::new(HashMap::new()),
+            section_stats: RwSignal::new(HashMap::new()),
+            section_stats_gen: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
         store
@@ -561,6 +571,9 @@ impl ChannelStore {
 
     /// Start relay subscriptions. Called once from App root after relay connects.
     pub fn start_sync(&self, relay: &RelayConnection) {
+        // ADR-2038: the section stats check reads the relay's NIP-11
+        // document; fetch it now so the first section visit does not wait.
+        crate::relay::info::prefetch();
         if self.sub_id.get_untracked().is_some() {
             return;
         }
@@ -848,12 +861,18 @@ impl ChannelStore {
                 let mut newly_added = false;
                 let event_ts = event.created_at;
                 let event_id = event.id.clone();
+                let topic = reply_topic(&event);
                 channel_msgs.update(|m| {
                     let events = m.entry(cid.clone()).or_insert_with(Vec::new);
                     newly_added = insert_message(events, event);
                 });
                 if newly_added {
                     store.note_inserted(&cid, &event_id, event_ts);
+                    // A live reply grows its topic's total too (seeded by the
+                    // section stats or a COUNT), so the row's count moves.
+                    if let Some(root) = topic {
+                        store.note_inserted(&topic_key(&root), &event_id, event_ts);
+                    }
                     last_active.update(|m| {
                         let ts = m.entry(cid).or_insert(0);
                         if event_ts > *ts {
@@ -979,12 +998,18 @@ impl ChannelStore {
             let mut newly_added = false;
             let event_ts = event.created_at;
             let event_id = event.id.clone();
+            let topic = reply_topic(&event);
             channel_msgs.update(|m| {
                 let events = m.entry(cid.clone()).or_insert_with(Vec::new);
                 newly_added = insert_message(events, event);
             });
             if newly_added {
                 store.note_inserted(&cid, &event_id, event_ts);
+                // A live reply grows its topic's total too (seeded by the
+                // section stats or a COUNT), so the row's count moves.
+                if let Some(root) = topic {
+                    store.note_inserted(&topic_key(&root), &event_id, event_ts);
+                }
                 last_active.update(|m| {
                     let ts = m.entry(cid).or_insert(0);
                     if event_ts > *ts {
@@ -1131,7 +1156,7 @@ impl ChannelStore {
             for (cid, ev) in events {
                 let ts = ev.created_at;
                 let id = ev.id.clone();
-                let topic = nostr_bbs_core::sealed::reply_root_of(&ev).map(str::to_lowercase);
+                let topic = reply_topic(&ev);
                 if insert_message(m.entry(cid.clone()).or_default(), ev) {
                     inserted.push((cid.clone(), id, ts, topic));
                     let n = newest.entry(cid).or_insert(0);
@@ -1381,7 +1406,10 @@ impl ChannelStore {
     }
 
     /// Ask, once per session per topic, for the section list's per-topic
-    /// stats of channel `cid`'s topics `roots`: the exact reply total (the
+    /// stats of channel `cid`'s topics `roots`: the fallback, and the
+    /// figures the section stats ([`Self::request_section_stats`],
+    /// ADR-2038) do not carry; pages pass only those topics. The exact
+    /// reply total (the
     /// relay's `#e:[root]` COUNT, as the thread page uses, kept current by
     /// [`Self::note_inserted`]) and the newest reply (`#e:[root]`,
     /// `limit:1`, into [`Self::topic_latest`]). Topics are taken in the
@@ -1487,7 +1515,10 @@ impl ChannelStore {
         ev: &NostrEvent,
     ) {
         let root = nostr_bbs_core::sealed::reply_root_of(ev).map(str::to_lowercase);
-        let opened = nostr_bbs_core::sealed::parse_sealed(&ev.tags).is_none()
+        // An edit is not activity (`classify_topics`, ADR-2038): it carries
+        // its topic's `reply` tag, so a limit-1 answer can be one.
+        let opened = crate::topics::thread::edit_target_of(ev).is_none()
+            && nostr_bbs_core::sealed::parse_sealed(&ev.tags).is_none()
             && ev.content != crate::zone_crypto::PLACEHOLDER_MISSING_KEY
             && ev.content != crate::zone_crypto::PLACEHOLDER_UNDECRYPTABLE;
         if let Some(root) = root.filter(|r| opened && wanted.get(r).is_some_and(|c| c == cid)) {
@@ -1514,6 +1545,136 @@ impl ChannelStore {
                 z.forget(std::slice::from_ref(&ev.id));
             }
         }
+    }
+
+    /// Ask the relay for channel `cid`'s section stats (ADR-2038), once per
+    /// visit: every marked topic with its last activity, last participant
+    /// and reply count, in one frame. Sent only when the relay's NIP-11
+    /// document advertises it; anything else (not advertised, refused,
+    /// malformed, or no answer within [`SECTION_STATS_TIMEOUT_MS`] of this
+    /// call, the NIP-11 fetch included) settles as failed, and the board
+    /// behaves as it did before. In a gated zone call it only once AUTH is
+    /// accepted (as the root list is), so the relay answers the member.
+    pub fn request_section_stats(&self, relay: &RelayConnection, cid: &str) {
+        if self.section_stats.with_untracked(|m| m.contains_key(cid)) {
+            return;
+        }
+        let gen = self
+            .section_stats_gen
+            .try_update_value(|g| {
+                let n = g.entry(cid.to_string()).or_insert(0);
+                *n += 1;
+                *n
+            })
+            .unwrap_or(0);
+        self.section_stats.update(|m| {
+            m.insert(cid.to_string(), SectionStatsState::Pending);
+        });
+        let store = *self;
+        let wire: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        {
+            let relay = relay.clone();
+            let wire = wire.clone();
+            let cid = cid.to_string();
+            crate::utils::set_timeout_once(
+                move || {
+                    if let Some(id) = wire.borrow_mut().take() {
+                        relay.cancel_section_stats(&id);
+                    }
+                    store.settle_section_stats(
+                        &cid,
+                        gen,
+                        SectionStatsState::Failed("timeout".into()),
+                    );
+                },
+                SECTION_STATS_TIMEOUT_MS,
+            );
+        }
+        let relay = relay.clone();
+        let cid = cid.to_string();
+        leptos::task::spawn_local(async move {
+            let advertised = crate::relay::info::nip11()
+                .await
+                .is_ok_and(|doc| crate::topics::section_stats::advertised(&doc));
+            if !advertised {
+                store.settle_section_stats(
+                    &cid,
+                    gen,
+                    SectionStatsState::Failed("not advertised".into()),
+                );
+                return;
+            }
+            let for_cid = cid.clone();
+            let on_answer = Rc::new(move |res: Result<serde_json::Value, String>| {
+                store.settle_section_stats(
+                    &for_cid,
+                    gen,
+                    SectionStatsState::from_answer(&for_cid, res),
+                );
+            });
+            let id = relay.section_stats(&cid, on_answer);
+            *wire.borrow_mut() = Some(id);
+        });
+    }
+
+    /// Settle request `gen` of channel `cid`, unless a newer request (or
+    /// an earlier settlement) got there first.
+    fn settle_section_stats(&self, cid: &str, gen: u64, state: SectionStatsState) {
+        let current = self
+            .section_stats_gen
+            .try_with_value(|g| g.get(cid).copied())
+            .flatten();
+        if current != Some(gen) {
+            return;
+        }
+        if let Some(stats) = state.stats() {
+            let as_of = stats.as_of;
+            let seeds = section_stats_totals(stats);
+            let _ = self.totals.try_update(|m| {
+                for (key, n) in seeds {
+                    // A COUNT already asked for (or answered) keeps its own.
+                    m.entry(key).or_insert_with(|| ChannelTotal {
+                        counted: Some(n),
+                        as_of,
+                        newer_ids: HashSet::new(),
+                    });
+                }
+            });
+        }
+        let _ = self.section_stats.try_update(|m| {
+            if let Some(slot) = m.get_mut(cid).filter(|s| !s.settled()) {
+                *slot = state;
+            }
+        });
+    }
+
+    /// A new visit to channel `cid`'s list: forget this channel's section
+    /// stats so the visit asks afresh. Call once per visit.
+    pub fn rearm_section_stats(&self, cid: &str) {
+        if self.section_stats.with_untracked(|m| m.contains_key(cid)) {
+            self.section_stats.update(|m| {
+                m.remove(cid);
+            });
+        }
+    }
+
+    /// Channel `cid`'s section stats state for this visit, if asked.
+    /// Reactive.
+    pub fn section_stats_state(&self, cid: &str) -> Option<SectionStatsState> {
+        self.section_stats.with(|m| m.get(cid).cloned())
+    }
+
+    /// Channel `cid`'s section stats, when answered. Reactive.
+    pub fn section_stats(&self, cid: &str) -> Option<std::sync::Arc<SectionStats>> {
+        self.section_stats
+            .with(|m| m.get(cid).and_then(|s| s.stats().cloned()))
+    }
+
+    /// Whether channel `cid`'s section stats have answered or failed this
+    /// visit (not asked counts as not settled). Reactive.
+    pub fn section_stats_settled(&self, cid: &str) -> bool {
+        self.section_stats
+            .with(|m| m.get(cid).is_some_and(SectionStatsState::settled))
     }
 
     /// Whether a deletion of message `id` by `author` is honoured: the
@@ -2574,6 +2735,36 @@ impl ChannelTotal {
 /// client's own send pacing (`relay.rs` MAX_SENDS_PER_SECOND, 8/s) never
 /// holds a reader's REQ behind more than a second of stats frames.
 pub const TOPIC_STATS_BATCH: usize = 5;
+
+/// The topic a message is a reply to, lower-case, when it is one: its
+/// `reply`-marked `e` tag, and not an edit (`classify_topics`: an edit is
+/// neither a reply nor activity).
+pub fn reply_topic(ev: &NostrEvent) -> Option<String> {
+    if crate::topics::thread::edit_target_of(ev).is_some() {
+        return None;
+    }
+    nostr_bbs_core::sealed::reply_root_of(ev).map(str::to_lowercase)
+}
+
+/// The topic totals a section stats answer seeds (ADR-2038): for each topic
+/// with an exact reply count, its list key and, for a sealed root, its
+/// original's, each with the count as of the answer. A live reply then adds
+/// to it ([`ChannelStore::note_inserted`]), so a row's count follows new
+/// replies during the visit.
+pub fn section_stats_totals(
+    stats: &crate::topics::section_stats::SectionStats,
+) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for t in &stats.topics {
+        if let Some(n) = t.replies {
+            out.push((topic_key(&t.id), n as u64));
+            if let Some(o) = &t.original {
+                out.push((topic_key(o), n as u64));
+            }
+        }
+    }
+    out
+}
 
 /// The list key of channel `cid`'s topic roots.
 pub fn roots_key(cid: &str) -> String {
@@ -4063,5 +4254,69 @@ mod tests {
         let json = serde_json::to_value(pinned.cache_form()).unwrap();
         assert_eq!(json["section"], "open-agents");
         assert_eq!(json["section_tag"], "open-agents");
+    }
+}
+
+#[cfg(test)]
+mod section_stats_total_tests {
+    //! PR #134 review finding 3: a live reply must move a row whose count
+    //! came from the section stats.
+    use super::*;
+    use crate::topics::section_stats::SectionStats;
+
+    fn reply_ev(id: &str, root: &str, ts: u64, edit: Option<&str>) -> NostrEvent {
+        let mut tags = crate::topics::thread::topic_reply_tags("chan", root, "", None);
+        if let Some(t) = edit {
+            tags.push(vec!["e".into(), t.into(), String::new(), "edit".into()]);
+        }
+        NostrEvent {
+            id: id.into(),
+            pubkey: "p".into(),
+            created_at: ts,
+            kind: 42,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        }
+    }
+
+    #[test]
+    fn stats_seed_a_total_that_live_replies_then_grow() {
+        let stats = SectionStats::parse(&serde_json::json!({
+            "channel": "chan", "as_of": 1_000,
+            "fields": ["id", "created_at", "last_at", "last_pubkey", "replies", "original"],
+            "topics": [["ROOT", 5, 900, "p", 50, null], ["env", 5, 800, null, 3, "orig"],
+                       ["big", 5, 700, null, null, null]]
+        }))
+        .unwrap();
+        let seeds = section_stats_totals(&stats);
+        assert_eq!(
+            seeds,
+            vec![
+                ("topic:root".to_string(), 50),
+                ("topic:env".to_string(), 3),
+                ("topic:orig".to_string(), 3)
+            ],
+            "no seed for an unknown count"
+        );
+        // The store's total for a seeded topic, then a live reply after the
+        // answer, then the same reply again and an older one: 51.
+        let mut t = ChannelTotal {
+            counted: Some(50),
+            as_of: stats.as_of,
+            newer_ids: HashSet::new(),
+        };
+        for (id, ts) in [("r1", 1_005), ("r1", 1_005), ("r0", 990)] {
+            if ts > t.as_of {
+                t.newer_ids.insert(id.to_string());
+            }
+        }
+        assert_eq!(t.total(), Some(51));
+        // Which topic a live message grows: a reply's, never an edit's.
+        assert_eq!(
+            reply_topic(&reply_ev("r1", "ROOT", 1, None)).as_deref(),
+            Some("root")
+        );
+        assert_eq!(reply_topic(&reply_ev("e1", "ROOT", 1, Some("r1"))), None);
     }
 }

@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_36 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_37 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -68,3 +68,4 @@ _36 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2035](ADR-2035-kanban-agent-columns-close-the-dispatch-loop-through-a-governed-case.md) | A kanban agent column dispatches its cards to a registered agent, and the agent's result returns as a governed case | 2026-11-23 | proposed | partial | inactive | — | — | jjohare | nostr-rust-forum |
 | [ADR-2036](ADR-2036-shared-client-core-and-retro-tui-redesign.md) | Extract shared nostr-bbs-client-core engine and re-imagine the retro BBS client as a responsive desktop and mobile TUI | 2026-11-26 | accepted | complete | staged | ADR-2008 | — | jjohare | nostr-rust-forum |
 | [ADR-2037](ADR-2037-pin-a-section-to-a-zone-from-zone-config.md) | Pin an existing section to a zone from zone config | 2026-11-28 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
+| [ADR-2038](ADR-2038-one-request-returns-a-section-s-topic-stats.md) | One SECTION-STATS request returns every topic's last activity and reply count for a section | 2026-11-28 | accepted | complete | inactive | — | — | jjohare | nostr-rust-forum |

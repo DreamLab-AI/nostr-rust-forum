@@ -44,3 +44,6 @@ p256 = { workspace = true }
 [dev-dependencies]
 nostr-bbs-jev = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true }
+# ADR-2038: the section-stats correctness oracle is the clients' own
+# `classify_topics`, run natively over the same seeded events.
+nostr-bbs-client-core = { workspace = true }

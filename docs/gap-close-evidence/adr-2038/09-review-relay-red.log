@@ -1,0 +1,13 @@
+# RED: 2026-11-28T15:33:31Z at b2d2c7d + new tests/migration file only
+test relay_do::section_stats::tests::expiry_parses_as_the_req_path_does ... FAILED
+test relay_do::section_stats::tests::a_topic_buried_in_reactions_costs_a_bounded_walk ... FAILED
+test relay_do::section_stats::tests::a_small_section_does_not_pay_for_the_whole_relay ... FAILED
+thread 'relay_do::section_stats::tests::expiry_parses_as_the_req_path_does' (2047822) panicked at crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs:1236:5:
+assertion `left == right` failed: only the unparsable one stays
+  left: (Some(3), Some(130))
+ right: (Some(1), Some(130))
+thread 'relay_do::section_stats::tests::a_topic_buried_in_reactions_costs_a_bounded_walk' (2047821) panicked at crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs:1197:5:
+steps 66961 -> 150961: the walk must stop at its cap
+thread 'relay_do::section_stats::tests::a_small_section_does_not_pay_for_the_whole_relay' (2047820) panicked at crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs:1211:5:
+steps 139859 -> 909859
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 751 filtered out; finished in 2.61s

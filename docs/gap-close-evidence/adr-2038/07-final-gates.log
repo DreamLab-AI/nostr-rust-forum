@@ -1,0 +1,10 @@
+# 2026-11-28T15:14:42Z HEAD 34fa898736572f95b3daf1ced9a6987effe82bf3 (final gate pass)
+fmt exit 0
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+clippy exit 0
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+wasm exit 0
+   Generated /home/devuser/workspace/.tmp/section-stats-target/doc/nostr_bbs_ascii/index.html and 28 other files
+doc exit 0
+ok: 37 ADR(s) valid (--check, README not written)
+adr exit 0

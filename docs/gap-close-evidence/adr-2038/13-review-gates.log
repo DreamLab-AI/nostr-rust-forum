@@ -1,0 +1,13 @@
+# 2026-11-28T15:50:44Z HEAD 7c7da0cbae496abef9b3c2b3d10927740ade8359 (review-fix gate pass)
+fmt exit 0
+clippy exit 0
+wasm exit 0
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+   Generated /home/devuser/workspace/.tmp/section-stats-target/doc/nostr_bbs_ascii/index.html and 28 other files
+doc exit 0
+ok: 37 ADR(s) valid (--check, README not written)
+adr exit 0
+node --test crates/nostr-bbs-forum-client/tests/*.test.mjs -> 0
+bash scripts/adr-ratchet.sh docs/adr origin/fix/topic-list-stability HEAD -> 0
+bash scripts/anti-drift-lint.sh -> 0

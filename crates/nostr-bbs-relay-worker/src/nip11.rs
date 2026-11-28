@@ -274,6 +274,11 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
                 "agent_auth": "nip98",
                 "agent_identity": "did:nostr",
             },
+            // ADR-2038: the `SECTION-STATS` request (one section's topics
+            // with last activity and reply counts). Clients send it only to a
+            // relay that advertises it here, so an old relay never sees an
+            // unknown verb.
+            "section_stats": crate::relay_do::section_stats_advert(),
             // REC-6 share (WP-9): forum-side reflection of the agentbox
             // authority-boundary default. Scaffolded and schema-owned by
             // agentbox — see `escalation_defaults_block`.

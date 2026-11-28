@@ -340,34 +340,10 @@ pub fn zone_group_binding(zone: &str) -> Option<String> {
 /// repeatedly; later calls return at once when the cache is filled.
 #[cfg(target_arch = "wasm32")]
 pub async fn ensure_bindings_loaded() -> Result<(), String> {
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen_futures::JsFuture;
     if loaded_bindings().is_some() {
         return Ok(());
     }
-    let url = crate::utils::relay_url::relay_api_base();
-    let headers = web_sys::Headers::new().map_err(|_| "headers")?;
-    headers
-        .set("Accept", "application/nostr+json")
-        .map_err(|_| "headers")?;
-    let init = web_sys::RequestInit::new();
-    init.set_headers(&headers);
-    let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|_| "request")?;
-    let win = web_sys::window().ok_or("no window")?;
-    let resp: web_sys::Response = JsFuture::from(win.fetch_with_request(&req))
-        .await
-        .map_err(|_| "NIP-11 fetch failed")?
-        .dyn_into()
-        .map_err(|_| "NIP-11 response")?;
-    if !resp.ok() {
-        return Err(format!("NIP-11 HTTP {}", resp.status()));
-    }
-    let text = JsFuture::from(resp.text().map_err(|_| "NIP-11 body")?)
-        .await
-        .map_err(|_| "NIP-11 body")?
-        .as_string()
-        .ok_or("NIP-11 body")?;
-    let doc: serde_json::Value = serde_json::from_str(&text).map_err(|_| "NIP-11 JSON")?;
+    let doc = crate::relay::info::nip11().await?;
     set_zone_group_bindings(ZoneGroupBindings::from_nip11(&doc));
     Ok(())
 }
