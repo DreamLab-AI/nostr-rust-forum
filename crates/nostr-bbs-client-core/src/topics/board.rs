@@ -354,14 +354,10 @@ pub fn updated_label(n: usize) -> String {
     format!("\u{21bb} {n} updated")
 }
 
-/// Accessible name of the same control: what it does, then how many topics
-/// it moves.
+/// Accessible name of the same control: its visible text (WCAG 2.5.3,
+/// so a voice user can say what they see), then what it does.
 pub fn updated_accessible_name(n: usize) -> String {
-    if n == 1 {
-        "Re-sort topics by latest activity (1 topic updated)".to_string()
-    } else {
-        format!("Re-sort topics by latest activity ({n} topics updated)")
-    }
+    format!("{n} updated: re-sort topics by latest activity")
 }
 
 /// Derive a one-line topic title from the root post content.
@@ -852,13 +848,13 @@ mod tests {
     fn updated_control_wording() {
         assert_eq!(updated_label(3), "\u{21bb} 3 updated");
         assert_eq!(
-            updated_accessible_name(1),
-            "Re-sort topics by latest activity (1 topic updated)"
-        );
-        assert_eq!(
             updated_accessible_name(4),
-            "Re-sort topics by latest activity (4 topics updated)"
+            "4 updated: re-sort topics by latest activity"
         );
+        // The visible words are part of the accessible name.
+        let visible = updated_label(4);
+        let words = visible.trim_start_matches('\u{21bb}').trim();
+        assert!(updated_accessible_name(4).starts_with(words));
     }
 
     #[test]

@@ -331,10 +331,14 @@ fn replies_label(n: u32) -> String {
     }
 }
 
-/// The "↻ N updated" control beside the topic count: always laid out (and
-/// made `invisible` at zero), so its appearing never moves the list.
+/// The "↻ N updated" control beside the topic count: always laid out, so
+/// its appearing never moves the list.
 pub(crate) const UPDATED_CLASS: &str = "inline-block ml-2 mt-2 text-xs whitespace-nowrap \
      za-text hover:opacity-80 underline underline-offset-2";
+/// The same control at zero: laid out but `invisible` (not seen, focused or
+/// read out). A literal class string, so the Tailwind scan sees it.
+pub(crate) const UPDATED_HIDDEN_CLASS: &str = "inline-block ml-2 mt-2 text-xs whitespace-nowrap \
+     za-text hover:opacity-80 underline underline-offset-2 invisible";
 
 #[cfg(test)]
 mod tests {
@@ -414,9 +418,19 @@ mod tests {
 
     #[test]
     fn updated_control_holds_its_place() {
-        let c = classes(UPDATED_CLASS);
-        assert!(c.contains(&"inline-block") && c.contains(&"whitespace-nowrap"));
-        assert!(!c.contains(&"block") && !c.contains(&"flex"));
+        let shown = classes(UPDATED_CLASS);
+        assert!(shown.contains(&"inline-block") && shown.contains(&"whitespace-nowrap"));
+        assert!(!shown.contains(&"block") && !shown.contains(&"flex"));
+        assert!(!shown.contains(&"invisible"));
+        // Hidden is the same box made invisible: never `hidden` (which
+        // would take its space away and move the list when it appears).
+        let hidden = classes(UPDATED_HIDDEN_CLASS);
+        assert!(hidden.contains(&"invisible") && !hidden.contains(&"hidden"));
+        let mut rest: Vec<&str> = hidden.into_iter().filter(|c| *c != "invisible").collect();
+        let mut same = shown.clone();
+        rest.sort_unstable();
+        same.sort_unstable();
+        assert_eq!(rest, same);
     }
 
     #[test]

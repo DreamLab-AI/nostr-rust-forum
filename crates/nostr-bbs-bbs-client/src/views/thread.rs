@@ -127,6 +127,23 @@ fn main_pane() -> Option<web_sys::HtmlElement> {
         .ok()
 }
 
+/// Whether row `id` (its `data-anchor-id`) is at least partly visible in
+/// the content pane.
+fn row_in_pane(id: &str) -> bool {
+    let Some(pane) = main_pane() else {
+        return false;
+    };
+    let id: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
+    let view = pane.get_bounding_client_rect();
+    pane.query_selector(&format!("[data-anchor-id=\"{id}\"]"))
+        .ok()
+        .flatten()
+        .is_some_and(|el| {
+            let r = el.get_bounding_client_rect();
+            r.bottom() > view.top() && r.top() < view.bottom()
+        })
+}
+
 /// Page `key`'s list one step (`older`, else newer) keeping the reader's
 /// place: the row on screen before the page lands is where it is after.
 /// Called from click handlers, which have no reactive owner: the store is
@@ -345,7 +362,10 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                 (next != *current).then_some(next)
             });
             if let Some(next) = next {
-                let anchor = if was {
+                // Keep the row on screen where it is, unless the reader is
+                // at the top of the board, where a new topic should be seen.
+                let at_top = order.with_untracked(|o| o.first().is_some_and(|id| row_in_pane(id)));
+                let anchor = if was && !at_top {
                     scroll_anchor::capture(main_pane().as_deref())
                 } else {
                     None

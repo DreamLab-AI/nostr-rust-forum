@@ -49,6 +49,7 @@ use crate::components::message_input::MessageInput;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::topic_list::{
     classify_topics, with_topic_stats, TopicList, TopicListSkeleton, TopicSummary, UPDATED_CLASS,
+    UPDATED_HIDDEN_CLASS,
 };
 use crate::components::zone_hero::ZoneHero;
 use crate::relay::{ConnectionState, RelayConnection};
@@ -235,6 +236,31 @@ fn list_branch(
 struct OrderState {
     cid: Option<String>,
     frozen: bool,
+}
+
+/// Whether topic row `id` (its `data-anchor-id`) is at least partly in the
+/// window's viewport.
+fn row_in_view(id: &str) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let height = window
+        .inner_height()
+        .ok()
+        .and_then(|h| h.as_f64())
+        .unwrap_or(0.0);
+    let id: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
+    window
+        .document()
+        .and_then(|d| {
+            d.query_selector(&format!("[data-anchor-id=\"{id}\"]"))
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|el| {
+            let r = el.get_bounding_client_rect();
+            r.bottom() > 0.0 && r.top() < height
+        })
 }
 
 #[component]
@@ -583,8 +609,10 @@ pub fn SectionPage() -> impl IntoView {
             });
             if let Some(next) = next {
                 // A frozen list only gains rows at its ends or loses some:
-                // keep the row on screen where it is.
-                let anchor = if frozen {
+                // keep the row on screen where it is, unless the reader is
+                // at the top of the list, where a new topic should be seen.
+                let at_top = order.with_untracked(|o| o.first().is_some_and(|id| row_in_view(id)));
+                let anchor = if frozen && !at_top {
                     scroll_anchor::capture(None)
                 } else {
                     None
@@ -748,8 +776,11 @@ pub fn SectionPage() -> impl IntoView {
                     // moves the list below.
                     <button
                         type="button"
-                        class=UPDATED_CLASS
-                        class:invisible=move || updated.try_get().unwrap_or(0) == 0
+                        class=move || if updated.try_get().unwrap_or(0) == 0 {
+                            UPDATED_HIDDEN_CLASS
+                        } else {
+                            UPDATED_CLASS
+                        }
                         disabled=move || updated.try_get().unwrap_or(0) == 0
                         aria-label=move || updated_accessible_name(updated.try_get().unwrap_or(0))
                         title="Re-sort by latest activity"
