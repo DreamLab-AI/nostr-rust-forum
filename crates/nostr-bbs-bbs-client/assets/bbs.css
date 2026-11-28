@@ -581,6 +581,66 @@ html.bbs-crt-off .bbs-crt::after {
   margin: 0;
 }
 
+/* Board topic rows: every line has a fixed height, so fields that arrive
+ * late (the relay's reply total and newest reply, a decrypted title in an
+ * encrypted zone, "started by" once someone else replies) never change a
+ * row's height and push the rows below it. Neither line wraps: the title
+ * ellipsises on one line (two on phones, below), the people truncate, and
+ * the reply count and time keep their width. */
+.bbs-topic-head,
+.bbs-topic-meta {
+  flex-wrap: nowrap;
+}
+.bbs-topic-head {
+  align-items: flex-start;
+}
+.bbs-topic-title-row {
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  min-width: 0;
+}
+.bbs-topic-title-row > .bbs-badge,
+.bbs-topic-replies,
+.bbs-topic-time {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.bbs-topic-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* One line's height (body line-height 1.5) even while empty. */
+  min-height: 1.5em;
+}
+.bbs-topic-people {
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+}
+.bbs-topic-people > * {
+  flex: 0 0 auto;
+}
+.bbs-topic-people > .bbs-author-chip {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The "re-sort" control is always laid out; at zero it keeps its space but
+ * is not seen, focused or read out, so its appearing moves nothing. */
+.bbs-hidden-keep-space {
+  visibility: hidden;
+}
+.bbs-updated-btn {
+  white-space: nowrap;
+}
+
 .tui-empty {
   text-align: center;
   padding: 1.6rem 1rem;
@@ -1661,6 +1721,19 @@ html.bbs-reduced-motion .sentry-radar::before {
   }
   .tui-card {
     padding: 0.4rem 0.4rem;
+  }
+  /* At 2x a phone holds ~20 columns: the topic title may take two lines,
+   * and always takes two lines' height, so a long encrypted-zone
+   * placeholder that decrypts to a short title (or the reverse) keeps the
+   * row's height. */
+  .bbs-topic-title {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    min-height: 3em;
   }
   .bbs-post {
     padding: 0.35rem 0.4rem;

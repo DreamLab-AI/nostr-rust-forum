@@ -190,6 +190,14 @@ pub struct ChannelStore {
     roots_targets: StoredValue<HashMap<String, String>>,
     /// Channels whose root list has been answered (reactive).
     roots_answered: RwSignal<HashSet<String>>,
+    /// Channels whose last root-list request failed (timed out, or refused
+    /// by the relay after its retry) and has not answered since. Its target
+    /// is cleared, so a later request past the backoff asks again.
+    roots_failed: RwSignal<HashSet<String>>,
+    /// Root-list key -> its failure backoff ([`RootsBackoff`]): a failed
+    /// root list is not asked again before its `retry_at`, however often a
+    /// view asks, except on a new visit ([`Self::rearm_topic_roots`]).
+    roots_backoff: StoredValue<HashMap<String, RootsBackoff>>,
     /// Channels whose root list came back under its limit: every marked
     /// topic root is held, so channel history paging lists no new topic.
     roots_complete: RwSignal<HashSet<String>>,
@@ -255,6 +263,8 @@ impl ChannelStore {
             topic_targets: StoredValue::new(HashMap::new()),
             roots_targets: StoredValue::new(HashMap::new()),
             roots_answered: RwSignal::new(HashSet::new()),
+            roots_failed: RwSignal::new(HashSet::new()),
+            roots_backoff: StoredValue::new(HashMap::new()),
             roots_complete: RwSignal::new(HashSet::new()),
             topic_latest: RwSignal::new(HashMap::new()),
             topic_stats_asked: StoredValue::new(HashSet::new()),
@@ -617,12 +627,13 @@ impl ChannelStore {
                         created_at: event.created_at,
                     };
 
+                    // Notifies only when the channel is new: a cached
+                    // channel the relay re-sends (every reconnect and AUTH
+                    // replay) changes nothing a page could show.
                     let mut inserted = false;
-                    channels_sig.update(|list| {
-                        if !list.iter().any(|c| c.id == meta.id) {
-                            list.push(meta);
-                            inserted = true;
-                        }
+                    channels_sig.maybe_update(|list| {
+                        inserted = push_channel_if_new(list, meta);
+                        inserted
                     });
 
                     // Apply any edit that outran this creation on the wire.
@@ -689,9 +700,8 @@ impl ChannelStore {
                         }));
                 }
             } else {
-                channels_sig.update(|list| {
-                    list.retain(|c| ids.contains(&c.id));
-                });
+                // Notifies only when a channel was actually pruned.
+                channels_sig.maybe_update(|list| retain_relay_channels(list, &ids));
                 // Drop edit timestamps for pruned channels so the cache stays
                 // in step with the live channel set.
                 store_for_eose
@@ -1253,18 +1263,39 @@ impl ChannelStore {
     /// channel) into the unwindowed list [`roots_key`]`(cid)`. A section can
     /// then list every topic, dormant ones included, and a deep link's slug
     /// (an id prefix) is matched against it.
+    ///
+    /// A request that failed is only repeated when this is called again
+    /// after its backoff has run out (from [`PAGE_TIMEOUT_MS`], doubling to
+    /// five minutes), or after a new visit ([`Self::rearm_topic_roots`]).
+    /// Nothing calls it when the backoff expires: callers re-run it on a
+    /// revisit or when the channel's history changes. Views re-run it on
+    /// every message, and a relay refusing subscriptions must not get two
+    /// more REQs per message.
     pub fn request_topic_roots(&self, relay: &RelayConnection, cid: &str, wait_auth: bool) {
         let key = roots_key(cid);
         let fresh = self.roots_targets.with_value(|m| !m.contains_key(&key));
-        if !fresh {
+        let now = js_sys::Date::now();
+        let backed_off = self
+            .roots_backoff
+            .with_value(|m| m.get(&key).is_some_and(|b| !b.may_ask(now)));
+        if !fresh || backed_off {
             return;
         }
         self.roots_targets.update_value(|m| {
             m.insert(key.clone(), cid.to_string());
         });
+        // A new request: the last failure no longer settles this visit's
+        // root list (a board would otherwise freeze at once without it).
+        if self.roots_failed.with_untracked(|s| s.contains(cid)) {
+            self.roots_failed.update(|s| {
+                clear_roots_failure(s, cid);
+            });
+        }
         let store = *self;
         let channel = cid.to_string();
-        self.one_shot_page(
+        let failed_channel = cid.to_string();
+        let failed_key = key.clone();
+        self.one_shot_page_or_fail(
             relay,
             &key,
             Filter {
@@ -1277,6 +1308,15 @@ impl ChannelStore {
             wait_auth,
             Box::new(move |events, page| {
                 let held = !events.is_empty();
+                let _ = store.roots_backoff.try_update_value(|m| {
+                    m.remove(&roots_key(&channel));
+                });
+                // Answered after all: no longer failed.
+                if store.roots_failed.with_untracked(|s| s.contains(&channel)) {
+                    store.roots_failed.update(|s| {
+                        s.remove(&channel);
+                    });
+                }
                 store.apply_page(events);
                 if held && page.delivered < RELAY_FILTER_LIMIT {
                     store.roots_complete.update(|s| {
@@ -1287,7 +1327,45 @@ impl ChannelStore {
                     s.insert(channel);
                 });
             }),
+            Box::new(move || {
+                // Unanswered: forget the target and back off, so a later
+                // call past the backoff (or a revisit) asks again, and
+                // record the failure (a page must not wait on an answer
+                // that will never come).
+                let now = js_sys::Date::now();
+                let _ = store.roots_backoff.try_update_value(|m| {
+                    m.entry(failed_key.clone()).or_default().failed(now);
+                });
+                let _ = store.roots_targets.try_update_value(|m| {
+                    m.remove(&failed_key);
+                });
+                let _ = store.roots_failed.try_update(|s| {
+                    s.insert(failed_channel);
+                });
+            }),
         );
+    }
+
+    /// A new visit to channel `cid`'s list (a page mounted, or switched to
+    /// this channel): a root list that failed may be asked again at once,
+    /// whatever its backoff. Call it once per visit, never from an effect
+    /// that re-runs on traffic.
+    pub fn rearm_topic_roots(&self, cid: &str) {
+        let key = roots_key(cid);
+        self.roots_backoff.update_value(|m| {
+            if let Some(b) = m.get_mut(&key) {
+                b.rearm();
+            }
+        });
+    }
+
+    /// Whether channel `cid`'s last root-list request failed (no answer
+    /// within [`PAGE_TIMEOUT_MS`], or refused after its retry), and neither
+    /// an answer nor a new request has come since. A later
+    /// [`Self::request_topic_roots`] past the backoff, or on a revisit,
+    /// asks again (and clears this). Reactive.
+    pub fn topic_roots_failed(&self, cid: &str) -> bool {
+        self.roots_failed.with(|s| s.contains(cid))
     }
 
     /// Whether channel `cid`'s root list is complete: answered under its
@@ -1436,6 +1514,26 @@ impl ChannelStore {
                 z.forget(std::slice::from_ref(&ev.id));
             }
         }
+    }
+
+    /// Whether a deletion of message `id` by `author` is honoured: the
+    /// store's own admission decision ([`tombstones::admits`]), with `id`
+    /// judged as a restored sealed original when the zone cache says it is
+    /// one. A topic list uses it to tell a deleted topic from one merely
+    /// evicted from the history window. Read-only, not tracked.
+    pub fn deletion_honoured(
+        &self,
+        zone_keys: Option<ZoneKeyStore>,
+        id: &str,
+        author: &str,
+    ) -> bool {
+        let sealed = is_restored_original(zone_keys, id);
+        let admin = self.signer_admin;
+        self.tombstones.with_untracked(|t| {
+            deletion_honoured_by(t, id, sealed.then_some(author), |d| {
+                admin.is_admin_untracked(d)
+            })
+        })
     }
 
     /// Topic `root`'s newest reply as the relay answered it, as
@@ -1596,7 +1694,22 @@ impl ChannelStore {
         wait_auth: bool,
         on_done: PageDone,
     ) {
-        self.one_shot_attempt(relay, cid, filter, wait_auth, on_done, 1);
+        self.one_shot_attempt(relay, cid, filter, wait_auth, on_done, None, 1);
+    }
+
+    /// [`Self::one_shot_page`], calling `on_fail` instead of `on_done` when
+    /// the page is abandoned: no answer within [`PAGE_TIMEOUT_MS`], or
+    /// refused (CLOSED) on its last attempt.
+    fn one_shot_page_or_fail(
+        &self,
+        relay: &RelayConnection,
+        cid: &str,
+        filter: Filter,
+        wait_auth: bool,
+        on_done: PageDone,
+        on_fail: PageFailed,
+    ) {
+        self.one_shot_attempt(relay, cid, filter, wait_auth, on_done, Some(on_fail), 1);
     }
 
     /// One attempt of [`Self::one_shot_page`]. A CLOSED answer (the relay
@@ -1604,7 +1717,12 @@ impl ChannelStore {
     /// marks this attempt failed: its subscription is dropped, what it
     /// buffered is forgotten, and with `retries` left the page is requested
     /// again on a fresh subscription; otherwise the cursor is released so a
-    /// later scroll asks again.
+    /// later scroll asks again. `on_fail`, if any, runs when the page is
+    /// abandoned (timeout, or CLOSED with no retries left).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the page's request, its two outcomes and its retry budget travel together"
+    )]
     fn one_shot_attempt(
         &self,
         relay: &RelayConnection,
@@ -1612,6 +1730,7 @@ impl ChannelStore {
         filter: Filter,
         wait_auth: bool,
         on_done: PageDone,
+        on_fail: Option<PageFailed>,
         retries: u8,
     ) {
         let retry_filter = filter.clone();
@@ -1626,6 +1745,7 @@ impl ChannelStore {
             done: bool,
             sub: Option<String>,
             on_done: Option<PageDone>,
+            on_fail: Option<PageFailed>,
         }
         let buf = Rc::new(RefCell::new(Buf {
             delivered: 0,
@@ -1634,6 +1754,7 @@ impl ChannelStore {
             done: false,
             sub: None,
             on_done: Some(on_done),
+            on_fail,
         }));
         let store = *self;
         let zone_keys = self.zone_store();
@@ -1672,6 +1793,7 @@ impl ChannelStore {
                         return;
                     }
                     b.done = true;
+                    b.on_fail = None;
                     let page = PageOutcome {
                         delivered: b.delivered,
                         oldest: b.oldest,
@@ -1701,7 +1823,7 @@ impl ChannelStore {
             let relay = relay.clone();
             let key = key.clone();
             Rc::new(move |reason: String| {
-                let (sub, buffered, done) = {
+                let (sub, buffered, done, on_fail) = {
                     let mut b = buf.borrow_mut();
                     if b.done {
                         return;
@@ -1711,6 +1833,7 @@ impl ChannelStore {
                         b.sub.take(),
                         std::mem::take(&mut b.events),
                         b.on_done.take(),
+                        b.on_fail.take(),
                     )
                 };
                 if let Some(id) = sub {
@@ -1728,15 +1851,21 @@ impl ChannelStore {
                         c.loading = false;
                     }
                 });
-                if let (Some(on_done), true) = (done, retries > 0) {
-                    store.one_shot_attempt(
+                match (done, retries > 0) {
+                    (Some(on_done), true) => store.one_shot_attempt(
                         &relay,
                         &key,
                         retry_filter.clone(),
                         wait_auth,
                         on_done,
+                        on_fail,
                         retries - 1,
-                    );
+                    ),
+                    _ => {
+                        if let Some(f) = on_fail {
+                            f();
+                        }
+                    }
                 }
             })
         };
@@ -1750,14 +1879,18 @@ impl ChannelStore {
         let relay = relay.clone();
         crate::utils::set_timeout_once(
             move || {
-                let (sub, buffered) = {
+                let (sub, buffered, on_fail) = {
                     let mut b = buf.borrow_mut();
                     if b.done {
                         return;
                     }
                     b.done = true;
                     b.on_done = None;
-                    (b.sub.take(), std::mem::take(&mut b.events))
+                    (
+                        b.sub.take(),
+                        std::mem::take(&mut b.events),
+                        b.on_fail.take(),
+                    )
                 };
                 if let Some(id) = sub {
                     relay.unsubscribe(&id);
@@ -1771,6 +1904,9 @@ impl ChannelStore {
                         c.loading = false;
                     }
                 });
+                if let Some(f) = on_fail {
+                    f();
+                }
             },
             PAGE_TIMEOUT_MS as i32,
         );
@@ -2098,6 +2234,240 @@ fn buffer_pending_meta(pending: &mut HashMap<String, MetaUpdate>, update: MetaUp
     }
 }
 
+/// Backoff of one failed root-list request: not asked again before
+/// `retry_at` (ms since the epoch), the wait starting at
+/// [`PAGE_TIMEOUT_MS`] and doubling per failure up to
+/// [`ROOTS_BACKOFF_CAP_MS`]. A new visit re-arms it at once; an answer
+/// clears it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RootsBackoff {
+    failures: u32,
+    retry_at: f64,
+}
+
+/// Longest wait between two asks of a failing root list.
+const ROOTS_BACKOFF_CAP_MS: f64 = 300_000.0;
+
+impl RootsBackoff {
+    /// Wait after the `failures`-th failure in a row.
+    fn wait_ms(failures: u32) -> f64 {
+        let doublings = failures.saturating_sub(1).min(16);
+        (f64::from(PAGE_TIMEOUT_MS) * f64::from(1u32 << doublings)).min(ROOTS_BACKOFF_CAP_MS)
+    }
+
+    /// Record a failure at `now`.
+    fn failed(&mut self, now: f64) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = now + Self::wait_ms(self.failures);
+    }
+
+    /// A new visit: ask again now. The failure count stays, so a relay that
+    /// keeps refusing backs off further each time.
+    fn rearm(&mut self) {
+        self.retry_at = 0.0;
+    }
+
+    /// Whether the root list may be asked at `now`.
+    fn may_ask(&self, now: f64) -> bool {
+        now >= self.retry_at
+    }
+}
+
+#[cfg(test)]
+mod roots_backoff_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_root_list_waits_doubling_up_to_the_cap() {
+        let mut b = RootsBackoff::default();
+        assert!(b.may_ask(0.0), "never failed: ask");
+        b.failed(1_000.0);
+        assert!(!b.may_ask(1_000.0 + 19_999.0), "within PAGE_TIMEOUT_MS");
+        assert!(b.may_ask(1_000.0 + 20_000.0));
+        b.failed(50_000.0);
+        assert_eq!(b.retry_at, 50_000.0 + 40_000.0);
+        for _ in 0..20 {
+            b.failed(0.0);
+        }
+        assert_eq!(b.retry_at, ROOTS_BACKOFF_CAP_MS, "capped");
+    }
+
+    #[test]
+    fn every_message_in_between_is_refused() {
+        // A view re-asking on each incoming message gets nothing out
+        // until the wait has run out.
+        let mut b = RootsBackoff::default();
+        b.failed(0.0);
+        let asked = (0..200)
+            .map(|i| f64::from(i) * 100.0)
+            .filter(|t| b.may_ask(*t))
+            .count();
+        assert_eq!(asked, 0);
+    }
+
+    #[test]
+    fn a_new_visit_rearms_at_once_but_keeps_the_count() {
+        let mut b = RootsBackoff::default();
+        b.failed(0.0);
+        b.failed(0.0);
+        b.rearm();
+        assert!(b.may_ask(1.0));
+        b.failed(10.0);
+        assert_eq!(b.retry_at, 10.0 + 80_000.0, "third failure: 4x");
+    }
+}
+
+/// Forget channel `cid`'s root-list failure, as a new request goes out.
+/// Returns whether it was recorded.
+fn clear_roots_failure(failed: &mut HashSet<String>, cid: &str) -> bool {
+    failed.remove(cid)
+}
+
+#[cfg(test)]
+mod roots_failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_request_unsettles_a_failed_root_list() {
+        // Fail, leave, return: the new request clears the failure, so the
+        // list is unsettled (answered nor failed) until the new answer.
+        let mut failed: HashSet<String> = ["c".to_string()].into_iter().collect();
+        assert!(clear_roots_failure(&mut failed, "c"));
+        assert!(!failed.contains("c"));
+        assert!(!clear_roots_failure(&mut failed, "c"));
+    }
+}
+
+/// Whether `tombstones` hide message `id`: [`tombstones::admits`] refuses
+/// it, as a restored sealed original of `sealed_author` when given, else
+/// as an ordinary message.
+fn deletion_honoured_by(
+    tombstones: &Tombstones,
+    id: &str,
+    sealed_author: Option<&str>,
+    is_admin: impl Fn(&str) -> bool,
+) -> bool {
+    let target = match sealed_author {
+        Some(author) => Target::SealedOriginal { author },
+        None => Target::Ordinary,
+    };
+    !tombstones::admits(tombstones, id, target, is_admin)
+}
+
+#[cfg(test)]
+mod deletion_honoured_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_honoured_deletion_hides_a_topic() {
+        let mut t = Tombstones::default();
+        assert!(!deletion_honoured_by(&t, "x", None, |_| false), "no kind-5");
+        // A kind-5 by someone who is neither the author nor an admin, on a
+        // restored sealed original: recorded, not honoured.
+        t.record("sealed", "mallory");
+        assert!(!deletion_honoured_by(&t, "sealed", Some("alice"), |_| {
+            false
+        }));
+        // By the author, or by a relay-vouched admin: honoured.
+        assert!(deletion_honoured_by(&t, "sealed", Some("mallory"), |_| {
+            false
+        }));
+        assert!(deletion_honoured_by(&t, "sealed", Some("alice"), |d| d == "mallory"));
+        // An ordinary message: the relay gated the deletion.
+        t.record("plain", "bob");
+        assert!(deletion_honoured_by(&t, "plain", None, |_| false));
+    }
+}
+
+/// Append `meta` to the channel list unless a channel with its id is
+/// already listed. Returns whether the list changed, so the caller notifies
+/// readers only then.
+fn push_channel_if_new(list: &mut Vec<ChannelMeta>, meta: ChannelMeta) -> bool {
+    if list.iter().any(|c| c.id == meta.id) {
+        return false;
+    }
+    list.push(meta);
+    true
+}
+
+/// Keep only the channels the relay delivered (`ids`). Returns whether any
+/// was dropped, so the caller notifies readers only then.
+fn retain_relay_channels(list: &mut Vec<ChannelMeta>, ids: &HashSet<String>) -> bool {
+    let before = list.len();
+    list.retain(|c| ids.contains(&c.id));
+    list.len() != before
+}
+
+#[cfg(test)]
+mod channel_list_tests {
+    use super::*;
+
+    fn meta(id: &str) -> ChannelMeta {
+        ChannelMeta {
+            id: id.into(),
+            name: id.into(),
+            description: String::new(),
+            section: String::new(),
+            section_tag: String::new(),
+            picture: String::new(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn a_channel_already_listed_is_not_a_change() {
+        let mut list = vec![meta("a")];
+        assert!(!push_channel_if_new(&mut list, meta("a")));
+        assert_eq!(list.len(), 1);
+        assert!(push_channel_if_new(&mut list, meta("b")));
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn pruning_nothing_is_not_a_change() {
+        let mut list = vec![meta("a"), meta("b")];
+        let all: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert!(!retain_relay_channels(&mut list, &all));
+        assert_eq!(list.len(), 2);
+        let some: HashSet<String> = ["b".to_string()].into_iter().collect();
+        assert!(retain_relay_channels(&mut list, &some));
+        assert_eq!(
+            list.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_list_does_not_notify() {
+        // The signal-level contract the section page relies on: a re-sent
+        // channel and a prune that drops nothing leave readers untouched.
+        let owner = Owner::new();
+        owner.with(|| {
+            let sig = RwSignal::new(vec![meta("a")]);
+            let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = runs.clone();
+            let memo = Memo::new(move |_| {
+                sig.track();
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+            memo.get_untracked();
+            let start = runs.load(std::sync::atomic::Ordering::Relaxed);
+            sig.maybe_update(|l| push_channel_if_new(l, meta("a")));
+            let ids: HashSet<String> = ["a".to_string()].into_iter().collect();
+            sig.maybe_update(|l| retain_relay_channels(l, &ids));
+            memo.get_untracked();
+            assert_eq!(
+                runs.load(std::sync::atomic::Ordering::Relaxed),
+                start,
+                "no change, no notification"
+            );
+            sig.maybe_update(|l| push_channel_if_new(l, meta("b")));
+            memo.get_untracked();
+            assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), start + 1);
+        });
+    }
+}
+
 // -- kind-5 deletion folding (post deletion) ----------------------------------
 
 /// Most rows the relay returns for one filter (`MAX_QUERY_LIMIT` in the relay
@@ -2171,6 +2541,9 @@ fn env_window(name: &str, default: usize) -> usize {
 /// What a history page request hands back once answered: the ingested
 /// messages and what the relay delivered.
 type PageDone = Box<dyn FnOnce(Vec<(String, NostrEvent)>, PageOutcome)>;
+/// Called once when a one-shot page is abandoned (see
+/// `one_shot_page_or_fail`).
+type PageFailed = Box<dyn FnOnce()>;
 
 /// A channel's true message total: the relay's NIP-45 COUNT of its kind-42s
 /// up to `as_of` (inclusive), plus the distinct messages newer than `as_of`
