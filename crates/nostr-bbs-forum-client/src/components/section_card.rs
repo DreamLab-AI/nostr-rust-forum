@@ -45,11 +45,13 @@ pub fn SectionCard(
         format!("{} messages", message_count)
     };
 
-    // "New" badge: show if last activity was within the past 24 hours
-    let is_recent = {
-        let now = (js_sys::Date::now() / 1000.0) as u64;
-        last_activity > 0 && now.saturating_sub(last_activity) < 86400
-    };
+    // "New" badge: activity since this channel was last read, by the same
+    // read position the forum index's "N new" chip uses (and that opening
+    // the section or a topic advances). It used to be "active in the past 24
+    // hours", which no amount of reading cleared.
+    let last_read =
+        crate::stores::read_position::use_read_positions().last_read_timestamp(channel_id.clone());
+    let is_recent = move || section_is_new(last_activity, last_read.get());
 
     let has_desc = !description.is_empty();
 
@@ -90,7 +92,7 @@ pub fn SectionCard(
                         <h3 class="font-semibold text-white za-group-hover-text truncate">
                             {name}
                         </h3>
-                        {is_recent.then(|| view! {
+                        {move || is_recent().then(|| view! {
                             <span class="text-[10px] font-bold uppercase tracking-wider text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 rounded px-1.5 py-0.5">
                                 "new"
                             </span>
@@ -128,5 +130,25 @@ pub fn SectionCard(
                 </span>
             </div>
         </A>
+    }
+}
+
+/// Whether a section card shows "new": it has activity newer than the
+/// channel's read position (a channel never opened has none).
+fn section_is_new(last_activity: u64, last_read: u64) -> bool {
+    last_activity > 0 && last_activity > last_read
+}
+
+#[cfg(test)]
+mod new_flag_tests {
+    use super::section_is_new;
+
+    #[test]
+    fn new_clears_once_the_section_is_read() {
+        assert!(section_is_new(100, 0), "never opened");
+        assert!(section_is_new(100, 99), "a post since the last read");
+        assert!(!section_is_new(100, 100), "read up to the newest post");
+        assert!(!section_is_new(100, 150));
+        assert!(!section_is_new(0, 0), "no activity at all");
     }
 }

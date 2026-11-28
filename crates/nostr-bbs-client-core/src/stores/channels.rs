@@ -102,6 +102,52 @@ struct CachedData {
     synced_at: u64,
 }
 
+// -- Inserted-message hook ----------------------------------------------------
+
+/// What a listener learns about one kind-42 the store has just inserted into a
+/// list (see [`ChannelStore::on_inserted`]). Taken from the event as stored,
+/// so for an encrypted zone it describes the decrypted post when its key was
+/// held. Carries no content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InsertedMessage {
+    /// The list the message went into: a channel id, a [`roots_key`] or a
+    /// [`topic_key`].
+    pub list: String,
+    /// Event id.
+    pub id: String,
+    /// Author pubkey as stored (the original author once decrypted).
+    pub pubkey: String,
+    /// The event's `created_at`.
+    pub created_at: u64,
+    /// The topic root it replies to, lower-case
+    /// ([`nostr_bbs_core::sealed::reply_root_of`]); `None` for a topic root.
+    pub reply_root: Option<String>,
+    /// Whether it is an edit of another post (`["e", id, "", "edit"]`).
+    pub edit: bool,
+    /// For a sealed envelope still locked (no zone key yet), the id of the
+    /// original it wraps; its author is unknown until it opens. `None` for
+    /// any other post, including a restored original.
+    pub sealed_inner: Option<String>,
+}
+
+impl InsertedMessage {
+    /// Describe `ev` as inserted into list `list`.
+    pub fn of(list: &str, ev: &NostrEvent) -> Self {
+        Self {
+            list: list.to_string(),
+            id: ev.id.clone(),
+            pubkey: ev.pubkey.clone(),
+            created_at: ev.created_at,
+            reply_root: nostr_bbs_core::sealed::reply_root_of(ev).map(str::to_lowercase),
+            edit: crate::topics::thread::edit_target_of(ev).is_some(),
+            sealed_inner: nostr_bbs_core::sealed::parse_sealed(&ev.tags).map(|s| s.inner_id),
+        }
+    }
+}
+
+/// A listener registered with [`ChannelStore::on_inserted`].
+pub type InsertedCallback = Rc<dyn Fn(&[InsertedMessage])>;
+
 // -- ChannelStore -------------------------------------------------------------
 
 /// Global channel store provided via Leptos context.
@@ -218,6 +264,9 @@ pub struct ChannelStore {
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
     first_pages: StoredValue<HashMap<String, FirstPageSnapshot>>,
+    /// Listeners told once per batch of genuinely new messages
+    /// ([`ChannelStore::on_inserted`]).
+    inserted_hooks: StoredValue<Vec<InsertedCallback>, leptos::prelude::LocalStorage>,
     /// Section stats (ADR-2038) per channel id: pending, answered or failed
     /// for this visit (reactive). Cleared per visit by
     /// [`ChannelStore::rearm_section_stats`].
@@ -279,11 +328,35 @@ impl ChannelStore {
             topic_stats_queue: StoredValue::new(std::collections::VecDeque::new()),
             topic_stats_busy: StoredValue::new(false),
             first_pages: StoredValue::new(HashMap::new()),
+            inserted_hooks: StoredValue::new_local(Vec::new()),
             section_stats: RwSignal::new(HashMap::new()),
             section_stats_gen: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
         store
+    }
+
+    /// Register `f` to be told about messages newly inserted into any list,
+    /// once per batch: once per page in [`Self::apply_page`] and once per
+    /// live or channel-history delivery. Duplicates already held are not
+    /// reported. `f` runs synchronously after the store update, outside any
+    /// reactive owner, and must not register further listeners.
+    pub fn on_inserted(&self, f: InsertedCallback) {
+        self.inserted_hooks.update_value(|h| h.push(f));
+    }
+
+    /// Tell every [`Self::on_inserted`] listener about `batch`.
+    fn notify_inserted(&self, batch: &[InsertedMessage]) {
+        if batch.is_empty() {
+            return;
+        }
+        let hooks = self
+            .inserted_hooks
+            .try_with_value(|h| h.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook(batch);
+        }
     }
 
     /// When the relay vouches for a new admin, drop the restored sealed
@@ -861,6 +934,7 @@ impl ChannelStore {
                 let mut newly_added = false;
                 let event_ts = event.created_at;
                 let event_id = event.id.clone();
+                let inserted = InsertedMessage::of(&cid, &event);
                 let topic = reply_topic(&event);
                 channel_msgs.update(|m| {
                     let events = m.entry(cid.clone()).or_insert_with(Vec::new);
@@ -879,6 +953,7 @@ impl ChannelStore {
                             *ts = event_ts;
                         }
                     });
+                    store.notify_inserted(std::slice::from_ref(&inserted));
                 }
             }
         });
@@ -998,6 +1073,7 @@ impl ChannelStore {
             let mut newly_added = false;
             let event_ts = event.created_at;
             let event_id = event.id.clone();
+            let inserted = InsertedMessage::of(&cid, &event);
             let topic = reply_topic(&event);
             channel_msgs.update(|m| {
                 let events = m.entry(cid.clone()).or_insert_with(Vec::new);
@@ -1016,6 +1092,7 @@ impl ChannelStore {
                         *ts = event_ts;
                     }
                 });
+                store.notify_inserted(std::slice::from_ref(&inserted));
             }
         });
 
@@ -1152,13 +1229,16 @@ impl ChannelStore {
         }
         let mut newest: HashMap<String, u64> = HashMap::new();
         let mut inserted: Vec<(String, String, u64, Option<String>)> = Vec::new();
+        let mut hooked: Vec<InsertedMessage> = Vec::new();
         self.channel_messages.update(|m| {
             for (cid, ev) in events {
                 let ts = ev.created_at;
                 let id = ev.id.clone();
                 let topic = reply_topic(&ev);
+                let meta = InsertedMessage::of(&cid, &ev);
                 if insert_message(m.entry(cid.clone()).or_default(), ev) {
                     inserted.push((cid.clone(), id, ts, topic));
+                    hooked.push(meta);
                     let n = newest.entry(cid).or_insert(0);
                     *n = (*n).max(ts);
                 }
@@ -1186,6 +1266,7 @@ impl ChannelStore {
                 }
             });
         }
+        self.notify_inserted(&hooked);
     }
 
     /// Sizes of the per-id collections (`alloc-stats` diagnostics).
@@ -2776,11 +2857,19 @@ pub fn topic_key(root: &str) -> String {
     format!("topic:{}", root.to_lowercase())
 }
 
+/// The list holding roots of subscribed topics fetched by id for their
+/// titles (`stores::thread_subs`), per channel. Kept apart from
+/// [`roots_key`] so they never enter a section's topic board.
+pub fn followed_roots_key(cid: &str) -> String {
+    format!("followed:{cid}")
+}
+
 /// Whether `key` of [`ChannelStore::channel_messages`] is a channel's own
-/// list, as opposed to a topic's paged list ([`topic_key`]) or a section's
-/// root list ([`roots_key`]), which repeat posts the channel list may hold.
+/// list, as opposed to a topic's paged list ([`topic_key`]), a section's
+/// root list ([`roots_key`]) or the subscribed-topic roots
+/// ([`followed_roots_key`]), which repeat posts the channel list may hold.
 pub fn is_channel_key(key: &str) -> bool {
-    !key.starts_with("topic:") && !key.starts_with("roots:")
+    !key.starts_with("topic:") && !key.starts_with("roots:") && !key.starts_with("followed:")
 }
 
 /// Every post the store holds, once each (by event id, case-insensitively),
@@ -3254,6 +3343,7 @@ mod tests {
         assert!(is_channel_key(&"c".repeat(64)));
         assert!(!is_channel_key(&topic_key("R")));
         assert!(!is_channel_key(&roots_key("c")));
+        assert!(!is_channel_key(&followed_roots_key("c")));
     }
     use super::*;
 

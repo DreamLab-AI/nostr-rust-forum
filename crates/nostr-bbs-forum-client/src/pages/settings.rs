@@ -762,8 +762,13 @@ pub fn SettingsPage() -> impl IntoView {
     });
 
     // -- Logout handler --
+    let toasts_for_logout = toasts;
     let on_logout = move |_| {
-        auth.logout();
+        // The page loads once a last subscriptions publish ends (≤ 3 s); a
+        // repeat click meanwhile does nothing, so it shows nothing.
+        if auth.logout() == crate::auth::LogoutOutcome::Finishing {
+            toasts_for_logout.show("Signing out\u{2026}", ToastVariant::Info);
+        }
     };
 
     // -- Pod git clone URL: copy-to-clipboard handler (ADR-089) --

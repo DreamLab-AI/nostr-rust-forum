@@ -21,6 +21,7 @@ use crate::app::base_href;
 use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::copy_key::KeyName;
+use crate::components::subscriptions_panel::{use_row_subscribe_swipe, SubscribeBell, SwipeStrip};
 use crate::utils::format_relative_time;
 use crate::utils::section_url::topic_path;
 
@@ -80,7 +81,7 @@ pub fn TopicList(
                                     &channel_id.get_value(),
                                     &id,
                                 ));
-                                view! { <TopicRow id=id topics=topics href=href /> }
+                                view! { <TopicRow id=id topics=topics href=href channel=channel_id.get_value() /> }
                             }
                         />
                     }.into_any()
@@ -152,7 +153,9 @@ const ROW_CLASS: &str =
     "relative block bg-gray-800/60 hover:bg-gray-800 border border-gray-700/60 \
      hover:border-amber-500/30 rounded-lg p-4 text-inherit transition-colors group";
 /// The row's three columns: avatar, title and byline, right-hand column.
-const ROW_INNER_CLASS: &str = "flex items-start gap-3";
+/// `pr-8` always reserves the subscribe bell's place (it is absolutely
+/// placed there), so the bell appearing never moves or resizes anything.
+const ROW_INNER_CLASS: &str = "flex items-start gap-3 pr-8";
 /// The avatar's slot (`AvatarSize::Md`, 36 px).
 const AVATAR_SLOT_CLASS: &str = "flex-shrink-0 mt-0.5";
 /// Title and byline.
@@ -226,8 +229,15 @@ fn TopicRow(
     id: String,
     topics: Memo<HashMap<String, TopicSummary>>,
     href: String,
+    channel: String,
 ) -> impl IntoView {
     let anchor_id = id.clone();
+    // Subscribe controls: the bell (any pointer) and the row swipe (touch and
+    // pen). Both act on the same store; neither follows the row's link.
+    let frame = NodeRef::<leptos::html::Div>::new();
+    let swipe = use_row_subscribe_swipe(frame, id.clone(), channel.clone());
+    let bell_root = id.clone();
+    let strip_root = id.clone();
     // A topic briefly missing from the map (the row is about to go) keeps
     // showing what it showed. `try_with`: see `history_loader::read_cursor`.
     let topic = Memo::new(move |prev: Option<&Option<TopicSummary>>| {
@@ -263,8 +273,22 @@ fn TopicRow(
     // profile name) sits above that overlay as its own click-to-copy button —
     // never a button nested inside a link.
     // Scroll anchor for history paging (utils/scroll_anchor.rs).
+    // The frame holds the row's place (and the scroll anchor); the strip a
+    // swipe reveals sits behind the card, which moves with the finger. While
+    // it moves the card is opaque, so the strip does not show through.
+    let card_style = move || {
+        let base = swipe.content_style();
+        if swipe.offset.get() != 0.0 {
+            format!("{base} background-color: rgb(31 41 55);")
+        } else {
+            base
+        }
+    };
     view! {
-        <div data-anchor-id=anchor_id class=ROW_CLASS>
+        <div node_ref=frame data-anchor-id=anchor_id class=FRAME_CLASS>
+        <SwipeStrip state=swipe root=strip_root />
+        <div class=ROW_CLASS style=card_style>
+            <SubscribeBell root=bell_root channel=channel />
             <div class=ROW_INNER_CLASS>
                 <div class=AVATAR_SLOT_CLASS>
                     {move || view! { <Avatar pubkey=last_pk.try_get().unwrap_or_default() size=AvatarSize::Md /> }}
@@ -319,8 +343,13 @@ fn TopicRow(
                 </div>
             </div>
         </div>
+        </div>
     }
 }
+
+/// The row's frame: its place in the list and the swipe's stage. No padding
+/// or border of its own, so it is exactly the card's height.
+const FRAME_CLASS: &str = "relative rounded-lg";
 
 /// "1 reply" / "N replies".
 fn replies_label(n: u32) -> String {
@@ -431,6 +460,19 @@ mod tests {
         rest.sort_unstable();
         same.sort_unstable();
         assert_eq!(rest, same);
+    }
+
+    #[test]
+    fn the_subscribe_bell_has_a_reserved_place() {
+        // Always reserved (real rows and skeletons share the class), so the
+        // bell appearing after sign-in never moves the row's contents, and
+        // the frame adds no height of its own.
+        assert!(classes(ROW_INNER_CLASS).contains(&"pr-8"));
+        let frame = classes(FRAME_CLASS);
+        assert!(frame.contains(&"relative"));
+        assert!(!frame
+            .iter()
+            .any(|c| c.starts_with('p') || c.starts_with("border")));
     }
 
     #[test]

@@ -12,8 +12,9 @@
 //! relay replaced under the same URL) with the one recorded in localStorage,
 //! and on any difference (including no record: data from before scoping)
 //! clears the relay-scoped data, then records the scope. Identity keys,
-//! zone keys, the inbox key, preferences, mutes, bookmarks and read
-//! positions are kept: they belong to the member, not to the relay.
+//! zone keys, the inbox key, preferences, mutes, bookmarks, read positions
+//! and topic subscriptions are kept: they belong to the member, not to the
+//! relay.
 
 /// localStorage entry recording the scope the stored data belongs to.
 const SCOPE_KEY: &str = "nostrbbs:relay_scope";
@@ -214,6 +215,10 @@ mod tests {
         }
         assert!(relay_scoped_local("nbss:hw:zone2"));
         let o = "a".repeat(64);
+        // Topic subscriptions belong to the member, like bookmarks.
+        assert!(!relay_scoped_local(
+            &crate::stores::thread_subs::storage_key(&o)
+        ));
         assert!(relay_scoped_local(&format!("nostrbbs:notifications:{o}")));
         assert!(relay_scoped_local(&format!("nostrbbs:notif_sync:{o}")));
         assert!(relay_scoped_local("nostrbbs_deletion_sync_v3_channels"));

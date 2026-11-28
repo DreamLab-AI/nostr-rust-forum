@@ -502,6 +502,12 @@ pub fn App() -> impl IntoView {
     // Zone end-to-end encryption (ADR-2016): keys load from IndexedDB now,
     // before channel sync, so held keys decrypt the first messages to arrive.
     crate::zone_crypto::store::provide_zone_key_store(use_channel_store());
+    // Topic subscriptions (unread counts, private cross-device copy). After
+    // the relay, channel and zone-key stores it reads; before the bell's
+    // `init_sync`, which raises notices for subscribed topics.
+    crate::stores::thread_subs::provide_thread_subs();
+    // The subscriptions panel's open/closed state on this device.
+    crate::stores::subs_panel::provide_subs_panel();
     // Encrypted-zone search loads at sign-in, not at the first search, and
     // its worker lives as long as the page (in-app navigation keeps it).
     crate::utils::sealed_search::autoload();
@@ -1494,6 +1500,9 @@ fn Layout(children: Children) -> impl IntoView {
 
             // Global overlays and layout components
             <ToastContainer />
+            // Subscribed topics: a fixed column (desktop) or drawer (mobile),
+            // overlaying the page so it never moves it; nothing signed out.
+            <crate::components::subscriptions_panel::SubscriptionsPanel />
             <GlobalSearch />
             <MobileBottomNav />
             <BookmarksModal is_open=bookmarks_open />
@@ -1542,9 +1551,14 @@ fn Layout(children: Children) -> impl IntoView {
 #[component]
 fn LogoutButton() -> impl IntoView {
     let auth = use_auth();
+    let toasts = use_toasts();
 
     let on_logout = move |_| {
-        auth.logout();
+        // The page loads once a last subscriptions publish ends (≤ 3 s); a
+        // repeat click meanwhile does nothing, so it shows nothing.
+        if auth.logout() == crate::auth::LogoutOutcome::Finishing {
+            toasts.show("Signing out\u{2026}", ToastVariant::Info);
+        }
     };
 
     view! {

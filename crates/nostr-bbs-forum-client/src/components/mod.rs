@@ -31,6 +31,8 @@ pub mod info_term;
 pub mod modal;
 pub mod popover_coord;
 pub mod toast;
+// Subscribed-topics panel and the topic-row subscribe controls.
+pub mod subscriptions_panel;
 
 // -- Rich Messages (Stream 2) ------------------------------------------------
 pub mod link_preview;

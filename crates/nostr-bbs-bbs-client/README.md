@@ -33,6 +33,7 @@ all run on the exact same stores and crypto primitives.
 
 - **Desktop (`>= 900px`)**: Collapsible left sidebar with unread badges, main scrollable viewport, `/` slash command bar, `Ctrl/Cmd+K` global + sealed search, `g <key>` chord navigation.
 - **Mobile (`< 900px`)**: Native vertical scrolling (zero scroll-hijack JS), slide-over navigation drawer, sticky 5-tab thumb bar (`Zones`, `Live`, `DMs`, `Agents`, `More`), `>= 44px` tap targets, inputs never below `16px` (no iOS auto-zoom), safe-area inset support, and zero horizontal overflow.
+- **Topic subscriptions** (signed-in members): each board topic row has a `[ ]`/`[*]` subscribe toggle (or press `s` on a focused row; Enter opens it; on touch, swipe the row either way). Subscribed topics are listed alphabetically, with a glowing new-post count to the left of each name, in a collapsible right-hand column on desktop (`]` or the top-bar `[*]` button) and, at `<= 640px`, in a right-hand drawer opened by tapping or pulling the small `SUBS` tab on the right edge (closed by pushing it right, tapping the scrim or Escape). Opening a thread clears its count.
 - **Phones (`<= 640px`, or touch screens in portrait below `900px`)**: all text at twice the desktop size. Every size is in `rem` from one root ladder (browser text size × shared font preference × the BBS TEXT SIZE setting × 2 on phones), so the member's browser setting and TEXT SIZE: LARGE still apply; ASCII art is fitted to its container instead of doubling.
 
 ## Configuration (`forum.toml` → `window.__ENV__`)

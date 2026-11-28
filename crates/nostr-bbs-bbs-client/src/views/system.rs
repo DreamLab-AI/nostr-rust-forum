@@ -418,8 +418,20 @@ pub fn SettingsView() -> impl IntoView {
                                         type="button"
                                         class="bbs-btn bbs-btn-danger bbs-btn-sm"
                                         on:click=move |_| {
-                                            auth.logout();
-                                            toasts.show("Signed out.", ToastVariant::Info);
+                                            // Signed out at once; a last publish of
+                                            // topic subscriptions may delay the page.
+                                            // A repeat click while that runs does nothing.
+                                            use nostr_bbs_client_core::auth::LogoutOutcome;
+                                            match auth.logout() {
+                                                LogoutOutcome::Finishing => toasts.show(
+                                                    "Signing out\u{2026}",
+                                                    ToastVariant::Info,
+                                                ),
+                                                LogoutOutcome::Done => {
+                                                    toasts.show("Signed out.", ToastVariant::Info)
+                                                }
+                                                LogoutOutcome::AlreadyFinishing => {}
+                                            }
                                         }
                                     >
                                         "SIGN OUT"
@@ -958,8 +970,12 @@ pub fn HelpView() -> impl IntoView {
                         <div class="bbs-kv-row"><code>"g g"</code><span>"Go to Door Games"</span></div>
                         <div class="bbs-kv-row"><code>"g w"</code><span>"Go to Sidestr Wallet"</span></div>
                         <div class="bbs-kv-row"><code>"g p"</code><span>"Go to Solid Pod"</span></div>
+                        <div class="bbs-kv-row"><code>"s"</code><span>"Subscribe to / unsubscribe from the focused topic row"</span></div>
+                        <div class="bbs-kv-row"><code>"Enter"</code><span>"Open the focused topic row"</span></div>
+                        <div class="bbs-kv-row"><code>"]"</code><span>"Show / hide subscribed topics"</span></div>
+                        <div class="bbs-kv-row"><code>"["</code><span>"Show / hide the sidebar"</span></div>
                         <div class="bbs-kv-row"><code>"?"</code><span>"Open this Help screen"</span></div>
-                        <div class="bbs-kv-row"><code>"Esc"</code><span>"Close drawer / search / command bar"</span></div>
+                        <div class="bbs-kv-row"><code>"Esc"</code><span>"Close drawer / subscriptions drawer / search / command bar"</span></div>
                     </div>
                 </section>
 

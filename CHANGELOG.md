@@ -18,6 +18,135 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Forum client: subscribe to topics, subscribed-topics panel (2026-11-28)
+
+Built on the client-core subscriptions store below. Not seen in a browser.
+
+- **Topic rows.** A bell button (outline / filled, `aria-pressed`, tooltip, focus ring) subscribes or unsubscribes
+  without opening the topic; its place is always reserved in the row, so it never changes a row's height or moves its
+  contents. On touch and pen a horizontal swipe either way does the same (claimed only after 10 px and twice the
+  vertical travel, never within 24 px of a screen edge, committed past a third of the row, springing back otherwise or
+  on cancel, instant under reduced motion); the strip behind shows the bell and "Subscribe" or "Unsubscribe".
+- **Panel.** Subscribed topics, alphabetical, with a glowing new-post numeral to the left of names with unread posts
+  and one-line names with the full title as a tooltip; a neutral "Topic unavailable" when a title cannot be read;
+  "Mark all read". Desktop: a column fixed at the left under the header, overlaying the page (opening or closing it
+  moves nothing), collapsed to an edge tab, the choice remembered on the device. Mobile (≤ 640 px): a drawer opened by
+  tapping or dragging a small edge tab (which shows the unread count), closed by swiping it left, the scrim or Escape,
+  with focus trapped while open and returned to the tab. Nothing shows signed out.
+- **Reading.** Opening a subscribed thread marks it read; the panel numeral and the bell notices for the same posts
+  clear together.
+  The notification centre's "Mark all read" clears the panel numerals too.
+- **Section "new" badge** (live defect, before this work): it showed for any section active in the past 24 hours,
+  whatever had been read, so it never cleared. It now shows only for activity newer than the channel's read position
+  (the one the index's "N new" chip uses and opening the section advances).
+- **Page freeze fixed.** Opening a subscribed thread could hang the tab: the thread page's mark-read effect read the
+  subscriptions and called a method that wrote them back unconditionally, so it re-ran for ever (a microtask loop
+  that starved the page). State is now written only when something changes.
+- Subscribe and unsubscribe publish within seconds (read markers alone at most every 30 minutes, or on page hide for a
+  local-key session), so little is pending when sign-out closes the connection. A relay copy that has disappeared is
+  republished. A still-locked sealed topic is followed under its original id (the one its replies name). After a
+  swipe, the next tap on the row is no longer eaten, and a mouse press released elsewhere no longer blocks later
+  touches.
+- Fixes after a browser check: the mobile drawer and its tab carry `touch-action: pan-y` (a horizontal drag was taken
+  by the browser and cancelled the close swipe), the drawer's swipe binding belongs to each open drawer, and the tab's
+  drag-to-open uses the row swipe's axis rule. The desktop column starts open only from 1280 px wide when the member
+  has not chosen. Client core: `RowSwipeState::with_reduced_motion`, `ThreadSubsStore::mark_read_while_viewing_ids`,
+  `subs_panel::initial_open_at`.
+- Shared pieces in client-core: `stores::subs_panel` (panel state, toggle action, labels), `utils::swipe` (gesture
+  logic and binding), `ThreadSubsStore::mark_read_while_viewing`, `NotificationStoreV2::mark_read_ids`; prefetched
+  topic roots kept in their own list, out of the section's topic board. web-sys features `MouseEvent` and
+  `PointerEvent` enabled on client-core.
+
+### BBS client: topic subscriptions UI (2026-11-28)
+
+BBS client only (`crates/nostr-bbs-bbs-client`), on the client-core pieces below; no core, worker or relay change. Not
+seen in a browser or against a live relay at the time of writing: checked by unit tests, clippy, the wasm build and
+`trunk build --release` only.
+
+- **Topic rows** (board view). Signed-in members get a `[ ]`/`[*]` toggle beside each topic card: a real button with
+  `aria-pressed` and a "Subscribe to / Unsubscribe from this topic" label and tooltip, in a gutter the card reserves, one
+  line high and 3ch wide, so it never changes the row's height, and it never touches the frozen board order. It is a
+  sibling of the card (the card is `role="button"`), so pressing it does not open the topic. On touch, a horizontal
+  swipe either way toggles, over a strip that says what the swipe will do (client-core `attach_row_swipe`). Keys: `s`
+  on a focused card toggles (announced in a polite live region; ignored on auto-repeat or with a modifier), and Enter
+  or Space now opens the focused card, which had `role="button"` without a key handler. A refusal (150-topic limit) is
+  a warning toast.
+- **Subscribed topics panel.** Alphabetical as delivered, a glowing new-post numeral in a fixed slot left of each
+  name (nothing at zero; "N+" and "99+" from `unread_badge`), names on one line with an ellipsis and the full title on
+  hover, "Topic unavailable" while a title is unknown, and an empty-state line. Desktop: a right-hand column of the
+  TUI grid, present only while open (when the member has not chosen, open from 1280 px wide and closed below, by
+  client-core `initial_open_at`; remembered per device; known at first paint, so nothing shifts on load); shown or hidden with `]`, the top-bar `[*]` button (with the total) or the footer's `[]] subs`. At 641 to
+  899 px it stays a narrower column. Phones (<= 640 px): a right-hand drawer behind a 24 px `SUBS` edge tab showing the
+  total; opened by tapping or pulling the tab, closed by pushing it right, tapping the scrim, Escape or opening a
+  topic. No open-by-edge-swipe and no open-by-swipe from content. While open it is a modal dialog: Tab and Shift+Tab
+  stay inside, focus returns to the tab on close, and it closes the navigation drawer (and the reverse).
+- **Thread view** calls `mark_read_while_viewing_ids` with the newest shown post's time, under the id it was opened by
+  and the root's own id when they differ (a sealed root), so opening a followed thread clears its numeral.
+- Visitors who are not signed in see neither toggle nor panel. Motion (swipe spring, drawer slide) is off under
+  `prefers-reduced-motion` and under the BBS's own REDUCED MOTION setting (the row spring through
+  `RowSwipeState::with_reduced_motion`). The keys are on the Help screen and in the
+  crate README.
+
+### Client core: topic subscriptions, unread counts and a private cross-device copy (2026-11-28)
+
+Client core plus one provider line in each client's `app.rs`; no view yet, so nothing is visible until the forum and BBS
+panels land, and those must call `mark_read` in the same release as the subscribe control. No worker or relay change.
+None of this has been seen in a browser or against a live relay.
+
+- **Store** (`stores/thread_subs.rs`). A member can subscribe to up to 150 topics. Each subscription records the topic
+  root, its channel and zone, on or off, and when it changed; switching one off leaves a tombstone for a year (at most
+  300) so merges converge. Each topic has a read marker that never moves back and never past this device's clock (a
+  post's time is chosen by its author and the relay accepts a week ahead); a new subscription starts it at the newest
+  reply already known, so a fast local clock cannot hide the next posts. Saved per account in localStorage
+  (`nostrbbs:thread_subs:v1:<pubkey>`, with the last relay copy seen), merged with what another tab saved on every
+  write, reloaded when another tab writes, removed at sign-out. Topic titles are never stored: the panel list resolves
+  them at runtime from root events in the channel store, re-resolving when a followed root arrives or a zone key
+  changes, fetching missing roots by id (20 a REQ, one in flight) through the usual admission and zone-decrypt path.
+- **Unread counts.** After NIP-42 AUTH, one paced pass asks for each subscribed topic's posts since its marker
+  (`{kinds:[42], #e:[root], since, limit:100}`, at most 9 filters a REQ, one REQ in flight, closed on its answer, a
+  refused batch re-sent with backoff up to six times). After a reconnect it asks only from each topic's in-session
+  high-water mark. While the app is open, counts grow from a new `ChannelStore::on_inserted` hook, fired once per batch
+  from `apply_page`, the live message handler and the channel-history subscription; no polling and no extra open
+  subscription. Edits, the member's own posts, duplicate ids and deleted posts are not counted; a still-locked sealed
+  post is counted only once it opens.
+- **Cross-device copy** (`stores/thread_subs_sync.rs`). A kind-30078 event whose only tag is
+  `["d","nostr-bbs/thread-subs/v1"]`, content NIP-44 encrypted to the member's own key through the auth store's signer.
+  Fetched and merged entry by entry before every publish (newer change wins, off wins a tie, markers take the larger),
+  and fetched again if it has gone stale while the copy was being sealed. Never published before a successful fetch,
+  nor over a copy that cannot be read. Pending changes go out at most once a minute, rate-limited on the last attempt
+  with backoff (up to 30 minutes) after failures; hiding the page skips the minute only for a subscribe or unsubscribe;
+  on `pagehide` only if the last fetch is under 10 s old. With a NIP-07 extension only subscribing and unsubscribing
+  schedule a publish; read markers alone go at most every 30 minutes; a declined prompt stops prompts for the session
+  until the next subscribe or unsubscribe; a prompt left open is abandoned after two minutes. An unchanged relay copy is
+  never decrypted again (any other id, even in the same second, is a change), and one tab publishes at a time.
+- **Sign-out** now clears everything persistent for the account at the click (keys, remembered session, push
+  registration, per-account lists, subscriptions), so closing the tab at any point leaves nothing signed in. For a
+  local-key or passkey session with unpublished subscription changes, the in-memory signer alone is kept for one last
+  publish (at most 3 s, nothing written to storage) before the page navigates; if that fails, changes made on this
+  device since its last successful publish are lost. A sign-out now always ends in a full page load (a reload when
+  already on the destination, which before this was skipped on the home page), so no account state stays in memory;
+  sign-in is refused ("Signing out…") while the last publish runs. `logout()` returns a `LogoutOutcome`; the forum's two
+  sign-out buttons and the BBS show "Signing out…" only for the sign-out that started it, and the welcome page's
+  sign-out uses `logout_to("/login")`. The installed-app boot profile is removed synchronously too, the load waits
+  (at most 500 ms) for the installed-app key's delete, and the BBS one-shot boot now requires a valid boot profile
+  before adopting a baked key, as the forum already did. A document that has signed out refuses sign-in until a fresh
+  load (even if that load is cancelled), the boot-time NIP-07 re-poll stops, and a page restored from the
+  back/forward cache reloads when its in-memory account is not the stored session. Subscriptions are
+  written only while the browser's stored session still names the account, so a second tab cannot write them back
+  after a sign-out elsewhere. A NIP-07 extension without `nip44`, or any error, leaves the feature local-only. A
+  device-key session's copy belongs to the device key, not the identity, and is refused by the relay unless the
+  device-key gate is on and the device is registered.
+- **Privacy.** Third parties see only that a member has such a copy, when it changed and its size. The relay operator
+  can also learn which topics a member follows and roughly how far they have read, from the client's own backlog
+  (`#e`/`since`) and title-fetch REQs.
+- **Bell.** A reply in a subscribed topic (not the member's own, not an edit, not a still-locked sealed post) raises an
+  in-app notice titled "New post in a subscribed topic in <section>", judged against the topic's marker rather than the
+  channel's read position. It is the same notice as the existing post notice (same id; a mention stays a mention), uses
+  the existing `Message` kind so stored lists stay readable by older builds, and passes the "Mentions only" level. No
+  push or OS alert.
+- New member data kept across a relay change (`relay_scope`), and a row in the kind-30078 `d`-tag table of
+  [`docs/BASELINE-architecture.md`](docs/BASELINE-architecture.md).
+
 ### Relay and clients: one request lists a section's topics in true order (2026-11-28)
 
 Decision: [ADR-2038](docs/adr/ADR-2038-one-request-returns-a-section-s-topic-stats.md); requirements:

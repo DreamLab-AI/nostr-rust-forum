@@ -284,6 +284,29 @@ pub fn ThreadPage() -> impl IntoView {
         }
     });
 
+    // Topic subscriptions: while the thread is shown, its read marker
+    // follows the newest post held for it, so the panel's count and the
+    // matching bell notices clear (here, in other tabs and on other devices).
+    if let Some(subs) = crate::stores::thread_subs::try_use_thread_subs() {
+        subs.mark_read_while_viewing(
+            move || topic_root.get().map(|r| r.id.to_ascii_lowercase()),
+            move || {
+                let root = topic_root.get()?.id;
+                channel_events.with(|events| {
+                    events
+                        .iter()
+                        .filter(|e| {
+                            e.id.eq_ignore_ascii_case(&root)
+                                || nostr_bbs_core::sealed::reply_root_of(e)
+                                    .is_some_and(|r| r.eq_ignore_ascii_case(&root))
+                        })
+                        .map(|e| e.created_at)
+                        .max()
+                })
+            },
+        );
+    }
+
     // One URL per topic: an old form (section-tag hash, `/forums/…`, zone id,
     // full root id) is replaced in place by the canonical one.
     keep_address_canonical(move || {
