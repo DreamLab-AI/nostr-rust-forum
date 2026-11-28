@@ -562,12 +562,13 @@ impl ChannelStore {
                         created_at: event.created_at,
                     };
 
+                    // Notifies only when the channel is new: a cached
+                    // channel the relay re-sends (every reconnect and AUTH
+                    // replay) changes nothing a page could show.
                     let mut inserted = false;
-                    channels_sig.update(|list| {
-                        if !list.iter().any(|c| c.id == meta.id) {
-                            list.push(meta);
-                            inserted = true;
-                        }
+                    channels_sig.maybe_update(|list| {
+                        inserted = push_channel_if_new(list, meta);
+                        inserted
                     });
 
                     // Apply any edit that outran this creation on the wire.
@@ -634,9 +635,8 @@ impl ChannelStore {
                         }));
                 }
             } else {
-                channels_sig.update(|list| {
-                    list.retain(|c| ids.contains(&c.id));
-                });
+                // Notifies only when a channel was actually pruned.
+                channels_sig.maybe_update(|list| retain_relay_channels(list, &ids));
                 // Drop edit timestamps for pruned channels so the cache stays
                 // in step with the live channel set.
                 store_for_eose
@@ -1383,6 +1383,14 @@ impl ChannelStore {
         }
     }
 
+    /// Whether the relay has answered topic `root`'s reply COUNT (asked by
+    /// [`Self::request_topic_stats`] alongside its newest reply), so a list
+    /// can tell "answered, no replies" from "not in yet". Reactive.
+    pub fn topic_stats_answered(&self, root: &str) -> bool {
+        self.totals
+            .with(|m| m.get(&topic_key(root)).is_some_and(|t| t.counted.is_some()))
+    }
+
     /// Topic `root`'s newest reply as the relay answered it, as
     /// (created_at, author). Reactive.
     pub fn topic_latest(&self, root: &str) -> Option<(u64, String)> {
@@ -2040,6 +2048,94 @@ fn buffer_pending_meta(pending: &mut HashMap<String, MetaUpdate>, update: MetaUp
         _ => {
             pending.insert(update.channel_id.clone(), update);
         }
+    }
+}
+
+/// Append `meta` to the channel list unless a channel with its id is
+/// already listed. Returns whether the list changed, so the caller notifies
+/// readers only then.
+fn push_channel_if_new(list: &mut Vec<ChannelMeta>, meta: ChannelMeta) -> bool {
+    if list.iter().any(|c| c.id == meta.id) {
+        return false;
+    }
+    list.push(meta);
+    true
+}
+
+/// Keep only the channels the relay delivered (`ids`). Returns whether any
+/// was dropped, so the caller notifies readers only then.
+fn retain_relay_channels(list: &mut Vec<ChannelMeta>, ids: &HashSet<String>) -> bool {
+    let before = list.len();
+    list.retain(|c| ids.contains(&c.id));
+    list.len() != before
+}
+
+#[cfg(test)]
+mod channel_list_tests {
+    use super::*;
+
+    fn meta(id: &str) -> ChannelMeta {
+        ChannelMeta {
+            id: id.into(),
+            name: id.into(),
+            description: String::new(),
+            section: String::new(),
+            picture: String::new(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn a_channel_already_listed_is_not_a_change() {
+        let mut list = vec![meta("a")];
+        assert!(!push_channel_if_new(&mut list, meta("a")));
+        assert_eq!(list.len(), 1);
+        assert!(push_channel_if_new(&mut list, meta("b")));
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn pruning_nothing_is_not_a_change() {
+        let mut list = vec![meta("a"), meta("b")];
+        let all: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert!(!retain_relay_channels(&mut list, &all));
+        assert_eq!(list.len(), 2);
+        let some: HashSet<String> = ["b".to_string()].into_iter().collect();
+        assert!(retain_relay_channels(&mut list, &some));
+        assert_eq!(
+            list.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_list_does_not_notify() {
+        // The signal-level contract the section page relies on: a re-sent
+        // channel and a prune that drops nothing leave readers untouched.
+        let owner = Owner::new();
+        owner.with(|| {
+            let sig = RwSignal::new(vec![meta("a")]);
+            let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = runs.clone();
+            let memo = Memo::new(move |_| {
+                sig.track();
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+            memo.get_untracked();
+            let start = runs.load(std::sync::atomic::Ordering::Relaxed);
+            sig.maybe_update(|l| push_channel_if_new(l, meta("a")));
+            let ids: HashSet<String> = ["a".to_string()].into_iter().collect();
+            sig.maybe_update(|l| retain_relay_channels(l, &ids));
+            memo.get_untracked();
+            assert_eq!(
+                runs.load(std::sync::atomic::Ordering::Relaxed),
+                start,
+                "no change, no notification"
+            );
+            sig.maybe_update(|l| push_channel_if_new(l, meta("b")));
+            memo.get_untracked();
+            assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), start + 1);
+        });
     }
 }
 
