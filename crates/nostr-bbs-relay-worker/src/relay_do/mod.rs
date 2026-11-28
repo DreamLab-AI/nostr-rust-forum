@@ -17,6 +17,7 @@
 //! - `filter` -- NIP-01 filter type, SQL query builder, in-memory matching
 //! - `broadcast` -- Event broadcasting, NIP-16 treatment, wire protocol, rate limiting
 //! - `nip_handlers` -- NIP-01/09/42/45 protocol handlers, event storage, whitelist
+//! - `section_stats` -- `SECTION-STATS`: one section's topics with activity and counts (ADR-2038)
 
 mod broadcast;
 mod calendar_projection;
@@ -29,6 +30,7 @@ mod nip_handlers;
 mod push_fanout;
 mod read_cache;
 pub(crate) mod receipts;
+mod section_stats;
 mod session;
 mod storage;
 
@@ -65,6 +67,18 @@ use session::{generate_challenge, SessionInfo};
 // (`crate::nip11`) so the advertised `auth_required` can never drift from the
 // mode the handlers actually enforce.
 pub(crate) use nip42::{parse_auth_mode, AuthMode, PROTECTED_READ_KINDS};
+
+/// The NIP-11 `nostr_bbs.section_stats` block (ADR-2038): the verb, the wire
+/// version and the answer's caps, from the constants the handler enforces.
+pub(crate) fn section_stats_advert() -> serde_json::Value {
+    serde_json::json!({
+        "verb": section_stats::VERB,
+        "version": section_stats::VERSION,
+        "max_topics": section_stats::MAX_TOPICS,
+        "reply_count_cap": section_stats::REPLY_COUNT_CAP,
+        "memo_secs": section_stats::MEMO_TTL_SECS,
+    })
+}
 
 /// Maximum WebSocket connections per IP address.
 const MAX_CONNECTIONS_PER_IP: u32 = 20;
@@ -138,6 +152,9 @@ pub struct NostrRelayDO {
     pub(crate) zone_epoch_cache: TtlCache<String>,
     /// ADR-2018: per-pubkey throttle for the trust-ledger activity writes.
     pub(crate) activity: ActivityLedger,
+    /// ADR-2038: computed `SECTION-STATS` payloads per channel, reused for
+    /// `section_stats::MEMO_TTL_SECS`. Read only after admission.
+    pub(crate) section_stats_cache: TtlCache<serde_json::Value>,
 }
 
 impl DurableObject for NostrRelayDO {
@@ -168,6 +185,7 @@ impl DurableObject for NostrRelayDO {
             epoch_rows_cache: TtlCache::new(LOOKUP_TTL_SECS),
             zone_epoch_cache: TtlCache::new(LOOKUP_TTL_SECS),
             activity: ActivityLedger::new(),
+            section_stats_cache: TtlCache::new(section_stats::MEMO_TTL_SECS),
         }
     }
 
@@ -387,6 +405,17 @@ impl DurableObject for NostrRelayDO {
                     return Ok(());
                 }
                 self.handle_count(session_id, &ip, &ws, &sub_id, filters)
+                    .await;
+            }
+            section_stats::VERB => {
+                // ADR-2038: ["SECTION-STATS", <id>, {"channel": <id>}]. A
+                // one-shot answer (or CLOSED), never a held subscription.
+                let Some(id) = arr[1].as_str().filter(|s| sub_id_ok(s)) else {
+                    Self::send_notice(&ws, "Invalid subscription ID");
+                    return Ok(());
+                };
+                let body = arr.get(2).cloned().unwrap_or(serde_json::Value::Null);
+                self.handle_section_stats(session_id, &ip, &ws, id, &body)
                     .await;
             }
             _ => {
