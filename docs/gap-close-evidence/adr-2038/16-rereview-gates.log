@@ -1,0 +1,10 @@
+# 2026-11-28T16:10:29Z HEAD ebd7698c81c2cb42faa8484eb1305b7500bb408f (re-review gate)
+fmt exit 0
+clippy exit 0
+wasm exit 0
+doc exit 0
+0
+70
+test exit 0
+ok: 37 ADR(s) valid (--check, README not written)
+adr exit 0
