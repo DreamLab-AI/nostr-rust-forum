@@ -784,6 +784,10 @@ impl AuthStore {
         );
         // "Continue where you left off" is per identity too.
         crate::utils::resume::clear_for_logout(self.state.get_untracked().pubkey.as_deref());
+        // So are topic subscriptions (the synced relay copy restores them).
+        crate::stores::thread_subs::clear_persisted_for_logout(
+            self.state.get_untracked().pubkey.as_deref(),
+        );
         self.privkey.update_value(|opt| {
             if let Some(ref mut v) = opt {
                 v.iter_mut().for_each(|b| *b = 0);
