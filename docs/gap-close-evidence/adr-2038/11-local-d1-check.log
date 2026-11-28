@@ -1,0 +1,8 @@
+# 2026-11-28T15:46:49Z local D1 (wrangler 4.166.0, miniflare) vs rusqlite, statements from emit_local_d1_check at 08cd174+wip
+schema: reviewer's d1test/schema.sql (relay schema incl. v3 tag writer and paging indexes; also holds 2 sample topic roots of another channel); seed: seeded(7)
+- q_roots_indexed before 0017: error 'no such index: idx_events_topic_root_channel: SQLITE_ERROR' (matched by index_missing)
+- 0017 applied twice: exit 0 both times (idempotent)
+- plan after 0017: SEARCH ev USING INDEX idx_events_topic_root_channel (<expr>=?)
+- q_roots_indexed: 28 rows, identical to rusqlite
+- q_stats: 27 rows, identical to rusqlite
+- q_roots_walk: 28 rows identical except walked 31 vs 29: the reviewer's schema file inserts 2 extra topic roots in another channel (ids ..0101, ..0102), counted relay-wide by the walk

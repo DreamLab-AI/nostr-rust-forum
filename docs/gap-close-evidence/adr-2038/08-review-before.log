@@ -1,0 +1,5 @@
+# BEFORE: 2026-11-28T15:30:55Z code at b2d2c7d (b2d2c7d), measurement test added; release, native SQLite, not D1; excludes the existence statement
+common: 300 topics x 30 replies, 2k roots elsewhere     statements  34 VM steps    1824089 |  130 ms | listed  300 counted  300 truncated false
+worst: 20 topics, one with 3 replies + 50k reactions    statements   4 VM steps     382201 |   32 ms | listed   20 counted   20 truncated false
+worst: 10-topic section, 50k topic roots elsewhere      statements   3 VM steps    2764980 |  171 ms | listed   10 counted   10 truncated false
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 750 filtered out; finished in 4.21s

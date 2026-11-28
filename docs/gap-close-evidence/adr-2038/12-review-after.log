@@ -1,0 +1,5 @@
+# AFTER: 2026-11-28T15:46:57Z code at 08cd174 + client-side wip; release, native SQLite with 0017 applied, not D1; includes the existence statement when run
+common: 300 topics x 30 replies, 2k roots elsewhere     statements   4 VM steps    1820587 |  123 ms | listed  300 counted  300 truncated false
+worst: 20 topics, one with 3 replies + 50k reactions    statements   2 VM steps      55901 |    5 ms | listed   20 counted   19 truncated false
+worst: 10-topic section, 50k topic roots elsewhere      statements   2 VM steps      15871 |    3 ms | listed   10 counted   10 truncated false
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 757 filtered out; finished in 3.97s
