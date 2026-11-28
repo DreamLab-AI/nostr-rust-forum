@@ -15,8 +15,8 @@ pub mod thread;
 
 pub use board::{
     board_events, board_order, classify_topics, first_paint_ready, keys_final, latest_post,
-    out_of_order, stable_order, topic_title, unread_count, with_topic_stats, TopicSummary,
-    FIRST_PAINT_STATS, FIRST_PAINT_TIMEOUT_MS,
+    out_of_order, stable_order, topic_title, unread_count, updated_accessible_name, updated_label,
+    with_topic_stats, TopicSummary, FIRST_PAINT_STATS, FIRST_PAINT_TIMEOUT_MS,
 };
 pub use jump::{channel_events_across, fallback, find_held, parent_of, topic_root_of, Fallback};
 pub use landing::{history_settled, landing_target, post_anchor_id, Landing};

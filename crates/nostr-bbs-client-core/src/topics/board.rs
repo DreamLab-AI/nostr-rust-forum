@@ -348,6 +348,22 @@ pub fn out_of_order(shown: &[String], sorted: &[String]) -> usize {
     ranks.len() - tails.len()
 }
 
+/// Text of the control that re-sorts a board shown out of order: "↻ N
+/// updated", N from [`out_of_order`].
+pub fn updated_label(n: usize) -> String {
+    format!("\u{21bb} {n} updated")
+}
+
+/// Accessible name of the same control: what it does, then how many topics
+/// it moves.
+pub fn updated_accessible_name(n: usize) -> String {
+    if n == 1 {
+        "Re-sort topics by latest activity (1 topic updated)".to_string()
+    } else {
+        format!("Re-sort topics by latest activity ({n} topics updated)")
+    }
+}
+
 /// Derive a one-line topic title from the root post content.
 ///
 /// Uses the first non-empty line, trimmed and clipped to a sane length so the
@@ -830,6 +846,19 @@ mod tests {
         assert!(first_paint_ready(true, 0, 0, false));
         // The timeout always paints: never an indefinite wait.
         assert!(first_paint_ready(false, 0, 40, true));
+    }
+
+    #[test]
+    fn updated_control_wording() {
+        assert_eq!(updated_label(3), "\u{21bb} 3 updated");
+        assert_eq!(
+            updated_accessible_name(1),
+            "Re-sort topics by latest activity (1 topic updated)"
+        );
+        assert_eq!(
+            updated_accessible_name(4),
+            "Re-sort topics by latest activity (4 topics updated)"
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 
@@ -46,17 +47,24 @@ use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use crate::components::canonical_address::keep_address_canonical;
 use crate::components::message_input::MessageInput;
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::topic_list::{classify_topics, with_topic_stats, TopicList, TopicSummary};
+use crate::components::topic_list::{
+    classify_topics, with_topic_stats, TopicList, TopicListSkeleton, TopicSummary, UPDATED_CLASS,
+};
 use crate::components::zone_hero::ZoneHero;
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
+use crate::topics::{
+    first_paint_ready, keys_final, out_of_order, stable_order, updated_accessible_name,
+    updated_label, FIRST_PAINT_TIMEOUT_MS,
+};
 use crate::utils::capitalize;
 use crate::utils::lookup::{
     deadline_for, key_state_memo, zone_is_encrypted, zone_is_gated, Lookup,
 };
+use crate::utils::scroll_anchor;
 use crate::utils::section_url::{canonical_section_path, find_by_section_slug};
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
@@ -161,6 +169,74 @@ fn resolve_section(
     resolve_channel(channels, category_slug, section_slug_param, zones)
 }
 
+/// What the topic area of the section page shows. The page's branch is
+/// driven by a memo of this alone, so a write to the channel list that
+/// changes nothing here (a reconnect, an AUTH replay, another channel's
+/// rename) never tears down the topic list, its rows or its history loaders.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ListBranch {
+    /// Skeleton rows: the lookup is still loading (`keys`: waiting on this
+    /// zone's keys), or the topics are found but the first paint is held
+    /// (see [`first_paint_ready`]).
+    Skeleton { keys: bool },
+    /// The topic list of this channel, found or authoritatively empty.
+    List(String),
+    /// Not found on a receipt, or no receipt before the deadline.
+    Unavailable {
+        heading: &'static str,
+        detail: &'static str,
+    },
+}
+
+/// The branch for lookup `state` of channel `cid`. Once a channel's list is
+/// painted it stays painted (`prev`) while its lookup holds; until then a
+/// found list is held as skeleton rows until `ready` says it may paint.
+fn list_branch(
+    prev: Option<&ListBranch>,
+    state: Lookup,
+    cid: Option<String>,
+    ready: impl FnOnce() -> bool,
+) -> ListBranch {
+    match (state, cid) {
+        (Lookup::Loading, _) => ListBranch::Skeleton { keys: false },
+        (Lookup::KeysLoading, _) => ListBranch::Skeleton { keys: true },
+        (Lookup::Found | Lookup::NotFound, Some(cid)) => {
+            let painted = matches!(prev, Some(ListBranch::List(p)) if *p == cid);
+            if painted || ready() {
+                ListBranch::List(cid)
+            } else {
+                ListBranch::Skeleton { keys: false }
+            }
+        }
+        // A timeout must not read as "empty", so it gets its own wording
+        // rather than TopicList's "No topics yet".
+        (Lookup::TimedOut, Some(_)) => ListBranch::Unavailable {
+            heading: "Topics Unavailable",
+            detail: "This section's topics did not finish loading. Check your connection and try again.",
+        },
+        (Lookup::KeysTimedOut, _) => ListBranch::Unavailable {
+            heading: "Topics Unavailable",
+            detail: "Your keys for this zone could not all be fetched or checked: the relay or the admin check did not answer, or they are taking too long. Nothing here is missing for certain. Reload to try again.",
+        },
+        (Lookup::TimedOut, None) => ListBranch::Unavailable {
+            heading: "Section Unavailable",
+            detail: "This section did not finish loading. Check your connection and try again.",
+        },
+        (Lookup::Found | Lookup::NotFound, None) => ListBranch::Unavailable {
+            heading: "Section Not Found",
+            detail: "This section could not be found in this zone.",
+        },
+    }
+}
+
+/// The display order's state for one channel: whether it is frozen (the
+/// list has painted and the zone's keys are final, so rows keep their
+/// place from now on).
+struct OrderState {
+    cid: Option<String>,
+    frozen: bool,
+}
+
 #[component]
 pub fn SectionPage() -> impl IntoView {
     let relay = expect_context::<RelayConnection>();
@@ -211,6 +287,10 @@ pub fn SectionPage() -> impl IntoView {
         let zones = load_zones();
         resolve_section(&chans, &category_slug(), &section_slug(), &zones)
     });
+    // The resolved channel's id, as a Memo: unchanged channel-list writes
+    // stop here. Everything that only needs the id reads this.
+    let channel_id =
+        Memo::new(move |_| resolved_channel.with(|c| c.as_ref().map(|c| c.id.clone())));
 
     // One URL per section: an old form (section-tag hash, `/forums/…`, zone
     // id) is replaced in place by the canonical one once the channel resolves.
@@ -258,8 +338,8 @@ pub fn SectionPage() -> impl IntoView {
     {
         let relay = relay.clone();
         Effect::new(move |_| {
-            if let Some(ch) = resolved_channel.get() {
-                store.ensure_subscribed(&relay, &ch.id);
+            if let Some(cid) = channel_id.get() {
+                store.ensure_subscribed(&relay, &cid);
             }
         });
     }
@@ -269,9 +349,8 @@ pub fn SectionPage() -> impl IntoView {
     // classified once per store change however many views read it (with
     // paged history a channel can hold tens of thousands of messages).
     let topics_memo = Memo::new(move |_| {
-        let cid = match resolved_channel.get() {
-            Some(ch) => ch.id,
-            None => return Vec::<TopicSummary>::new(),
+        let Some(cid) = channel_id.get() else {
+            return Vec::<TopicSummary>::new();
         };
         // Every topic root (one root-list REQ, not windowed) plus the
         // channel's history window (replies, live posts, roots of older
@@ -299,15 +378,15 @@ pub fn SectionPage() -> impl IntoView {
     {
         let relay_for_stats = expect_context::<RelayConnection>();
         Effect::new(move |_| {
-            let Some(ch) = resolved_channel.get() else {
+            let Some(cid) = channel_id.get() else {
                 return;
             };
             let gated = zone_is_gated(&category_slug(), &load_zones());
-            if !store.history_receipt(&ch.id).settles(gated) {
+            if !store.history_receipt(&cid).settles(gated) {
                 return;
             }
             let ids: Vec<String> = topics_memo.with(|ts| ts.iter().map(|t| t.id.clone()).collect());
-            store.request_topic_stats(&relay_for_stats, &ch.id, &ids, gated);
+            store.request_topic_stats(&relay_for_stats, &cid, &ids, gated);
         });
     }
     let topics: Signal<Vec<TopicSummary>> = topics_memo.into();
@@ -317,10 +396,10 @@ pub fn SectionPage() -> impl IntoView {
     {
         let relay_for_roots = expect_context::<RelayConnection>();
         Effect::new(move |_| {
-            if let Some(ch) = resolved_channel.get() {
+            if let Some(cid) = channel_id.get() {
                 let gated = zone_is_gated(&category_slug(), &load_zones());
-                if store.history_receipt(&ch.id).settles(gated) {
-                    store.request_topic_roots(&relay_for_roots, &ch.id, gated);
+                if store.history_receipt(&cid).settles(gated) {
+                    store.request_topic_roots(&relay_for_roots, &cid, gated);
                 }
             }
         });
@@ -342,9 +421,8 @@ pub fn SectionPage() -> impl IntoView {
     {
         let last_marked = RwSignal::new(String::new());
         Effect::new(move |_| {
-            let cid = match resolved_channel.get() {
-                Some(ch) => ch.id,
-                None => return,
+            let Some(cid) = channel_id.get() else {
+                return;
             };
             // Latest kind-42 message in the channel (max created_at, tie-broken by
             // id for determinism — matches the index's `created_at >` semantics).
@@ -373,7 +451,7 @@ pub fn SectionPage() -> impl IntoView {
     let section_lookup = Memo::new(move |_| {
         let gated = zone_is_gated(&category_slug(), &load_zones());
         Lookup::decide(
-            resolved_channel.with(Option::is_some),
+            channel_id.with(Option::is_some),
             store.channel_receipt.get().settles(gated),
             deadline.get(),
         )
@@ -398,7 +476,7 @@ pub fn SectionPage() -> impl IntoView {
     let topics_lookup = Memo::new(move |_| {
         section_lookup.get().then(|| {
             let gated = zone_is_gated(&category_slug(), &load_zones());
-            let cid = resolved_channel.get().map(|c| c.id).unwrap_or_default();
+            let cid = channel_id.get().unwrap_or_default();
             Lookup::decide_with_keys(
                 topics.with(|t| !t.is_empty()),
                 store.history_receipt(&cid).settles(gated),
@@ -408,6 +486,117 @@ pub fn SectionPage() -> impl IntoView {
         })
     });
     let section_loading = Memo::new(move |_| section_lookup.get().is_loading());
+
+    // First paint (cause: a list painted on its first topic, then filled in
+    // by the root list and the stats batches under the reader). A found list
+    // is held as skeleton rows until the section's root list has answered
+    // and the first stats are in, or FIRST_PAINT_TIMEOUT_MS after it was
+    // found. A store that already holds all of that paints at once.
+    let roots_answered = Memo::new(move |_| {
+        channel_id
+            .get()
+            .is_some_and(|cid| store.topic_roots_answered(&cid))
+    });
+    let stats_answered = Memo::new(move |_| {
+        topics.with(|ts| {
+            ts.iter()
+                .filter(|t| store.topic_stats_answered(&t.id))
+                .count()
+        })
+    });
+    let hold_expired = RwSignal::new(Option::<String>::None);
+    {
+        let armed = StoredValue::new(Option::<String>::None);
+        Effect::new(move |_| {
+            let Some(cid) = channel_id.get() else {
+                return;
+            };
+            if !matches!(topics_lookup.get(), Lookup::Found | Lookup::NotFound)
+                || armed.with_value(|a| a.as_deref() == Some(cid.as_str()))
+            {
+                return;
+            }
+            armed.set_value(Some(cid.clone()));
+            crate::utils::set_timeout_once(
+                move || {
+                    let _ = hold_expired.try_set(Some(cid));
+                },
+                FIRST_PAINT_TIMEOUT_MS,
+            );
+        });
+    }
+    let branch = Memo::new(move |prev: Option<&ListBranch>| {
+        let cid = channel_id.get();
+        list_branch(prev, topics_lookup.get(), cid.clone(), || {
+            let timed_out = hold_expired.with(|e| e.is_some() && *e == cid);
+            first_paint_ready(
+                roots_answered.get(),
+                stats_answered.get(),
+                topics.with(Vec::len),
+                timed_out,
+            )
+        })
+    });
+
+    // Display order (cause: every stats answer re-sorted the painted list).
+    // Before the list freezes it follows the true order; once it has
+    // painted and the zone's keys are final, a listed topic keeps its place,
+    // a new one goes on top and an older page at the bottom, with the
+    // reader's place kept. Navigating away and back starts afresh.
+    let true_ids =
+        Memo::new(move |_| topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>()));
+    let by_id = Memo::new(move |_| {
+        topics.with(|ts| {
+            ts.iter()
+                .map(|t| (t.id.clone(), t.clone()))
+                .collect::<HashMap<_, _>>()
+        })
+    });
+    let order = RwSignal::new(true_ids.get_untracked());
+    {
+        let state = StoredValue::new(OrderState {
+            cid: channel_id.get_untracked(),
+            frozen: false,
+        });
+        Effect::new(move |_| {
+            let ids = true_ids.get();
+            let cid = channel_id.get();
+            let freeze = matches!(branch.get(), ListBranch::List(_)) && keys_final(keys.get());
+            let Some(frozen) = state.try_update_value(|s| {
+                if s.cid != cid {
+                    s.cid = cid;
+                    s.frozen = false;
+                }
+                let was = s.frozen;
+                s.frozen |= freeze;
+                was
+            }) else {
+                return;
+            };
+            let next = order.with_untracked(|shown| {
+                let next = if frozen {
+                    stable_order(shown, &ids)
+                } else {
+                    ids.clone()
+                };
+                (next != *shown).then_some(next)
+            });
+            if let Some(next) = next {
+                // A frozen list only gains rows at its ends or loses some:
+                // keep the row on screen where it is.
+                let anchor = if frozen {
+                    scroll_anchor::capture(None)
+                } else {
+                    None
+                };
+                order.set(next);
+                if let Some(a) = anchor {
+                    scroll_anchor::restore(a, None);
+                }
+            }
+        });
+    }
+    let updated = Memo::new(move |_| order.with(|o| true_ids.with(|t| out_of_order(o, t))));
 
     let header_name = move || {
         resolved_channel
@@ -555,6 +744,23 @@ pub fn SectionPage() -> impl IntoView {
                             if n == 1 { "1 topic".to_string() } else { format!("{n} topics") }
                         }}
                     </span>
+                    // Always laid out, hidden at zero: its appearing never
+                    // moves the list below.
+                    <button
+                        type="button"
+                        class=UPDATED_CLASS
+                        class:invisible=move || updated.try_get().unwrap_or(0) == 0
+                        disabled=move || updated.try_get().unwrap_or(0) == 0
+                        aria-label=move || updated_accessible_name(updated.try_get().unwrap_or(0))
+                        title="Re-sort by latest activity"
+                        on:click=move |_| {
+                            if let Some(ids) = true_ids.try_get_untracked() {
+                                order.set(ids);
+                            }
+                        }
+                    >
+                        {move || updated_label(updated.try_get().unwrap_or(0))}
+                    </button>
                 </div>
 
                 <Show when=move || {
@@ -646,90 +852,72 @@ pub fn SectionPage() -> impl IntoView {
             </Show>
 
             {move || {
-                let Some(state) = topics_lookup.try_get() else {
+                let Some(branch) = branch.try_get() else {
                     return ().into_any();
                 };
-                if state.is_loading() {
-                    view! {
-                        <div class="flex flex-col items-center justify-center py-20 gap-3">
-                            <div class="animate-spin w-6 h-6 border-2 za-spinner rounded-full"></div>
-                            <span class="text-gray-400 text-sm">{if state == Lookup::KeysLoading {
+                match branch {
+                    ListBranch::Skeleton { keys } => view! {
+                        <TopicListSkeleton
+                            status=if keys {
                                 "Fetching your keys for this zone\u{2026}"
                             } else {
-                                "Loading topics..."
-                            }}</span>
-                        </div>
-                    }.into_any()
-                } else if !matches!(state, Lookup::TimedOut | Lookup::KeysTimedOut)
-                    && resolved_channel.with(Option::is_some)
-                {
-                    // Found or authoritatively empty: TopicList renders both.
-                    let ch_id = resolved_channel.get().map(|c| c.id).unwrap_or_default();
-                    // Topics are newest first, so older history loads at the
-                    // END of the list: scrolling there (or the control) pages
-                    // back until the start of the channel.
-                    let history_cid = Signal::derive(move || resolved_channel.get().map(|c| c.id));
-                    let history_gated = Signal::derive(move || zone_is_gated(&category_slug(), &load_zones()));
-                    // The complete root list already lists every topic:
-                    // channel paging (older or newer) would add none.
-                    let topics_complete = Signal::derive(move || {
-                        resolved_channel
-                            .get()
-                            .is_some_and(|c| store.topic_roots_complete(&c.id))
-                    });
-                    // Bounded window: once older pages have evicted the
-                    // newest topics, a loader above the list brings them back.
-                    view! {
-                        <crate::components::history_loader::HistoryLoader
-                            channel_id=history_cid
-                            gated=history_gated
-                            label="Load newer topics"
-                            direction=crate::components::history_loader::HistoryDirection::Newer
-                            exhausted=topics_complete
+                                "Loading topics\u{2026}"
+                            }
+                            visible_status=keys
                         />
-                        <TopicList
-                            channel_id=ch_id
-                            category=category_for_topics.get()
-                            topics=topics
-                        />
-                        <crate::components::history_loader::HistoryLoader
-                            channel_id=history_cid
-                            gated=history_gated
-                            label="Load older topics"
-                            exhausted=topics_complete
-                        />
-                    }.into_any()
-                } else {
-                    // Not found on a receipt, or no receipt before the
-                    // deadline. A timeout must not read as "empty", so it gets
-                    // its own wording rather than TopicList's "No topics yet".
-                    let (heading, detail) = match (state, resolved_channel.with(Option::is_some)) {
-                        (Lookup::TimedOut, true) => (
-                            "Topics Unavailable",
-                            "This section's topics did not finish loading. Check your connection and try again.",
-                        ),
-                        (Lookup::KeysTimedOut, _) => (
-                            "Topics Unavailable",
-                            "Your keys for this zone could not all be fetched or checked: the relay or the admin check did not answer, or they are taking too long. Nothing here is missing for certain. Reload to try again.",
-                        ),
-                        (Lookup::TimedOut, false) => (
-                            "Section Unavailable",
-                            "This section did not finish loading. Check your connection and try again.",
-                        ),
-                        _ => (
-                            "Section Not Found",
-                            "This section could not be found in this zone.",
-                        ),
-                    };
-                    view! {
+                    }.into_any(),
+                    ListBranch::List(cid) => {
+                        // Topics are newest first, so older history loads at
+                        // the END of the list: scrolling there (or the
+                        // control) pages back until the start of the channel.
+                        let history_cid = Signal::from(channel_id);
+                        let history_gated = Signal::derive(move || zone_is_gated(&category_slug(), &load_zones()));
+                        // The complete root list already lists every topic:
+                        // channel paging (older or newer) would add none.
+                        let topics_complete = Signal::derive(move || {
+                            channel_id
+                                .get()
+                                .is_some_and(|c| store.topic_roots_complete(&c))
+                        });
+                        // Older pages are not pulled until the root list has
+                        // answered: before that, dormant roots would land in
+                        // the middle of a list already on screen.
+                        let older_exhausted = Signal::derive(move || {
+                            topics_complete.get() || !roots_answered.get()
+                        });
+                        // Bounded window: once older pages have evicted the
+                        // newest topics, a loader above the list brings them back.
+                        view! {
+                            <crate::components::history_loader::HistoryLoader
+                                channel_id=history_cid
+                                gated=history_gated
+                                label="Load newer topics"
+                                direction=crate::components::history_loader::HistoryDirection::Newer
+                                exhausted=topics_complete
+                            />
+                            <TopicList
+                                channel_id=cid
+                                category=category_for_topics.get_untracked()
+                                order=order.into()
+                                topics=by_id
+                            />
+                            <crate::components::history_loader::HistoryLoader
+                                channel_id=history_cid
+                                gated=history_gated
+                                label="Load older topics"
+                                exhausted=older_exhausted
+                            />
+                        }.into_any()
+                    }
+                    ListBranch::Unavailable { heading, detail } => view! {
                         <div class="glass-card p-8 text-center">
                             <h2 class="text-xl font-bold text-white mb-2">{heading}</h2>
                             <p class="text-gray-400 text-sm mb-4">{detail}</p>
-                            <A href=base_href(&format!("/{}", category_url_slug())) attr:class="za-text hover:opacity-80 text-sm underline">
+                            <A href=base_href(&format!("/{}", untrack(category_url_slug))) attr:class="za-text hover:opacity-80 text-sm underline">
                                 "Back to zone"
                             </A>
                         </div>
-                    }.into_any()
+                    }.into_any(),
                 }
             }}
         </div>
@@ -821,3 +1009,92 @@ async fn publish_topic_root(
 // a topic list, not a chat log. Per-message rendering, reactions, and the live
 // chat composer live on `/chat/:channel_id` (ChannelPage) and the per-topic
 // ThreadPage.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loading_shows_skeleton_rows() {
+        assert_eq!(
+            list_branch(None, Lookup::Loading, None, || true),
+            ListBranch::Skeleton { keys: false }
+        );
+        assert_eq!(
+            list_branch(None, Lookup::KeysLoading, Some("c".into()), || true),
+            ListBranch::Skeleton { keys: true }
+        );
+    }
+
+    #[test]
+    fn a_found_list_is_held_until_it_may_paint() {
+        let cid = || Some("c".to_string());
+        assert_eq!(
+            list_branch(None, Lookup::Found, cid(), || false),
+            ListBranch::Skeleton { keys: false }
+        );
+        assert_eq!(
+            list_branch(None, Lookup::Found, cid(), || true),
+            ListBranch::List("c".into())
+        );
+        // An authoritatively empty section is held the same way, then
+        // shows TopicList's "No topics yet".
+        assert_eq!(
+            list_branch(None, Lookup::NotFound, cid(), || true),
+            ListBranch::List("c".into())
+        );
+    }
+
+    #[test]
+    fn a_painted_list_stays_painted_and_the_same_value() {
+        // The memo's value is unchanged, so the branch is not rebuilt; the
+        // readiness inputs are not even read.
+        let prev = ListBranch::List("c".into());
+        assert_eq!(
+            list_branch(Some(&prev), Lookup::Found, Some("c".into()), || {
+                panic!("readiness is not re-checked once painted")
+            }),
+            prev
+        );
+        // Found and NotFound are one branch: the first topic arriving in an
+        // empty section does not rebuild the list.
+        assert_eq!(
+            list_branch(Some(&prev), Lookup::NotFound, Some("c".into()), || false),
+            prev
+        );
+        // Another section starts afresh.
+        assert_eq!(
+            list_branch(Some(&prev), Lookup::Found, Some("d".into()), || false),
+            ListBranch::Skeleton { keys: false }
+        );
+    }
+
+    #[test]
+    fn absence_and_timeouts_have_their_own_wording() {
+        let heading = |b: ListBranch| match b {
+            ListBranch::Unavailable { heading, .. } => heading,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            heading(list_branch(
+                None,
+                Lookup::TimedOut,
+                Some("c".into()),
+                || true
+            )),
+            "Topics Unavailable"
+        );
+        assert_eq!(
+            heading(list_branch(None, Lookup::TimedOut, None, || true)),
+            "Section Unavailable"
+        );
+        assert_eq!(
+            heading(list_branch(None, Lookup::KeysTimedOut, None, || true)),
+            "Topics Unavailable"
+        );
+        assert_eq!(
+            heading(list_branch(None, Lookup::NotFound, None, || true)),
+            "Section Not Found"
+        );
+    }
+}
