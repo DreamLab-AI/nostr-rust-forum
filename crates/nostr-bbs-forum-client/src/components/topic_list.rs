@@ -409,7 +409,7 @@ mod tests {
         assert!(classes(SKELETON_AVATAR_CLASS).contains(&"h-9"));
         // The title bar holds a non-breaking space: one title line high.
         assert!(classes(SKELETON_TITLE_CLASS).contains(&"inline-block"));
-        assert!(SKELETON_ROWS >= 4);
+        const { assert!(SKELETON_ROWS >= 4) };
     }
 
     #[test]
