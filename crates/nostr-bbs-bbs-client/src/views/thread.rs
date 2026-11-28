@@ -16,7 +16,7 @@
 //! - Per-identity auto-saved drafts (`draft:v2:`), bookmarks, mute, read positions
 //! - Image picker + clipboard image paste via NIP-98 Solid Pod PUT
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use leptos::prelude::*;
@@ -34,10 +34,10 @@ use nostr_bbs_client_core::stores::zones::{load_zones, resolve_zone_param};
 use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
 use nostr_bbs_client_core::topics::{
     board_events, classify_topics, edit_tags, find_topic_root, first_paint_ready,
-    first_row_in_full_view, first_stats_landed, history_settled, landing_target, latest_post,
-    latest_version, out_of_order, post_anchor_id, sealed_aliases, stable_order, thread_events,
-    thread_replies, topic_reply_tags, topic_root_tags, topic_title, updated_accessible_name,
-    updated_label, with_topic_stats, Landing, ReplyView, TopicSummary, FIRST_PAINT_TIMEOUT_MS,
+    first_row_in_full_view, history_settled, landing_target, latest_post, latest_version,
+    post_anchor_id, sealed_aliases, thread_events, thread_replies, topic_reply_tags,
+    topic_root_tags, topic_title, updated_accessible_name, updated_label, with_topic_stats,
+    FrozenBoard, Landing, ReplyView, TopicSummary, FIRST_PAINT_TIMEOUT_MS,
 };
 use nostr_bbs_client_core::utils::lookup::zone_is_gated;
 use nostr_bbs_client_core::utils::scroll_anchor;
@@ -222,9 +222,14 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         Effect::new(move |_| {
             let cid = cid.get_value();
             channels.ensure_subscribed(&relay, &cid);
+            // The root list goes out alongside the history REQ (once AUTH
+            // is done in a gated zone, where only that answer counts), not
+            // after its answer: one round trip less before first paint.
+            if !gated || relay.authenticated().get() {
+                channels.request_topic_roots(&relay, &cid, gated);
+            }
             if channels.history_receipt(&cid).settles(gated) {
                 channels.settle_first_page(&cid, gated);
-                channels.request_topic_roots(&relay, &cid, gated);
             }
         });
     }
@@ -283,19 +288,10 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     });
 
     // First paint: once topics are found the board waits (on its "Loading
-    // topics" card) for the root list and the first stats, or
-    // FIRST_PAINT_TIMEOUT_MS, so dormant topics and the relay's newest
-    // replies do not re-sort rows already on screen. A store that already
-    // holds them paints at once.
-    let answered_ids = Memo::new(move |_| {
-        topics.with(|ts| {
-            ts.iter()
-                .filter(|t| channels.topic_stats_answered(&t.id))
-                .map(|t| t.id.clone())
-                .collect::<HashSet<_>>()
-        })
-    });
-    let stats_answered = Memo::new(move |_| answered_ids.with(HashSet::len));
+    // topics" card) for its history window's settled answer and its root
+    // list (answered or failed), or FIRST_PAINT_TIMEOUT_MS, so dormant topics
+    // do not land under the reader. Stats are not waited for: they never
+    // move a painted row. A store that already holds both paints at once.
     let hold_expired = RwSignal::new(false);
     {
         let armed = StoredValue::new(false);
@@ -314,10 +310,13 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     }
     // Latched: once painted, the board stays painted.
     let painted = Memo::new(move |prev: Option<&bool>| {
+        let cid = cid.get_value();
         prev.copied().unwrap_or(false)
-            || (settled.get()
-                && first_paint_ready(true, stats_answered.get(), topics.with(Vec::len), false))
-            || (hold_expired.get() && !topics.with(Vec::is_empty))
+            || first_paint_ready(
+                channels.history_receipt(&cid).settles(gated),
+                channels.topic_roots_answered(&cid) || channels.topic_roots_failed(&cid),
+                hold_expired.get() && !topics.with(Vec::is_empty),
+            )
     });
     // Sealed envelopes and their originals in this board's lists: a sealed
     // root opens under its original id, and swaps in place.
@@ -335,11 +334,11 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         })
     });
 
-    // Display order: the true order until the board has painted; then a
-    // listed topic keeps its place, a new one goes on top and an older page
-    // at the bottom, with the reader's place kept. A row whose first stats
-    // land after the paint is placed once and not counted as updated.
-    // Leaving the board and coming back starts afresh.
+    // Display order: painted in the true order of what is known then, then
+    // frozen (`FrozenBoard`): stats, counts and decrypts change a row's
+    // figures, never its place; a sealed root swaps in place; the reader's
+    // own new topic goes on top; other new activity waits for "↻ N
+    // updated". Leaving the board and coming back paints afresh.
     let true_ids =
         Memo::new(move |_| topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>()));
     let by_id = Memo::new(move |_| {
@@ -354,59 +353,35 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     } else {
         Vec::new()
     });
+    let board = StoredValue::new(None::<FrozenBoard>);
     {
-        // (frozen, every topic whose first stats have landed this visit with
-        // its sealed counterpart, sealed pairs both ways: an envelope leaves
-        // the list when it opens, so pairs are kept.)
-        let state = StoredValue::new((
-            false,
-            HashSet::<String>::new(),
-            HashMap::<String, String>::new(),
-        ));
+        let me = auth.pubkey();
         Effect::new(move |_| {
-            let ids = true_ids.get();
             let shown = painted.get();
-            let answered = answered_ids.get();
-            let Some((was, first_stats, aliases)) =
-                state.try_update_value(|(frozen, seen, aliases)| {
-                    sealed_pairs.with(|pairs| {
-                        for (env, orig) in pairs {
-                            aliases.insert(env.clone(), orig.clone());
-                            aliases.insert(orig.clone(), env.clone());
-                        }
-                    });
+            let next = topics.with(|sorted| {
+                board.try_update_value(|frozen| {
+                    if !shown {
+                        return (false, Vec::new());
+                    }
+                    let b = frozen.get_or_insert_with(|| FrozenBoard::paint(sorted));
+                    sealed_pairs.with(|pairs| b.note_aliases(pairs.iter().cloned()));
                     // An original opened as it arrived never had its
                     // envelope in a list: the zone cache knows the pair.
-                    for id in &ids {
-                        if let Some(env) = restored_envelope_of(zk_store, id) {
-                            aliases.insert(env.clone(), id.clone());
-                            aliases.insert(id.clone(), env);
-                        }
-                    }
-                    let was = *frozen;
-                    *frozen |= shown;
-                    let landed = first_stats_landed(&answered, seen, aliases);
-                    let first_stats = if was { landed } else { HashSet::new() };
-                    (was, first_stats, aliases.clone())
+                    b.note_aliases(sorted.iter().filter_map(|t| {
+                        restored_envelope_of(zk_store, &t.id).map(|env| (env, t.id.clone()))
+                    }));
+                    b.update(sorted, me.get_untracked().as_deref());
+                    (true, b.shown().to_vec())
                 })
-            else {
+            });
+            let Some((frozen, next)) = next else {
                 return;
             };
-            let next = order.with_untracked(|current| {
-                let next = if !shown {
-                    Vec::new()
-                } else if was {
-                    stable_order(current, &ids, &aliases, &first_stats)
-                } else {
-                    ids.clone()
-                };
-                (next != *current).then_some(next)
-            });
-            if let Some(next) = next {
+            if order.with_untracked(|current| *current != next) {
                 // Keep the row on screen where it is, unless the reader is
-                // at the top of the board, where a new topic should be seen.
+                // at the top of the board, where their new topic is seen.
                 let at_top = order.with_untracked(|o| o.first().is_some_and(|id| at_board_top(id)));
-                let anchor = if was && !at_top {
+                let anchor = if frozen && !at_top {
                     scroll_anchor::capture(main_pane().as_deref())
                 } else {
                     None
@@ -418,7 +393,15 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             }
         });
     }
-    let updated = Memo::new(move |_| order.with(|o| true_ids.with(|t| out_of_order(o, t))));
+    // Real activity newer than the paint, not late stats.
+    let updated = Memo::new(move |_| {
+        order.track();
+        topics.with(|sorted| {
+            board
+                .try_with_value(|b| b.as_ref().map_or(0, |b| b.updated(sorted)))
+                .unwrap_or(0)
+        })
+    });
     // Older history adds topics only while the root list is incomplete.
     let can_load_older = Memo::new(move |_| {
         let cid = cid.get_value();
@@ -484,9 +467,21 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                         aria-label=move || updated_accessible_name(updated.try_get().unwrap_or(0))
                         title="Re-sort by latest activity"
                         on:click=move |_| {
-                            if let Some(ids) = true_ids.try_get_untracked() {
-                                order.set(ids);
-                            }
+                            let Some(shown) = topics
+                                .try_with_untracked(|sorted| {
+                                    board.try_update_value(|b| {
+                                        b.as_mut().map(|b| {
+                                            b.repaint(sorted);
+                                            b.shown().to_vec()
+                                        })
+                                    })
+                                })
+                                .flatten()
+                                .flatten()
+                            else {
+                                return;
+                            };
+                            order.set(shown);
                         }
                     >
                         {move || updated_label(updated.try_get().unwrap_or(0))}

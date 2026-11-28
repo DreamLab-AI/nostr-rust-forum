@@ -1453,23 +1453,6 @@ impl ChannelStore {
         }
     }
 
-    /// Whether topic `root`'s stats (asked by [`Self::request_topic_stats`])
-    /// are in far enough to place it in a list: its reply COUNT has
-    /// answered, and either it has no replies or its newest reply (which
-    /// sets its place) has arrived. A topic whose stats never come in is
-    /// never "answered"; a list neither waits for it for ever (first paint
-    /// has a timeout) nor moves its row. Read-only over existing state.
-    /// Reactive.
-    pub fn topic_stats_answered(&self, root: &str) -> bool {
-        let counted = self
-            .totals
-            .with(|m| m.get(&topic_key(root)).and_then(|t| t.counted));
-        stats_place_known(counted, || {
-            self.topic_latest
-                .with(|m| m.contains_key(&root.to_lowercase()))
-        })
-    }
-
     /// Topic `root`'s newest reply as the relay answered it, as
     /// (created_at, author). Reactive.
     pub fn topic_latest(&self, root: &str) -> Option<(u64, String)> {
@@ -2165,36 +2148,6 @@ fn buffer_pending_meta(pending: &mut HashMap<String, MetaUpdate>, update: MetaUp
         _ => {
             pending.insert(update.channel_id.clone(), update);
         }
-    }
-}
-
-/// Whether a topic's place in a list is known from its stats: the reply
-/// COUNT has answered (`counted`), and either it counted no replies or the
-/// newest reply is in (`latest_known`, asked only then).
-fn stats_place_known(counted: Option<u64>, latest_known: impl FnOnce() -> bool) -> bool {
-    match counted {
-        None => false,
-        Some(0) => true,
-        Some(_) => latest_known(),
-    }
-}
-
-#[cfg(test)]
-mod stats_place_tests {
-    use super::*;
-
-    #[test]
-    fn a_topic_is_placed_once_its_count_and_newest_reply_are_in() {
-        assert!(!stats_place_known(None, || true), "no COUNT yet");
-        assert!(
-            stats_place_known(Some(0), || false),
-            "no replies: nothing to wait for"
-        );
-        assert!(
-            !stats_place_known(Some(3), || false),
-            "replies, newest not in"
-        );
-        assert!(stats_place_known(Some(3), || true));
     }
 }
 

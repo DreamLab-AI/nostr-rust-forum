@@ -36,7 +36,7 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 
@@ -58,9 +58,8 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::topics::{
-    first_paint_ready, first_row_in_full_view, first_stats_landed, older_paging_armed,
-    out_of_order, sealed_aliases, stable_order, updated_accessible_name, updated_label,
-    FIRST_PAINT_TIMEOUT_MS,
+    first_paint_ready, first_row_in_full_view, older_paging_armed, sealed_aliases,
+    updated_accessible_name, updated_label, FrozenBoard, FIRST_PAINT_TIMEOUT_MS,
 };
 use crate::utils::capitalize;
 use crate::utils::lookup::{
@@ -229,20 +228,6 @@ fn list_branch(
             detail: "This section could not be found in this zone.",
         },
     }
-}
-
-/// The display order's state for one channel: whether it is frozen (the
-/// list has painted, so rows keep their place from now on), every topic
-/// whose first stats have landed this visit, with its sealed counterpart
-/// (a row whose first stats land after the freeze is placed once, see
-/// [`first_stats_landed`] and [`stable_order`]), and every sealed envelope
-/// and original seen, both ways (an envelope leaves the list when it
-/// opens, so the pair is kept).
-struct OrderState {
-    cid: Option<String>,
-    frozen: bool,
-    answered: HashSet<String>,
-    aliases: HashMap<String, String>,
 }
 
 /// Height of the forum's sticky header (`h-16`), when it cannot be measured.
@@ -451,8 +436,12 @@ pub fn SectionPage() -> impl IntoView {
                 if prev.flatten().as_deref() != Some(cid) {
                     store.rearm_topic_roots(cid);
                 }
+                // Sent alongside the history REQ rather than after its
+                // answer (one round trip less before first paint). A gated
+                // zone's root list only counts once AUTH is done, so it
+                // goes out then: its timeout does not run during sign-in.
                 let gated = zone_is_gated(&category_slug(), &load_zones());
-                if store.history_receipt(cid).settles(gated) {
+                if !gated || relay_for_roots.authenticated().get() {
                     store.request_topic_roots(&relay_for_roots, cid, gated);
                 }
             }
@@ -543,24 +532,16 @@ pub fn SectionPage() -> impl IntoView {
     let section_loading = Memo::new(move |_| section_lookup.get().is_loading());
 
     // First paint (cause: a list painted on its first topic, then filled in
-    // by the root list and the stats batches under the reader). A found list
-    // is held as skeleton rows until the section's root list has answered
-    // and the first stats are in, or FIRST_PAINT_TIMEOUT_MS after it was
-    // found. A store that already holds all of that paints at once.
+    // by the root list under the reader). A found list is held as skeleton
+    // rows until the history window has its settled answer and the root list
+    // has answered (or failed), or FIRST_PAINT_TIMEOUT_MS after it was found.
+    // Stats are not waited for: they never move a painted row. A store that
+    // already holds both paints at once.
     let roots_answered = Memo::new(move |_| {
         channel_id
             .get()
             .is_some_and(|cid| store.topic_roots_answered(&cid))
     });
-    let answered_ids = Memo::new(move |_| {
-        topics.with(|ts| {
-            ts.iter()
-                .filter(|t| store.topic_stats_answered(&t.id))
-                .map(|t| t.id.clone())
-                .collect::<HashSet<_>>()
-        })
-    });
-    let stats_answered = Memo::new(move |_| answered_ids.with(HashSet::len));
     let roots_failed = Memo::new(move |_| {
         channel_id
             .get()
@@ -594,23 +575,27 @@ pub fn SectionPage() -> impl IntoView {
     let branch = Memo::new(move |prev: Option<&ListBranch>| {
         let cid = channel_id.get();
         list_branch(prev, topics_lookup.get(), cid.clone(), || {
-            let timed_out = hold_expired_here.get();
+            let window_settled = cid.as_deref().is_some_and(|c| {
+                store
+                    .history_receipt(c)
+                    .settles(zone_is_gated(&category_slug(), &load_zones()))
+            });
             first_paint_ready(
-                roots_answered.get(),
-                stats_answered.get(),
-                topics.with(Vec::len),
-                timed_out,
+                window_settled,
+                roots_answered.get() || roots_failed.get(),
+                hold_expired_here.get(),
             )
         })
     });
 
     // Display order (cause: every stats answer re-sorted the painted list).
-    // Before the list paints it follows the true order; once painted, a
-    // listed topic keeps its place, a new one goes on top and an older page
-    // at the bottom, with the reader's place kept. A sealed root that opens
-    // (or closes again) swaps in place; a row whose first stats land after
-    // the paint is placed once and not counted as updated. Navigating away
-    // and back starts afresh.
+    // Before the list paints it follows the true order. It paints in the
+    // true order of what is known then (the settled window orders every
+    // recently active topic exactly, above all the rest) and is then frozen
+    // (`FrozenBoard`): stats, counts and decrypts change a row's figures,
+    // never its place; a sealed root swaps in place; the reader's own new
+    // topic goes on top; other new activity waits for "↻ N updated".
+    // Navigating away and back paints afresh.
     let true_ids =
         Memo::new(move |_| topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>()));
     let by_id = Memo::new(move |_| {
@@ -637,60 +622,45 @@ pub fn SectionPage() -> impl IntoView {
         })
     });
     let order = RwSignal::new(true_ids.get_untracked());
+    // (channel, the frozen board once painted)
+    let board = StoredValue::new((channel_id.get_untracked(), None::<FrozenBoard>));
     {
-        let state = StoredValue::new(OrderState {
-            cid: channel_id.get_untracked(),
-            frozen: false,
-            answered: HashSet::new(),
-            aliases: HashMap::new(),
-        });
+        let me = auth.pubkey();
         Effect::new(move |_| {
-            let ids = true_ids.get();
             let cid = channel_id.get();
-            let answered = answered_ids.get();
             let painted = matches!(branch.get(), ListBranch::List(_));
-            let Some((frozen, first_stats, aliases)) = state.try_update_value(|s| {
-                if s.cid != cid {
-                    s.cid = cid;
-                    s.frozen = false;
-                    s.answered.clear();
-                    s.aliases.clear();
-                }
-                sealed_pairs.with(|pairs| {
-                    for (env, orig) in pairs {
-                        s.aliases.insert(env.clone(), orig.clone());
-                        s.aliases.insert(orig.clone(), env.clone());
+            let next = topics.with(|sorted| {
+                board.try_update_value(|(for_cid, frozen)| {
+                    if *for_cid != cid {
+                        *for_cid = cid.clone();
+                        *frozen = None;
                     }
-                });
-                // An original opened as it arrived never had its envelope
-                // in a list: the zone cache knows the pair.
-                for id in &ids {
-                    if let Some(env) =
-                        crate::zone_crypto::store::restored_envelope_of(zone_keys, id)
-                    {
-                        s.aliases.insert(env.clone(), id.clone());
-                        s.aliases.insert(id.clone(), env);
+                    if frozen.is_none() && painted {
+                        *frozen = Some(FrozenBoard::paint(sorted));
                     }
-                }
-                let was = s.frozen;
-                s.frozen |= painted;
-                let landed = first_stats_landed(&answered, &mut s.answered, &s.aliases);
-                let first_stats = if was { landed } else { HashSet::new() };
-                (was, first_stats, s.aliases.clone())
-            }) else {
+                    let Some(b) = frozen.as_mut() else {
+                        return (
+                            false,
+                            sorted.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+                        );
+                    };
+                    sealed_pairs.with(|pairs| b.note_aliases(pairs.iter().cloned()));
+                    // An original opened as it arrived never had its
+                    // envelope in a list: the zone cache knows the pair.
+                    b.note_aliases(sorted.iter().filter_map(|t| {
+                        crate::zone_crypto::store::restored_envelope_of(zone_keys, &t.id)
+                            .map(|env| (env, t.id.clone()))
+                    }));
+                    b.update(sorted, me.get_untracked().as_deref());
+                    (true, b.shown().to_vec())
+                })
+            });
+            let Some((frozen, next)) = next else {
                 return;
             };
-            let next = order.with_untracked(|shown| {
-                let next = if frozen {
-                    stable_order(shown, &ids, &aliases, &first_stats)
-                } else {
-                    ids.clone()
-                };
-                (next != *shown).then_some(next)
-            });
-            if let Some(next) = next {
+            if order.with_untracked(|shown| *shown != next) {
                 // Keep the row on screen where it is, unless the reader is
-                // at the top of the list, where a new topic should be seen.
+                // at the top of the list, where their new topic is seen.
                 let at_top = order.with_untracked(|o| o.first().is_some_and(|id| at_list_top(id)));
                 let anchor = if frozen && !at_top {
                     scroll_anchor::capture(None)
@@ -704,7 +674,16 @@ pub fn SectionPage() -> impl IntoView {
             }
         });
     }
-    let updated = Memo::new(move |_| order.with(|o| true_ids.with(|t| out_of_order(o, t))));
+    // Real activity newer than the paint, not late stats. Re-read when the
+    // shown order or the topics change; the board itself is read untracked.
+    let updated = Memo::new(move |_| {
+        order.track();
+        topics.with(|sorted| {
+            board
+                .try_with_value(|(_, b)| b.as_ref().map_or(0, |b| b.updated(sorted)))
+                .unwrap_or(0)
+        })
+    });
 
     let header_name = move || {
         resolved_channel
@@ -865,9 +844,21 @@ pub fn SectionPage() -> impl IntoView {
                         aria-label=move || updated_accessible_name(updated.try_get().unwrap_or(0))
                         title="Re-sort by latest activity"
                         on:click=move |_| {
-                            if let Some(ids) = true_ids.try_get_untracked() {
-                                order.set(ids);
-                            }
+                            let Some(shown) = topics
+                                .try_with_untracked(|sorted| {
+                                    board.try_update_value(|(_, b)| {
+                                        b.as_mut().map(|b| {
+                                            b.repaint(sorted);
+                                            b.shown().to_vec()
+                                        })
+                                    })
+                                })
+                                .flatten()
+                                .flatten()
+                            else {
+                                return;
+                            };
+                            order.set(shown);
                         }
                     >
                         {move || updated_label(updated.try_get().unwrap_or(0))}
