@@ -1500,6 +1500,9 @@ fn Layout(children: Children) -> impl IntoView {
 
             // Global overlays and layout components
             <ToastContainer />
+            // Subscribed topics: a fixed column (desktop) or drawer (mobile),
+            // overlaying the page so it never moves it; nothing signed out.
+            <crate::components::subscriptions_panel::SubscriptionsPanel />
             <GlobalSearch />
             <MobileBottomNav />
             <BookmarksModal is_open=bookmarks_open />

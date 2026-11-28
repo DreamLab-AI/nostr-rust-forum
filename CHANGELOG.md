@@ -18,6 +18,28 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Forum client: subscribe to topics, subscribed-topics panel (2026-11-28)
+
+Built on the client-core subscriptions store below. Not seen in a browser.
+
+- **Topic rows.** A bell button (outline / filled, `aria-pressed`, tooltip, focus ring) subscribes or unsubscribes
+  without opening the topic; its place is always reserved in the row, so it never changes a row's height or moves its
+  contents. On touch and pen a horizontal swipe either way does the same (claimed only after 10 px and twice the
+  vertical travel, never within 24 px of a screen edge, committed past a third of the row, springing back otherwise or
+  on cancel, instant under reduced motion); the strip behind shows the bell and "Subscribe" or "Unsubscribe".
+- **Panel.** Subscribed topics, alphabetical, with a glowing new-post numeral to the left of names with unread posts
+  and one-line names with the full title as a tooltip; a neutral "Topic unavailable" when a title cannot be read;
+  "Mark all read". Desktop: a column fixed at the left under the header, overlaying the page (opening or closing it
+  moves nothing), collapsed to an edge tab, the choice remembered on the device. Mobile (≤ 640 px): a drawer opened by
+  tapping or dragging a small edge tab (which shows the unread count), closed by swiping it left, the scrim or Escape,
+  with focus trapped while open and returned to the tab. Nothing shows signed out.
+- **Reading.** Opening a subscribed thread marks it read; the panel numeral and the bell notices for the same posts
+  clear together.
+- Shared pieces in client-core: `stores::subs_panel` (panel state, toggle action, labels), `utils::swipe` (gesture
+  logic and binding), `ThreadSubsStore::mark_read_while_viewing`, `NotificationStoreV2::mark_read_ids`; prefetched
+  topic roots kept in their own list, out of the section's topic board. web-sys features `MouseEvent` and
+  `PointerEvent` enabled on client-core.
+
 ### Client core: topic subscriptions, unread counts and a private cross-device copy (2026-11-28)
 
 Client core plus one provider line in each client's `app.rs`; no view yet, so nothing is visible until the forum and BBS
