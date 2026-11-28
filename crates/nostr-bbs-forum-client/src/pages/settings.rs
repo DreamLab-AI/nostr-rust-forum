@@ -762,8 +762,13 @@ pub fn SettingsPage() -> impl IntoView {
     });
 
     // -- Logout handler --
+    let toasts_for_logout = toasts;
     let on_logout = move |_| {
         auth.logout();
+        // The page navigates once a last subscriptions publish ends (≤ 3 s).
+        if auth.signing_out().get_untracked() {
+            toasts_for_logout.show("Signing out\u{2026}", ToastVariant::Info);
+        }
     };
 
     // -- Pod git clone URL: copy-to-clipboard handler (ADR-089) --

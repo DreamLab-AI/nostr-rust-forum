@@ -36,9 +36,14 @@
 //! - Never publish before this session's first fetch succeeded (a timeout is
 //!   a failure, an empty answer is not), nor over a copy that cannot be
 //!   decrypted or read: that would wipe what another device wrote.
-//! - Pending changes go out when the page is hidden (`visibilitychange`, when
-//!   the page can still wait for the relay), at sign-out (bounded), and
-//!   otherwise at most once per [`PUBLISH_INTERVAL_MS`]. On `pagehide` the
+//! - Pending changes go out at most once per [`PUBLISH_INTERVAL_MS`],
+//!   rate-limited on the last attempt (failures back off up to 30 minutes);
+//!   hiding the page (`visibilitychange`, when it can still wait for the
+//!   relay) skips that interval only for a subscribe or unsubscribe; sign-out
+//!   gets one bounded publish (local-key and passkey sessions; it writes
+//!   nothing to storage). A declined signature stops prompts for the session
+//!   until the member subscribes or unsubscribes again. Signer calls are
+//!   abandoned after two minutes. On `pagehide` the
 //!   copy is published only if the last fetch is under
 //!   [`PAGEHIDE_FRESH_MS`] old (normally the hide just before it), so it never
 //!   overwrites a copy it has not seen.
@@ -48,8 +53,9 @@
 //!   [`EXTENSION_MARKER_INTERVAL_MS`].
 //! - The last relay copy seen (id, `created_at` and digests) is kept with the
 //!   local copy, so an unchanged relay copy is never decrypted again, and
-//!   other tabs see that nothing is pending. One tab publishes at a time
-//!   (a short-lived lock in localStorage).
+//!   other tabs see that nothing is pending. One tab publishes at a time: a
+//!   lock in localStorage outlasting a signer call, taken again before the
+//!   publish; another tab waits for its expiry or for the holder's write.
 //! - Without NIP-44 (a NIP-07 extension lacking `nip44`), or on any error, the
 //!   feature stays local-only ([`SyncStatus::LocalOnly`]); the local list
 //!   keeps working.
@@ -135,16 +141,32 @@ pub enum LocalOnlyReason {
     /// topics were merged from several devices). Retried after the next
     /// change.
     TooLarge,
-    /// The relay did not answer, refused, or the connection dropped. Retried
-    /// after a reconnect or the next change.
+    /// The relay did not answer, refused, or the connection dropped (or a
+    /// signer call took longer than two minutes). Retried with backoff.
     RelayError,
+    /// The signer refused to encrypt or sign (a declined NIP-07 prompt).
+    /// No more prompts this session until the member subscribes or
+    /// unsubscribes again, or reloads.
+    SignerRefused,
 }
 
 impl LocalOnlyReason {
     /// Whether this ends syncing for the rest of the session.
     pub(crate) fn ends_session(self) -> bool {
-        matches!(self, LocalOnlyReason::NoNip44 | LocalOnlyReason::Unreadable)
+        matches!(
+            self,
+            LocalOnlyReason::NoNip44 | LocalOnlyReason::Unreadable | LocalOnlyReason::SignerRefused
+        )
     }
+}
+
+/// Pause after `failures` failed attempts in a row before the next one,
+/// milliseconds: one minute, doubling, at most 30 minutes.
+pub(crate) fn failure_backoff_ms(failures: u32) -> u64 {
+    if failures == 0 {
+        return 0;
+    }
+    (PUBLISH_INTERVAL_MS << (failures - 1).min(16)).min(EXTENSION_MARKER_INTERVAL_MS)
 }
 
 /// At most one scheduled publish per this many milliseconds.
@@ -174,12 +196,13 @@ pub(crate) struct RemoteSeen {
 }
 
 impl RemoteSeen {
-    /// The newer of two records (by `created_at`, then id), for merging what
-    /// two tabs stored.
+    /// The newer of two records, for merging what two tabs stored: the later
+    /// `created_at`, and in the same second the **lower** id (the copy the
+    /// relay keeps, NIP-01).
     pub fn newer(a: Option<RemoteSeen>, b: Option<RemoteSeen>) -> Option<RemoteSeen> {
         match (a, b) {
             (Some(a), Some(b)) => {
-                if (b.created_at, &b.id) > (a.created_at, &a.id) {
+                if b.created_at > a.created_at || (b.created_at == a.created_at && b.id < a.id) {
                     Some(b)
                 } else {
                     Some(a)
@@ -213,14 +236,12 @@ pub(crate) fn digests(subs: &Subs) -> Result<Digests, LocalOnlyReason> {
     })
 }
 
-/// Whether relay copy `latest` is newer than the one last seen (`known`):
-/// a different event, later (`created_at`, then id). A stale answer naming an
-/// older copy is not a change.
+/// Whether relay copy `latest` differs from the one last seen (`known`):
+/// any other event id counts, whatever its `created_at` (in the same second
+/// the relay keeps the lower id, so "newer" cannot be judged by time alone,
+/// and merging an older copy is harmless).
 pub(crate) fn remote_changed(known: Option<&RemoteSeen>, latest: &NostrEvent) -> bool {
-    match known {
-        None => true,
-        Some(k) => k.id != latest.id && (latest.created_at, &latest.id) > (k.created_at, &k.id),
-    }
+    known.is_none_or(|k| k.id != latest.id)
 }
 
 /// What asked for a publish decision.
@@ -257,6 +278,8 @@ pub(crate) struct PlanInput<'a> {
     pub last_fetch_ms: Option<u64>,
     /// When this browser last published, 0 if never.
     pub published_ms: u64,
+    /// After failed attempts: nothing before this time (milliseconds).
+    pub not_before_ms: u64,
 }
 
 /// The publish decision.
@@ -302,16 +325,18 @@ pub(crate) fn plan(p: &PlanInput<'_>) -> Plan {
     } else {
         PUBLISH_INTERVAL_MS
     };
-    let earliest = p.published_ms.saturating_add(interval);
+    let earliest = p.published_ms.saturating_add(interval).max(p.not_before_ms);
     match p.trigger {
         Trigger::Scheduled if p.now_ms < earliest => {
             return Plan::Wait { until_ms: earliest };
         }
-        // Hiding the page is not worth an extension prompt for markers alone
-        // inside their interval; anything else goes now.
-        Trigger::Hidden | Trigger::PageHide
-            if markers_only && p.extension && p.now_ms < earliest =>
-        {
+        // After a failure, hiding the page does not retry early either.
+        Trigger::Hidden | Trigger::PageHide if p.now_ms < p.not_before_ms => {
+            return Plan::Nothing;
+        }
+        // Hiding the page skips the interval only for a membership change
+        // (subscribe or unsubscribe); markers alone wait for theirs.
+        Trigger::Hidden | Trigger::PageHide if markers_only && p.now_ms < earliest => {
             return Plan::Nothing;
         }
         _ => {}
@@ -462,14 +487,14 @@ pub(crate) async fn seal(
     let content = signer
         .nip44_encrypt(&owner, &plain)
         .await
-        .map_err(|_| LocalOnlyReason::NoNip44)?;
+        .map_err(|_| LocalOnlyReason::SignerRefused)?;
     if content.len() > RELAY_CONTENT_CAP {
         return Err(LocalOnlyReason::TooLarge);
     }
     signer
         .sign_event(unsigned_event(&owner, content, created_at))
         .await
-        .map_err(|_| LocalOnlyReason::NoSigner)
+        .map_err(|_| LocalOnlyReason::SignerRefused)
 }
 
 /// Decrypt and read a copy with the signer's own key (markers clamped to
@@ -790,6 +815,7 @@ mod tests {
             now_ms: T,
             last_fetch_ms: Some(T),
             published_ms: 0,
+            not_before_ms: 0,
         }
     }
 
@@ -947,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn a_relay_copy_counts_as_changed_only_when_newer() {
+    fn any_other_relay_copy_counts_as_changed_including_the_same_second() {
         let s = signer();
         let mut subs = Subs::default();
         subs.subscribe(&id(1), &id(2), "", 1, 1_000).unwrap();
@@ -963,18 +989,105 @@ mod tests {
             !remote_changed(Some(&same), &ev),
             "same copy: not decrypted again"
         );
-        let newer_known = RemoteSeen {
+        // Equal created_at, either id order: a change (the relay keeps the
+        // lower id, so time cannot decide).
+        for other in ["0".repeat(64), "f".repeat(64)] {
+            let k = RemoteSeen {
+                id: other,
+                created_at: 200,
+                ..same.clone()
+            };
+            assert!(remote_changed(Some(&k), &ev));
+        }
+        let later_known = RemoteSeen {
             id: "f".repeat(64),
             created_at: 300,
-            ..same.clone()
-        };
-        assert!(!remote_changed(Some(&newer_known), &ev), "a stale answer");
-        let older_known = RemoteSeen {
-            id: "0".repeat(64),
-            created_at: 100,
             ..same
         };
-        assert!(remote_changed(Some(&older_known), &ev));
+        assert!(
+            remote_changed(Some(&later_known), &ev),
+            "merging is harmless"
+        );
+    }
+
+    #[test]
+    fn of_two_records_in_the_same_second_the_lower_id_is_newer() {
+        let r = |id: &str, at: u64| RemoteSeen {
+            id: id.into(),
+            created_at: at,
+            digest: String::new(),
+            entries_digest: String::new(),
+        };
+        let a = r("aaa", 100);
+        let b = r("bbb", 100);
+        assert_eq!(
+            RemoteSeen::newer(Some(a.clone()), Some(b.clone())),
+            Some(a.clone())
+        );
+        assert_eq!(
+            RemoteSeen::newer(Some(b.clone()), Some(a.clone())),
+            Some(a.clone())
+        );
+        let c = r("zzz", 101);
+        assert_eq!(RemoteSeen::newer(Some(a.clone()), Some(c.clone())), Some(c));
+        assert_eq!(RemoteSeen::newer(None, Some(a.clone())), Some(a));
+    }
+
+    #[test]
+    fn failed_attempts_back_off_and_hide_does_not_retry_early() {
+        assert_eq!(failure_backoff_ms(0), 0);
+        assert_eq!(failure_backoff_ms(1), 60_000);
+        assert_eq!(failure_backoff_ms(2), 120_000);
+        assert_eq!(failure_backoff_ms(20), EXTENSION_MARKER_INTERVAL_MS);
+        let local = dig("a", "x");
+        let old = seen("b", "y");
+        let p = PlanInput {
+            not_before_ms: T + 5_000,
+            ..input(&local, Some(&old))
+        };
+        assert_eq!(
+            plan(&p),
+            Plan::Wait {
+                until_ms: T + 5_000
+            }
+        );
+        let hidden = PlanInput {
+            trigger: Trigger::Hidden,
+            ..p.clone()
+        };
+        assert_eq!(plan(&hidden), Plan::Nothing);
+        // Sign-out is the last chance: it still tries.
+        let out = PlanInput {
+            trigger: Trigger::SignOut,
+            ..p
+        };
+        assert_eq!(plan(&out), Plan::Publish);
+    }
+
+    #[test]
+    fn hiding_skips_the_interval_only_for_a_membership_change() {
+        let local = dig("a", "x");
+        // Markers alone, inside the interval: hiding waits, any signer.
+        let markers = seen("b", "x");
+        let p = PlanInput {
+            trigger: Trigger::Hidden,
+            published_ms: T - 1_000,
+            ..input(&local, Some(&markers))
+        };
+        assert_eq!(plan(&p), Plan::Nothing);
+        // A subscribe or unsubscribe goes on hide at once.
+        let membership = seen("b", "y");
+        let p = PlanInput {
+            trigger: Trigger::Hidden,
+            published_ms: T - 1_000,
+            ..input(&local, Some(&membership))
+        };
+        assert_eq!(plan(&p), Plan::Publish);
+    }
+
+    #[test]
+    fn a_declined_signature_ends_the_session() {
+        assert!(LocalOnlyReason::SignerRefused.ends_session());
     }
 
     #[test]

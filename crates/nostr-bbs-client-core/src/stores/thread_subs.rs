@@ -84,8 +84,15 @@ pub const STORAGE_KEY_PREFIX: &str = "nostrbbs:thread_subs:v1:";
 /// Prefix of the per-account publish lock (one tab publishes at a time).
 const LOCK_KEY_PREFIX: &str = "nostrbbs:thread_subs_lock:v1:";
 
-/// How long a tab's publish lock lasts, milliseconds.
-const LOCK_MS: u64 = 60_000;
+/// How long a signer call made for the relay copy (encrypt, decrypt, sign)
+/// may take before it is abandoned, milliseconds: a NIP-07 prompt left open
+/// must not stall the copy for the session.
+const SIGNER_TIMEOUT_MS: u32 = 120_000;
+
+/// How long a tab's publish lock lasts, milliseconds: longer than a signer
+/// call may take, so a lock held across an open prompt does not expire under
+/// it (it is taken again just before publishing, too).
+const LOCK_MS: u64 = SIGNER_TIMEOUT_MS as u64 + 30_000;
 
 /// The most topics one member can follow at once. Keeps the synced copy under
 /// the relay's 64 KiB content cap; [`ThreadSubsStore::subscribe`] refuses with
@@ -129,6 +136,14 @@ const MAX_RETRIES: u32 = 6;
 
 /// Still-locked sealed posts held to count once they open.
 const MAX_PENDING_LOCKED: usize = 500;
+
+/// Most bytes of not-held sealed envelopes kept to decrypt again later.
+const MAX_PENDING_BYTES: usize = 256 * 1024;
+
+/// Allowance subtracted from a topic's high-water mark (seconds): a post
+/// dated up to five minutes before the newest one seen (a slow clock, a
+/// late relay write) is still asked for after a reconnect.
+const BACKDATE_ALLOWANCE_SECS: u64 = 300;
 
 /// Delay before a scheduled publish once changes settle, milliseconds.
 const PUBLISH_SETTLE_MS: u64 = 2_000;
@@ -693,11 +708,13 @@ pub(crate) fn unseen_root<'a>(
 
 /// The `since` of a topic's backlog filter: just after its read marker, or,
 /// once a backlog answer this session has delivered posts up to `high`, from
-/// `high` (inclusive: a post in the same second may not have been delivered
-/// yet; duplicates are dropped by id). So a reconnect asks only for what is
+/// `high` less [`BACKDATE_ALLOWANCE_SECS`] (a post dated a little earlier
+/// may arrive later; duplicates are dropped by id). So a reconnect asks only for what is
 /// newer than what was already seen, not the whole span again.
 pub(crate) fn backlog_since(read_at: u64, high: Option<u64>) -> u64 {
-    read_at.saturating_add(1).max(high.unwrap_or(0))
+    read_at
+        .saturating_add(1)
+        .max(high.map_or(0, |h| h.saturating_sub(BACKDATE_ALLOWANCE_SECS)))
 }
 
 /// The backlog filter for topic `root` from `since`:
@@ -971,12 +988,18 @@ struct PendingLocked {
 struct SyncCtl {
     /// This account's first fetch-and-merge succeeded: publishing is allowed.
     fetched: bool,
-    /// Local-only for the rest of the session (unreadable relay copy, no
-    /// NIP-44).
-    disabled: bool,
+    /// Local-only for the rest of the session, and why (unreadable relay
+    /// copy, no NIP-44, a refused signature — the last is lifted by an
+    /// explicit subscribe or unsubscribe).
+    disabled: Option<LocalOnlyReason>,
     busy: bool,
     last_fetch_ms: Option<u64>,
     timer_at: Option<u64>,
+    /// Failed attempts in a row, and the time before which none is retried.
+    failures: u32,
+    not_before_ms: u64,
+    /// Another tab holds the publish lock until then.
+    lock_wait_until: u64,
 }
 
 /// What the store needs from elsewhere, captured once at the app root.
@@ -1045,8 +1068,18 @@ impl ThreadSubsStore {
                 }
             })
         };
+        // Memos over the followed entries only: a read-marker change leaves
+        // them equal, so neither titles nor the panel list recompute.
+        let active = Memo::new(move |_| current());
+        let pairs = Memo::new(move |_| {
+            active.with(|v| {
+                v.iter()
+                    .map(|e| (e.r.clone(), e.c.clone()))
+                    .collect::<Vec<_>>()
+            })
+        });
         let titles = Memo::new(move |_| {
-            let wanted: Vec<(String, String)> = current().into_iter().map(|e| (e.r, e.c)).collect();
+            let wanted = pairs.get();
             titles_rev.track();
             if let Some(r) = zone_rev {
                 r.track();
@@ -1056,7 +1089,7 @@ impl ThreadSubsStore {
                 .with_untracked(|m| resolve_titles(m, &wanted))
         });
         let topics = Memo::new(move |_| {
-            let entries = current();
+            let entries = active.get();
             let titles = titles.get();
             let metas: HashMap<String, crate::stores::channels::ChannelMeta> =
                 channels.channels.with(|list| {
@@ -1229,9 +1262,22 @@ impl ThreadSubsStore {
             result = o.subs.subscribe(root, channel, &zone, start, at);
         });
         if result? {
+            self.lift_refusal();
             self.after_change();
         }
         Ok(())
+    }
+
+    /// An explicit subscribe or unsubscribe lifts a session's refused
+    /// signature, so the next publish asks the signer again.
+    fn lift_refusal(&self) {
+        self.sync.update_value(|c| {
+            if c.disabled == Some(LocalOnlyReason::SignerRefused) {
+                c.disabled = None;
+                c.failures = 0;
+                c.not_before_ms = 0;
+            }
+        });
     }
 
     /// Stop following topic `root`. Its unread count goes with it.
@@ -1245,6 +1291,7 @@ impl ThreadSubsStore {
             }
         });
         if changed {
+            self.lift_refusal();
             self.after_change();
         }
     }
@@ -1479,12 +1526,23 @@ impl ThreadSubsStore {
         if locked.is_empty() {
             return;
         }
+        let size = |e: &NostrEvent| {
+            e.content.len() + e.tags.iter().flatten().map(String::len).sum::<usize>() + 256
+        };
         self.pending.update_value(|p| {
+            let mut bytes: usize = p.values().filter_map(|i| i.raw.as_ref()).map(size).sum();
             for (env, item) in locked {
                 if p.len() >= MAX_PENDING_LOCKED {
                     break;
                 }
-                p.entry(env).or_insert(item);
+                let add = item.raw.as_ref().map_or(0, size);
+                if bytes + add > MAX_PENDING_BYTES {
+                    continue;
+                }
+                if let std::collections::hash_map::Entry::Vacant(slot) = p.entry(env) {
+                    bytes += add;
+                    slot.insert(item);
+                }
             }
         });
     }
@@ -2062,7 +2120,7 @@ impl ThreadSubsStore {
         let ctl = self.sync.get_value();
         sync::plan(&PlanInput {
             fetched: ctl.fetched,
-            disabled: ctl.disabled,
+            disabled: ctl.disabled.is_some(),
             local: local.as_ref(),
             local_empty: subs.entries.is_empty(),
             remote: remote.as_ref(),
@@ -2071,26 +2129,35 @@ impl ThreadSubsStore {
             now_ms: now,
             last_fetch_ms: ctl.last_fetch_ms,
             published_ms,
+            not_before_ms: ctl.not_before_ms,
         })
     }
 
     /// After a change, a reconnect or a sync: start the first sync for the
-    /// account, or arm the timer for the next publish the plan allows.
+    /// account (one fetch per session; a reconnect fetches again only when
+    /// something is pending), or arm the timer for the next publish the plan
+    /// allows.
     fn schedule_sync(&self) {
         if !self.relay_ready() {
             return;
         }
         let ctl = self.sync.get_value();
-        if ctl.disabled || ctl.busy {
+        if ctl.disabled.is_some() || ctl.busy {
             return;
         }
         if !ctl.fetched {
-            self.spawn_sync(Trigger::Scheduled);
+            if now_ms() >= ctl.not_before_ms {
+                self.spawn_sync(Trigger::Scheduled);
+            } else {
+                self.arm_timer(ctl.not_before_ms);
+            }
             return;
         }
         match self.plan_now(Trigger::Scheduled) {
-            Plan::Wait { until_ms } => self.arm_timer(until_ms),
-            Plan::Publish | Plan::Refetch => self.arm_timer(now_ms() + PUBLISH_SETTLE_MS),
+            Plan::Wait { until_ms } => self.arm_timer(until_ms.max(ctl.lock_wait_until)),
+            Plan::Publish | Plan::Refetch => {
+                self.arm_timer((now_ms() + PUBLISH_SETTLE_MS).max(ctl.lock_wait_until))
+            }
             Plan::TooLarge => self
                 .sync_status
                 .set(SyncStatus::LocalOnly(LocalOnlyReason::TooLarge)),
@@ -2118,18 +2185,31 @@ impl ThreadSubsStore {
                         c.timer_at = None;
                     }
                 });
-                let ctl = store.sync.get_value();
-                if ctl.busy || ctl.disabled || !store.relay_ready() {
-                    return;
-                }
-                match store.plan_now(Trigger::Scheduled) {
-                    Plan::Publish | Plan::Refetch => store.spawn_sync(Trigger::Scheduled),
-                    Plan::Wait { until_ms } => store.arm_timer(until_ms),
-                    _ => {}
-                }
+                store.schedule_or_run();
             },
             delay,
         );
+    }
+
+    /// A timer fired: run the sync if the plan says so now, else re-arm.
+    fn schedule_or_run(&self) {
+        let ctl = self.sync.get_value();
+        if ctl.busy || ctl.disabled.is_some() || !self.relay_ready() {
+            return;
+        }
+        if !ctl.fetched {
+            self.schedule_sync();
+            return;
+        }
+        let now = now_ms();
+        match self.plan_now(Trigger::Scheduled) {
+            Plan::Publish | Plan::Refetch if now >= ctl.lock_wait_until => {
+                self.spawn_sync(Trigger::Scheduled)
+            }
+            Plan::Publish | Plan::Refetch => self.arm_timer(ctl.lock_wait_until),
+            Plan::Wait { until_ms } => self.arm_timer(until_ms.max(ctl.lock_wait_until)),
+            _ => {}
+        }
     }
 
     fn spawn_sync(&self, trigger: Trigger) {
@@ -2144,11 +2224,25 @@ impl ThreadSubsStore {
             }
             store.sync.update_value(|c| c.busy = false);
             match outcome {
-                Ok(()) => store.schedule_sync(),
+                Ok(()) => {
+                    store.sync.update_value(|c| {
+                        c.failures = 0;
+                        c.not_before_ms = 0;
+                    });
+                    store.schedule_sync();
+                }
                 Err(reason) => {
-                    if reason.ends_session() {
-                        store.sync.update_value(|c| c.disabled = true);
-                    }
+                    let now = now_ms();
+                    store.sync.update_value(|c| {
+                        if reason.ends_session() {
+                            c.disabled = Some(reason);
+                        } else {
+                            // Rate-limited on the attempt, not the last
+                            // success: back off before trying again.
+                            c.failures += 1;
+                            c.not_before_ms = now + sync::failure_backoff_ms(c.failures);
+                        }
+                    });
                     store.sync_status.set(SyncStatus::LocalOnly(reason));
                 }
             }
@@ -2169,9 +2263,9 @@ impl ThreadSubsStore {
         Ok(signer)
     }
 
-    /// Fetch the relay copy and merge it in. A copy whose id is the one last
-    /// seen (kept with the local copy, so across reloads too) is not
-    /// decrypted again.
+    /// Fetch the relay copy (one REQ, closed on its answer) and merge it in.
+    /// A copy whose id is the one last seen (kept with the local copy, so
+    /// across reloads too) is not decrypted again.
     async fn fetch_and_merge(
         &self,
         signer: &dyn nostr_bbs_core::signer::Signer,
@@ -2186,7 +2280,7 @@ impl ThreadSubsStore {
         self.sync.update_value(|c| c.last_fetch_ms = Some(now_ms()));
         let known = self.owned.with_untracked(|o| o.remote.clone());
         if let Some(ev) = latest.filter(|ev| sync::remote_changed(known.as_ref(), ev)) {
-            let mut remote = sync::open(signer, &ev, now_secs()).await?;
+            let mut remote = timed(sync::open(signer, &ev, now_secs()), SIGNER_TIMEOUT_MS).await?;
             if self.generation() != gen {
                 return Ok(());
             }
@@ -2218,7 +2312,9 @@ impl ThreadSubsStore {
     /// fetch has gone stale by the time the copy is sealed (a NIP-07 prompt
     /// can take minutes), and starts over if the relay copy changed
     /// meanwhile. Never publishes before a successful fetch, nor over a copy
-    /// it cannot read (that fails the fetch with `Unreadable`).
+    /// it cannot read (that fails the fetch with `Unreadable`). When another
+    /// tab holds the publish lock it waits for that lock's expiry (or for the
+    /// other tab's write, which shows nothing is pending).
     async fn sync_once(&self, gen: u64, trigger: Trigger) -> Result<(), LocalOnlyReason> {
         let signer = self.sync_signer()?;
         let relay = self.deps.with_value(|d| d.relay.clone());
@@ -2233,15 +2329,12 @@ impl ThreadSubsStore {
                 Plan::TooLarge => return Err(LocalOnlyReason::TooLarge),
                 Plan::Wait { .. } | Plan::Nothing | Plan::Blocked => return Ok(()),
             }
-            // At sign-out this tab must publish whatever another holds.
-            let locked = trigger == Trigger::SignOut || self.acquire_lock();
-            if !locked {
+            if let Err(until) = self.acquire_lock() {
+                self.sync.update_value(|c| c.lock_wait_until = until);
                 return Ok(());
             }
             let result = self.seal_and_publish(&*signer, &relay, gen).await;
-            if trigger != Trigger::SignOut {
-                self.release_lock();
-            }
+            self.release_lock();
             match result {
                 Ok(true) => return Ok(()),
                 Ok(false) => continue,
@@ -2266,7 +2359,7 @@ impl ThreadSubsStore {
         snapshot.prune(now);
         let d = sync::digests(&snapshot)?;
         let created_at = now_secs().max(remote.as_ref().map_or(0, |r| r.created_at + 1));
-        let ev = sync::seal(signer, &snapshot, created_at).await?;
+        let ev = timed(sync::seal(signer, &snapshot, created_at), SIGNER_TIMEOUT_MS).await?;
         if self.generation() != gen {
             return Ok(true);
         }
@@ -2280,6 +2373,12 @@ impl ThreadSubsStore {
             if latest.is_some_and(|l| sync::remote_changed(remote.as_ref(), &l)) {
                 return Ok(false);
             }
+        }
+        // Extend the lock across the publish (the prompt may have used most
+        // of it).
+        if let Err(until) = self.acquire_lock() {
+            self.sync.update_value(|c| c.lock_wait_until = until);
+            return Ok(true);
         }
         sync::publish(relay, &ev).await?;
         if self.generation() != gen {
@@ -2298,21 +2397,30 @@ impl ThreadSubsStore {
         Ok(true)
     }
 
-    /// Take the per-account publish lock unless another tab holds a live one.
-    fn acquire_lock(&self) -> bool {
+    /// Take (or extend) the per-account publish lock unless another tab holds
+    /// a live one; `Err(until)` gives that lock's expiry.
+    fn acquire_lock(&self) -> Result<(), u64> {
         let Some(owner) = self.me() else {
-            return false;
+            return Err(now_ms() + LOCK_MS);
         };
         let mine = self.tab_id.get_value();
         let key = lock_key(&owner);
         let now = now_ms();
         if let Ok(v) = LocalStorage::get::<(String, u64)>(&key) {
             if v.0 != mine && v.1 > now {
-                return false;
+                return Err(v.1);
             }
         }
-        let _ = LocalStorage::set(&key, (mine.clone(), now + LOCK_MS));
-        LocalStorage::get::<(String, u64)>(&key).is_ok_and(|v| v.0 == mine)
+        let until = now + LOCK_MS;
+        let _ = LocalStorage::set(&key, (mine.clone(), until));
+        match LocalStorage::get::<(String, u64)>(&key) {
+            Ok(v) if v.0 == mine => {
+                self.sync.update_value(|c| c.lock_wait_until = 0);
+                Ok(())
+            }
+            Ok(v) => Err(v.1),
+            Err(_) => Err(until),
+        }
     }
 
     fn release_lock(&self) {
@@ -2326,10 +2434,14 @@ impl ThreadSubsStore {
     }
 
     /// The page was hidden: publish pending changes now, fetching and merging
-    /// first (the page can still wait while hidden).
+    /// first (the page can still wait while hidden), within the plan's
+    /// limits.
     fn flush_on_hidden(&self) {
         let ctl = self.sync.get_value();
-        if ctl.busy || ctl.disabled || !ctl.fetched || !self.relay_ready() {
+        if ctl.busy || ctl.disabled.is_some() || !ctl.fetched || !self.relay_ready() {
+            return;
+        }
+        if now_ms() < ctl.lock_wait_until {
             return;
         }
         if matches!(
@@ -2347,7 +2459,7 @@ impl ThreadSubsStore {
     /// next session checks what actually arrived.
     fn flush_on_pagehide(&self) {
         let ctl = self.sync.get_value();
-        if ctl.busy || !self.relay_ready() {
+        if ctl.busy || !self.relay_ready() || now_ms() < ctl.lock_wait_until {
             return;
         }
         if self.plan_now(Trigger::PageHide) != Plan::Publish {
@@ -2370,12 +2482,17 @@ impl ThreadSubsStore {
         });
     }
 
-    /// A last publish before sign-out removes the local copy, if one is
-    /// pending and allowed; `None` when there is nothing to do.
+    /// A last publish for sign-out, built from what is in memory **now**
+    /// (signer, list, last relay copy seen), so it runs after the session is
+    /// cleared and writes nothing to storage. `None` when nothing is pending
+    /// or allowed, and always for a NIP-07 extension (it would prompt).
     fn sign_out_job(&self) -> Option<Pin<Box<dyn Future<Output = ()>>>> {
         self.ensure_owner();
+        if self.is_extension() {
+            return None;
+        }
         let ctl = self.sync.get_value();
-        if ctl.disabled || !ctl.fetched || !self.relay_ready() {
+        if ctl.disabled.is_some() || !ctl.fetched || !self.relay_ready() {
             return None;
         }
         if !matches!(
@@ -2384,10 +2501,14 @@ impl ThreadSubsStore {
         ) {
             return None;
         }
-        let store = *self;
-        let gen = self.generation();
+        let signer = self.sync_signer().ok()?;
+        let relay = self.deps.with_value(|d| d.relay.clone());
+        let (mut local, remote) = self
+            .owned
+            .with_untracked(|o| (o.subs.clone(), o.remote.clone()));
+        local.prune(now_ms());
         Some(Box::pin(async move {
-            let _ = store.sync_once(gen, Trigger::SignOut).await;
+            let _ = sign_out_publish(&*signer, &relay, local, remote).await;
         }))
     }
 
@@ -2519,6 +2640,54 @@ fn accept_root(deps: &Deps, wanted: &HashSet<String>, ev: NostrEvent) {
 }
 
 // -- Sign-out -----------------------------------------------------------------
+
+/// Run `fut`, giving up with [`LocalOnlyReason::RelayError`] after `ms`
+/// milliseconds (a NIP-07 prompt left open never answers).
+async fn timed<T>(
+    fut: impl Future<Output = Result<T, LocalOnlyReason>>,
+    ms: u32,
+) -> Result<T, LocalOnlyReason> {
+    let slot: Rc<crate::relay::OneShot<()>> = crate::relay::OneShot::new();
+    let late = slot.clone();
+    let _timer = gloo::timers::callback::Timeout::new(ms, move || late.fill(()));
+    let timeout = Box::pin(async move { slot.wait().await });
+    match futures_util::future::select(Box::pin(fut), timeout).await {
+        futures_util::future::Either::Left((r, _)) => r,
+        futures_util::future::Either::Right(_) => Err(LocalOnlyReason::RelayError),
+    }
+}
+
+/// The sign-out publish: fetch, merge in memory, publish if the relay copy
+/// lacks something. Uses only what it was given; touches no store or
+/// storage, so it is safe after the session has been cleared.
+async fn sign_out_publish(
+    signer: &dyn nostr_bbs_core::signer::Signer,
+    relay: &RelayConnection,
+    mut local: Subs,
+    mut remote: Option<RemoteSeen>,
+) -> Result<(), LocalOnlyReason> {
+    let owner = signer.public_key().to_string();
+    let latest = sync::fetch_latest(relay, &owner).await?;
+    if let Some(ev) = latest.filter(|ev| sync::remote_changed(remote.as_ref(), ev)) {
+        let r = sync::open(signer, &ev, now_secs()).await?;
+        local = local.join(&r, now_secs());
+        let d = sync::digests(&r)?;
+        remote = Some(RemoteSeen {
+            id: ev.id.clone(),
+            created_at: ev.created_at,
+            digest: d.full,
+            entries_digest: d.entries,
+        });
+    }
+    local.prune(now_ms());
+    let d = sync::digests(&local)?;
+    if remote.as_ref().is_some_and(|r| r.digest == d.full) {
+        return Ok(());
+    }
+    let created_at = now_secs().max(remote.as_ref().map_or(0, |r| r.created_at + 1));
+    let ev = sync::seal(signer, &local, created_at).await?;
+    sync::publish(relay, &ev).await
+}
 
 thread_local! {
     /// The store, for sign-out (which runs outside any reactive owner).
@@ -3164,9 +3333,17 @@ mod tests {
     fn after_a_reconnect_the_backlog_asks_only_from_the_high_water_mark() {
         // First pass: just after the marker.
         assert_eq!(backlog_since(1_000, None), 1_001);
-        // A previous answer delivered posts up to 5_000: ask from there
-        // (inclusive), not from the marker again.
-        assert_eq!(backlog_since(1_000, Some(5_000)), 5_000);
+        // A previous answer delivered posts up to 5_000: ask from there,
+        // less the backdating allowance, not from the marker again.
+        assert_eq!(
+            backlog_since(1_000, Some(5_000)),
+            5_000 - BACKDATE_ALLOWANCE_SECS
+        );
+        assert_eq!(
+            backlog_since(1_000, Some(1_100)),
+            1_001,
+            "never before the marker"
+        );
         // A marker moved past the mark wins.
         assert_eq!(backlog_since(9_000, Some(5_000)), 9_001);
     }

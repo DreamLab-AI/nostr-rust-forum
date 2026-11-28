@@ -134,6 +134,9 @@ pub struct AuthStore {
     pub pod_url: RwSignal<Option<String>>,
     /// Web ID from passkey auth server response (Solid WebID URI).
     pub web_id: RwSignal<Option<String>>,
+    /// Set from sign-out until its navigation, while a last subscriptions
+    /// publish may still be running; see [`Self::signing_out`].
+    signing_out: RwSignal<bool>,
 }
 
 impl AuthStore {
@@ -144,7 +147,16 @@ impl AuthStore {
             signer: StoredValue::new(None),
             pod_url: RwSignal::new(None),
             web_id: RwSignal::new(None),
+            signing_out: RwSignal::new(false),
         }
+    }
+
+    /// Whether a sign-out is finishing: the account is already signed out
+    /// (nothing of it is left in storage), and a last publish of its topic
+    /// subscriptions may run for up to 3 s before the page navigates. Views
+    /// can show "Signing out…" while this is true.
+    pub fn signing_out(&self) -> ReadSignal<bool> {
+        self.signing_out.read_only()
     }
 
     // -- Getters --------------------------------------------------------------
@@ -771,36 +783,56 @@ impl AuthStore {
         }
     }
 
-    /// Log out: zero privkey, clear state and storage.
-    ///
-    /// When topic subscriptions have changes the member's relay copy lacks,
-    /// they get one bounded chance to be published first, while the signer
-    /// is still here (at most `thread_subs::SIGN_OUT_FLUSH_MS`, 3 s); sign-out
-    /// then proceeds whatever happened. A second call while that runs is
-    /// ignored.
+    /// Log out: zero privkey, clear state and storage, then go to the home
+    /// page. See [`Self::logout_to`].
     pub fn logout(&self) {
-        if LOGGING_OUT.with(std::cell::Cell::get) {
-            return;
-        }
-        if let Some(job) = crate::stores::thread_subs::sign_out_flush() {
-            LOGGING_OUT.with(|f| f.set(true));
-            let me = *self;
-            leptos::task::spawn_local(async move {
-                crate::stores::thread_subs::within(
-                    job,
-                    crate::stores::thread_subs::SIGN_OUT_FLUSH_MS,
-                )
-                .await;
-                LOGGING_OUT.with(|f| f.set(false));
-                me.finish_logout();
-            });
-            return;
-        }
-        self.finish_logout();
+        self.logout_to(&base_href("/"));
     }
 
-    /// The sign-out itself (see [`Self::logout`]).
-    fn finish_logout(&self) {
+    /// Log out and finish on `dest` (a full page load, so nothing of the
+    /// account stays in memory either).
+    ///
+    /// Everything persistent is cleared **at once**, before this returns: the
+    /// stored keys and remembered session, the push registration, the
+    /// per-account lists, the installed-app bake (started) and the topic
+    /// subscriptions. Closing the tab at any point after the click therefore
+    /// leaves nothing signed in.
+    ///
+    /// When topic subscriptions have changes the member's relay copy lacks
+    /// (and the signer is a local key or passkey, never a NIP-07 extension,
+    /// which would prompt), the in-memory signer alone is kept for one last
+    /// publish, waited for at most `thread_subs::SIGN_OUT_FLUSH_MS` (3 s),
+    /// before navigating; it writes nothing to storage. If someone signs in
+    /// meanwhile, the navigation is skipped and nothing of theirs is touched.
+    /// A second call while that runs is ignored.
+    pub fn logout_to(&self, dest: &str) {
+        if self.signing_out.get_untracked() {
+            return;
+        }
+        // Captured before anything is cleared: the signer, the list and the
+        // last relay copy seen, held only by the job.
+        let job = crate::stores::thread_subs::sign_out_flush();
+        self.clear_session();
+        let Some(job) = job else {
+            navigate_after_logout(dest);
+            return;
+        };
+        self.signing_out.set(true);
+        let me = *self;
+        let dest = dest.to_string();
+        leptos::task::spawn_local(async move {
+            crate::stores::thread_subs::within(job, crate::stores::thread_subs::SIGN_OUT_FLUSH_MS)
+                .await;
+            me.signing_out.set(false);
+            // Someone signed in during the publish: leave their session be.
+            if me.state.get_untracked().pubkey.is_none() {
+                navigate_after_logout(&dest);
+            }
+        });
+    }
+
+    /// Clear everything of the signed-in account, persistent and in memory.
+    fn clear_session(&self) {
         // ADR-2023: this device must stop waking for the account that signs out.
         crate::utils::push::teardown_on_logout();
         // Zone images fetched for this account must not outlive it.
@@ -837,15 +869,6 @@ impl AuthStore {
                 web_sys::console::warn_1(&format!("[logout] unbake failed: {e}").into());
             }
         });
-
-        if let Some(window) = web_sys::window() {
-            if let Ok(location) = window.location().pathname() {
-                let home = base_href("/");
-                if location != home {
-                    let _ = window.location().set_href(&home);
-                }
-            }
-        }
     }
 
     // -- Internal helpers (passkey result application) -------------------------
@@ -1002,9 +1025,15 @@ pub fn provide_auth() {
     provide_context(store);
 }
 
-thread_local! {
-    /// Set while sign-out waits for the last subscriptions publish.
-    static LOGGING_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// Load `dest` unless the page is already there.
+fn navigate_after_logout(dest: &str) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(location) = window.location().pathname() {
+            if location != dest {
+                let _ = window.location().set_href(dest);
+            }
+        }
+    }
 }
 
 /// Get the auth store from context. Panics if `provide_auth()` was not called.

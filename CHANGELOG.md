@@ -44,11 +44,18 @@ None of this has been seen in a browser or against a live relay.
   `["d","nostr-bbs/thread-subs/v1"]`, content NIP-44 encrypted to the member's own key through the auth store's signer.
   Fetched and merged entry by entry before every publish (newer change wins, off wins a tie, markers take the larger),
   and fetched again if it has gone stale while the copy was being sealed. Never published before a successful fetch,
-  nor over a copy that cannot be read. Pending changes go out when the page is hidden, at sign-out (waiting at most
-  3 s; changes made since the last successful publish are lost if that fails), and otherwise at most once a minute; on
-  `pagehide` only if the last fetch is under 10 s old. With a NIP-07 extension only subscribing and unsubscribing
-  schedule a publish; read markers alone go at most every 30 minutes. An unchanged relay copy is never decrypted again,
-  and one tab publishes at a time. A NIP-07 extension without `nip44`, or any error, leaves the feature local-only. A
+  nor over a copy that cannot be read. Pending changes go out at most once a minute, rate-limited on the last attempt
+  with backoff (up to 30 minutes) after failures; hiding the page skips the minute only for a subscribe or unsubscribe;
+  on `pagehide` only if the last fetch is under 10 s old. With a NIP-07 extension only subscribing and unsubscribing
+  schedule a publish; read markers alone go at most every 30 minutes; a declined prompt stops prompts for the session
+  until the next subscribe or unsubscribe; a prompt left open is abandoned after two minutes. An unchanged relay copy is
+  never decrypted again (any other id, even in the same second, is a change), and one tab publishes at a time.
+- **Sign-out** now clears everything persistent for the account at the click (keys, remembered session, push
+  registration, per-account lists, subscriptions), so closing the tab at any point leaves nothing signed in. For a
+  local-key or passkey session with unpublished subscription changes, the in-memory signer alone is kept for one last
+  publish (at most 3 s, nothing written to storage) before the page navigates; if that fails, changes made on this
+  device since its last successful publish are lost. `AuthStore::signing_out` lets views show "Signing out…"; the
+  forum's two sign-out buttons and the BBS now do, and the welcome page's sign-out uses `logout_to("/login")`. A NIP-07 extension without `nip44`, or any error, leaves the feature local-only. A
   device-key session's copy belongs to the device key, not the identity, and is refused by the relay unless the
   device-key gate is on and the device is registered.
 - **Privacy.** Third parties see only that a member has such a copy, when it changed and its size. The relay operator

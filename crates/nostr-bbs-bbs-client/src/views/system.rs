@@ -419,7 +419,14 @@ pub fn SettingsView() -> impl IntoView {
                                         class="bbs-btn bbs-btn-danger bbs-btn-sm"
                                         on:click=move |_| {
                                             auth.logout();
-                                            toasts.show("Signed out.", ToastVariant::Info);
+                                            // Signed out at once; a last publish of
+                                            // topic subscriptions may delay the page.
+                                            let msg = if auth.signing_out().get_untracked() {
+                                                "Signing out\u{2026}"
+                                            } else {
+                                                "Signed out."
+                                            };
+                                            toasts.show(msg, ToastVariant::Info);
                                         }
                                     >
                                         "SIGN OUT"

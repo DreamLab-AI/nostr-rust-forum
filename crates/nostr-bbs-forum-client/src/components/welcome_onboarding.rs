@@ -150,8 +150,9 @@ pub fn WelcomeOnboarding() -> impl IntoView {
     };
 
     let sign_out = move |_: web_sys::MouseEvent| {
-        auth.logout();
-        navigate.with_value(|n| n("/login", NavigateOptions::default()));
+        // Signs out and loads the login page itself (after a last
+        // subscriptions publish, if one is pending).
+        auth.logout_to(&crate::app::base_href("/login"));
     };
 
     // Bake the key for the installed app, bound to the home zone. Waits for
