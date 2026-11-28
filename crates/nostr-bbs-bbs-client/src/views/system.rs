@@ -418,15 +418,20 @@ pub fn SettingsView() -> impl IntoView {
                                         type="button"
                                         class="bbs-btn bbs-btn-danger bbs-btn-sm"
                                         on:click=move |_| {
-                                            auth.logout();
                                             // Signed out at once; a last publish of
                                             // topic subscriptions may delay the page.
-                                            let msg = if auth.signing_out().get_untracked() {
-                                                "Signing out\u{2026}"
-                                            } else {
-                                                "Signed out."
-                                            };
-                                            toasts.show(msg, ToastVariant::Info);
+                                            // A repeat click while that runs does nothing.
+                                            use nostr_bbs_client_core::auth::LogoutOutcome;
+                                            match auth.logout() {
+                                                LogoutOutcome::Finishing => toasts.show(
+                                                    "Signing out\u{2026}",
+                                                    ToastVariant::Info,
+                                                ),
+                                                LogoutOutcome::Done => {
+                                                    toasts.show("Signed out.", ToastVariant::Info)
+                                                }
+                                                LogoutOutcome::AlreadyFinishing => {}
+                                            }
                                         }
                                     >
                                         "SIGN OUT"

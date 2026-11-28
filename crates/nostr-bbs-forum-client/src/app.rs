@@ -1549,9 +1549,9 @@ fn LogoutButton() -> impl IntoView {
     let toasts = use_toasts();
 
     let on_logout = move |_| {
-        auth.logout();
-        // The page navigates once a last subscriptions publish ends (≤ 3 s).
-        if auth.signing_out().get_untracked() {
+        // The page loads once a last subscriptions publish ends (≤ 3 s); a
+        // repeat click meanwhile does nothing, so it shows nothing.
+        if auth.logout() == crate::auth::LogoutOutcome::Finishing {
             toasts.show("Signing out\u{2026}", ToastVariant::Info);
         }
     };

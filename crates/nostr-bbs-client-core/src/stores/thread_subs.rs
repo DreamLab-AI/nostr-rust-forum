@@ -904,6 +904,12 @@ pub(crate) fn sort_topics(topics: &mut [SubscribedTopic]) {
 
 // -- Persistence --------------------------------------------------------------
 
+/// Whether the subscriptions of `owner` may be written: only while the
+/// browser's stored session (`session`) is that account's.
+pub(crate) fn persist_allowed(session: Option<&str>, owner: &str) -> bool {
+    session.is_some_and(|s| s.eq_ignore_ascii_case(owner))
+}
+
 /// `owner`'s stored copy; empty when absent or unreadable.
 fn load_local(owner: &str, now_secs: u64) -> (Subs, Option<RemoteSeen>, u64) {
     match LocalStorage::get::<LocalDoc>(storage_key(owner)) {
@@ -1385,12 +1391,17 @@ impl ThreadSubsStore {
     }
 
     /// Save to the owner's key, merged with what is stored (another tab may
-    /// have written since), and adopt the merge.
+    /// have written since), and adopt the merge. Nothing is written once the
+    /// browser's stored session no longer names the owner: another tab has
+    /// signed the account out, and its subscriptions must not reappear.
     fn persist(&self) {
         let memory = self.owned.get_untracked();
         let Some(owner) = memory.owner.clone() else {
             return;
         };
+        if !persist_allowed(crate::auth::persisted_session_pubkey().as_deref(), &owner) {
+            return;
+        }
         let next = Self::merged_with_stored(&memory, &owner);
         let _ = LocalStorage::set(
             storage_key(&owner),
@@ -2244,6 +2255,13 @@ impl ThreadSubsStore {
                         }
                     });
                     store.sync_status.set(SyncStatus::LocalOnly(reason));
+                    // Retried with backoff: one timer (deduplicated by
+                    // `arm_timer`, dropped on an account switch by the
+                    // generation check), not on every change.
+                    let ctl = store.sync.get_value();
+                    if ctl.disabled.is_none() {
+                        store.arm_timer(ctl.not_before_ms);
+                    }
                 }
             }
         });
@@ -3445,5 +3463,15 @@ mod tests {
         let old: LocalDoc =
             serde_json::from_str(&serde_json::to_string(&s.to_doc()).unwrap()).unwrap();
         assert_eq!(old.remote, None);
+    }
+
+    #[test]
+    fn subscriptions_are_written_only_while_the_session_is_the_owners() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        assert!(persist_allowed(Some(&a), &a));
+        assert!(persist_allowed(Some(&a.to_uppercase()), &a));
+        assert!(!persist_allowed(None, &a), "signed out in another tab");
+        assert!(!persist_allowed(Some(&b), &a), "another account signed in");
     }
 }

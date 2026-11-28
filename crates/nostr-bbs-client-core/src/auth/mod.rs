@@ -329,6 +329,7 @@ impl AuthStore {
 
     /// Register a new passkey and derive Nostr keypair from PRF.
     pub async fn register_with_passkey(&self, display_name: &str) -> Result<(), String> {
+        self.refuse_while_signing_out()?;
         self.state.update(|s| {
             s.error = None;
             s.state = AuthPhase::Authenticating;
@@ -358,6 +359,7 @@ impl AuthStore {
 
     /// Authenticate with an existing passkey, re-deriving the Nostr privkey.
     pub async fn login_with_passkey(&self, pubkey: Option<&str>) -> Result<(), String> {
+        self.refuse_while_signing_out()?;
         self.state.update(|s| {
             s.error = None;
             s.state = AuthPhase::Authenticating;
@@ -397,6 +399,7 @@ impl AuthStore {
         display_name: &str,
         persistence: KeyPersistence,
     ) -> Result<String, String> {
+        self.refuse_while_signing_out()?;
         let keypair = nostr_bbs_core::generate_keypair()
             .map_err(|e| format!("Key generation failed: {e}"))?;
 
@@ -541,6 +544,7 @@ impl AuthStore {
         key_input: &str,
         persistence: KeyPersistence,
     ) -> Result<(), String> {
+        self.refuse_while_signing_out()?;
         // Tolerate a key typed from a sheet in groups ("nsec1 abcd efgh …"):
         // no valid key contains whitespace.
         let compact = zeroize::Zeroizing::new(key_input.split_whitespace().collect::<String>());
@@ -712,6 +716,7 @@ impl AuthStore {
     /// Calls `window.nostr.getPublicKey()` to get the pubkey. No private key
     /// is stored — all signing is delegated to the extension via `signEvent()`.
     pub async fn login_with_nip07(&self) -> Result<(), String> {
+        self.refuse_while_signing_out()?;
         self.state.update(|s| {
             s.error = None;
             s.state = AuthPhase::Authenticating;
@@ -783,52 +788,64 @@ impl AuthStore {
         }
     }
 
-    /// Log out: zero privkey, clear state and storage, then go to the home
+    /// Log out: zero privkey, clear state and storage, then load the home
     /// page. See [`Self::logout_to`].
-    pub fn logout(&self) {
-        self.logout_to(&base_href("/"));
+    pub fn logout(&self) -> LogoutOutcome {
+        self.logout_to(&base_href("/"))
     }
 
-    /// Log out and finish on `dest` (a full page load, so nothing of the
-    /// account stays in memory either).
+    /// Log out and finish with a **full page load** of `dest` (a reload when
+    /// the page is already there), so nothing of the account stays in memory
+    /// either: zone keys, decrypted lists, the relay socket authenticated as
+    /// it. A sign-out always ends in that load.
     ///
     /// Everything persistent is cleared **at once**, before this returns: the
-    /// stored keys and remembered session, the push registration, the
-    /// per-account lists, the installed-app bake (started) and the topic
-    /// subscriptions. Closing the tab at any point after the click therefore
-    /// leaves nothing signed in.
+    /// stored keys and remembered session, the installed-app boot profile, the
+    /// push registration, the per-account lists and the topic subscriptions
+    /// (the installed-app key in IndexedDB is deleted asynchronously, but
+    /// without the boot profile nothing adopts it). Closing the tab at any
+    /// point after the click therefore leaves nothing signed in.
     ///
     /// When topic subscriptions have changes the member's relay copy lacks
     /// (and the signer is a local key or passkey, never a NIP-07 extension,
     /// which would prompt), the in-memory signer alone is kept for one last
     /// publish, waited for at most `thread_subs::SIGN_OUT_FLUSH_MS` (3 s),
-    /// before navigating; it writes nothing to storage. If someone signs in
-    /// meanwhile, the navigation is skipped and nothing of theirs is touched.
-    /// A second call while that runs is ignored.
-    pub fn logout_to(&self, dest: &str) {
+    /// before the load; it writes nothing to storage. Meanwhile
+    /// [`Self::signing_out`] is set, sign-in is refused ("Signing out…"),
+    /// and a further sign-out call returns
+    /// [`LogoutOutcome::AlreadyFinishing`] and does nothing.
+    pub fn logout_to(&self, dest: &str) -> LogoutOutcome {
         if self.signing_out.get_untracked() {
-            return;
+            return LogoutOutcome::AlreadyFinishing;
         }
         // Captured before anything is cleared: the signer, the list and the
         // last relay copy seen, held only by the job.
         let job = crate::stores::thread_subs::sign_out_flush();
         self.clear_session();
         let Some(job) = job else {
-            navigate_after_logout(dest);
-            return;
+            full_load(dest);
+            return LogoutOutcome::Done;
         };
         self.signing_out.set(true);
-        let me = *self;
         let dest = dest.to_string();
         leptos::task::spawn_local(async move {
             crate::stores::thread_subs::within(job, crate::stores::thread_subs::SIGN_OUT_FLUSH_MS)
                 .await;
-            me.signing_out.set(false);
-            // Someone signed in during the publish: leave their session be.
-            if me.state.get_untracked().pubkey.is_none() {
-                navigate_after_logout(&dest);
-            }
+            // Always: in-app navigation during the wait must not carry this
+            // account's memory into the next session. `signing_out` stays set
+            // until the page goes, so no sign-in can start meanwhile.
+            full_load(&dest);
         });
+        LogoutOutcome::Finishing
+    }
+
+    /// Refuse a sign-in while a sign-out is finishing (see
+    /// [`Self::logout_to`]).
+    fn refuse_while_signing_out(&self) -> Result<(), String> {
+        if self.signing_out.get_untracked() {
+            return Err("Signing out\u{2026} please wait a moment.".to_string());
+        }
+        Ok(())
     }
 
     /// Clear everything of the signed-in account, persistent and in memory.
@@ -861,6 +878,10 @@ impl AuthStore {
         self.state.set(AuthState::default());
         LocalStorage::delete(STORAGE_KEY);
         clear_privkey_session();
+        // The installed-app boot trigger goes now (the async unbake below
+        // deletes it too, then the key): a tab closed before that finishes
+        // must not boot into this account.
+        LocalStorage::delete(nostr_bbs_core::BOOTPROFILE_KEY);
         // Signing out also forgets the installed-app bake: otherwise the next
         // `?pwa=1` launch would silently adopt this account again (a shared
         // phone would open someone else's account).
@@ -1025,14 +1046,65 @@ pub fn provide_auth() {
     provide_context(store);
 }
 
-/// Load `dest` unless the page is already there.
-fn navigate_after_logout(dest: &str) {
-    if let Some(window) = web_sys::window() {
-        if let Ok(location) = window.location().pathname() {
-            if location != dest {
-                let _ = window.location().set_href(dest);
-            }
-        }
+/// The pubkey of the session persisted on this browser (written by every
+/// sign-in, removed by sign-out), if any. Public data only.
+pub(crate) fn persisted_session_pubkey() -> Option<String> {
+    let json: String = LocalStorage::get(STORAGE_KEY).ok()?;
+    serde_json::from_str::<session::StoredSession>(&json)
+        .ok()?
+        .public_key
+}
+
+/// What [`AuthStore::logout_to`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogoutOutcome {
+    /// Signed out; the page is loading `dest`.
+    Done,
+    /// Signed out; a last publish runs (at most 3 s) before the page loads
+    /// `dest`. Show "Signing out…".
+    Finishing,
+    /// A sign-out was already finishing; this call did nothing.
+    AlreadyFinishing,
+}
+
+/// How to end a sign-out on `dest` from `current`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadAction {
+    Reload,
+    Replace,
+}
+
+fn load_action(current: &str, dest: &str) -> LoadAction {
+    if current == dest {
+        LoadAction::Reload
+    } else {
+        LoadAction::Replace
+    }
+}
+
+/// A full document load of `dest`: a reload when the page is already there,
+/// else a replace (so Back does not return to the signed-in page).
+fn full_load(dest: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let location = window.location();
+    let current = location.pathname().unwrap_or_default();
+    let _ = match load_action(&current, dest) {
+        LoadAction::Reload => location.reload(),
+        LoadAction::Replace => location.replace(dest),
+    };
+}
+
+#[cfg(test)]
+mod logout_load_tests {
+    use super::{load_action, LoadAction};
+
+    #[test]
+    fn a_sign_out_always_ends_in_a_full_load() {
+        assert_eq!(load_action("/", "/"), LoadAction::Reload, "already home");
+        assert_eq!(load_action("/forums", "/"), LoadAction::Replace);
+        assert_eq!(load_action("/login", "/login"), LoadAction::Reload);
     }
 }
 

@@ -54,8 +54,13 @@ None of this has been seen in a browser or against a live relay.
   registration, per-account lists, subscriptions), so closing the tab at any point leaves nothing signed in. For a
   local-key or passkey session with unpublished subscription changes, the in-memory signer alone is kept for one last
   publish (at most 3 s, nothing written to storage) before the page navigates; if that fails, changes made on this
-  device since its last successful publish are lost. `AuthStore::signing_out` lets views show "Signing out…"; the
-  forum's two sign-out buttons and the BBS now do, and the welcome page's sign-out uses `logout_to("/login")`. A NIP-07 extension without `nip44`, or any error, leaves the feature local-only. A
+  device since its last successful publish are lost. A sign-out now always ends in a full page load (a reload when
+  already on the destination, which before this was skipped on the home page), so no account state stays in memory;
+  sign-in is refused ("Signing out…") while the last publish runs. `logout()` returns a `LogoutOutcome`; the forum's two
+  sign-out buttons and the BBS show "Signing out…" only for the sign-out that started it, and the welcome page's
+  sign-out uses `logout_to("/login")`. The installed-app boot profile is removed synchronously too. Subscriptions are
+  written only while the browser's stored session still names the account, so a second tab cannot write them back
+  after a sign-out elsewhere. A NIP-07 extension without `nip44`, or any error, leaves the feature local-only. A
   device-key session's copy belongs to the device key, not the identity, and is refused by the relay unless the
   device-key gate is on and the device is registered.
 - **Privacy.** Third parties see only that a member has such a copy, when it changed and its size. The relay operator
