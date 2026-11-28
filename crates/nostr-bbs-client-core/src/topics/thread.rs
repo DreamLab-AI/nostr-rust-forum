@@ -86,6 +86,27 @@ pub fn edit_target_of(ev: &NostrEvent) -> Option<String> {
         .map(|t| t[1].clone())
 }
 
+/// The channel an event is filed in: its `root`-marked `e` tag, else its
+/// first unmarked `e` tag, lowercased. An `edit`, `reply` or other marked
+/// `e` tag names a post, never the channel.
+fn channel_anchor(ev: &NostrEvent) -> Option<String> {
+    let e_tags = || ev.tags.iter().filter(|t| t.len() >= 2 && t[0] == "e");
+    e_tags()
+        .find(|t| t.get(3).map(String::as_str) == Some("root"))
+        .or_else(|| e_tags().find(|t| t.get(3).is_none_or(|m| m.is_empty())))
+        .map(|t| t[1].to_lowercase())
+}
+
+/// Whether `edit` may replace the text of `original` (ADR-2037 review):
+/// same author, and filed in the same channel. An edit posted in another
+/// channel, which may sit in another zone with other readers and writers,
+/// is ignored, so moving a channel to another zone cannot be undone for its
+/// posts by editing them from outside.
+fn edit_applies_to(edit: &NostrEvent, original: &NostrEvent) -> bool {
+    edit.pubkey.eq_ignore_ascii_case(&original.pubkey)
+        && channel_anchor(edit) == channel_anchor(original)
+}
+
 /// Resolve the latest authored version of `original` from `events`.
 ///
 /// Walks every edit that the SAME author published against `original.id`
@@ -105,7 +126,7 @@ pub fn latest_version(original: &NostrEvent, events: &[NostrEvent]) -> (String, 
         let next = events
             .iter()
             .filter(|e| {
-                e.pubkey.eq_ignore_ascii_case(&original.pubkey)
+                edit_applies_to(e, original)
                     && edit_target(e).as_deref() == Some(current_id.as_str())
             })
             // Most recent edit of this id wins (last-write-wins by created_at,
@@ -204,12 +225,13 @@ pub fn thread_replies(root: &NostrEvent, events: &[NostrEvent]) -> Vec<ReplyView
             edits_of.entry(target).or_default().push(e);
         }
     }
-    // The newest same-author edit of `id`, as `latest_version` picks it.
-    let newest_edit = |id: &str, author: &str| -> Option<&NostrEvent> {
+    // The newest same-author, same-channel edit of `id`, as
+    // `latest_version` picks it.
+    let newest_edit = |id: &str, original: &NostrEvent| -> Option<&NostrEvent> {
         edits_of.get(id).and_then(|v| {
             v.iter()
                 .copied()
-                .filter(|e| e.pubkey.eq_ignore_ascii_case(author))
+                .filter(|e| edit_applies_to(e, original))
                 .max_by(|a, b| {
                     a.created_at
                         .cmp(&b.created_at)
@@ -222,7 +244,7 @@ pub fn thread_replies(root: &NostrEvent, events: &[NostrEvent]) -> Vec<ReplyView
         let mut content = &original.content;
         let mut edited = false;
         for _ in 0..64 {
-            match newest_edit(&current, &original.pubkey) {
+            match newest_edit(&current, original) {
                 Some(e) => {
                     content = &e.content;
                     edited = true;
@@ -975,5 +997,77 @@ mod tests {
             .iter()
             .any(|t| t == &["t", nostr_bbs_core::sealed::TOPIC_MARKER]));
         assert_eq!(crate::topics::classify_topics("chan", &[root]).len(), 1);
+    }
+
+    // -- ADR-2037 review: edits apply only within their channel ---------------
+
+    #[test]
+    fn an_edit_posted_in_another_channel_does_not_replace_the_text() {
+        let orig = ev(
+            "orig",
+            "alice",
+            100,
+            "v1",
+            vec![vec!["e", "pinned", "", "root"]],
+        );
+        let elsewhere = ev(
+            "e1",
+            "alice",
+            200,
+            "rewritten from outside",
+            vec![vec!["e", "other", "", "root"], edit_tag("orig")],
+        );
+        let events = vec![orig.clone(), elsewhere.clone()];
+        let (content, _, edited) = latest_version(&orig, &events);
+        assert_eq!(content, "v1");
+        assert!(!edited);
+        // The same edit filed in the original's channel applies.
+        let here = ev(
+            "e2",
+            "alice",
+            300,
+            "v2",
+            vec![vec!["e", "pinned", "", "root"], edit_tag("orig")],
+        );
+        let events = vec![orig.clone(), elsewhere, here];
+        let (content, _, edited) = latest_version(&orig, &events);
+        assert_eq!(content, "v2");
+        assert!(edited);
+    }
+
+    #[test]
+    fn a_reply_is_not_rewritten_by_an_edit_from_another_channel() {
+        let root = ev(
+            "root",
+            "bob",
+            100,
+            "topic",
+            vec![vec!["e", "pinned", "", "root"]],
+        );
+        let reply = ev(
+            "r1",
+            "alice",
+            110,
+            "reply v1",
+            vec![
+                vec!["e", "pinned", "", "root"],
+                vec!["e", "root", "", "reply"],
+            ],
+        );
+        let outside = ev(
+            "x1",
+            "alice",
+            120,
+            "rewritten",
+            vec![
+                vec!["e", "other", "", "root"],
+                vec!["e", "root", "", "reply"],
+                edit_tag("r1"),
+            ],
+        );
+        let views = thread_replies(&root, &[root.clone(), reply, outside]);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].content, "reply v1");
+        assert!(!views[0].edited);
     }
 }
