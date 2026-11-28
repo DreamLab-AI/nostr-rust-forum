@@ -269,9 +269,7 @@ fn at_list_top(id: &str) -> bool {
     // The sticky header covers the top of the viewport: a row under it is
     // not in view.
     let header_bottom = document
-        .query_selector("header")
-        .ok()
-        .flatten()
+        .get_element_by_id(crate::app::APP_HEADER_ID)
         .map(|h| h.get_bounding_client_rect().bottom())
         .filter(|b| b.is_finite() && *b >= 0.0)
         .unwrap_or(HEADER_FALLBACK_PX);
@@ -440,27 +438,25 @@ pub fn SectionPage() -> impl IntoView {
     }
     let topics: Signal<Vec<TopicSummary>> = topics_memo.into();
 
-    // A new visit to a section may ask a root list that failed earlier
-    // again at once (its backoff otherwise holds; see
-    // `ChannelStore::request_topic_roots`). Created before the request
-    // effect below, so it runs first; tracks the channel id only.
-    Effect::new(move |_| {
-        if let Some(cid) = channel_id.get() {
-            store.rearm_topic_roots(&cid);
-        }
-    });
-
     // Fetch the section's topic roots once (decision ii: sealed roots carry
     // ["t","topic"]), so dormant topics are listed without paging the channel.
+    // A new visit (the first run, or a switch to another section) may ask a
+    // root list that failed earlier again at once; a re-run for the same
+    // channel respects its backoff (see `ChannelStore::request_topic_roots`).
     {
         let relay_for_roots = expect_context::<RelayConnection>();
-        Effect::new(move |_| {
-            if let Some(cid) = channel_id.get() {
+        Effect::new(move |prev: Option<Option<String>>| {
+            let current = channel_id.get();
+            if let Some(cid) = current.as_deref() {
+                if prev.flatten().as_deref() != Some(cid) {
+                    store.rearm_topic_roots(cid);
+                }
                 let gated = zone_is_gated(&category_slug(), &load_zones());
-                if store.history_receipt(&cid).settles(gated) {
-                    store.request_topic_roots(&relay_for_roots, &cid, gated);
+                if store.history_receipt(cid).settles(gated) {
+                    store.request_topic_roots(&relay_for_roots, cid, gated);
                 }
             }
+            current
         });
     }
 
@@ -564,7 +560,18 @@ pub fn SectionPage() -> impl IntoView {
                 .collect::<HashSet<_>>()
         })
     });
-    let stats_answered = Memo::new(move |_| answered_ids.with(HashSet::len));
+    // Topics whose stats request failed: settled for placement (their late
+    // stats update the row, never place it) and not waited for.
+    let given_up_ids = Memo::new(move |_| {
+        topics.with(|ts| {
+            ts.iter()
+                .filter(|t| store.topic_stats_given_up(&t.id))
+                .map(|t| t.id.clone())
+                .collect::<HashSet<_>>()
+        })
+    });
+    let stats_answered =
+        Memo::new(move |_| answered_ids.with(|a| given_up_ids.with(|g| a.union(g).count())));
     let roots_failed = Memo::new(move |_| {
         channel_id
             .get()
@@ -678,7 +685,9 @@ pub fn SectionPage() -> impl IntoView {
                 }
                 let was = s.frozen;
                 s.frozen |= painted;
-                let landed = first_stats_landed(&answered, &mut s.answered, &s.aliases);
+                let landed = given_up_ids.with(|given_up| {
+                    first_stats_landed(&answered, given_up, &mut s.answered, &s.aliases)
+                });
                 let first_stats = if was { landed } else { HashSet::new() };
                 (was, first_stats, s.aliases.clone())
             }) else {

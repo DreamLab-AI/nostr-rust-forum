@@ -332,6 +332,10 @@ fn redirect_spinner() -> impl IntoView {
 
 // -- App root -----------------------------------------------------------------
 
+/// Id of the sticky app header, for pages that measure what it covers (the
+/// section page's "reader at the top of the list" check).
+pub(crate) const APP_HEADER_ID: &str = "app-header";
+
 #[component]
 pub fn App() -> impl IntoView {
     // Sign-in link (sheet QR / tapped link, `utils::connect_link`): take the
@@ -1255,7 +1259,7 @@ fn Layout(children: Children) -> impl IntoView {
             {dev_auth_panel()}
 
             // Header
-            <header class="border-b border-gray-800/50 bg-gray-900/80 backdrop-blur-md sticky top-0 z-50">
+            <header id=APP_HEADER_ID class="border-b border-gray-800/50 bg-gray-900/80 backdrop-blur-md sticky top-0 z-50">
                 <nav class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
                     <div class="flex items-center gap-1 min-w-0">
                         // Back (members' request: the installed app has no
