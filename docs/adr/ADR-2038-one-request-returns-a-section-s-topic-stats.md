@@ -102,7 +102,8 @@ without one request per topic, and without breaking the stored message database.
 
 8. **Clients** (shared in client-core; forum `pages/section.rs`, BBS `views/thread.rs`):
    - ask once per visit, with the root list and under its AUTH rule (after AUTH in a gated zone), only when the relay's NIP-11
-     advertises it (`relay/info.rs` fetches NIP-11 once per session, now shared with the zone-group bindings); not advertised,
+     advertises it (`relay/info.rs` fetches NIP-11 once per session, started when the channel store begins syncing so the
+     first visit does not wait on it, and shared with the zone-group bindings); not advertised,
      any `CLOSED`, an old relay's `NOTICE "Unknown message type: SECTION-STATS"` (no toast), a malformed answer or no answer
      within 8 s counts as failed (`SectionStatsState::from_answer`, `ChannelStore::request_section_stats`);
    - the answer is folded into the structure the board orders by with `max` (`fold_section_stats`): it only raises a figure;
@@ -157,8 +158,10 @@ marked roots), at most once per channel per 30 s; this is an estimate, not a mea
 - `last_at` relies on `event_tags.created_at` mirroring `events.created_at` (migration 0015 backfill), as paging does.
 - The answer may be up to 30 s old; the window's newest messages are folded in by the client anyway.
 - No single-flight: two readers missing the memo at once both compute.
-- The correlated sub-queries need an SQLite that allows outer references inside a FROM sub-query, which current SQLite and
-  D1 do; not verified on D1.
+- D1 compatibility is not verified. Binding the ids as one JSON array to `json_each(?)` with correlated scalar sub-queries
+  is already deployed (the member deletion gate's statement in `lib.rs`); the bounded walk's outer reference from inside a
+  FROM sub-query is used nowhere else and was run on SQLite 3.53 only. If D1 refuses it, every answer is `CLOSED error:`
+  and both clients fall back to the PR #130 behaviour: safe, but the feature would be inert until the SQL is changed.
 
 **Rollback.** Revert the relay change: NIP-11 drops the block, new clients stop asking and behave as before. Reverting a
 client alone is equally safe. No stored data or schema is touched, so there is nothing to undo in D1.

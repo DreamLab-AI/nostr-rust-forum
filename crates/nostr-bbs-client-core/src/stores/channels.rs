@@ -571,6 +571,9 @@ impl ChannelStore {
 
     /// Start relay subscriptions. Called once from App root after relay connects.
     pub fn start_sync(&self, relay: &RelayConnection) {
+        // ADR-2038: the section stats check reads the relay's NIP-11
+        // document; fetch it now so the first section visit does not wait.
+        crate::relay::info::prefetch();
         if self.sub_id.get_untracked().is_some() {
             return;
         }

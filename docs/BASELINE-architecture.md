@@ -209,7 +209,7 @@ bounds them (`nip_handlers.rs:71-77`).
   relay only admin-gates 9000-9020 and 39000-39002 on an `h` tag and stores them
   (`relay_do/nip_handlers.rs:60-61,1328-1340`); kind 9 is world-readable
   (`relay_do/nip42.rs:44`). `supported_nips` dropped 29 on 2026-11-16
-  (`crates/nostr-bbs-relay-worker/src/nip11.rs:16`, asserted by the test at `:307`,
+  (`crates/nostr-bbs-relay-worker/src/nip11.rs:16`, asserted by the test at `:312`,
   re-read at `3c48e26`); this bullet previously said it was advertised, and the
   citations were from `0065dd9`. ADR-2030 proposes the group engine.
 - **Deletion and absence gaps (2026-11-22).** No un-tombstone route, a moderator's
@@ -298,7 +298,7 @@ The pay routes are live (`PAY_ENABLED = "true"` in production). `crates/nostr-bb
 
 ## Relay read cost — ADR-2018
 
-[ADR-2018](adr/ADR-2018-relay-read-caches-and-activity-throttle.md) makes the relay's D1 cost scale with requests rather than delivered events. The Durable Object holds 60-second memos of channel → zone, viewer cohorts and device owner (`relay_do/read_cache.rs`, fields at `relay_do/mod.rs:97`), the read gate decides membership from the cached cohorts with the pure `zone_read_permitted` (`relay_do/nip_handlers.rs:1746`), and the trust-ledger writes are coalesced by `ActivityLedger` to one flush per pubkey per five minutes. The forcing fact was D1's free tier: 5 M row reads a day, of which the old per-event lookups spent ~70% on machine traffic alone. Any new per-event D1 read on a read path reopens that ADR.
+[ADR-2018](adr/ADR-2018-relay-read-caches-and-activity-throttle.md) makes the relay's D1 cost scale with requests rather than delivered events. The Durable Object holds 60-second memos of channel → zone, viewer cohorts and device owner (`relay_do/read_cache.rs`, fields from `relay_do/mod.rs:122`), the read gate decides membership from the cached cohorts with the pure `zone_read_permitted` (`relay_do/nip_handlers.rs:1746`), and the trust-ledger writes are coalesced by `ActivityLedger` to one flush per pubkey per five minutes. The forcing fact was D1's free tier: 5 M row reads a day, of which the old per-event lookups spent ~70% on machine traffic alone. Any new per-event D1 read on a read path reopens that ADR.
 
 ## Encrypted zones and sealed-original history — ADR-2016, ADR-2017
 
@@ -434,7 +434,7 @@ the rest of this document's `verified_commit` stamp is not re-asserted for the o
   today both replaceable branches keep a late older row, `storage.rs:97-139`), persisted dedup and watermark, and a
   `PeerConnector` implementation (`relay-worker/src/mesh.rs:143`, no implementor today). The
   30 s re-sign and the C re-check need a Durable Object alarm; the only alarm today is idle
-  eviction (`relay_do/mod.rs:371`). Activation order across the estate (round-2 C9): agentbox
+  eviction (`relay_do/mod.rs:448`). Activation order across the estate (round-2 C9): agentbox
   2162; VisionClaw 2159 then 2161 (`public`, `dids`); forum 2030 then 2031 (with the ADR-2032
   30312 publisher, which voice needs); VisionClaw 2157 then 2161 (`space:`); VisionClaw 2160.
 - **Spatial descriptor (ADR-2032).** Extra tags on the home-signed 39000 whose content
