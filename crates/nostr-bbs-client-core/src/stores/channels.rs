@@ -150,9 +150,9 @@ pub struct ChannelStore {
     roots_targets: StoredValue<HashMap<String, String>>,
     /// Channels whose root list has been answered (reactive).
     roots_answered: RwSignal<HashSet<String>>,
-    /// Channels whose root-list request failed this session (timed out, or
-    /// refused by the relay after its retry). Its target is cleared, so the
-    /// next request asks again.
+    /// Channels whose last root-list request failed (timed out, or refused
+    /// by the relay after its retry) and has not answered since. Its target
+    /// is cleared, so a later request past the backoff asks again.
     roots_failed: RwSignal<HashSet<String>>,
     /// Root-list key -> its failure backoff ([`RootsBackoff`]): a failed
     /// root list is not asked again before its `retry_at`, however often a
@@ -177,6 +177,16 @@ pub struct ChannelStore {
     topic_stats_queue: StoredValue<std::collections::VecDeque<(String, String, bool)>>,
     /// Whether a stats batch is in flight (batches go one at a time).
     topic_stats_busy: StoredValue<bool>,
+    /// Topics (lower-case root ids) whose stats batch failed (CLOSED, or
+    /// no answer within [`PAGE_TIMEOUT_MS`]): settled for placement, so a
+    /// late answer updates the row's figures but never places it.
+    topic_stats_given_up: RwSignal<HashSet<String>>,
+    /// Topics whose failed batch has been queued again once (the bound on
+    /// retries).
+    topic_stats_retried: StoredValue<HashSet<String>>,
+    /// Stats batches that failed in a row: the next batch waits
+    /// [`stats_batch_delay_ms`] of it.
+    topic_stats_failures: StoredValue<u32>,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -235,6 +245,9 @@ impl ChannelStore {
             topic_stats_asked: StoredValue::new(HashSet::new()),
             topic_stats_queue: StoredValue::new(std::collections::VecDeque::new()),
             topic_stats_busy: StoredValue::new(false),
+            topic_stats_given_up: RwSignal::new(HashSet::new()),
+            topic_stats_retried: StoredValue::new(HashSet::new()),
+            topic_stats_failures: StoredValue::new(0),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -1214,11 +1227,13 @@ impl ChannelStore {
     /// then list every topic, dormant ones included, and a deep link's slug
     /// (an id prefix) is matched against it.
     ///
-    /// A request that failed is not repeated before its backoff has run out
-    /// (from [`PAGE_TIMEOUT_MS`], doubling to five minutes; a new visit,
-    /// [`Self::rearm_topic_roots`], may ask at once): views re-run this on
-    /// every message, and a relay
-    /// refusing subscriptions must not get two more REQs per message.
+    /// A request that failed is only repeated when this is called again
+    /// after its backoff has run out (from [`PAGE_TIMEOUT_MS`], doubling to
+    /// five minutes), or after a new visit ([`Self::rearm_topic_roots`]).
+    /// Nothing calls it when the backoff expires: callers re-run it on a
+    /// revisit or when the channel's history changes. Views re-run it on
+    /// every message, and a relay refusing subscriptions must not get two
+    /// more REQs per message.
     pub fn request_topic_roots(&self, relay: &RelayConnection, cid: &str, wait_auth: bool) {
         let key = roots_key(cid);
         let fresh = self.roots_targets.with_value(|m| !m.contains_key(&key));
@@ -1252,6 +1267,12 @@ impl ChannelStore {
                 let _ = store.roots_backoff.try_update_value(|m| {
                     m.remove(&roots_key(&channel));
                 });
+                // Answered after all: no longer failed.
+                if store.roots_failed.with_untracked(|s| s.contains(&channel)) {
+                    store.roots_failed.update(|s| {
+                        s.remove(&channel);
+                    });
+                }
                 store.apply_page(events);
                 if held && page.delivered < RELAY_FILTER_LIMIT {
                     store.roots_complete.update(|s| {
@@ -1263,10 +1284,10 @@ impl ChannelStore {
                 });
             }),
             Box::new(move || {
-                // Unanswered: forget the target and back off, so it is
-                // asked again later (or on the next visit), and record the
-                // failure (a page must not wait on an answer that will
-                // never come).
+                // Unanswered: forget the target and back off, so a later
+                // call past the backoff (or a revisit) asks again, and
+                // record the failure (a page must not wait on an answer
+                // that will never come).
                 let now = js_sys::Date::now();
                 let _ = store.roots_backoff.try_update_value(|m| {
                     m.entry(failed_key.clone()).or_default().failed(now);
@@ -1294,9 +1315,10 @@ impl ChannelStore {
         });
     }
 
-    /// Whether channel `cid`'s root-list request has failed this session
-    /// (no answer within [`PAGE_TIMEOUT_MS`], or refused after its retry).
-    /// It is asked again once its backoff has run out. Reactive.
+    /// Whether channel `cid`'s last root-list request failed (no answer
+    /// within [`PAGE_TIMEOUT_MS`], or refused after its retry) and none has
+    /// answered since. A later [`Self::request_topic_roots`] past the
+    /// backoff, or on a revisit, asks again. Reactive.
     pub fn topic_roots_failed(&self, cid: &str) -> bool {
         self.roots_failed.with(|s| s.contains(cid))
     }
@@ -1380,24 +1402,90 @@ impl ChannelStore {
         });
         let sub: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let done = Rc::new(std::cell::Cell::new(false));
-        let batch_roots: Vec<String> = batch.iter().map(|(_, r, _)| r.clone()).collect();
-        let on_receipt = {
+        // Ends the batch once, however it ends: an answer, a CLOSED, or no
+        // answer within PAGE_TIMEOUT_MS. Without the last two a refused
+        // batch held the pump for the session, and its answer on a later
+        // reconnect placed every row of it at once in front of the reader.
+        let finish: Rc<dyn Fn(StatsBatchEnd)> = {
+            let batch = batch.clone();
             let sub = sub.clone();
             let relay = relay.clone();
-            Rc::new(move |authed: bool| {
-                if (!authed && wait_auth) || done.replace(true) {
+            let done = done.clone();
+            Rc::new(move |end: StatsBatchEnd| {
+                if done.replace(true) {
                     return;
                 }
                 if let Some(id) = sub.borrow_mut().take() {
                     relay.unsubscribe(&id);
                 }
-                // Every newest reply this batch had is in (none for a topic
-                // without replies).
-                let _ = store.topic_latest_answered.try_update(|s| {
-                    s.extend(batch_roots.iter().cloned());
-                });
-                store.topic_stats_busy.set_value(false);
-                store.pump_topic_stats(&relay);
+                let failures = store
+                    .topic_stats_failures
+                    .try_update_value(|f| {
+                        *f = match end {
+                            StatsBatchEnd::Answered => 0,
+                            StatsBatchEnd::Failed => f.saturating_add(1),
+                        };
+                        *f
+                    })
+                    .unwrap_or(0);
+                match end {
+                    StatsBatchEnd::Answered => {
+                        // Every newest reply this batch had is in (none for
+                        // a topic without replies).
+                        let _ = store.topic_latest_answered.try_update(|s| {
+                            s.extend(batch.iter().map(|(_, r, _)| r.clone()));
+                        });
+                    }
+                    StatsBatchEnd::Failed => {
+                        let _ = store.topic_stats_given_up.try_update(|s| {
+                            s.extend(batch.iter().map(|(_, r, _)| r.clone()));
+                        });
+                        // Queue each topic again once, at the back.
+                        let again: Vec<(String, String, bool)> = store
+                            .topic_stats_retried
+                            .try_update_value(|retried| {
+                                batch
+                                    .iter()
+                                    .filter(|(_, r, _)| {
+                                        let again = retry_stats_topic(retried.contains(r));
+                                        retried.insert(r.clone());
+                                        again
+                                    })
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let _ = store
+                            .topic_stats_queue
+                            .try_update_value(|q| q.extend(again));
+                    }
+                }
+                let _ = store.topic_stats_busy.try_set_value(false);
+                let delay = stats_batch_delay_ms(failures);
+                let relay = relay.clone();
+                if delay == 0 {
+                    store.pump_topic_stats(&relay);
+                } else {
+                    crate::utils::set_timeout_once(move || store.pump_topic_stats(&relay), delay);
+                }
+            })
+        };
+        let on_receipt = {
+            let finish = finish.clone();
+            Rc::new(move |authed: bool| {
+                if !authed && wait_auth {
+                    return;
+                }
+                finish(StatsBatchEnd::Answered);
+            })
+        };
+        let on_closed = {
+            let finish = finish.clone();
+            Rc::new(move |reason: String| {
+                web_sys::console::warn_1(
+                    &format!("[Stats] topic stats request closed by relay: {reason}").into(),
+                );
+                finish(StatsBatchEnd::Failed);
             })
         };
         let filters = batch
@@ -1409,8 +1497,21 @@ impl ChannelStore {
                 ..Default::default()
             })
             .collect();
-        let id = relay.subscribe_with_receipt(filters, on_event, on_receipt);
+        let id = relay.subscribe_with_receipt_or_closed(filters, on_event, on_receipt, on_closed);
         *sub.borrow_mut() = Some(id);
+        crate::utils::set_timeout_once(
+            move || finish(StatsBatchEnd::Failed),
+            PAGE_TIMEOUT_MS as i32,
+        );
+    }
+
+    /// Whether topic `root`'s stats batch failed and was given up for
+    /// placement (see [`Self::topic_stats_answered`]): a list treats the
+    /// row as placed, so stats that arrive later (from the one retry)
+    /// update its figures in place and never move it. Reactive.
+    pub fn topic_stats_given_up(&self, root: &str) -> bool {
+        self.topic_stats_given_up
+            .with(|s| s.contains(&root.to_lowercase()))
     }
 
     /// Record `ev` as topic `root`'s newest reply if it is one: in the
@@ -2164,6 +2265,54 @@ fn buffer_pending_meta(pending: &mut HashMap<String, MetaUpdate>, update: MetaUp
         _ => {
             pending.insert(update.channel_id.clone(), update);
         }
+    }
+}
+
+/// How a topic-stats batch ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatsBatchEnd {
+    /// Its REQ answered (EOSE): the newest replies are in.
+    Answered,
+    /// CLOSED by the relay, or no answer within [`PAGE_TIMEOUT_MS`].
+    Failed,
+}
+
+/// Longest pause before the next stats batch after failures in a row.
+const STATS_BACKOFF_CAP_MS: i32 = 60_000;
+
+/// Pause before the next stats batch after `failures` failed batches in a
+/// row: none after an answer, then 1 s doubling to [`STATS_BACKOFF_CAP_MS`],
+/// so a relay refusing subscriptions is not sent one batch after another.
+fn stats_batch_delay_ms(failures: u32) -> i32 {
+    if failures == 0 {
+        return 0;
+    }
+    let doublings = (failures - 1).min(16);
+    (1_000i32.saturating_mul(1 << doublings)).min(STATS_BACKOFF_CAP_MS)
+}
+
+/// Whether a topic of a failed batch is queued again: once only.
+fn retry_stats_topic(already_retried: bool) -> bool {
+    !already_retried
+}
+
+#[cfg(test)]
+mod stats_batch_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_batch_pauses_the_pump_with_a_bounded_backoff() {
+        assert_eq!(stats_batch_delay_ms(0), 0, "an answer: next batch at once");
+        assert_eq!(stats_batch_delay_ms(1), 1_000);
+        assert_eq!(stats_batch_delay_ms(2), 2_000);
+        assert_eq!(stats_batch_delay_ms(7), 60_000);
+        assert_eq!(stats_batch_delay_ms(40), STATS_BACKOFF_CAP_MS);
+    }
+
+    #[test]
+    fn a_failed_topic_is_retried_once() {
+        assert!(retry_stats_topic(false));
+        assert!(!retry_stats_topic(true));
     }
 }
 
