@@ -801,10 +801,11 @@ impl AuthStore {
     ///
     /// Everything persistent is cleared **at once**, before this returns: the
     /// stored keys and remembered session, the installed-app boot profile, the
-    /// push registration, the per-account lists and the topic subscriptions
-    /// (the installed-app key in IndexedDB is deleted asynchronously, but
-    /// without the boot profile nothing adopts it). Closing the tab at any
-    /// point after the click therefore leaves nothing signed in.
+    /// push registration, the per-account lists and the topic subscriptions.
+    /// The installed-app key in IndexedDB is deleted asynchronously; the load
+    /// waits for that delete (at most [`UNBAKE_WAIT_MS`]), and neither client
+    /// adopts a baked key without the boot profile, so a tab closed or
+    /// reloaded before the delete finishes still boots signed out.
     ///
     /// When topic subscriptions have changes the member's relay copy lacks
     /// (and the signer is a local key or passkey, never a NIP-07 extension,
@@ -815,41 +816,61 @@ impl AuthStore {
     /// and a further sign-out call returns
     /// [`LogoutOutcome::AlreadyFinishing`] and does nothing.
     pub fn logout_to(&self, dest: &str) -> LogoutOutcome {
-        if self.signing_out.get_untracked() {
+        if self.signing_out.get_untracked() || signed_out_here() {
             return LogoutOutcome::AlreadyFinishing;
         }
+        debug_assert!(
+            !dest.contains('#'),
+            "a sign-out destination has no fragment"
+        );
         // Captured before anything is cleared: the signer, the list and the
         // last relay copy seen, held only by the job.
         let job = crate::stores::thread_subs::sign_out_flush();
-        self.clear_session();
-        let Some(job) = job else {
-            full_load(dest);
-            return LogoutOutcome::Done;
-        };
+        // Terminal for this document, on every path and before any await: a
+        // cancelled load (Esc, Stop) leaves a page that refuses sign-in.
+        SIGNED_OUT.with(|f| f.set(true));
         self.signing_out.set(true);
+        let unbaked = self.clear_session();
+        let outcome = if job.is_some() {
+            LogoutOutcome::Finishing
+        } else {
+            LogoutOutcome::Done
+        };
         let dest = dest.to_string();
         leptos::task::spawn_local(async move {
-            crate::stores::thread_subs::within(job, crate::stores::thread_subs::SIGN_OUT_FLUSH_MS)
+            if let Some(job) = job {
+                crate::stores::thread_subs::within(
+                    job,
+                    crate::stores::thread_subs::SIGN_OUT_FLUSH_MS,
+                )
                 .await;
-            // Always: in-app navigation during the wait must not carry this
-            // account's memory into the next session. `signing_out` stays set
-            // until the page goes, so no sign-in can start meanwhile.
+            }
+            // The installed-app key must be gone before the page goes (the
+            // BBS one-shot boot would adopt it); bounded, then load anyway.
+            crate::stores::thread_subs::within(
+                Box::pin(async move { unbaked.wait().await }),
+                UNBAKE_WAIT_MS,
+            )
+            .await;
+            // Always a full load: in-app navigation during the wait must not
+            // carry this account's memory into the next session.
             full_load(&dest);
         });
-        LogoutOutcome::Finishing
+        outcome
     }
 
-    /// Refuse a sign-in while a sign-out is finishing (see
-    /// [`Self::logout_to`]).
+    /// Refuse a sign-in while a sign-out is finishing, or after one in this
+    /// document (see [`Self::logout_to`]).
     fn refuse_while_signing_out(&self) -> Result<(), String> {
-        if self.signing_out.get_untracked() {
+        if self.signing_out.get_untracked() || signed_out_here() {
             return Err("Signing out\u{2026} please wait a moment.".to_string());
         }
         Ok(())
     }
 
     /// Clear everything of the signed-in account, persistent and in memory.
-    fn clear_session(&self) {
+    /// Returns a slot filled once the installed-app key's async delete ends.
+    fn clear_session(&self) -> Rc<crate::relay::OneShot<()>> {
         // ADR-2023: this device must stop waking for the account that signs out.
         crate::utils::push::teardown_on_logout();
         // Zone images fetched for this account must not outlive it.
@@ -885,11 +906,15 @@ impl AuthStore {
         // Signing out also forgets the installed-app bake: otherwise the next
         // `?pwa=1` launch would silently adopt this account again (a shared
         // phone would open someone else's account).
-        leptos::task::spawn_local(async {
+        let done: Rc<crate::relay::OneShot<()>> = crate::relay::OneShot::new();
+        let fill = done.clone();
+        leptos::task::spawn_local(async move {
             if let Err(e) = crate::utils::bake::unbake().await {
                 web_sys::console::warn_1(&format!("[logout] unbake failed: {e}").into());
             }
+            fill.fill(());
         });
+        done
     }
 
     // -- Internal helpers (passkey result application) -------------------------
@@ -1083,22 +1108,85 @@ fn load_action(current: &str, dest: &str) -> LoadAction {
 }
 
 /// A full document load of `dest`: a reload when the page is already there,
-/// else a replace (so Back does not return to the signed-in page).
+/// else a replace (so Back does not return to the signed-in page). If that
+/// throws, falls back to assigning the address; the sign-in guard stays set
+/// either way (fail safe).
 fn full_load(dest: &str) {
     let Some(window) = web_sys::window() else {
         return;
     };
     let location = window.location();
     let current = location.pathname().unwrap_or_default();
-    let _ = match load_action(&current, dest) {
+    let result = match load_action(&current, dest) {
         LoadAction::Reload => location.reload(),
         LoadAction::Replace => location.replace(dest),
     };
+    if result.is_err() {
+        let _ = location.set_href(dest);
+    }
+}
+
+/// How long a sign-out waits for the installed-app key's delete before the
+/// page loads, milliseconds.
+pub const UNBAKE_WAIT_MS: u32 = 500;
+
+thread_local! {
+    /// Set by a sign-out and never cleared: this document has signed an
+    /// account out, so it refuses sign-in until a fresh load.
+    static SIGNED_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this document has signed an account out (see [`SIGNED_OUT`]).
+pub(crate) fn signed_out_here() -> bool {
+    SIGNED_OUT.with(std::cell::Cell::get)
+}
+
+/// After a back/forward-cache restore: whether the page must reload because
+/// what it holds in memory is not the stored session any more (a sign-out
+/// happened here, or elsewhere, or another account signed in).
+pub(crate) fn stale_after_restore(
+    signed_out_here: bool,
+    stored: Option<&str>,
+    in_memory: Option<&str>,
+) -> bool {
+    if signed_out_here {
+        return true;
+    }
+    match (stored, in_memory) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(s), Some(m)) => !s.eq_ignore_ascii_case(m),
+    }
 }
 
 #[cfg(test)]
 mod logout_load_tests {
     use super::{load_action, LoadAction};
+
+    #[test]
+    fn a_restored_page_reloads_when_its_memory_is_not_the_stored_session() {
+        use super::stale_after_restore as stale;
+        let (a, b) = ("aa", "bb");
+        assert!(stale(true, None, None), "signed out in this document");
+        assert!(stale(false, None, Some(a)), "signed out elsewhere");
+        assert!(stale(false, Some(b), Some(a)), "another account signed in");
+        assert!(!stale(false, Some(a), Some(a)));
+        assert!(!stale(false, Some("AA"), Some(a)));
+        assert!(!stale(false, Some(a), None), "nothing in memory to leak");
+        assert!(!stale(false, None, None));
+    }
+
+    #[test]
+    fn sign_out_destinations_have_no_fragment() {
+        // A fragment-only difference would be a same-document navigation,
+        // not a load.
+        for dest in [
+            crate::base::base_href("/"),
+            crate::base::base_href("/login"),
+        ] {
+            assert!(!dest.contains('#'), "{dest}");
+        }
+    }
 
     #[test]
     fn a_sign_out_always_ends_in_a_full_load() {

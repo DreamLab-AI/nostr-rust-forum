@@ -564,6 +564,20 @@ pub(super) fn register_pagehide_listener(store: AuthStore) {
             if !event.persisted() {
                 return;
             }
+            // Restored from the back/forward cache holding another session's
+            // memory (signed out here or elsewhere, or a different account
+            // signed in): reload rather than show or act on it.
+            let in_memory = store_clone2.state.with_untracked(|s| s.pubkey.clone());
+            if super::stale_after_restore(
+                super::signed_out_here(),
+                super::persisted_session_pubkey().as_deref(),
+                in_memory.as_deref(),
+            ) {
+                if let Some(w) = web_sys::window() {
+                    let _ = w.location().reload();
+                }
+                return;
+            }
             let has_key = store_clone2.privkey.with_value(|opt| opt.is_some());
             if !has_key {
                 store_clone2.state.update(|s| {
@@ -642,8 +656,9 @@ fn schedule_nip07_provider_repoll(
     }
     set_timeout(
         move || {
-            // Resolved elsewhere already (e.g. an explicit login) — stop.
-            if state.get_untracked().is_authenticated {
+            // Resolved elsewhere already (e.g. an explicit login), or this
+            // document has signed out — stop.
+            if state.get_untracked().is_authenticated || super::signed_out_here() {
                 return;
             }
             if super::nip07::has_nip07_extension() {

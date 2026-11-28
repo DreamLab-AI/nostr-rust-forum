@@ -58,7 +58,11 @@ None of this has been seen in a browser or against a live relay.
   already on the destination, which before this was skipped on the home page), so no account state stays in memory;
   sign-in is refused ("Signing out…") while the last publish runs. `logout()` returns a `LogoutOutcome`; the forum's two
   sign-out buttons and the BBS show "Signing out…" only for the sign-out that started it, and the welcome page's
-  sign-out uses `logout_to("/login")`. The installed-app boot profile is removed synchronously too. Subscriptions are
+  sign-out uses `logout_to("/login")`. The installed-app boot profile is removed synchronously too, the load waits
+  (at most 500 ms) for the installed-app key's delete, and the BBS one-shot boot now requires a valid boot profile
+  before adopting a baked key, as the forum already did. A document that has signed out refuses sign-in until a fresh
+  load (even if that load is cancelled), the boot-time NIP-07 re-poll stops, and a page restored from the
+  back/forward cache reloads when its in-memory account is not the stored session. Subscriptions are
   written only while the browser's stored session still names the account, so a second tab cannot write them back
   after a sign-out elsewhere. A NIP-07 extension without `nip44`, or any error, leaves the feature local-only. A
   device-key session's copy belongs to the device key, not the identity, and is refused by the relay unless the

@@ -220,7 +220,7 @@ pub async fn bake_local(secret: &[u8; 32], zone_id: &str) -> Result<(), JsValue>
 
 /// One-shot adoption: unwrap the baked key, sign into [`AuthStore`] and enter
 /// PWA mode on `zone_slug`, or route to [`crate::router::Route::Rebind`] when
-/// nothing is baked.
+/// nothing is baked (no valid boot profile, as the forum's `is_baked`).
 ///
 /// The key is held in memory only (ADR-2008): the bake is the installed app's
 /// durable copy, so it is never copied into web storage as plain hex.
@@ -230,6 +230,21 @@ pub async fn adopt_baked_or_rebind(
     router: crate::router::Router,
     zone_slug: String,
 ) {
+    // The boot profile is written after the key record by every bake and
+    // deleted first (synchronously) by every sign-out and "forget": without a
+    // valid one there is no installed account to adopt, even if a key record
+    // outlived an interrupted delete.
+    let has_profile = {
+        use gloo::storage::{LocalStorage, Storage};
+        LocalStorage::get::<String>(BOOTPROFILE_KEY)
+            .ok()
+            .and_then(|raw| nostr_bbs_core::parse_boot_profile(&raw))
+            .is_some()
+    };
+    if !has_profile {
+        router.go(crate::router::Route::Rebind);
+        return;
+    }
     if let Some(secret) = unwrap_baked_secret().await {
         let hex_sk = zeroize::Zeroizing::new(hex::encode(&secret[..]));
         if auth
