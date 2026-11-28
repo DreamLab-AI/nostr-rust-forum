@@ -1530,6 +1530,16 @@ impl NostrRelayDO {
                     return;
                 }
             };
+            // ADR-2037: a post into a pinned channel encrypted to any other
+            // zone's key is refused, encrypted pinned zone or not.
+            if let crate::zone_config::ChannelPin::Pinned(pinned) =
+                ZoneConfig::load(&self.env).pinned_zone(&channel_id)
+            {
+                if crate::zone_config::zk_names_other_zone(pinned, &event.tags) {
+                    Self::send_ok(ws, &event.id, false, PINNED_FOREIGN_ZK_REASON);
+                    return;
+                }
+            }
             // ADR-2017: sealed originals are admin-only and belong to encrypted
             // zones. They are exempt from the drift check in `validate_event`,
             // so this gate must reject every other shape, including a sealed
@@ -2672,6 +2682,11 @@ pub(crate) fn channel_write_rejection(
     }
 }
 
+/// OK reason for a kind-42 into a pinned channel whose `zk` names another
+/// zone (ADR-2037): the client encrypted for the zone the channel used to be in.
+pub(crate) const PINNED_FOREIGN_ZK_REASON: &str =
+    "blocked: this channel belongs to another zone now; reload and post again";
+
 /// The zone a write is gated by, or the rejection when the lookup could not
 /// be answered (F3: a write is never treated as going to an unscoped channel
 /// because D1 failed).
@@ -2828,7 +2843,25 @@ impl NostrRelayDO {
     /// The zone `channel_id` is bound to, through the 60 s per-DO memo
     /// (bound channels only). `Err` when D1 could not answer: callers fail
     /// closed (see [`trust::ZoneLookupError`]).
+    ///
+    /// ADR-2037: the zone-config pin is consulted first, ahead of both memos,
+    /// so a pin is never shadowed by a remembered `channel_zones` answer and
+    /// a pinned channel resolves while D1 is down. Pinned answers are not
+    /// memoised (the config is read per call, as every gate here does).
     pub(crate) async fn cached_channel_zone(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<String>, trust::ZoneLookupError> {
+        let zones = ZoneConfig::load(&self.env);
+        trust::resolve_channel_zone(&zones, channel_id, || {
+            self.memoised_channel_zone(channel_id)
+        })
+        .await
+    }
+
+    /// [`Self::cached_channel_zone`] once the pin check found no pin: the
+    /// memos, then D1 through [`trust::get_channel_zone`].
+    async fn memoised_channel_zone(
         &self,
         channel_id: &str,
     ) -> Result<Option<String>, trust::ZoneLookupError> {
@@ -9529,5 +9562,151 @@ mod sealed_target_sql_tests {
             super::parse_trusted_sealers(&many).len(),
             super::MAX_TRUSTED_SEALERS
         );
+    }
+}
+
+#[cfg(test)]
+mod channel_pin_gate_tests {
+    //! ADR-2037: a channel pinned to a zone in `ZONE_CONFIG` is read-gated by
+    //! that zone, whatever its `channel_zones` row says and whether or not D1
+    //! answers. Every read path (REQ, COUNT, live broadcast, push) decides
+    //! through `channel_read_decision_for` on the `cached_channel_zone`
+    //! answer, which these tests reproduce with a stubbed D1.
+    use super::*;
+    use crate::trust::{resolve_channel_zone, ZoneLookupError};
+    use crate::zone_config::ZoneConfig;
+
+    const PINNED: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    /// "members" read the zone the channel is bound to in D1; "staff" is a
+    /// hidden, encrypted zone that pins the channel.
+    fn zones() -> ZoneConfig {
+        ZoneConfig::from_json(&format!(
+            r#"[{{"id":"open","required_cohorts":["members"],"visibility":"locked","encrypted":true}},
+                {{"id":"staff","required_cohorts":["staff"],"visibility":"hidden","encrypted":true,
+                  "channels":["{PINNED}"]}}]"#
+        ))
+        .with_encryption(true)
+    }
+
+    fn viewer(cohorts: &[&str], authed: bool, admin: bool) -> ViewerContext {
+        ViewerContext {
+            session_pubkey: authed.then(|| "s".repeat(64)),
+            access_pubkey: authed.then(|| "s".repeat(64)),
+            is_admin: admin,
+            viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
+            viewer_is_admin: admin,
+            recipient_keys: vec![],
+        }
+    }
+
+    /// The zone a gate sees for `PINNED` when D1 answers `d1`.
+    fn zone_seen(
+        zones: &ZoneConfig,
+        d1: Result<Option<String>, ZoneLookupError>,
+    ) -> Result<Option<String>, ZoneLookupError> {
+        block_on(resolve_channel_zone(zones, PINNED, || {
+            std::future::ready(d1)
+        }))
+    }
+
+    fn delivered(
+        kind: u64,
+        zone: &Result<Option<String>, ZoneLookupError>,
+        ctx: &ViewerContext,
+    ) -> bool {
+        matches!(
+            channel_read_decision_for(kind, zone, &zones(), ctx),
+            ReadDecision::Deliver
+        )
+    }
+
+    #[test]
+    fn a_pinned_channel_is_read_by_admins_and_pinned_zone_members_only() {
+        let zones = zones();
+        // D1 still binds the channel to "open", or has no row, or is down.
+        for d1 in [Ok(Some("open".to_string())), Ok(None), Err(ZoneLookupError)] {
+            let zone = zone_seen(&zones, d1);
+            assert_eq!(zone, Ok(Some("staff".to_string())));
+            for kind in [40, 41, 42] {
+                assert!(
+                    delivered(kind, &zone, &viewer(&[], true, true)),
+                    "admin, kind {kind}"
+                );
+                assert!(
+                    delivered(kind, &zone, &viewer(&["staff"], true, false)),
+                    "staff, kind {kind}"
+                );
+                // A member of the zone the channel used to be in: nothing, not
+                // even the definition (the pinned zone is hidden).
+                assert!(
+                    !delivered(kind, &zone, &viewer(&["members"], true, false)),
+                    "member, kind {kind}"
+                );
+                assert!(
+                    !delivered(kind, &zone, &viewer(&[], false, false)),
+                    "anonymous, kind {kind}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn without_the_pin_the_same_channel_follows_its_d1_row() {
+        // Behaviour neutrality: drop `channels` and the members read again.
+        let unpinned = ZoneConfig::from_json(
+            r#"[{"id":"open","required_cohorts":["members"],"visibility":"locked","encrypted":true},
+                {"id":"staff","required_cohorts":["staff"],"visibility":"hidden","encrypted":true}]"#,
+        )
+        .with_encryption(true);
+        let zone = block_on(resolve_channel_zone(&unpinned, PINNED, || {
+            std::future::ready(Ok(Some("open".to_string())))
+        }));
+        assert_eq!(zone, Ok(Some("open".to_string())));
+        assert!(matches!(
+            channel_read_decision_for(42, &zone, &unpinned, &viewer(&["members"], true, false)),
+            ReadDecision::Deliver
+        ));
+    }
+
+    #[test]
+    fn writes_into_a_pinned_channel_follow_the_pinned_zone() {
+        let zones = zones();
+        let zone = zone_for_write(zone_seen(&zones, Ok(Some("open".to_string()))));
+        assert_eq!(zone, Ok(Some("staff".to_string())));
+        let zone = zone.unwrap().unwrap();
+        assert!(!zones.cohorts_can_write(&zone, &["members".to_string()]));
+        assert!(zones.cohorts_can_write(&zone, &["staff".to_string()]));
+        // A double pin makes the zone unknown: the write is refused.
+        let doubled = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"a","required_cohorts":["a"],"channels":["{PINNED}"]}},
+                {{"id":"b","required_cohorts":["b"],"channels":["{PINNED}"]}}]"#
+        ));
+        assert!(zone_for_write(zone_seen(&doubled, Ok(None))).is_err());
+    }
+
+    #[test]
+    fn a_double_pin_withholds_the_channel_from_everyone() {
+        let doubled = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"a","required_cohorts":["a"],"channels":["{PINNED}"]}},
+                {{"id":"b","required_cohorts":["b"],"channels":["{PINNED}"]}}]"#
+        ));
+        let zone = zone_seen(&doubled, Ok(None));
+        for ctx in [viewer(&["a"], true, false), viewer(&[], true, true)] {
+            assert!(matches!(
+                channel_read_decision_for(42, &zone, &doubled, &ctx),
+                ReadDecision::Withhold
+            ));
+        }
     }
 }

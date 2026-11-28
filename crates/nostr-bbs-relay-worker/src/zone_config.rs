@@ -15,6 +15,12 @@
 //! - read  gate: `required_cohorts` — empty + `visibility = public` ⇒ unauth read.
 //! - write gate: `write_cohorts ?? required_cohorts`.
 //! - admins bypass both, unconditionally (enforced at the call sites).
+//!
+//! Channel pins (ADR-2037): a zone may list kind-40 channel ids in `channels`.
+//! A pinned channel belongs to that zone whatever its `channel_zones` row or
+//! signed `section` tag says, so an existing section can be moved to another
+//! zone from config alone. [`ZoneConfig::pinned_zone`] is the lookup; every
+//! channel-to-zone resolution in the worker consults it before D1.
 
 use serde::Deserialize;
 use worker::Env;
@@ -61,6 +67,12 @@ pub struct Zone {
     /// tag's fifth element is only a hint checked against it.
     #[serde(default)]
     pub group_pubkey: Option<String>,
+    /// ADR-2037: kind-40 channel ids (64 hex) pinned to this zone. A pinned
+    /// channel is gated by this zone ahead of any `channel_zones` row. Entries
+    /// are compared case-insensitively; an entry that is not 64 hex digits can
+    /// name no channel and is ignored (config validation refuses it).
+    #[serde(default)]
+    pub channels: Vec<String>,
 }
 
 impl Zone {
@@ -71,6 +83,25 @@ impl Zone {
             None => self.required_cohorts.as_slice(),
         }
     }
+}
+
+/// What the zone config says about one channel (ADR-2037).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelPin<'a> {
+    /// No zone pins the channel: its `channel_zones` row decides.
+    Unpinned,
+    /// Exactly one zone pins the channel.
+    Pinned(&'a str),
+    /// Two or more zones pin the channel. Config validation refuses this; a
+    /// hand-edited `ZONE_CONFIG` that does it anyway makes the channel's zone
+    /// unknown, and callers fail closed (reads withheld, writes refused).
+    Conflict,
+}
+
+/// Whether `s` is 64 hex digits, either case: the only form a channel id
+/// (a kind-40 event id) can take.
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The full set of zone definitions parsed from `ZONE_CONFIG`.
@@ -129,6 +160,34 @@ impl ZoneConfig {
     /// Look up a zone definition by id.
     pub fn get(&self, id: &str) -> Option<&Zone> {
         self.zones.iter().find(|z| z.id == id)
+    }
+
+    /// The zone that pins `channel_id` through its `channels` list
+    /// (ADR-2037). Ids compare case-insensitively, so a mixed-case alias of a
+    /// pinned channel is still pinned; entries that are not 64 hex digits are
+    /// skipped. A channel listed by one zone more than once is still
+    /// [`ChannelPin::Pinned`]; listed by two different zones it is
+    /// [`ChannelPin::Conflict`].
+    pub fn pinned_zone(&self, channel_id: &str) -> ChannelPin<'_> {
+        let mut found: Option<&str> = None;
+        for z in &self.zones {
+            let pins = z
+                .channels
+                .iter()
+                .map(|c| c.trim())
+                .any(|c| is_hex64(c) && c.eq_ignore_ascii_case(channel_id));
+            if !pins {
+                continue;
+            }
+            match found {
+                Some(prev) if prev != z.id => return ChannelPin::Conflict,
+                _ => found = Some(z.id.as_str()),
+            }
+        }
+        match found {
+            Some(z) => ChannelPin::Pinned(z),
+            None => ChannelPin::Unpinned,
+        }
     }
 
     /// The zone's bound group pubkey, if one is configured and well formed
@@ -252,6 +311,17 @@ pub fn is_zone_ciphertext(zone: &str, tags: &[Vec<String>], content: &str) -> bo
         Ok(bytes) => bytes.len() >= 99 && bytes[0] == 0x02,
         Err(_) => false,
     }
+}
+
+/// ADR-2037: whether a kind-42 into a channel pinned to `pinned` names some
+/// other zone in a `zk` tag. Such a post was encrypted to another zone's key,
+/// typically by a client that does not know the pin, and anyone holding that
+/// key could read it at rest; the relay refuses it whether or not the pinned
+/// zone is encrypted. Only applied to pinned channels, so it changes nothing
+/// when no pins are configured.
+pub fn zk_names_other_zone(pinned: &str, tags: &[Vec<String>]) -> bool {
+    tags.iter()
+        .any(|t| t.len() >= 2 && t[0] == "zk" && t[1] != pinned)
 }
 
 #[cfg(test)]
@@ -432,5 +502,99 @@ mod tests {
         assert!(!c.cohorts_can_write("nope", &["friends".to_string()]));
         assert!(!c.is_public_read("nope"));
         assert!(!c.defs_visible_to_nonmember("nope"));
+    }
+
+    // -- ADR-2037 channel pins ---------------------------------------------
+
+    const PINNED: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn pinned_cfg() -> ZoneConfig {
+        ZoneConfig::from_json(&format!(
+            r#"[{{"id":"open","required_cohorts":["members"],"visibility":"locked","encrypted":true}},
+                {{"id":"staff","required_cohorts":["staff"],"visibility":"hidden","encrypted":true,
+                  "channels":["{PINNED}"]}}]"#
+        ))
+        .with_encryption(true)
+    }
+
+    #[test]
+    fn channels_default_to_empty_and_nothing_is_pinned() {
+        let c = cfg();
+        assert!(c.zones.iter().all(|z| z.channels.is_empty()));
+        assert_eq!(c.pinned_zone(PINNED), ChannelPin::Unpinned);
+    }
+
+    #[test]
+    fn a_listed_channel_is_pinned_to_its_zone() {
+        let c = pinned_cfg();
+        assert_eq!(c.pinned_zone(PINNED), ChannelPin::Pinned("staff"));
+        assert_eq!(c.pinned_zone(OTHER), ChannelPin::Unpinned);
+        assert_eq!(c.pinned_zone(""), ChannelPin::Unpinned);
+    }
+
+    #[test]
+    fn pins_compare_case_insensitively_and_skip_malformed_entries() {
+        let upper = "AB".repeat(32);
+        let c = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"staff","required_cohorts":["staff"],"channels":[" {upper} ","abc","{}"]}}]"#,
+            "zz".repeat(32)
+        ));
+        // A mixed-case entry, or a mixed-case alias of the id, is still pinned.
+        assert_eq!(c.pinned_zone(&"ab".repeat(32)), ChannelPin::Pinned("staff"));
+        assert_eq!(c.pinned_zone(&upper), ChannelPin::Pinned("staff"));
+        // Entries that are not 64 hex digits name nothing.
+        assert_eq!(c.pinned_zone("abc"), ChannelPin::Unpinned);
+        assert_eq!(c.pinned_zone(&"zz".repeat(32)), ChannelPin::Unpinned);
+    }
+
+    #[test]
+    fn a_channel_pinned_by_two_zones_is_a_conflict() {
+        let c = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"a","required_cohorts":["a"],"channels":["{PINNED}","{PINNED}"]}},
+                {{"id":"b","required_cohorts":["b"],"channels":["{OTHER}"]}},
+                {{"id":"c","required_cohorts":["c"],"channels":["{OTHER}"]}}]"#
+        ));
+        // Listed twice by one zone: still that zone.
+        assert_eq!(c.pinned_zone(PINNED), ChannelPin::Pinned("a"));
+        assert_eq!(c.pinned_zone(OTHER), ChannelPin::Conflict);
+    }
+
+    #[test]
+    fn a_post_into_a_pinned_channel_under_the_old_zone_key_is_refused() {
+        // The channel moved from "open" to "staff"; an old client still
+        // encrypts for "open".
+        let c = pinned_cfg();
+        let ChannelPin::Pinned(zone) = c.pinned_zone(PINNED) else {
+            panic!("pinned");
+        };
+        let (mut tags, ct) = zk_payload();
+        tags[1][1] = "open".into();
+        assert!(c.is_encrypted(zone));
+        assert!(!is_zone_ciphertext(zone, &tags, &ct));
+        assert!(zk_names_other_zone(zone, &tags));
+        // The pinned zone's own ciphertext passes both checks.
+        tags[1][1] = "staff".into();
+        assert!(is_zone_ciphertext(zone, &tags, &ct));
+        assert!(!zk_names_other_zone(zone, &tags));
+    }
+
+    #[test]
+    fn foreign_zk_is_refused_even_when_the_pinned_zone_is_plaintext() {
+        // The shape check is skipped for an unencrypted zone, so the pin
+        // guard is what stops old-zone ciphertext from being stored.
+        let c = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"staff","required_cohorts":["staff"],"channels":["{PINNED}"]}}]"#
+        ))
+        .with_encryption(true);
+        assert!(!c.is_encrypted("staff"));
+        let (mut tags, _) = zk_payload();
+        tags[1][1] = "open".into();
+        assert!(zk_names_other_zone("staff", &tags));
+        // A plaintext post carries no zk and is untouched by the guard.
+        assert!(!zk_names_other_zone(
+            "staff",
+            &[vec!["e".to_string(), PINNED.into()]]
+        ));
     }
 }
