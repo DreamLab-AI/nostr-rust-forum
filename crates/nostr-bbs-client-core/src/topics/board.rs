@@ -485,23 +485,28 @@ impl FrozenBoard {
         if !self.frozen {
             return 0;
         }
+        // The reader's just-posted topic is left out only while its newest
+        // activity is still the reader's own root: a reply to it counts.
         let mine: HashSet<&str> = sorted
             .iter()
-            .filter(|t| self.just_posted_by(t, me))
+            .filter(|t| self.just_posted_by(t, me) && t.last_activity <= t.created_at)
             .map(|t| t.id.as_str())
             .collect();
+        let listed: HashSet<&str> = sorted.iter().map(|t| t.id.as_str()).collect();
         let fresh: Vec<&str> = sorted
             .iter()
             .filter(|t| t.last_activity > self.baseline && !mine.contains(t.id.as_str()))
             .map(|t| t.id.as_str())
             .collect();
+        // The top of the list as compared: rows kept for topics no longer
+        // listed (evicted) are not part of it.
         let in_place = fresh
             .iter()
             .zip(
                 self.shown
                     .iter()
                     .map(String::as_str)
-                    .filter(|id| !mine.contains(id)),
+                    .filter(|id| listed.contains(id) && !mine.contains(id)),
             )
             .take_while(|(f, s)| **f == *s)
             .count();
@@ -509,17 +514,38 @@ impl FrozenBoard {
     }
 
     /// The reader pressed the control: show `sorted` (the full true order,
-    /// stats included), take `newest_known` as the new baseline, stay
-    /// frozen. Sealed pairs are kept.
-    pub fn repaint(&mut self, sorted: &[TopicSummary], newest_known: u64, now_secs: u64) {
-        let mut seen = HashSet::new();
-        self.shown = sorted
+    /// stats included), then the rows kept for topics that are missing but
+    /// not deleted (evicted from the window) in their order; take
+    /// `newest_known` as the new baseline (never lower than the old one),
+    /// stay frozen. Sealed pairs are kept.
+    pub fn repaint(
+        &mut self,
+        sorted: &[TopicSummary],
+        newest_known: u64,
+        now_secs: u64,
+        deleted: &dyn Fn(&str) -> bool,
+    ) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut shown: Vec<String> = sorted
             .iter()
-            .filter(|t| seen.insert(t.id.as_str()))
+            .filter(|t| seen.insert(t.id.clone()))
             .map(|t| t.id.clone())
             .collect();
+        for id in std::mem::take(&mut self.shown) {
+            let alias_listed = self.aliases.get(&id).is_some_and(|a| seen.contains(a));
+            let gone = deleted(&id) || self.aliases.get(&id).is_some_and(|a| deleted(a));
+            if !alias_listed && !gone && seen.insert(id.clone()) {
+                shown.push(id);
+            }
+        }
+        self.shown = shown;
         self.frozen = true;
-        self.baseline = newest_known.max(sorted.iter().map(|t| t.last_activity).max().unwrap_or(0));
+        // Never lower: a kept (evicted) row's activity is not in `sorted`,
+        // and must not read as new when it is paged back in.
+        self.baseline = self
+            .baseline
+            .max(newest_known)
+            .max(sorted.iter().map(|t| t.last_activity).max().unwrap_or(0));
         self.painted_at = now_secs;
     }
 }
@@ -1156,7 +1182,7 @@ mod tests {
                 }
             }
             assert!(board.is_frozen(), "seed {seed}");
-            let frozen: Vec<String> = board.shown().to_vec();
+            let mut frozen: Vec<String> = board.shown().to_vec();
             let canon = |id: &str| {
                 if id == "orig" {
                     "env".to_string()
@@ -1244,8 +1270,120 @@ mod tests {
                         "seed {seed}: quiet section"
                     );
                 }
+                // Now and then the reader presses the control: the full
+                // true order, and no row lost (evicted topics included).
+                if rng.below(10) == 0 {
+                    board.repaint(&fl, newest(&fl), now, &never_deleted);
+                    let after: Vec<String> = board.shown().iter().map(|id| canon(id)).collect();
+                    assert!(
+                        shown.iter().all(|id| after.contains(id)),
+                        "seed {seed}: a repaint dropped a kept row"
+                    );
+                    assert_eq!(board.updated(&fl, Some(ME)), 0, "seed {seed}");
+                    frozen = after;
+                }
             }
         }
+    }
+
+    #[test]
+    fn a_repaint_keeps_rows_of_evicted_topics() {
+        let ts = vec![
+            topic("a", "x", 10, 50),
+            topic("b", "x", 5, 40),
+            topic("c", "x", 1, 30),
+        ];
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs(None, true, 50, 10, &never_deleted),
+        );
+        // b is evicted by older paging (not deleted), then c gets a reply.
+        let mut now = sorted(vec![ts[0].clone(), ts[2].clone()]);
+        now[1].last_activity = 60;
+        let now = sorted(now);
+        board.update(&now, &inputs(None, true, 60, 11, &never_deleted));
+        board.repaint(&now, 60, 12, &never_deleted);
+        assert_eq!(board.shown(), &ids(&["c", "a", "b"])[..]);
+        // A deleted one does not come back.
+        let deleted = |id: &str| id == "b";
+        board.repaint(&now, 60, 13, &deleted);
+        assert_eq!(board.shown(), &ids(&["c", "a"])[..]);
+    }
+
+    #[test]
+    fn a_reply_to_the_reader_s_just_posted_topic_counts() {
+        let mut ts = vec![topic("a", "x", 10, 50)];
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs(Some("me"), true, 50, 1_000, &never_deleted),
+        );
+        ts.push(topic("mine", "me", 1_005, 1_005));
+        let now = sorted(ts.clone());
+        board.update(
+            &now,
+            &inputs(Some("me"), true, 1_005, 1_005, &never_deleted),
+        );
+        assert_eq!(board.updated(&now, Some("me")), 0, "the reader's own root");
+        // Someone replies to it: real activity. It is already on top, so
+        // in place; a reply to a, below, is not.
+        ts[1].last_activity = 1_010;
+        ts[0].last_activity = 1_020;
+        let now = sorted(ts.clone());
+        board.update(
+            &now,
+            &inputs(Some("me"), true, 1_020, 1_020, &never_deleted),
+        );
+        assert_eq!(board.shown(), &ids(&["mine", "a"])[..]);
+        assert_eq!(
+            board.updated(&now, Some("me")),
+            2,
+            "both count, neither in place"
+        );
+    }
+
+    #[test]
+    fn an_evicted_row_does_not_break_the_top_of_the_list() {
+        let mut ts = vec![topic("a", "x", 10, 50), topic("b", "x", 5, 40)];
+        let mut board = FrozenBoard::new();
+        board.update(
+            &sorted(ts.clone()),
+            &inputs(None, true, 50, 10, &never_deleted),
+        );
+        // a is evicted (kept on top), b gets a reply: b is the top of the
+        // listed rows, so in place.
+        ts.remove(0);
+        ts[0].last_activity = 70;
+        let now = sorted(ts.clone());
+        board.update(&now, &inputs(None, true, 70, 11, &never_deleted));
+        assert_eq!(board.shown(), &ids(&["a", "b"])[..]);
+        assert_eq!(board.updated(&now, None), 0);
+    }
+
+    #[test]
+    fn a_revisit_after_a_failed_root_list_waits_for_the_new_answer() {
+        // The page passes `ready_to_freeze` = window settled and the root
+        // list answered or failed. A new request clears the failure
+        // (`ChannelStore::request_topic_roots`), so on the revisit the
+        // board stays provisional until the new answer, then freezes in
+        // the true order.
+        let window_only = sorted(vec![topic("w", "x", 1, 900)]);
+        let mut board = FrozenBoard::new();
+        board.update(&window_only, &inputs(None, false, 900, 10, &never_deleted));
+        assert!(
+            !board.is_frozen(),
+            "the failure from the last visit was cleared"
+        );
+        let with_roots = sorted(vec![
+            topic("w", "x", 1, 900),
+            topic("busy", "x", 2, 950),
+            topic("quiet", "x", 3, 3),
+        ]);
+        board.update(&with_roots, &inputs(None, true, 950, 11, &never_deleted));
+        assert!(board.is_frozen());
+        assert_eq!(board.shown(), &ids(&["busy", "w", "quiet"])[..]);
+        assert_eq!(board.updated(&with_roots, None), 0);
     }
 
     #[test]
@@ -1417,7 +1555,7 @@ mod tests {
         let now = sorted(ts.clone());
         board.update(&now, &inputs(None, true, 80, 11, &never_deleted));
         assert_eq!(board.updated(&now, None), 2);
-        board.repaint(&now, 80, 12);
+        board.repaint(&now, 80, 12, &never_deleted);
         assert_eq!(board.shown(), &ids(&["n", "c", "a", "b"])[..]);
         assert!(board.is_frozen());
         assert_eq!(board.updated(&now, None), 0);

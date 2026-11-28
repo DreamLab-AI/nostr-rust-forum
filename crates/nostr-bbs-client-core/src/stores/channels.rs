@@ -1284,6 +1284,13 @@ impl ChannelStore {
         self.roots_targets.update_value(|m| {
             m.insert(key.clone(), cid.to_string());
         });
+        // A new request: the last failure no longer settles this visit's
+        // root list (a board would otherwise freeze at once without it).
+        if self.roots_failed.with_untracked(|s| s.contains(cid)) {
+            self.roots_failed.update(|s| {
+                clear_roots_failure(s, cid);
+            });
+        }
         let store = *self;
         let channel = cid.to_string();
         let failed_channel = cid.to_string();
@@ -1353,9 +1360,10 @@ impl ChannelStore {
     }
 
     /// Whether channel `cid`'s last root-list request failed (no answer
-    /// within [`PAGE_TIMEOUT_MS`], or refused after its retry) and none has
-    /// answered since. A later [`Self::request_topic_roots`] past the
-    /// backoff, or on a revisit, asks again. Reactive.
+    /// within [`PAGE_TIMEOUT_MS`], or refused after its retry), and neither
+    /// an answer nor a new request has come since. A later
+    /// [`Self::request_topic_roots`] past the backoff, or on a revisit,
+    /// asks again (and clears this). Reactive.
     pub fn topic_roots_failed(&self, cid: &str) -> bool {
         self.roots_failed.with(|s| s.contains(cid))
     }
@@ -2306,6 +2314,27 @@ mod roots_backoff_tests {
         assert!(b.may_ask(1.0));
         b.failed(10.0);
         assert_eq!(b.retry_at, 10.0 + 80_000.0, "third failure: 4x");
+    }
+}
+
+/// Forget channel `cid`'s root-list failure, as a new request goes out.
+/// Returns whether it was recorded.
+fn clear_roots_failure(failed: &mut HashSet<String>, cid: &str) -> bool {
+    failed.remove(cid)
+}
+
+#[cfg(test)]
+mod roots_failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_request_unsettles_a_failed_root_list() {
+        // Fail, leave, return: the new request clears the failure, so the
+        // list is unsettled (answered nor failed) until the new answer.
+        let mut failed: HashSet<String> = ["c".to_string()].into_iter().collect();
+        assert!(clear_roots_failure(&mut failed, "c"));
+        assert!(!failed.contains("c"));
+        assert!(!clear_roots_failure(&mut failed, "c"));
     }
 }
 
