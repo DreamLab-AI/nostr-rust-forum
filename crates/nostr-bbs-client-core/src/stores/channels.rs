@@ -154,6 +154,14 @@ pub struct ChannelStore {
     /// refused by the relay after its retry). Its target is cleared, so the
     /// next request asks again.
     roots_failed: RwSignal<HashSet<String>>,
+    /// Root-list key -> its failure backoff ([`RootsBackoff`]): a failed
+    /// root list is not asked again before its `retry_at`, however often a
+    /// view asks, except on a new visit ([`Self::rearm_topic_roots`]).
+    roots_backoff: StoredValue<HashMap<String, RootsBackoff>>,
+    /// Topics (lower-case root ids) whose newest-reply REQ has answered,
+    /// with or without a reply: with the COUNT, what
+    /// [`Self::topic_stats_answered`] waits for.
+    topic_latest_answered: RwSignal<HashSet<String>>,
     /// Channels whose root list came back under its limit: every marked
     /// topic root is held, so channel history paging lists no new topic.
     roots_complete: RwSignal<HashSet<String>>,
@@ -220,6 +228,8 @@ impl ChannelStore {
             roots_targets: StoredValue::new(HashMap::new()),
             roots_answered: RwSignal::new(HashSet::new()),
             roots_failed: RwSignal::new(HashSet::new()),
+            roots_backoff: StoredValue::new(HashMap::new()),
+            topic_latest_answered: RwSignal::new(HashSet::new()),
             roots_complete: RwSignal::new(HashSet::new()),
             topic_latest: RwSignal::new(HashMap::new()),
             topic_stats_asked: StoredValue::new(HashSet::new()),
@@ -1203,10 +1213,20 @@ impl ChannelStore {
     /// channel) into the unwindowed list [`roots_key`]`(cid)`. A section can
     /// then list every topic, dormant ones included, and a deep link's slug
     /// (an id prefix) is matched against it.
+    ///
+    /// A request that failed is not repeated before its backoff has run out
+    /// (from [`PAGE_TIMEOUT_MS`], doubling to five minutes; a new visit,
+    /// [`Self::rearm_topic_roots`], may ask at once): views re-run this on
+    /// every message, and a relay
+    /// refusing subscriptions must not get two more REQs per message.
     pub fn request_topic_roots(&self, relay: &RelayConnection, cid: &str, wait_auth: bool) {
         let key = roots_key(cid);
         let fresh = self.roots_targets.with_value(|m| !m.contains_key(&key));
-        if !fresh {
+        let now = js_sys::Date::now();
+        let backed_off = self
+            .roots_backoff
+            .with_value(|m| m.get(&key).is_some_and(|b| !b.may_ask(now)));
+        if !fresh || backed_off {
             return;
         }
         self.roots_targets.update_value(|m| {
@@ -1229,6 +1249,9 @@ impl ChannelStore {
             wait_auth,
             Box::new(move |events, page| {
                 let held = !events.is_empty();
+                let _ = store.roots_backoff.try_update_value(|m| {
+                    m.remove(&roots_key(&channel));
+                });
                 store.apply_page(events);
                 if held && page.delivered < RELAY_FILTER_LIMIT {
                     store.roots_complete.update(|s| {
@@ -1240,9 +1263,14 @@ impl ChannelStore {
                 });
             }),
             Box::new(move || {
-                // Unanswered: forget the target so the section's next
-                // visit asks again, and record the failure (a page must
-                // not wait on an answer that will never come).
+                // Unanswered: forget the target and back off, so it is
+                // asked again later (or on the next visit), and record the
+                // failure (a page must not wait on an answer that will
+                // never come).
+                let now = js_sys::Date::now();
+                let _ = store.roots_backoff.try_update_value(|m| {
+                    m.entry(failed_key.clone()).or_default().failed(now);
+                });
                 let _ = store.roots_targets.try_update_value(|m| {
                     m.remove(&failed_key);
                 });
@@ -1253,9 +1281,22 @@ impl ChannelStore {
         );
     }
 
+    /// A new visit to channel `cid`'s list (a page mounted, or switched to
+    /// this channel): a root list that failed may be asked again at once,
+    /// whatever its backoff. Call it once per visit, never from an effect
+    /// that re-runs on traffic.
+    pub fn rearm_topic_roots(&self, cid: &str) {
+        let key = roots_key(cid);
+        self.roots_backoff.update_value(|m| {
+            if let Some(b) = m.get_mut(&key) {
+                b.rearm();
+            }
+        });
+    }
+
     /// Whether channel `cid`'s root-list request has failed this session
     /// (no answer within [`PAGE_TIMEOUT_MS`], or refused after its retry).
-    /// The next [`Self::request_topic_roots`] asks again. Reactive.
+    /// It is asked again once its backoff has run out. Reactive.
     pub fn topic_roots_failed(&self, cid: &str) -> bool {
         self.roots_failed.with(|s| s.contains(cid))
     }
@@ -1339,6 +1380,7 @@ impl ChannelStore {
         });
         let sub: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let done = Rc::new(std::cell::Cell::new(false));
+        let batch_roots: Vec<String> = batch.iter().map(|(_, r, _)| r.clone()).collect();
         let on_receipt = {
             let sub = sub.clone();
             let relay = relay.clone();
@@ -1349,6 +1391,11 @@ impl ChannelStore {
                 if let Some(id) = sub.borrow_mut().take() {
                     relay.unsubscribe(&id);
                 }
+                // Every newest reply this batch had is in (none for a topic
+                // without replies).
+                let _ = store.topic_latest_answered.try_update(|s| {
+                    s.extend(batch_roots.iter().cloned());
+                });
                 store.topic_stats_busy.set_value(false);
                 store.pump_topic_stats(&relay);
             })
@@ -1408,12 +1455,18 @@ impl ChannelStore {
         }
     }
 
-    /// Whether the relay has answered topic `root`'s reply COUNT (asked by
-    /// [`Self::request_topic_stats`] alongside its newest reply), so a list
-    /// can tell "answered, no replies" from "not in yet". Reactive.
+    /// Whether the relay has answered both of topic `root`'s stats (asked
+    /// by [`Self::request_topic_stats`]): its reply COUNT and its newest
+    /// reply, which is what places the topic in the list. A list can then
+    /// tell "answered, no replies" from "not in yet". Reactive.
     pub fn topic_stats_answered(&self, root: &str) -> bool {
-        self.totals
-            .with(|m| m.get(&topic_key(root)).is_some_and(|t| t.counted.is_some()))
+        let counted = self
+            .totals
+            .with(|m| m.get(&topic_key(root)).is_some_and(|t| t.counted.is_some()));
+        counted
+            && self
+                .topic_latest_answered
+                .with(|s| s.contains(&root.to_lowercase()))
     }
 
     /// Topic `root`'s newest reply as the relay answered it, as
@@ -2111,6 +2164,89 @@ fn buffer_pending_meta(pending: &mut HashMap<String, MetaUpdate>, update: MetaUp
         _ => {
             pending.insert(update.channel_id.clone(), update);
         }
+    }
+}
+
+/// Backoff of one failed root-list request: not asked again before
+/// `retry_at` (ms since the epoch), the wait starting at
+/// [`PAGE_TIMEOUT_MS`] and doubling per failure up to
+/// [`ROOTS_BACKOFF_CAP_MS`]. A new visit re-arms it at once; an answer
+/// clears it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RootsBackoff {
+    failures: u32,
+    retry_at: f64,
+}
+
+/// Longest wait between two asks of a failing root list.
+const ROOTS_BACKOFF_CAP_MS: f64 = 300_000.0;
+
+impl RootsBackoff {
+    /// Wait after the `failures`-th failure in a row.
+    fn wait_ms(failures: u32) -> f64 {
+        let doublings = failures.saturating_sub(1).min(16);
+        (f64::from(PAGE_TIMEOUT_MS) * f64::from(1u32 << doublings)).min(ROOTS_BACKOFF_CAP_MS)
+    }
+
+    /// Record a failure at `now`.
+    fn failed(&mut self, now: f64) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = now + Self::wait_ms(self.failures);
+    }
+
+    /// A new visit: ask again now. The failure count stays, so a relay that
+    /// keeps refusing backs off further each time.
+    fn rearm(&mut self) {
+        self.retry_at = 0.0;
+    }
+
+    /// Whether the root list may be asked at `now`.
+    fn may_ask(&self, now: f64) -> bool {
+        now >= self.retry_at
+    }
+}
+
+#[cfg(test)]
+mod roots_backoff_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_root_list_waits_doubling_up_to_the_cap() {
+        let mut b = RootsBackoff::default();
+        assert!(b.may_ask(0.0), "never failed: ask");
+        b.failed(1_000.0);
+        assert!(!b.may_ask(1_000.0 + 19_999.0), "within PAGE_TIMEOUT_MS");
+        assert!(b.may_ask(1_000.0 + 20_000.0));
+        b.failed(50_000.0);
+        assert_eq!(b.retry_at, 50_000.0 + 40_000.0);
+        for _ in 0..20 {
+            b.failed(0.0);
+        }
+        assert_eq!(b.retry_at, ROOTS_BACKOFF_CAP_MS, "capped");
+    }
+
+    #[test]
+    fn every_message_in_between_is_refused() {
+        // A view re-asking on each incoming message gets nothing out
+        // until the wait has run out.
+        let mut b = RootsBackoff::default();
+        b.failed(0.0);
+        let asked = (0..200)
+            .map(|i| f64::from(i) * 100.0)
+            .filter(|t| b.may_ask(*t))
+            .count();
+        assert_eq!(asked, 0);
+    }
+
+    #[test]
+    fn a_new_visit_rearms_at_once_but_keeps_the_count() {
+        let mut b = RootsBackoff::default();
+        b.failed(0.0);
+        b.failed(0.0);
+        b.rearm();
+        assert!(b.may_ask(1.0));
+        b.failed(10.0);
+        assert_eq!(b.retry_at, 10.0 + 80_000.0, "third failure: 4x");
     }
 }
 
