@@ -164,7 +164,7 @@ impl ZoneConfig {
             return Self::default();
         }
         let cfg = Self::from_json(trimmed).with_encryption(enabled);
-        if !cfg.pin_errors.is_empty() {
+        if !cfg.pin_errors().is_empty() {
             // Once per isolate: the config is parsed per request, and it can
             // only change with a redeploy, which starts new isolates.
             static LOGGED: std::sync::atomic::AtomicBool =
@@ -172,7 +172,7 @@ impl ZoneConfig {
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 worker::console_error!(
                     "ZONE_CONFIG channel pins misconfigured; affected pins fail closed: {}",
-                    cfg.pin_errors.join("; ")
+                    cfg.pin_errors().join("; ")
                 );
             }
         }
