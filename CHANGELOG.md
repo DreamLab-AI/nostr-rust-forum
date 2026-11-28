@@ -36,8 +36,20 @@ byte-for-byte as before. Not exercised against a live relay or in a browser.
   open tile. Public zones with no cohorts stay open.
 - **Sealed search.** `nostr-bbs-search-build --zone-config <file>` leaves posts of a channel pinned to another zone out of
   an index, and a reconcile excludes those already in it.
+- **Security review fixes.** A malformed or misspelt pin list fails closed on the relay (logged), and config loading
+  refuses misspelt pin keys; `validate_zone_config_json` checks a hand-edited `ZONE_CONFIG`. `/api/admin/channel-zone`
+  refuses a pinned channel (409). Comments into a pinned channel encrypted for another zone are refused.
+  `scripts/sealed-search-nightly.sh` passes `NBSS_ZONE_CONFIG` as `--zone-config`.
+- **Behaviour change, all zone-bound channels.** A non-admin's kind-41 (rename, description, picture, pin/unpin control)
+  now needs write access to the channel's zone, after the existing trust-level rule: a TL3 member or a channel's TL2
+  creator who cannot write the zone can no longer edit its metadata. A kind-42 edit whose target is not a message of the
+  same channel is refused by the relay and ignored by clients. Channels with no zone, admins, and edits this kit's
+  clients publish are unaffected.
 - **Limits.** Posts made before the move stay under the old zone's key, so anyone who synced them or holds that key can
-  still read them; the pinned id is visible in page source; existing images stay under the old zone's media path.
+  still read them; the pinned id is visible in page source; existing images stay under the old zone's media path; a
+  `locked` target zone still shows the channel's name, description, picture and rename history to non-members (use
+  `hidden`); sealed-search rows indexed before the pin persist until a reconcile or rebuild removes them. Removing a pin
+  hands the channel back to its `channel_zones` row; with no row it becomes unscoped, so confirm the row first.
 
 ### Forum client: layout shift and a two-tab notice gap (2026-11-28)
 
