@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: inactive
 supersedes: []
 superseded_by: []
-verified_commit: branch feat/section-topic-stats (stacked on fix/topic-list-stability, PR #130); the commit this record lands in
+verified_commit: 34fa898 (branch feat/section-topic-stats, stacked on fix/topic-list-stability ef41392); later commits on the branch touch docs and evidence only
 verified_paths: [crates/nostr-bbs-relay-worker/src/relay_do/section_stats.rs, crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs, crates/nostr-bbs-relay-worker/src/relay_do/mod.rs, crates/nostr-bbs-relay-worker/src/nip11.rs, crates/nostr-bbs-client-core/src/topics/section_stats.rs, crates/nostr-bbs-client-core/src/topics/board.rs, crates/nostr-bbs-client-core/src/relay.rs, crates/nostr-bbs-client-core/src/relay/info.rs, crates/nostr-bbs-client-core/src/stores/channels.rs, crates/nostr-bbs-client-core/src/zone_crypto/tickets.rs, crates/nostr-bbs-forum-client/src/pages/section.rs, crates/nostr-bbs-bbs-client/src/views/thread.rs]
 owner: jjohare
 review_trigger: the first deployment of a relay carrying it; any change to the channel read rule (channel_read_decision_for), to the topic, reply, edit or sealed tag shapes, to event_tags or its indexes; the subscriptions feature (kit PR #131) asking for cross-section unread counts
@@ -187,7 +187,7 @@ request. Recorded as follow-up; not implemented here.
 
 ## Verification
 
-From the worktree root at the commit this record lands in:
+From the worktree root at `34fa898` (workspace test suite run at `6ba03ed`; the later NIP-11 prefetch commit re-ran the client-core suite, the CI security-crates job and all other gates):
 
 - `cargo test -p nostr-bbs-relay-worker --lib section_stats` (19 tests: oracle against `classify_topics` over 12 seeds,
   deletion, sealed and dual-present, cross-channel leak, edits and reactions, expiry, truncation, reply cap, budget, walk
