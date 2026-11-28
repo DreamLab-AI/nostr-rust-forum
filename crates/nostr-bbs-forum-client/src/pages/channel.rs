@@ -416,7 +416,13 @@ pub fn ChannelPage() -> impl IntoView {
                         id: event.id.clone(),
                         name: name.clone(),
                         description,
-                        section: section.clone(),
+                        // ADR-2037: routed by the zone pin when one exists.
+                        section: crate::stores::zones::effective_section(
+                            &event.id,
+                            &section,
+                            &load_zones(),
+                        ),
+                        section_tag: section.clone(),
                         picture,
                         created_at: event.created_at,
                     };
@@ -1492,6 +1498,7 @@ mod header_tests {
             name: "Fairfield Events".into(),
             description: "old".into(),
             section: String::new(),
+            section_tag: String::new(),
             picture: String::new(),
             created_at: 100,
         }];

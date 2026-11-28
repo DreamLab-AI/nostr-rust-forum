@@ -342,6 +342,7 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
                 }
             }
         }
+        validate_channel_pins(&cfg.zones)?;
     }
 
     for host in &cfg.preview.allowed_hosts {
@@ -440,6 +441,201 @@ fn preview_host_problem(host: &str) -> Result<(), &'static str> {
     }
     if OPEN_SUFFIXES.contains(&host) {
         return Err("is an open-registration suffix; list the specific site beneath it");
+    }
+    Ok(())
+}
+
+/// Keys an operator plausibly writes when meaning `channels` (ADR-2037),
+/// compared case-insensitively.
+const PIN_KEY_MISSPELLINGS: &[&str] = &["channel", "pin", "pins", "pinned", "pinned_channels"];
+
+/// Whether a zone key looks like a misspelt `channels` (ADR-2037): one of a
+/// short list of likely alternatives (`channel`, `pin`, `pins`, `pinned`,
+/// `pinned_channels`), or within edit distance 2 of `channels`, in either
+/// case, but never `channels` itself. Unrelated keys that merely contain
+/// "pin" or "channel" (`mapping`, `channel_order`, `default_channel`) do not
+/// match. The relay worker uses this same rule and fails such pins closed.
+pub fn is_misspelt_pin_key(key: &str) -> bool {
+    if key == "channels" {
+        return false;
+    }
+    let k = key.to_ascii_lowercase();
+    PIN_KEY_MISSPELLINGS.contains(&k.as_str()) || edit_distance(&k, "channels") <= 2
+}
+
+/// Levenshtein distance over bytes (keys are ASCII in practice).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// Refuse a `zones` array (as JSON: the `[[zones]]` tables of a `forum.toml`,
+/// or a `ZONE_CONFIG` value) any of whose zones carries a misspelt pin key.
+///
+/// # Errors
+///
+/// A message naming the zone and the key.
+pub fn check_zone_pin_keys(zones: &serde_json::Value) -> Result<(), String> {
+    for z in zones.as_array().into_iter().flatten() {
+        let Some(obj) = z.as_object() else { continue };
+        let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        if let Some(key) = obj.keys().find(|k| is_misspelt_pin_key(k)) {
+            return Err(format!(
+                "zone '{id}' has unknown key '{key}' — did you mean 'channels'? (an \
+                 unrecognised pin key would leave the channel in its old zone)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every key a [`crate::schema::Zone`] serialises when all its fields are
+/// set. A test serialises a fully populated zone and checks this list against
+/// it, so it cannot drift from the schema.
+pub const ZONE_SCHEMA_KEYS: &[&str] = &[
+    "id",
+    "slug",
+    "display_name",
+    "required_cohorts",
+    "write_cohorts",
+    "banner_image_url",
+    "accent_hex",
+    "visibility",
+    "encrypted",
+    "agent_keys",
+    "history_from_epoch",
+    "group_pubkey",
+    "auto_approve",
+    "kanban",
+    "search",
+    "channels",
+];
+
+/// Zone keys a deployed `ZONE_CONFIG` legitimately carries that the config
+/// schema does not model: `section_order` is read only by the clients
+/// (`nostr_bbs_client_core::stores::zones::Zone::section_order`) and is in
+/// every live projection.
+pub const CLIENT_ONLY_ZONE_KEYS: &[&str] = &["section_order"];
+
+/// Check a `ZONE_CONFIG` JSON value as deployed (ADR-2037): misspelt pin
+/// keys, malformed or duplicate `channels` entries, and pinning zone ids that
+/// extend another zone's id. Use it on a hand-edited projection before it is
+/// handed to the workers; `forum.toml` gets the same checks on load.
+///
+/// # Errors
+///
+/// Invalid JSON or the first pin problem found.
+pub fn validate_zone_config_json(raw: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("ZONE_CONFIG is not valid JSON: {e}"))?;
+    check_zone_pin_keys(&value)?;
+    // Strict about keys here (the workers stay tolerant): any key that is
+    // not a schema field or a known client-only field is refused, since the
+    // workers would silently ignore it, and an ignored pin key leaves the
+    // channel in its old zone.
+    for z in value.as_array().into_iter().flatten() {
+        let Some(obj) = z.as_object() else { continue };
+        let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        if let Some(key) = obj.keys().find(|k| {
+            !ZONE_SCHEMA_KEYS.contains(&k.as_str()) && !CLIENT_ONLY_ZONE_KEYS.contains(&k.as_str())
+        }) {
+            return Err(format!(
+                "zone '{id}' has unknown key '{key}': the workers would ignore it (known keys: {})",
+                ZONE_SCHEMA_KEYS
+                    .iter()
+                    .chain(CLIENT_ONLY_ZONE_KEYS)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // The clients deserialise `section_order` as a list of section ids; any
+        // other shape would fail the whole client-side ZONE_CONFIG parse.
+        if let Some(order) = obj.get("section_order") {
+            let ok = order
+                .as_array()
+                .is_some_and(|a| a.iter().all(serde_json::Value::is_string));
+            if !ok {
+                return Err(format!(
+                    "zone '{id}' section_order must be an array of strings (got {order})"
+                ));
+            }
+        }
+    }
+    let zones: Vec<crate::schema::Zone> = value
+        .as_array()
+        .ok_or("ZONE_CONFIG must be a JSON array")?
+        .iter()
+        .map(|z| {
+            let mut z = z.clone();
+            // The projection's other fields are not this check's concern;
+            // fill the one required field the workers do not need.
+            if let Some(obj) = z.as_object_mut() {
+                obj.entry("display_name")
+                    .or_insert(serde_json::Value::String(String::new()));
+            }
+            serde_json::from_value(z).map_err(|e| format!("ZONE_CONFIG zone: {e}"))
+        })
+        .collect::<Result<_, String>>()?;
+    validate_channel_pins(&zones)
+}
+
+/// ADR-2037 channel pins (`[[zones]] channels`): every entry is a kind-40
+/// event id (64-char lowercase hex), no channel is listed twice, and a zone
+/// that pins channels does not have an id of the form `<other zone id>-…`.
+///
+/// The last rule exists because the clients resolve a section to a zone by
+/// exact id or by the first `<zone id>-` prefix in config order, and media
+/// uploads use the prefix rule alone: a channel pinned to `staff-only` while a
+/// zone `staff` exists would have its uploads filed under `staff`.
+fn validate_channel_pins(zones: &[crate::schema::Zone]) -> Result<(), String> {
+    let mut owner: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for zone in zones {
+        for id in &zone.channels {
+            let well_formed =
+                id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            if !well_formed {
+                return Err(format!(
+                    "zone '{}' channels entry '{}' must be a kind-40 event id: 64-char \
+                     lowercase hex",
+                    zone.id, id
+                ));
+            }
+            if let Some(prev) = owner.insert(id.as_str(), zone.id.as_str()) {
+                return Err(if prev == zone.id {
+                    format!("zone '{}' lists channel {id} twice", zone.id)
+                } else {
+                    format!(
+                        "channel {id} is pinned by both zone '{prev}' and zone '{}' — a \
+                         channel can belong to one zone only",
+                        zone.id
+                    )
+                });
+            }
+        }
+        if zone.channels.is_empty() {
+            continue;
+        }
+        if let Some(shadow) = zones
+            .iter()
+            .find(|z| z.id != zone.id && zone.id.starts_with(&format!("{}-", z.id)))
+        {
+            return Err(format!(
+                "zone '{}' pins channels but its id starts with '{}-', so clients would \
+                 file the pinned channels' media under zone '{}'; give the zone an id \
+                 that does not extend another zone's",
+                zone.id, shadow.id, shadow.id
+            ));
+        }
     }
     Ok(())
 }
@@ -982,6 +1178,7 @@ operator = "tier-2"
             kanban: false,
             search: None,
             group_pubkey: None,
+            channels: Vec::new(),
         }
     }
 
@@ -1098,6 +1295,7 @@ operator = "tier-2"
             kanban: false,
             search: None,
             group_pubkey: None,
+            channels: Vec::new(),
         }];
         assert!(validate_config(&cfg).is_ok());
     }
@@ -1121,6 +1319,7 @@ operator = "tier-2"
             kanban: false,
             search: None,
             group_pubkey: None,
+            channels: Vec::new(),
         }];
         assert!(validate_config(&cfg).is_err());
     }
@@ -1144,6 +1343,7 @@ operator = "tier-2"
             kanban: false,
             search: None,
             group_pubkey: None,
+            channels: Vec::new(),
         }
     }
 
@@ -1296,5 +1496,239 @@ bot_profile = "tag"
         assert_eq!(cfg.zones[0].accent_hex.as_deref(), Some("#3b82f6"));
         assert!(cfg.features.poker);
         assert_eq!(cfg.poker, Poker::default());
+    }
+
+    // -- ADR-2037 channel pins ----------------------------------------------
+
+    const PIN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PIN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn pinning(id: &str, channels: &[&str]) -> Zone {
+        Zone {
+            channels: channels.iter().map(|c| c.to_string()).collect(),
+            visibility: ZoneVisibility::Hidden,
+            required_cohorts: vec![id.to_string()],
+            ..zone_with_slug(id, None)
+        }
+    }
+
+    #[test]
+    fn well_formed_channel_pins_validate() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![pinning("open", &[]), pinning("staff", &[PIN_A, PIN_B])];
+        assert!(validate_config(&cfg).is_ok(), "{:?}", validate_config(&cfg));
+    }
+
+    #[test]
+    fn malformed_channel_pins_are_rejected() {
+        let upper = PIN_A.to_uppercase();
+        let short = &PIN_A[..63];
+        let not_hex = "g".repeat(64);
+        let padded = format!(" {}", &PIN_A[..63]);
+        for bad in [upper.as_str(), short, not_hex.as_str(), padded.as_str(), ""] {
+            let mut cfg = baseline_cfg();
+            cfg.zones = vec![pinning("staff", &[bad])];
+            let err = validate_config(&cfg).unwrap_err();
+            assert!(err.contains("64-char"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_channel_pinned_by_two_zones_is_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![
+            pinning("staff", &[PIN_A]),
+            pinning("board", &[PIN_B, PIN_A]),
+        ];
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.contains("pinned by both zone 'staff' and zone 'board'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_channel_listed_twice_by_one_zone_is_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![pinning("staff", &[PIN_A, PIN_A])];
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn a_pinning_zone_may_not_extend_another_zone_id() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![pinning("staff", &[]), pinning("staff-only", &[PIN_A])];
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.contains("starts with 'staff-'"), "{err}");
+        // Without pins the same ids are as valid as they were before.
+        cfg.zones = vec![pinning("staff", &[]), pinning("staff-only", &[])];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn channel_pins_parse_from_toml_and_stay_out_of_an_unpinned_projection() {
+        let toml = format!("id = \"staff\"\ndisplay_name = \"Staff\"\nchannels = [\"{PIN_A}\"]\n");
+        let zone: Zone = toml::from_str(&toml).unwrap();
+        assert_eq!(zone.channels, vec![PIN_A.to_string()]);
+        let json = serde_json::to_value(&zone).unwrap();
+        assert_eq!(json["channels"], serde_json::json!([PIN_A]));
+        let plain: Zone = toml::from_str("id = \"open\"\ndisplay_name = \"Open\"\n").unwrap();
+        assert!(plain.channels.is_empty());
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("channels").is_none(), "no pins, no key: {json}");
+    }
+
+    #[test]
+    fn misspelt_pin_keys_are_refused_on_load() {
+        let base = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../forum.example.toml"),
+        )
+        .unwrap();
+        for key in ["channel", "Channels", "pins", "pinned_channels"] {
+            let toml = format!(
+                "{base}\n[[zones]]\nid = \"staff\"\ndisplay_name = \"Staff\"\n{key} = [\"{PIN_A}\"]\n"
+            );
+            let err = crate::load_from_str(&toml).unwrap_err().to_string();
+            assert!(err.contains("did you mean 'channels'"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_zone_config_json_is_checked_like_forum_toml() {
+        assert!(validate_zone_config_json(&format!(
+            r#"[{{"id":"open"}},{{"id":"staff","channels":["{PIN_A}"]}}]"#
+        ))
+        .is_ok());
+        let typo =
+            validate_zone_config_json(&format!(r#"[{{"id":"staff","channel":["{PIN_A}"]}}]"#));
+        assert!(typo.unwrap_err().contains("did you mean"));
+        let bad = validate_zone_config_json(r#"[{"id":"staff","channels":["abc"]}]"#);
+        assert!(bad.unwrap_err().contains("64-char"));
+        let doubled = validate_zone_config_json(&format!(
+            r#"[{{"id":"a","channels":["{PIN_A}"]}},{{"id":"b","channels":["{PIN_A}"]}}]"#
+        ));
+        assert!(doubled.unwrap_err().contains("pinned by both"));
+        assert!(validate_zone_config_json("{}").is_err());
+    }
+
+    #[test]
+    fn unrelated_zone_keys_still_load() {
+        let base = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../forum.example.toml"),
+        )
+        .unwrap();
+        for key in [
+            "mapping",
+            "shipping",
+            "channel_order",
+            "featured_channels",
+            "default_channel",
+        ] {
+            let toml = format!(
+                "{base}\n[[zones]]\nid = \"staff\"\ndisplay_name = \"Staff\"\n{key} = [\"{PIN_A}\"]\n"
+            );
+            assert!(crate::load_from_str(&toml).is_ok(), "{key}");
+            assert!(!is_misspelt_pin_key(key), "{key}");
+        }
+        for key in [
+            "channel",
+            "Channels",
+            "CHANNELS",
+            "chanels",
+            "pin",
+            "pins",
+            "pinned",
+            "pinned_channels",
+        ] {
+            assert!(is_misspelt_pin_key(key), "{key}");
+        }
+        assert!(!is_misspelt_pin_key("channels"));
+    }
+
+    #[test]
+    fn zone_schema_keys_match_a_fully_populated_zone() {
+        let full = Zone {
+            id: "z".into(),
+            slug: Some("z".into()),
+            display_name: "Z".into(),
+            required_cohorts: vec!["z".into()],
+            write_cohorts: Some(vec!["z".into()]),
+            banner_image_url: Some("/b.webp".into()),
+            accent_hex: Some("#123456".into()),
+            visibility: ZoneVisibility::Hidden,
+            encrypted: true,
+            agent_keys: true,
+            history_from_epoch: Some(1),
+            group_pubkey: Some("ab".repeat(32)),
+            auto_approve: true,
+            kanban: true,
+            search: Some(SearchMode::Sealed),
+            channels: vec![PIN_A.into()],
+        };
+        // Every field is set to a non-default value above, so no
+        // `skip_serializing_if` can hide one, and this exhaustive pattern (no
+        // `..`) stops compiling when the schema gains a field.
+        let Zone {
+            id: _,
+            slug: _,
+            display_name: _,
+            required_cohorts: _,
+            write_cohorts: _,
+            banner_image_url: _,
+            accent_hex: _,
+            visibility: _,
+            encrypted: _,
+            agent_keys: _,
+            history_from_epoch: _,
+            group_pubkey: _,
+            auto_approve: _,
+            kanban: _,
+            search: _,
+            channels: _,
+        } = full.clone();
+        const SCHEMA_FIELDS: usize = 16;
+        let json = serde_json::to_value(&full).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), SCHEMA_FIELDS);
+        assert_eq!(ZONE_SCHEMA_KEYS.len(), SCHEMA_FIELDS);
+        let mut got: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut want = ZONE_SCHEMA_KEYS.to_vec();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
+        // And the fully populated zone validates cleanly as a ZONE_CONFIG.
+        let raw = serde_json::to_string(&vec![full]).unwrap();
+        assert_eq!(validate_zone_config_json(&raw), Ok(()));
+    }
+
+    #[test]
+    fn unknown_zone_keys_are_refused_by_the_zone_config_validator() {
+        for key in [
+            "channel_ids",
+            "channel_pins",
+            "pinnedChannels",
+            "pinned-channels",
+            "pinned_channel",
+            "colour",
+        ] {
+            let raw = format!(r#"[{{"id":"staff","{key}":["{PIN_A}"]}}]"#);
+            let err = validate_zone_config_json(&raw).unwrap_err();
+            assert!(err.contains("staff") && err.contains(key), "{key}: {err}");
+        }
+        // The client-only key every live projection carries is accepted.
+        assert_eq!(
+            validate_zone_config_json(r#"[{"id":"open","section_order":["open-a"]}]"#),
+            Ok(())
+        );
+        for bad in [r#""open-a""#, "[1]", "null", r#"{"a":"b"}"#] {
+            let raw = format!(r#"[{{"id":"open","section_order":{bad}}}]"#);
+            let err = validate_zone_config_json(&raw).unwrap_err();
+            assert!(err.contains("section_order"), "{bad}: {err}");
+        }
     }
 }

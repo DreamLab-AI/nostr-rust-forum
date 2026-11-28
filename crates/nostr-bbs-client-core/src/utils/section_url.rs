@@ -164,6 +164,7 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             section: section.to_string(),
+            section_tag: section.to_string(),
             picture: String::new(),
             created_at: 0,
         }

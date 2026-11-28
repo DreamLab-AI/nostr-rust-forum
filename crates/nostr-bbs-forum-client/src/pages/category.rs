@@ -653,7 +653,7 @@ pub fn CategoryPage() -> impl IntoView {
                 <ChannelEditModal
                     is_open=edit_open
                     channel_id=meta.id
-                    section=meta.section
+                    section=meta.section_tag
                     picture=meta.picture
                     initial_name=meta.name
                     initial_description=meta.description

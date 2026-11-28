@@ -18,6 +18,43 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Zones: pin a section to a zone from config (2026-11-28)
+
+Decision: [ADR-2037](docs/adr/ADR-2037-pin-a-section-to-a-zone-from-zone-config.md). Relay worker, both clients,
+`nostr-bbs-config` and `nostr-bbs-search-build`. With no pins configured nothing changes, and `ZONE_CONFIG` projects
+byte-for-byte as before. Not exercised against a live relay or in a browser.
+
+- **Config.** `[[zones]] channels = [<kind-40 id>, ...]` pins existing channels to that zone. Validation refuses a malformed
+  id, a channel listed twice or pinned by two zones, and a pinning zone whose id extends another zone's (`<zone>-...`).
+- **Relay.** The pin decides a channel's zone ahead of its `channel_zones` row and ahead of the 60 s memo, for every read
+  and write gate, profile stats and the triage sweep; a pinned channel resolves while D1 is down, and a double pin fails
+  closed. A post into a pinned channel encrypted for another zone is refused.
+- **Clients.** A pinned channel is listed, opened, searched and encrypted under its pinned zone (forum and BBS). The cached
+  channel list heals on load, so adding or removing a pin needs only a reload; caches from older builds load unchanged.
+  The admin Channels tab shows "Pinned to zone X by zone config" instead of "Bind to zone" for a pinned channel.
+- **Tiles.** A non-public zone with no `required_cohorts` (admins only on the relay) is no longer shown to everyone as an
+  open tile. Public zones with no cohorts stay open.
+- **Sealed search.** `nostr-bbs-search-build --zone-config <file>` leaves posts of a channel pinned to another zone out of
+  an index, and a reconcile excludes those already in it.
+- **Security review fixes.** A malformed or misspelt pin list fails closed on the relay (logged), and config loading
+  refuses misspelt pin keys; `validate_zone_config_json` checks a hand-edited `ZONE_CONFIG`. `/api/admin/channel-zone`
+  refuses a pinned channel (409). Comments into a pinned channel encrypted for another zone are refused.
+  `scripts/sealed-search-nightly.sh` passes `NBSS_ZONE_CONFIG` as `--zone-config`.
+  Second pass: the misspelt-key rule is an explicit list plus edit distance 2 from `channels` (unrelated keys such as
+  `channel_order` are no longer refused or quarantined); a wrong-typed `channels` breaks only its own zone's pins instead
+  of the whole `ZONE_CONFIG`; `scripts/validate-zone-config.sh` checks a `ZONE_CONFIG` file; kind-41 must name a stored
+  kind-40 by its exact id; edit-target lookups that fail are retryable, and placement checks run after the zone gate.
+- **Behaviour change, all zone-bound channels.** A non-admin's kind-41 (rename, description, picture, pin/unpin control)
+  now needs write access to the channel's zone, after the existing trust-level rule: a TL3 member or a channel's TL2
+  creator who cannot write the zone can no longer edit its metadata. A kind-42 edit whose target is not a message of the
+  same channel is refused by the relay and ignored by clients. Channels with no zone, admins, and edits this kit's
+  clients publish are unaffected.
+- **Limits.** Posts made before the move stay under the old zone's key, so anyone who synced them or holds that key can
+  still read them; the pinned id is visible in page source; existing images stay under the old zone's media path; a
+  `locked` target zone still shows the channel's name, description, picture and rename history to non-members (use
+  `hidden`); sealed-search rows indexed before the pin persist until a reconcile or rebuild removes them. Removing a pin
+  hands the channel back to its `channel_zones` row; with no row it becomes unscoped, so confirm the row first.
+
 ### Forum and BBS clients: topic lists stay put while they load (2026-11-28)
 
 - **Forum section page.** The topic list was rebuilt whenever the channel list was written (a reconnect, an AUTH replay, any channel's rename), because the page's branch read the whole resolved channel. It now reads one memo of the lookup state and the channel id, so the list, its rows and its history loaders survive unrelated writes. The store's channel list also notifies only when a channel is added or pruned, not when the relay re-sends one it already holds.

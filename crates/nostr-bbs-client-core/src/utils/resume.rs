@@ -388,6 +388,7 @@ mod tests {
             name: "Rants".into(),
             description: String::new(),
             section: "zone2-rants".into(),
+            section_tag: "zone2-rants".into(),
             picture: String::new(),
             created_at: 0,
         };

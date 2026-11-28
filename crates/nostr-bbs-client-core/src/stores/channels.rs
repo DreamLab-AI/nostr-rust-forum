@@ -34,9 +34,49 @@ pub struct ChannelMeta {
     pub id: String,
     pub name: String,
     pub description: String,
+    /// The section the channel is routed by: [`section_tag`](Self::section_tag),
+    /// or the id of the zone that pins the channel in `ZONE_CONFIG` (ADR-2037).
+    /// Set from [`crate::stores::zones::effective_section`] at ingest and
+    /// recomputed whenever the cache is loaded, so every zone resolver follows
+    /// a pin, and a removed pin, without a resolver of its own.
     pub section: String,
+    /// The raw `section` tag of the signed kind-40 (ADR-2037). Caches written
+    /// before this field existed load with it empty and are healed from
+    /// `section` on load (see [`heal_cached_sections`]).
+    #[serde(default)]
+    pub section_tag: String,
     pub picture: String,
     pub created_at: u64,
+}
+
+impl ChannelMeta {
+    /// The form a channel is cached in (ADR-2037): `section` holds the raw
+    /// tag, so a cache read by a build without pin support routes exactly as
+    /// it did before pins existed, and [`heal_cached_sections`] recomputes the
+    /// routed section on load.
+    pub fn cache_form(self) -> Self {
+        Self {
+            section: self.section_tag.clone(),
+            ..self
+        }
+    }
+}
+
+/// ADR-2037: restore each cached channel's raw tag and recompute its routed
+/// `section` from it against the current zone config.
+///
+/// The cache stores the raw tag in `section` (see `save_cache`), and caches
+/// from builds before `section_tag` existed hold only that, so an empty
+/// `section_tag` is taken from `section`. Recomputing on every load means a
+/// pin added or removed since the cache was written takes effect before the
+/// relay answers, and an old cache never keeps a channel in the wrong zone.
+pub fn heal_cached_sections(channels: &mut [ChannelMeta], zones: &[Zone]) {
+    for c in channels.iter_mut() {
+        if c.section_tag.is_empty() {
+            c.section_tag = std::mem::take(&mut c.section);
+        }
+        c.section = crate::stores::zones::effective_section(&c.id, &c.section_tag, zones);
+    }
 }
 
 /// Cached channel data persisted to localStorage.
@@ -492,14 +532,24 @@ impl ChannelStore {
 
     fn load_cache() -> CachedData {
         let json: Result<String, _> = LocalStorage::get(CACHE_KEY);
-        json.ok()
+        let mut data: CachedData = json
+            .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        heal_cached_sections(&mut data.channels, &crate::stores::zones::load_zones());
+        data
     }
 
     fn save_cache(&self) {
         let data = CachedData {
-            channels: self.channels.get_untracked(),
+            // ADR-2037: `section` is cached as the raw tag, so a cache read by
+            // a build without pin support routes as it always did.
+            channels: self
+                .channels
+                .get_untracked()
+                .into_iter()
+                .map(ChannelMeta::cache_form)
+                .collect(),
             last_active: self.last_active.get_untracked(),
             meta_updated_at: self.meta_updated_at.get_untracked(),
             synced_at: (js_sys::Date::now() / 1000.0) as u64,
@@ -567,7 +617,12 @@ impl ChannelStore {
                         id: event.id.clone(),
                         name,
                         description,
-                        section,
+                        section: crate::stores::zones::effective_section(
+                            &event.id,
+                            &section,
+                            &crate::stores::zones::load_zones(),
+                        ),
+                        section_tag: section,
                         picture,
                         created_at: event.created_at,
                     };
@@ -3554,6 +3609,7 @@ mod tests {
             name: name.into(),
             description: "orig desc".into(),
             section: "music".into(),
+            section_tag: "music".into(),
             picture: String::new(),
             created_at,
         }
@@ -3842,5 +3898,79 @@ mod tests {
         assert_eq!(msgs["chan"].len(), 1);
         // Still recorded, so a message with that id could never appear later.
         assert!(tomb.names("nonexistent-id"));
+    }
+
+    // -- ADR-2037: routed section, cache healing -------------------------------
+
+    const PIN: &str = "9999999999999999999999999999999999999999999999999999999999999999";
+
+    fn pin_zones(pinned: bool) -> Vec<Zone> {
+        let mut zones: Vec<Zone> = serde_json::from_str(
+            r#"[{"id":"open","required_cohorts":["members"],"encrypted":true},
+                {"id":"staff","visibility":"hidden","encrypted":true}]"#,
+        )
+        .unwrap();
+        if pinned {
+            zones[1].channels = vec![PIN.to_string()];
+        }
+        zones
+    }
+
+    #[test]
+    fn a_cache_from_before_section_tag_loads_and_routes_as_before() {
+        // The exact shape older builds wrote: no `section_tag`.
+        let old = format!(
+            r#"{{"channels":[{{"id":"{PIN}","name":"Agents","description":"","section":"open-agents","picture":"","created_at":1}},
+                             {{"id":"c2","name":"Music","description":"","section":"","picture":"","created_at":2}}],
+                "last_active":{{}},"synced_at":5}}"#
+        );
+        let mut data: CachedData = serde_json::from_str(&old).unwrap();
+        assert_eq!(data.channels[0].section_tag, "");
+        heal_cached_sections(&mut data.channels, &pin_zones(false));
+        assert_eq!(data.channels[0].section, "open-agents");
+        assert_eq!(data.channels[0].section_tag, "open-agents");
+        assert_eq!(data.channels[1].section, "");
+        assert_eq!(data.channels[1].section_tag, "");
+        // The same old cache under a pin routes the channel to the pinned zone.
+        let mut data: CachedData = serde_json::from_str(&old).unwrap();
+        heal_cached_sections(&mut data.channels, &pin_zones(true));
+        assert_eq!(data.channels[0].section, "staff");
+        assert_eq!(data.channels[0].section_tag, "open-agents");
+    }
+
+    #[test]
+    fn removing_a_pin_heals_the_cached_section() {
+        let mut list = vec![ChannelMeta {
+            section: String::new(),
+            section_tag: "open-agents".into(),
+            ..channel(PIN, "Agents", 1)
+        }];
+        heal_cached_sections(&mut list, &pin_zones(true));
+        assert_eq!(list[0].section, "staff");
+        // Saved while pinned, then loaded after the pin was removed.
+        let saved = serde_json::to_string(&CachedData {
+            channels: list.into_iter().map(ChannelMeta::cache_form).collect(),
+            ..CachedData::default()
+        })
+        .unwrap();
+        let mut back: CachedData = serde_json::from_str(&saved).unwrap();
+        heal_cached_sections(&mut back.channels, &pin_zones(false));
+        assert_eq!(back.channels[0].section, "open-agents");
+        // Loading twice changes nothing more (healing is idempotent).
+        let again = back.channels.clone();
+        heal_cached_sections(&mut back.channels, &pin_zones(false));
+        assert_eq!(back.channels[0].section, again[0].section);
+    }
+
+    #[test]
+    fn the_cache_form_holds_the_raw_tag_for_builds_without_pins() {
+        let pinned = ChannelMeta {
+            section: "staff".into(),
+            section_tag: "open-agents".into(),
+            ..channel(PIN, "Agents", 1)
+        };
+        let json = serde_json::to_value(pinned.cache_form()).unwrap();
+        assert_eq!(json["section"], "open-agents");
+        assert_eq!(json["section_tag"], "open-agents");
     }
 }

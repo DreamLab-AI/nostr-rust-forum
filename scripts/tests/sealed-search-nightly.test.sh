@@ -158,4 +158,11 @@ check "default: compact --all at 4096 exclusions" 1 "$(grep -c '^compact.*--all'
 STUB_PARTIAL=0 STUB_EXCLUDED=4095 run_job
 check "default: no compaction below it" 0 "$(grep -c '^compact' "$tmp/calls" || true)"
 
+# ADR-2037: NBSS_ZONE_CONFIG reaches every builder call as --zone-config.
+check "no zone config: no --zone-config" 0 "$(grep -c -- '--zone-config' "$tmp/calls" || true)"
+echo "NBSS_ZONE_CONFIG=$tmp/zone-config.json" >>"$tmp/zone.env"
+STUB_PARTIAL=1 run_job
+check "zone config: exit 0" 0 "$rc"
+check "zone config passed to every call" "$(wc -l <"$tmp/calls")" "$(grep -c -- "--zone-config $tmp/zone-config.json" "$tmp/calls")"
+
 [ "$fails" -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

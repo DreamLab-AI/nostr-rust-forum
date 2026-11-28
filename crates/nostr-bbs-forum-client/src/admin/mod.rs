@@ -722,8 +722,10 @@ impl AdminStore {
         let event_created_at = signed.created_at;
         let event_pubkey = signed.pubkey.clone();
         let store_for_bind = self.clone();
+        // ADR-2037: decided from the signed id, so a channel a zone pins is
+        // never bound to the zone its section tag names.
         let bind_zone = crate::stores::zones::configured_zones()
-            .and_then(|z| crate::stores::zones::zone_id_for_section(section, &z));
+            .and_then(|z| crate::stores::zones::bind_zone_for(&event_id, section, &z));
 
         // Shared one-shot guard: whichever of the relay ack or the timeout fires
         // first wins; the loser is a no-op. This prevents a late relay OK from
