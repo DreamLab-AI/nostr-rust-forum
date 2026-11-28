@@ -27,7 +27,9 @@ use crate::stores::subs_panel::{
     swipe_label, toggle_label, unread_badge, use_subs_panel, SubscribeToggle, TITLE_PLACEHOLDER,
 };
 use crate::stores::thread_subs::{use_thread_subs, SubscribedTopic};
-use crate::utils::swipe::{attach_row_swipe, RowSwipeGuard, RowSwipeState, SwipeDir};
+use crate::utils::swipe::{
+    attach_row_swipe, lock_decision, Lock, RowSwipeGuard, RowSwipeState, SwipeDir,
+};
 
 /// The panel column / drawer.
 const PANEL_CLASS: &str = "fixed left-0 top-16 bottom-0 w-64 max-w-[85vw] z-40 \
@@ -230,7 +232,10 @@ fn PanelBody(on_follow: Callback<()>) -> impl IntoView {
     let topics = subs.topics();
     let total = subs.total_unread();
     view! {
-        <div class="flex-1 overflow-y-auto overscroll-contain px-1 py-2">
+        // A scroll container ends the touch-action intersection, so it carries
+        // `pan-y` itself: the list scrolls, a horizontal drag reaches the
+        // drawer's swipe.
+        <div class="flex-1 overflow-y-auto overscroll-contain px-1 py-2" style=SHEET_TOUCH_ACTION>
             {move || {
                 let list = topics.get();
                 if list.is_empty() {
@@ -347,51 +352,122 @@ fn DesktopColumn() -> impl IntoView {
 /// Selector for the focusable elements of the drawer (focus trap).
 const FOCUSABLE: &str = "a[href], button:not([disabled])";
 
+/// The drawer's and tab's `touch-action`: vertical panning stays the
+/// browser's (the list scrolls), horizontal travel reaches the gesture code
+/// instead of becoming a pan that cancels it.
+const SHEET_TOUCH_ACTION: &str = "touch-action: pan-y;";
+
 #[component]
 fn MobileDrawer() -> impl IntoView {
     let panel = use_subs_panel();
     let tab_ref = NodeRef::<html::Button>::new();
-    let drawer_ref = NodeRef::<html::Div>::new();
-    let close_ref = NodeRef::<html::Button>::new();
-    let swipe = RowSwipeState::new();
-    let guard: StoredValue<Option<RowSwipeGuard>, LocalStorage> = StoredValue::new_local(None);
     let was_open = StoredValue::new(false);
 
-    let close = move || {
-        panel.set_open(false);
-    };
-
-    // Open: focus into the drawer and bind its swipe-to-close. Close: return
-    // focus to the tab.
+    // Closing returns focus to the tab (once it is back in the page).
     Effect::new(move |_| {
         let open = panel.is_open();
+        let tab = tab_ref.get();
         if open {
-            if let Some(el) = drawer_ref.get() {
-                if guard.with_value(Option::is_none) {
-                    let el: web_sys::HtmlElement = el.unchecked_into();
-                    guard.set_value(Some(attach_row_swipe(&el, swipe, move |dir| {
-                        if dir == SwipeDir::Left {
-                            panel.set_open(false);
-                        }
-                    })));
-                }
-            }
-            if let Some(b) = close_ref.get() {
-                let _ = b.focus();
-            }
             was_open.set_value(true);
-        } else {
-            guard.set_value(None);
-            if was_open.get_value() {
+        } else if was_open.get_value() {
+            if let Some(t) = tab {
                 was_open.set_value(false);
-                if let Some(t) = tab_ref.get() {
-                    let _ = t.focus();
-                }
+                let _ = t.focus();
             }
         }
     });
 
-    // Focus trap and Escape while open.
+    // Tab: tap opens; a rightward drag opens too, claimed by the same axis
+    // rule as the row swipe (no edge exclusion: the tab is the affordance).
+    let drag_from: StoredValue<Option<(i32, f64, f64)>> = StoredValue::new(None);
+    let on_tab_down = move |ev: web_sys::PointerEvent| {
+        drag_from.set_value(Some((
+            ev.pointer_id(),
+            ev.client_x() as f64,
+            ev.client_y() as f64,
+        )));
+    };
+    let on_tab_move = move |ev: web_sys::PointerEvent| {
+        let Some((id, x0, y0)) = drag_from.get_value() else {
+            return;
+        };
+        if id != ev.pointer_id() {
+            return;
+        }
+        let (dx, dy) = (ev.client_x() as f64 - x0, ev.client_y() as f64 - y0);
+        match lock_decision(dx, dy) {
+            Lock::Horizontal if dx > 0.0 => {
+                ev.prevent_default();
+                drag_from.set_value(None);
+                panel.set_open(true);
+            }
+            Lock::Horizontal | Lock::Vertical => drag_from.set_value(None),
+            Lock::Undecided => {}
+        }
+    };
+    let on_tab_end = move |_: web_sys::PointerEvent| drag_from.set_value(None);
+
+    view! {
+        <Show
+            when=move || panel.is_open()
+            fallback=move || view! {
+                <button
+                    node_ref=tab_ref
+                    type="button"
+                    class=TAB_CLASS
+                    style=SHEET_TOUCH_ACTION
+                    aria-label="Show subscribed topics"
+                    title="Subscribed topics"
+                    aria-expanded="false"
+                    aria-controls="subs-drawer"
+                    on:click=move |_| panel.set_open(true)
+                    on:pointerdown=on_tab_down
+                    on:pointermove=on_tab_move
+                    on:pointerup=on_tab_end
+                    on:pointercancel=on_tab_end
+                >
+                    {bell_svg(false, "w-3.5 h-3.5")}
+                    {tab_marker()}
+                </button>
+            }
+        >
+            <DrawerSheet />
+        </Show>
+    }
+}
+
+/// The open drawer. Its own component, so the swipe binding and focus belong
+/// to this mount of the element and go with it.
+#[component]
+fn DrawerSheet() -> impl IntoView {
+    let panel = use_subs_panel();
+    let drawer_ref = NodeRef::<html::Div>::new();
+    let close_ref = NodeRef::<html::Button>::new();
+    let swipe = RowSwipeState::new();
+    let guard: StoredValue<Option<RowSwipeGuard>, LocalStorage> = StoredValue::new_local(None);
+    let close = move || panel.set_open(false);
+
+    // Once mounted: bind swipe-to-close (the row swipe's rules: touch and pen,
+    // claimed only when clearly horizontal; a leftward release past a third
+    // of the drawer closes it) and move focus into the drawer.
+    Effect::new(move |_| {
+        let Some(el) = drawer_ref.get() else {
+            return;
+        };
+        if guard.with_value(Option::is_none) {
+            let el: web_sys::HtmlElement = el.unchecked_into();
+            guard.set_value(Some(attach_row_swipe(&el, swipe, move |dir| {
+                if dir == SwipeDir::Left {
+                    panel.set_open(false);
+                }
+            })));
+        }
+        if let Some(b) = close_ref.get() {
+            let _ = b.focus();
+        }
+    });
+
+    // Focus trap and Escape.
     let on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
         "Escape" => {
             ev.prevent_default();
@@ -431,21 +507,6 @@ fn MobileDrawer() -> impl IntoView {
         _ => {}
     };
 
-    // Tab: tap opens; dragging it rightwards opens too.
-    let drag_from: StoredValue<Option<(i32, f64)>> = StoredValue::new(None);
-    let on_tab_down = move |ev: web_sys::PointerEvent| {
-        drag_from.set_value(Some((ev.pointer_id(), ev.client_x() as f64)));
-    };
-    let on_tab_move = move |ev: web_sys::PointerEvent| {
-        if let Some((id, x0)) = drag_from.get_value() {
-            if id == ev.pointer_id() && ev.client_x() as f64 - x0 > 24.0 {
-                drag_from.set_value(None);
-                panel.set_open(true);
-            }
-        }
-    };
-    let on_tab_end = move |_: web_sys::PointerEvent| drag_from.set_value(None);
-
     let on_follow = Callback::new(move |_| panel.set_open(false));
     let drawer_style = move || {
         // Follows a leftward drag; never further right than open.
@@ -455,61 +516,37 @@ fn MobileDrawer() -> impl IntoView {
         } else {
             "none"
         };
-        format!("transform: translateX({dx}px); transition: {transition};")
+        format!("{SHEET_TOUCH_ACTION} transform: translateX({dx}px); transition: {transition};")
     };
 
     view! {
-        <Show
-            when=move || panel.is_open()
-            fallback=move || view! {
-                <button
-                    node_ref=tab_ref
-                    type="button"
-                    class=TAB_CLASS
-                    style="touch-action: none;"
-                    aria-label="Show subscribed topics"
-                    title="Subscribed topics"
-                    aria-expanded="false"
-                    aria-controls="subs-drawer"
-                    on:click=move |_| panel.set_open(true)
-                    on:pointerdown=on_tab_down
-                    on:pointermove=on_tab_move
-                    on:pointerup=on_tab_end
-                    on:pointercancel=on_tab_end
-                >
-                    {bell_svg(false, "w-3.5 h-3.5")}
-                    {tab_marker()}
-                </button>
-            }
+        <div class=SCRIM_CLASS aria-hidden="true" on:click=move |_| close()></div>
+        <div
+            node_ref=drawer_ref
+            id="subs-drawer"
+            class=DRAWER_CLASS
+            style=drawer_style
+            role="dialog"
+            aria-modal="true"
+            aria-label="Subscribed topics"
+            on:keydown=on_keydown
         >
-            <div class=SCRIM_CLASS aria-hidden="true" on:click=move |_| close()></div>
-            <div
-                node_ref=drawer_ref
-                id="subs-drawer"
-                class=DRAWER_CLASS
-                style=drawer_style
-                role="dialog"
-                aria-modal="true"
-                aria-label="Subscribed topics"
-                on:keydown=on_keydown
-            >
-                <div class="flex items-center justify-between px-3 h-11 border-b border-gray-800">
-                    <h2 class="text-sm font-semibold text-gray-200">"Subscribed"</h2>
-                    <button
-                        node_ref=close_ref
-                        type="button"
-                        class="w-9 h-9 rounded-md text-gray-400 hover:text-white hover:bg-gray-800 flex items-center justify-center focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400"
-                        aria-label="Close subscribed topics"
-                        on:click=move |_| close()
-                    >
-                        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                            <path d="M18 6L6 18M6 6l12 12" stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                    </button>
-                </div>
-                <PanelBody on_follow=on_follow />
+            <div class="flex items-center justify-between px-3 h-11 border-b border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-200">"Subscribed"</h2>
+                <button
+                    node_ref=close_ref
+                    type="button"
+                    class="w-9 h-9 rounded-md text-gray-400 hover:text-white hover:bg-gray-800 flex items-center justify-center focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400"
+                    aria-label="Close subscribed topics"
+                    on:click=move |_| close()
+                >
+                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <path d="M18 6L6 18M6 6l12 12" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </button>
             </div>
-        </Show>
+            <PanelBody on_follow=on_follow />
+        </div>
     }
 }
 
@@ -543,5 +580,12 @@ mod tests {
     #[test]
     fn the_focus_trap_covers_links_and_buttons() {
         assert!(FOCUSABLE.contains("a[href]") && FOCUSABLE.contains("button"));
+    }
+
+    #[test]
+    fn the_drawer_and_tab_leave_horizontal_travel_to_the_gesture() {
+        // `auto` let the browser take a horizontal drag as a pan and cancel
+        // the close gesture; `pan-y` keeps vertical scrolling the browser's.
+        assert_eq!(SHEET_TOUCH_ACTION, "touch-action: pan-y;");
     }
 }

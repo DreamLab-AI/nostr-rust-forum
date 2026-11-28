@@ -1424,13 +1424,27 @@ impl ThreadSubsStore {
         root: impl Fn() -> Option<String> + 'static,
         newest: impl Fn() -> Option<u64> + 'static,
     ) {
+        self.mark_read_while_viewing_ids(move || root().into_iter().collect(), newest);
+    }
+
+    /// [`Self::mark_read_while_viewing`] for a thread known by more than one
+    /// id (a sealed root: the envelope's id and the original's): every listed
+    /// id that is followed is marked.
+    pub fn mark_read_while_viewing_ids(
+        &self,
+        roots: impl Fn() -> Vec<String> + 'static,
+        newest: impl Fn() -> Option<u64> + 'static,
+    ) {
         let store = *self;
         Effect::new(move |_| {
-            let (Some(root), Some(newest)) = (root(), newest()) else {
+            let roots = roots();
+            let Some(newest) = newest() else {
                 return;
             };
-            if store.is_subscribed(&root) {
-                store.mark_read(&root, newest);
+            for root in roots {
+                if store.is_subscribed(&root) {
+                    store.mark_read(&root, newest);
+                }
             }
         });
     }
@@ -2821,6 +2835,12 @@ async fn sign_out_publish(
 thread_local! {
     /// The store, for sign-out (which runs outside any reactive owner).
     static GLOBAL: Cell<Option<ThreadSubsStore>> = const { Cell::new(None) };
+}
+
+/// The store, for code outside a reactive owner (the notification centre's
+/// "Mark all read"). `None` before [`provide_thread_subs`].
+pub(crate) fn global_thread_subs() -> Option<ThreadSubsStore> {
+    GLOBAL.with(Cell::get)
 }
 
 /// A bounded last publish to run before sign-out removes the local copy:

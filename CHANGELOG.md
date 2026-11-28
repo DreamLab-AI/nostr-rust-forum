@@ -35,6 +35,15 @@ Built on the client-core subscriptions store below. Not seen in a browser.
   with focus trapped while open and returned to the tab. Nothing shows signed out.
 - **Reading.** Opening a subscribed thread marks it read; the panel numeral and the bell notices for the same posts
   clear together.
+  The notification centre's "Mark all read" clears the panel numerals too.
+- **Section "new" badge** (live defect, before this work): it showed for any section active in the past 24 hours,
+  whatever had been read, so it never cleared. It now shows only for activity newer than the channel's read position
+  (the one the index's "N new" chip uses and opening the section advances).
+- Fixes after a browser check: the mobile drawer and its tab carry `touch-action: pan-y` (a horizontal drag was taken
+  by the browser and cancelled the close swipe), the drawer's swipe binding belongs to each open drawer, and the tab's
+  drag-to-open uses the row swipe's axis rule. The desktop column starts open only from 1280 px wide when the member
+  has not chosen. Client core: `RowSwipeState::with_reduced_motion`, `ThreadSubsStore::mark_read_while_viewing_ids`,
+  `subs_panel::initial_open_at`.
 - Shared pieces in client-core: `stores::subs_panel` (panel state, toggle action, labels), `utils::swipe` (gesture
   logic and binding), `ThreadSubsStore::mark_read_while_viewing`, `NotificationStoreV2::mark_read_ids`; prefetched
   topic roots kept in their own list, out of the section's topic board. web-sys features `MouseEvent` and

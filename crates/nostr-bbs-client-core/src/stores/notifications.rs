@@ -334,7 +334,9 @@ impl NotificationStoreV2 {
         self.persist();
     }
 
-    /// Mark all notifications as read.
+    /// Mark all notifications as read, and every subscribed topic with
+    /// them, so the panel's numerals clear too (the reverse already holds:
+    /// reading a topic marks its post notices read).
     pub fn mark_all_read(&self) {
         self.items.update(|list| {
             for n in list.iter_mut() {
@@ -342,6 +344,9 @@ impl NotificationStoreV2 {
             }
         });
         self.persist();
+        if let Some(subs) = crate::stores::thread_subs::global_thread_subs() {
+            subs.mark_all_read();
+        }
     }
 
     /// Push a new notification.

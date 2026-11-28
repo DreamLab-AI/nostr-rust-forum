@@ -22,9 +22,32 @@ pub const PANEL_KEY: &str = "nostrbbs:subs_panel:v1";
 pub const MOBILE_MAX_WIDTH_PX: u32 = 640;
 
 /// Whether the panel starts open: never on mobile (the drawer always starts
-/// closed); on desktop the remembered choice, open when none.
+/// closed); on desktop the remembered choice, open when none. See
+/// [`initial_open_at`] for the width-aware rule the provider uses.
 pub fn initial_open(mobile: bool, stored: Option<bool>) -> bool {
     !mobile && stored.unwrap_or(true)
+}
+
+/// Widths at or above this (CSS px) leave room for the desktop column beside
+/// the content, so it starts open when the member has not chosen.
+pub const DESKTOP_OPEN_MIN_WIDTH_PX: u32 = 1280;
+
+/// Whether the panel starts open at viewport `width`: never on mobile
+/// (≤ [`MOBILE_MAX_WIDTH_PX`]); otherwise the remembered choice, or, with
+/// none, open only from [`DESKTOP_OPEN_MIN_WIDTH_PX`] (below that the column
+/// would cover the content).
+pub fn initial_open_at(width: f64, stored: Option<bool>) -> bool {
+    if width <= MOBILE_MAX_WIDTH_PX as f64 {
+        return false;
+    }
+    stored.unwrap_or(width >= DESKTOP_OPEN_MIN_WIDTH_PX as f64)
+}
+
+fn viewport_width() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.inner_width().ok())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
 }
 
 /// The subscriptions panel's open/closed state on this device. Provide once
@@ -74,8 +97,13 @@ pub fn provide_subs_panel() -> SubsPanel {
     let query = mobile_query();
     let mobile = query.as_ref().is_some_and(|q| q.matches());
     let stored = LocalStorage::get::<bool>(PANEL_KEY).ok();
+    let open = if mobile {
+        false
+    } else {
+        initial_open_at(viewport_width(), stored)
+    };
     let panel = SubsPanel {
-        open: RwSignal::new(initial_open(mobile, stored)),
+        open: RwSignal::new(open),
         mobile: RwSignal::new(mobile),
     };
     if let Some(q) = query {
@@ -87,7 +115,9 @@ pub fn provide_subs_panel() -> SubsPanel {
                 // Crossing into mobile closes the drawer; back to desktop
                 // restores the remembered column.
                 let stored = LocalStorage::get::<bool>(PANEL_KEY).ok();
-                panel.open.set(initial_open(now_mobile, stored));
+                panel
+                    .open
+                    .set(!now_mobile && initial_open_at(viewport_width(), stored));
             }
         });
         listener.forget();
@@ -213,6 +243,21 @@ mod tests {
         assert!(initial_open(false, None));
         assert!(!initial_open(false, Some(false)));
         assert!(initial_open(false, Some(true)));
+    }
+
+    #[test]
+    fn the_desktop_column_starts_open_only_where_it_has_room() {
+        assert!(!initial_open_at(390.0, None), "mobile");
+        assert!(
+            !initial_open_at(640.0, Some(true)),
+            "mobile ignores the choice"
+        );
+        assert!(!initial_open_at(641.0, None), "it would cover the content");
+        assert!(!initial_open_at(1279.0, None));
+        assert!(initial_open_at(1280.0, None));
+        assert!(initial_open_at(1920.0, None));
+        assert!(initial_open_at(900.0, Some(true)), "a choice is kept");
+        assert!(!initial_open_at(1920.0, Some(false)));
     }
 
     #[test]

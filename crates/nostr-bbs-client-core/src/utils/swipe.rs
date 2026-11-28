@@ -283,12 +283,19 @@ pub struct RowSwipeState {
 }
 
 impl RowSwipeState {
-    /// Fresh state for one row.
+    /// Fresh state for one row, following the system's reduced-motion
+    /// preference.
     pub fn new() -> Self {
+        Self::with_reduced_motion(prefers_reduced_motion())
+    }
+
+    /// Fresh state with an explicit reduced-motion choice (a client with its
+    /// own motion setting).
+    pub fn with_reduced_motion(reduced_motion: bool) -> Self {
         Self {
             offset: RwSignal::new(0.0),
             settling: RwSignal::new(false),
-            reduced_motion: prefers_reduced_motion(),
+            reduced_motion,
         }
     }
 
