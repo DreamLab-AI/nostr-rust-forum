@@ -150,6 +150,10 @@ pub struct ChannelStore {
     roots_targets: StoredValue<HashMap<String, String>>,
     /// Channels whose root list has been answered (reactive).
     roots_answered: RwSignal<HashSet<String>>,
+    /// Channels whose root-list request failed this session (timed out, or
+    /// refused by the relay after its retry). Its target is cleared, so the
+    /// next request asks again.
+    roots_failed: RwSignal<HashSet<String>>,
     /// Channels whose root list came back under its limit: every marked
     /// topic root is held, so channel history paging lists no new topic.
     roots_complete: RwSignal<HashSet<String>>,
@@ -215,6 +219,7 @@ impl ChannelStore {
             topic_targets: StoredValue::new(HashMap::new()),
             roots_targets: StoredValue::new(HashMap::new()),
             roots_answered: RwSignal::new(HashSet::new()),
+            roots_failed: RwSignal::new(HashSet::new()),
             roots_complete: RwSignal::new(HashSet::new()),
             topic_latest: RwSignal::new(HashMap::new()),
             topic_stats_asked: StoredValue::new(HashSet::new()),
@@ -1209,7 +1214,9 @@ impl ChannelStore {
         });
         let store = *self;
         let channel = cid.to_string();
-        self.one_shot_page(
+        let failed_channel = cid.to_string();
+        let failed_key = key.clone();
+        self.one_shot_page_or_fail(
             relay,
             &key,
             Filter {
@@ -1232,7 +1239,25 @@ impl ChannelStore {
                     s.insert(channel);
                 });
             }),
+            Box::new(move || {
+                // Unanswered: forget the target so the section's next
+                // visit asks again, and record the failure (a page must
+                // not wait on an answer that will never come).
+                let _ = store.roots_targets.try_update_value(|m| {
+                    m.remove(&failed_key);
+                });
+                let _ = store.roots_failed.try_update(|s| {
+                    s.insert(failed_channel);
+                });
+            }),
         );
+    }
+
+    /// Whether channel `cid`'s root-list request has failed this session
+    /// (no answer within [`PAGE_TIMEOUT_MS`], or refused after its retry).
+    /// The next [`Self::request_topic_roots`] asks again. Reactive.
+    pub fn topic_roots_failed(&self, cid: &str) -> bool {
+        self.roots_failed.with(|s| s.contains(cid))
     }
 
     /// Whether channel `cid`'s root list is complete: answered under its
@@ -1549,7 +1574,22 @@ impl ChannelStore {
         wait_auth: bool,
         on_done: PageDone,
     ) {
-        self.one_shot_attempt(relay, cid, filter, wait_auth, on_done, 1);
+        self.one_shot_attempt(relay, cid, filter, wait_auth, on_done, None, 1);
+    }
+
+    /// [`Self::one_shot_page`], calling `on_fail` instead of `on_done` when
+    /// the page is abandoned: no answer within [`PAGE_TIMEOUT_MS`], or
+    /// refused (CLOSED) on its last attempt.
+    fn one_shot_page_or_fail(
+        &self,
+        relay: &RelayConnection,
+        cid: &str,
+        filter: Filter,
+        wait_auth: bool,
+        on_done: PageDone,
+        on_fail: PageFailed,
+    ) {
+        self.one_shot_attempt(relay, cid, filter, wait_auth, on_done, Some(on_fail), 1);
     }
 
     /// One attempt of [`Self::one_shot_page`]. A CLOSED answer (the relay
@@ -1557,7 +1597,12 @@ impl ChannelStore {
     /// marks this attempt failed: its subscription is dropped, what it
     /// buffered is forgotten, and with `retries` left the page is requested
     /// again on a fresh subscription; otherwise the cursor is released so a
-    /// later scroll asks again.
+    /// later scroll asks again. `on_fail`, if any, runs when the page is
+    /// abandoned (timeout, or CLOSED with no retries left).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the page's request, its two outcomes and its retry budget travel together"
+    )]
     fn one_shot_attempt(
         &self,
         relay: &RelayConnection,
@@ -1565,6 +1610,7 @@ impl ChannelStore {
         filter: Filter,
         wait_auth: bool,
         on_done: PageDone,
+        on_fail: Option<PageFailed>,
         retries: u8,
     ) {
         let retry_filter = filter.clone();
@@ -1579,6 +1625,7 @@ impl ChannelStore {
             done: bool,
             sub: Option<String>,
             on_done: Option<PageDone>,
+            on_fail: Option<PageFailed>,
         }
         let buf = Rc::new(RefCell::new(Buf {
             delivered: 0,
@@ -1587,6 +1634,7 @@ impl ChannelStore {
             done: false,
             sub: None,
             on_done: Some(on_done),
+            on_fail,
         }));
         let store = *self;
         let zone_keys = self.zone_store();
@@ -1625,6 +1673,7 @@ impl ChannelStore {
                         return;
                     }
                     b.done = true;
+                    b.on_fail = None;
                     let page = PageOutcome {
                         delivered: b.delivered,
                         oldest: b.oldest,
@@ -1654,7 +1703,7 @@ impl ChannelStore {
             let relay = relay.clone();
             let key = key.clone();
             Rc::new(move |reason: String| {
-                let (sub, buffered, done) = {
+                let (sub, buffered, done, on_fail) = {
                     let mut b = buf.borrow_mut();
                     if b.done {
                         return;
@@ -1664,6 +1713,7 @@ impl ChannelStore {
                         b.sub.take(),
                         std::mem::take(&mut b.events),
                         b.on_done.take(),
+                        b.on_fail.take(),
                     )
                 };
                 if let Some(id) = sub {
@@ -1681,15 +1731,21 @@ impl ChannelStore {
                         c.loading = false;
                     }
                 });
-                if let (Some(on_done), true) = (done, retries > 0) {
-                    store.one_shot_attempt(
+                match (done, retries > 0) {
+                    (Some(on_done), true) => store.one_shot_attempt(
                         &relay,
                         &key,
                         retry_filter.clone(),
                         wait_auth,
                         on_done,
+                        on_fail,
                         retries - 1,
-                    );
+                    ),
+                    _ => {
+                        if let Some(f) = on_fail {
+                            f();
+                        }
+                    }
                 }
             })
         };
@@ -1703,14 +1759,18 @@ impl ChannelStore {
         let relay = relay.clone();
         crate::utils::set_timeout_once(
             move || {
-                let (sub, buffered) = {
+                let (sub, buffered, on_fail) = {
                     let mut b = buf.borrow_mut();
                     if b.done {
                         return;
                     }
                     b.done = true;
                     b.on_done = None;
-                    (b.sub.take(), std::mem::take(&mut b.events))
+                    (
+                        b.sub.take(),
+                        std::mem::take(&mut b.events),
+                        b.on_fail.take(),
+                    )
                 };
                 if let Some(id) = sub {
                     relay.unsubscribe(&id);
@@ -1724,6 +1784,9 @@ impl ChannelStore {
                         c.loading = false;
                     }
                 });
+                if let Some(f) = on_fail {
+                    f();
+                }
             },
             PAGE_TIMEOUT_MS as i32,
         );
@@ -2212,6 +2275,9 @@ fn env_window(name: &str, default: usize) -> usize {
 /// What a history page request hands back once answered: the ingested
 /// messages and what the relay delivered.
 type PageDone = Box<dyn FnOnce(Vec<(String, NostrEvent)>, PageOutcome)>;
+/// Called once when a one-shot page is abandoned (see
+/// `one_shot_page_or_fail`).
+type PageFailed = Box<dyn FnOnce()>;
 
 /// A channel's true message total: the relay's NIP-45 COUNT of its kind-42s
 /// up to `as_of` (inclusive), plus the distinct messages newer than `as_of`
