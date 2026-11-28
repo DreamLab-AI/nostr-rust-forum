@@ -8,11 +8,13 @@
 //! count and last poster. Shared by the forum's section page and the BBS
 //! board view so both list the same topics in the same order.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use nostr_bbs_core::NostrEvent;
 
 use super::thread::edit_target_of;
+use crate::utils::lookup::KeyState;
 
 /// A single topic (kind-42 root) plus its derived thread stats.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,14 +203,22 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
         .into_iter()
         .filter_map(|id| roots.remove(&id))
         .collect();
-    out.sort_by_key(|b| std::cmp::Reverse(b.last_activity));
+    out.sort_by(board_order);
     out
+}
+
+/// The board's true order: newest activity first, ties broken by id so
+/// two topics active in the same second always list the same way round.
+pub fn board_order(a: &TopicSummary, b: &TopicSummary) -> Ordering {
+    b.last_activity
+        .cmp(&a.last_activity)
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 /// Fold the relay's per-topic stats into window-derived summaries: the
 /// reply count becomes the exact total when that is larger (the window may
 /// hold a fraction of the topic), and a newer reply than any held sets the
-/// last activity and last participant. Re-sorted, newest activity first.
+/// last activity and last participant. Re-sorted by [`board_order`].
 /// `stats` returns (exact total, newest reply as (created_at, author)).
 pub fn with_topic_stats(
     mut topics: Vec<TopicSummary>,
@@ -224,8 +234,118 @@ pub fn with_topic_stats(
             }
         }
     }
-    topics.sort_by_key(|b| std::cmp::Reverse(b.last_activity));
+    topics.sort_by(board_order);
     topics
+}
+
+/// How long a board waits for its root list and first stats before it
+/// paints anyway, in milliseconds (see [`first_paint_ready`]).
+pub const FIRST_PAINT_TIMEOUT_MS: i32 = 1_500;
+
+/// Topics whose stats a board waits for before its first paint: the first
+/// two stats batches (`stores::channels::TOPIC_STATS_BATCH` is 5).
+pub const FIRST_PAINT_STATS: usize = 10;
+
+/// Whether a board that has found its topics may paint them: once the
+/// section's root list has answered (dormant topics are in, so none lands
+/// mid-list later) and the stats of the first [`FIRST_PAINT_STATS`] listed
+/// topics (or all of them, when fewer) are in, or once `timed_out`
+/// ([`FIRST_PAINT_TIMEOUT_MS`] after the topics were found). A board whose
+/// store already holds all of that paints at once.
+pub fn first_paint_ready(
+    roots_answered: bool,
+    stats_answered: usize,
+    listed: usize,
+    timed_out: bool,
+) -> bool {
+    timed_out || (roots_answered && stats_answered >= listed.min(FIRST_PAINT_STATS))
+}
+
+/// Whether a board's key state can no longer change which topics it lists:
+/// no keys are needed, or they have all been fetched (or given up on). A
+/// sealed topic root opens under its ORIGINAL id when its key arrives, so
+/// until then a painted board follows the true order rather than freezing.
+pub fn keys_final(keys: KeyState) -> bool {
+    matches!(
+        keys,
+        KeyState::NotNeeded | KeyState::Settled | KeyState::Stalled
+    )
+}
+
+/// The order a painted board shows its topics in, given the order it shows
+/// now (`shown`, topic ids) and the true order (`sorted`, by
+/// [`board_order`]).
+///
+/// A topic already shown keeps its place, however its activity changed;
+/// one that is gone is dropped. A topic not shown yet goes to the top when
+/// it sorts ahead of the first topic still shown (a brand-new topic, or
+/// one the window brings back), otherwise to the bottom (an older page),
+/// each group in true order. With nothing shown the true order is used.
+/// The result never holds an id twice.
+pub fn stable_order(shown: &[String], sorted: &[String]) -> Vec<String> {
+    let rank: HashMap<&str, usize> = sorted
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(sorted.len());
+    let kept: Vec<&str> = shown
+        .iter()
+        .map(String::as_str)
+        .filter(|id| rank.contains_key(id) && seen.insert(id))
+        .collect();
+    let Some(first) = kept.first().map(|id| rank[id]) else {
+        let mut once = HashSet::with_capacity(sorted.len());
+        return sorted
+            .iter()
+            .filter(|id| once.insert(id.as_str()))
+            .cloned()
+            .collect();
+    };
+    let mut top = Vec::new();
+    let mut bottom = Vec::new();
+    for (i, id) in sorted.iter().enumerate() {
+        if seen.insert(id.as_str()) {
+            if i < first {
+                top.push(id.clone());
+            } else {
+                bottom.push(id.clone());
+            }
+        }
+    }
+    top.into_iter()
+        .chain(kept.into_iter().map(str::to_string))
+        .chain(bottom)
+        .collect()
+}
+
+/// How many shown topics are out of their true place: the fewest rows that
+/// would have to move for `shown` to read in `sorted` order (the length of
+/// `shown` less its longest run already in true order). One topic bumped
+/// by a reply counts one, not every row it would push down. Ids missing
+/// from `sorted` are ignored.
+pub fn out_of_order(shown: &[String], sorted: &[String]) -> usize {
+    let rank: HashMap<&str, usize> = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    let ranks: Vec<usize> = shown
+        .iter()
+        .filter_map(|id| rank.get(id.as_str()).copied())
+        .collect();
+    // Longest strictly increasing subsequence, patience sorting.
+    let mut tails: Vec<usize> = Vec::new();
+    for r in &ranks {
+        let at = tails.partition_point(|t| t < r);
+        if at == tails.len() {
+            tails.push(*r);
+        } else {
+            tails[at] = *r;
+        }
+    }
+    ranks.len() - tails.len()
 }
 
 /// Derive a one-line topic title from the root post content.
@@ -593,5 +713,131 @@ mod tests {
         assert_eq!(unread_count(&es, 30), 0);
         assert_eq!(latest_post(&es), Some(("b".into(), 30)));
         assert_eq!(latest_post(&[]), None);
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn ties_in_activity_break_by_id_in_both_sorts() {
+        let cid = "chan";
+        let root = |id: &str| ev(id, "op", id, 50, 42, vec![vec!["e", cid, "", "root"]]);
+        // Same second, delivered in either order: always b before c.
+        for events in [vec![root("c"), root("b")], vec![root("b"), root("c")]] {
+            let order: Vec<String> = classify_topics(cid, &events)
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            assert_eq!(order, ids(&["b", "c"]));
+        }
+        let out = with_topic_stats(
+            vec![summary("z", 0, 10, "a"), summary("y", 0, 5, "a")],
+            |t| match t.id.as_str() {
+                "y" => (0, Some((10, "b".into()))),
+                _ => (0, None),
+            },
+        );
+        let order: Vec<&str> = out.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(order, ["y", "z"], "tied at 10: by id");
+    }
+
+    #[test]
+    fn nothing_shown_takes_the_true_order() {
+        assert_eq!(stable_order(&[], &ids(&["a", "b"])), ids(&["a", "b"]));
+        // Every shown topic gone (another section's ids): the true order.
+        assert_eq!(
+            stable_order(&ids(&["x"]), &ids(&["a", "b"])),
+            ids(&["a", "b"])
+        );
+    }
+
+    #[test]
+    fn shown_topics_keep_their_place_when_their_activity_changes() {
+        // c was bumped by a reply: true order c, a, b. The rows stay.
+        let shown = ids(&["a", "b", "c"]);
+        assert_eq!(stable_order(&shown, &ids(&["c", "a", "b"])), shown);
+        assert_eq!(out_of_order(&shown, &ids(&["c", "a", "b"])), 1);
+    }
+
+    #[test]
+    fn new_topics_go_to_the_top_and_older_pages_to_the_bottom() {
+        let shown = ids(&["b", "c", "d"]);
+        // n is newer than everything shown; o and p come from an older page.
+        let sorted = ids(&["n", "b", "c", "d", "o", "p"]);
+        assert_eq!(stable_order(&shown, &sorted), sorted);
+        // A late dormant topic that belongs mid-list goes to the bottom,
+        // where it reads out of order rather than pushing rows down.
+        let sorted = ids(&["b", "m", "c", "d"]);
+        let next = stable_order(&shown, &sorted);
+        assert_eq!(next, ids(&["b", "c", "d", "m"]));
+        assert_eq!(out_of_order(&next, &sorted), 1);
+    }
+
+    #[test]
+    fn a_new_topic_is_compared_with_the_first_row_still_shown() {
+        // Shown b, a; a has since been bumped above b, and x arrives
+        // between them. x sorts ahead of b, the row at the top of the
+        // screen, so it goes on top: the rows below it do not move.
+        let shown = ids(&["b", "a"]);
+        let sorted = ids(&["a", "x", "b"]);
+        assert_eq!(stable_order(&shown, &sorted), ids(&["x", "b", "a"]));
+    }
+
+    #[test]
+    fn gone_topics_are_dropped_and_nothing_is_listed_twice() {
+        let shown = ids(&["a", "gone", "b", "a"]);
+        let sorted = ids(&["b", "a", "new", "b"]);
+        let next = stable_order(&shown, &sorted);
+        assert_eq!(next, ids(&["a", "b", "new"]));
+        let unique: HashSet<&String> = next.iter().collect();
+        assert_eq!(unique.len(), next.len());
+        // Duplicates in the true order alone are dropped as well.
+        assert_eq!(stable_order(&[], &ids(&["a", "a"])), ids(&["a"]));
+    }
+
+    #[test]
+    fn re_sorting_on_request_is_the_true_order() {
+        // The "updated" control clears the shown order: the next order is
+        // the true one and nothing reads out of order.
+        let sorted = ids(&["c", "a", "b"]);
+        let next = stable_order(&[], &sorted);
+        assert_eq!(out_of_order(&next, &sorted), 0);
+    }
+
+    #[test]
+    fn out_of_order_counts_the_rows_that_would_move() {
+        let sorted = ids(&["a", "b", "c", "d", "e"]);
+        assert_eq!(out_of_order(&sorted, &sorted), 0);
+        assert_eq!(out_of_order(&ids(&["e", "a", "b", "c", "d"]), &sorted), 1);
+        assert_eq!(out_of_order(&ids(&["b", "a", "d", "c", "e"]), &sorted), 2);
+        assert_eq!(out_of_order(&ids(&["e", "d", "c", "b", "a"]), &sorted), 4);
+        assert_eq!(out_of_order(&ids(&["zz", "b", "a"]), &sorted), 1);
+        assert_eq!(out_of_order(&[], &sorted), 0);
+    }
+
+    #[test]
+    fn first_paint_waits_for_the_root_list_and_the_first_stats() {
+        // Found, but the root list has not answered: hold.
+        assert!(!first_paint_ready(false, 40, 40, false));
+        // Root list in, first stats batch only: hold.
+        assert!(!first_paint_ready(true, 5, 40, false));
+        // Root list and the first two batches: paint.
+        assert!(first_paint_ready(true, FIRST_PAINT_STATS, 40, false));
+        // A small board needs only its own topics' stats.
+        assert!(first_paint_ready(true, 3, 3, false));
+        // An empty board needs only the root list.
+        assert!(first_paint_ready(true, 0, 0, false));
+        // The timeout always paints: never an indefinite wait.
+        assert!(first_paint_ready(false, 0, 40, true));
+    }
+
+    #[test]
+    fn only_final_key_states_let_a_board_freeze() {
+        assert!(keys_final(KeyState::NotNeeded));
+        assert!(keys_final(KeyState::Settled));
+        assert!(keys_final(KeyState::Stalled));
+        assert!(!keys_final(KeyState::Pending));
+        assert!(!keys_final(KeyState::Progressing { until: 1.0 }));
     }
 }
