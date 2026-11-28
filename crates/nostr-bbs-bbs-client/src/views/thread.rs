@@ -16,7 +16,7 @@
 //! - Per-identity auto-saved drafts (`draft:v2:`), bookmarks, mute, read positions
 //! - Image picker + clipboard image paste via NIP-98 Solid Pod PUT
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use leptos::prelude::*;
@@ -33,13 +33,13 @@ use nostr_bbs_client_core::stores::read_position::use_read_positions;
 use nostr_bbs_client_core::stores::zones::{load_zones, resolve_zone_param};
 use nostr_bbs_client_core::toast::{use_toasts, ToastVariant};
 use nostr_bbs_client_core::topics::{
-    board_events, classify_topics, edit_tags, find_topic_root, first_paint_ready, history_settled,
-    keys_final, landing_target, latest_post, latest_version, out_of_order, post_anchor_id,
-    stable_order, thread_events, thread_replies, topic_reply_tags, topic_root_tags, topic_title,
-    updated_accessible_name, updated_label, with_topic_stats, Landing, ReplyView, TopicSummary,
-    FIRST_PAINT_TIMEOUT_MS,
+    board_events, classify_topics, edit_tags, find_topic_root, first_paint_ready,
+    first_row_in_full_view, history_settled, landing_target, latest_post, latest_version,
+    out_of_order, post_anchor_id, sealed_aliases, stable_order, thread_events, thread_replies,
+    topic_reply_tags, topic_root_tags, topic_title, updated_accessible_name, updated_label,
+    with_topic_stats, Landing, ReplyView, TopicSummary, FIRST_PAINT_TIMEOUT_MS,
 };
-use nostr_bbs_client_core::utils::lookup::{deadline_for, key_state_memo, zone_is_gated};
+use nostr_bbs_client_core::utils::lookup::zone_is_gated;
 use nostr_bbs_client_core::utils::scroll_anchor;
 use nostr_bbs_client_core::utils::{format_relative_time, set_timeout_once, shorten_pubkey};
 use nostr_bbs_client_core::zone_crypto::store::{try_use_zone_key_store, ZoneWriter};
@@ -127,12 +127,16 @@ fn main_pane() -> Option<web_sys::HtmlElement> {
         .ok()
 }
 
-/// Whether row `id` (its `data-anchor-id`) is at least partly visible in
-/// the content pane.
-fn row_in_pane(id: &str) -> bool {
+/// Whether the reader is at the top of the board: the content pane is not
+/// scrolled, or row `id` (the first shown, by its `data-anchor-id`) lies
+/// wholly inside the pane.
+fn at_board_top(id: &str) -> bool {
     let Some(pane) = main_pane() else {
         return false;
     };
+    if pane.scroll_top() <= 1 {
+        return true;
+    }
     let id: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
     let view = pane.get_bounding_client_rect();
     pane.query_selector(&format!("[data-anchor-id=\"{id}\"]"))
@@ -140,7 +144,7 @@ fn row_in_pane(id: &str) -> bool {
         .flatten()
         .is_some_and(|el| {
             let r = el.get_bounding_client_rect();
-            r.bottom() > view.top() && r.top() < view.bottom()
+            first_row_in_full_view(r.top(), r.bottom(), view.top(), view.bottom())
         })
 }
 
@@ -278,13 +282,15 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
     // FIRST_PAINT_TIMEOUT_MS, so dormant topics and the relay's newest
     // replies do not re-sort rows already on screen. A store that already
     // holds them paints at once.
-    let stats_answered = Memo::new(move |_| {
+    let answered_ids = Memo::new(move |_| {
         topics.with(|ts| {
             ts.iter()
                 .filter(|t| channels.topic_stats_answered(&t.id))
-                .count()
+                .map(|t| t.id.clone())
+                .collect::<HashSet<_>>()
         })
     });
+    let stats_answered = Memo::new(move |_| answered_ids.with(HashSet::len));
     let hold_expired = RwSignal::new(false);
     {
         let armed = StoredValue::new(false);
@@ -308,21 +314,26 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
                 && first_paint_ready(true, stats_answered.get(), topics.with(Vec::len), false))
             || (hold_expired.get() && !topics.with(Vec::is_empty))
     });
-    // An encrypted zone's sealed topic roots open under their original ids
-    // when the keys arrive: the order freezes only once the keys are final.
-    let keys = {
-        let deadline = deadline_for(move || cid.try_get_value());
-        let auth_pubkey = auth.pubkey();
-        key_state_memo(
-            move || zk_store.is_some() && is_enc,
-            move |now| zk_store.and_then(|z| z.key_phase_for(auth_pubkey.get().as_deref(), now)),
-            deadline,
-        )
-    };
+    // Sealed envelopes and their originals in this board's lists: a sealed
+    // root opens under its original id, and swaps in place.
+    let sealed_pairs = Memo::new(move |_| {
+        let cid = cid.get_value();
+        let roots = roots_key(&cid);
+        channels.channel_messages.with(|m| {
+            let mut pairs = Vec::new();
+            for key in [&cid, &roots] {
+                if let Some(events) = m.get(key) {
+                    pairs.extend(sealed_aliases(events));
+                }
+            }
+            pairs
+        })
+    });
 
-    // Display order: the true order until the board has painted and its
-    // keys are final; then a listed topic keeps its place, a new one goes on
-    // top and an older page at the bottom, with the reader's place kept.
+    // Display order: the true order until the board has painted; then a
+    // listed topic keeps its place, a new one goes on top and an older page
+    // at the bottom, with the reader's place kept. A row whose first stats
+    // land after the paint is placed once and not counted as updated.
     // Leaving the board and coming back starts afresh.
     let true_ids =
         Memo::new(move |_| topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>()));
@@ -339,23 +350,43 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
         Vec::new()
     });
     {
-        let frozen = StoredValue::new(false);
+        // (frozen, topics whose first stats had landed, sealed pairs both
+        // ways: an envelope leaves the list when it opens, so pairs are kept.)
+        let state = StoredValue::new((
+            false,
+            HashSet::<String>::new(),
+            HashMap::<String, String>::new(),
+        ));
         Effect::new(move |_| {
             let ids = true_ids.get();
             let shown = painted.get();
-            let freeze = shown && keys_final(keys.get());
-            let Some(was) = frozen.try_update_value(|f| {
-                let was = *f;
-                *f |= freeze;
-                was
-            }) else {
+            let answered = answered_ids.get();
+            let Some((was, first_stats, aliases)) =
+                state.try_update_value(|(frozen, seen, aliases)| {
+                    sealed_pairs.with(|pairs| {
+                        for (env, orig) in pairs {
+                            aliases.insert(env.clone(), orig.clone());
+                            aliases.insert(orig.clone(), env.clone());
+                        }
+                    });
+                    let was = *frozen;
+                    *frozen |= shown;
+                    let first_stats: HashSet<String> = if was {
+                        answered.difference(seen).cloned().collect()
+                    } else {
+                        HashSet::new()
+                    };
+                    *seen = answered;
+                    (was, first_stats, aliases.clone())
+                })
+            else {
                 return;
             };
             let next = order.with_untracked(|current| {
                 let next = if !shown {
                     Vec::new()
                 } else if was {
-                    stable_order(current, &ids)
+                    stable_order(current, &ids, &aliases, &first_stats)
                 } else {
                     ids.clone()
                 };
@@ -364,7 +395,7 @@ pub fn BoardView(zone: String, channel_id: String) -> impl IntoView {
             if let Some(next) = next {
                 // Keep the row on screen where it is, unless the reader is
                 // at the top of the board, where a new topic should be seen.
-                let at_top = order.with_untracked(|o| o.first().is_some_and(|id| row_in_pane(id)));
+                let at_top = order.with_untracked(|o| o.first().is_some_and(|id| at_board_top(id)));
                 let anchor = if was && !at_top {
                     scroll_anchor::capture(main_pane().as_deref())
                 } else {
@@ -606,7 +637,14 @@ fn TopicRow(
                 <div class="tui-row bbs-topic-title-row">
                     {move || is_unread.try_get().unwrap_or(false).then(|| view! { <span class="bbs-badge bbs-badge-accent">"NEW"</span> })}
                     {encrypted.then(|| view! { <span class="bbs-badge bbs-badge-ok">"🔒"</span> })}
-                    <strong class="bbs-topic-title">{move || title.try_get().unwrap_or_default()}</strong>
+                    // The whole title on hover: one line on a desktop
+                    // ellipsises it.
+                    <strong
+                        class="bbs-topic-title"
+                        title=move || title.try_get().unwrap_or_default()
+                    >
+                        {move || title.try_get().unwrap_or_default()}
+                    </strong>
                 </div>
                 <span class="bbs-badge bbs-topic-replies">{move || replies.try_get().unwrap_or_default()}</span>
             </div>
