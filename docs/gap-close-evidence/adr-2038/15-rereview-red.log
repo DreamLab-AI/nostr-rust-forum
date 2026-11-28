@@ -1,0 +1,14 @@
+# RED re-review: 2026-11-28T16:07:40Z at a26e5dd + tests and a busy_answer stub with the old behaviour
+test relay_do::section_stats::tests::a_planner_refusing_the_index_falls_back_too ... FAILED
+test relay_do::section_stats::tests::a_busy_relay_answers_a_missing_section_like_a_gated_one ... FAILED
+test relay_do::section_stats::tests::a_reply_dated_after_the_answer_is_not_counted ... FAILED
+thread 'relay_do::section_stats::tests::a_planner_refusing_the_index_falls_back_too' (2203543) panicked at crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs:1478:5:
+thread 'relay_do::section_stats::tests::a_busy_relay_answers_a_missing_section_like_a_gated_one' (2203542) panicked at crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs:1487:5:
+assertion `left == right` failed
+  left: Err("busy")
+ right: Ok(None)
+thread 'relay_do::section_stats::tests::a_reply_dated_after_the_answer_is_not_counted' (2203544) panicked at crates/nostr-bbs-relay-worker/src/relay_do/section_stats_tests.rs:1472:5:
+assertion `left == right` failed
+  left: Some(2)
+ right: Some(1)
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 758 filtered out; finished in 0.92s

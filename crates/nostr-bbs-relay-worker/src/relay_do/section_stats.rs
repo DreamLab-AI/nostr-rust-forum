@@ -374,13 +374,23 @@ pub(crate) fn stats_sql(with_counts: bool) -> String {
              ORDER BY w.created_at DESC, w.event_id DESC LIMIT {lim}"
         )
     };
+    // The count is as of `?2` (the answer's `as_of`), like COUNT's `until`:
+    // the client adds replies dated after it, so one dated ahead of the
+    // relay's clock must not be in both.
+    let count_walk = |v: &str, lim: &str| {
+        format!(
+            "SELECT w.event_id AS eid, w.created_at AS wat FROM event_tags w \
+             WHERE w.name = 'e' AND w.value = {v} AND w.created_at <= ?2 \
+             ORDER BY w.created_at DESC, w.event_id DESC LIMIT {lim}"
+        )
+    };
     let counts = if with_counts {
         format!(
             "(SELECT COUNT(*) FROM ({}) y CROSS JOIN events r ON r.id = y.eid WHERE {}) AS n, \
              (SELECT COUNT(*) FROM ({})) AS visited",
-            walk("jv.value", "?5"),
+            count_walk("jv.value", "?5"),
             qualifies("jv.value"),
-            walk("jv.value", "?5"),
+            count_walk("jv.value", "?5"),
         )
     } else {
         // ?5 stays bound (D1 and SQLite refuse an unused binding).
@@ -605,9 +615,23 @@ struct Found {
     visited: u64,
 }
 
+/// The answer for a request refused a computation slot (all
+/// [`MAX_CONCURRENT`] in use), given whether the section exists.
+/// A section not known to exist gets the missing-section answer (the
+/// reader's own refusal), the same as a gated one, so filling the slots
+/// cannot turn the refusal into an existence oracle (PR #134 re-review).
+pub(crate) fn busy_answer(exists: Result<bool, String>) -> Shared {
+    match exists {
+        Ok(false) => Ok(None),
+        Ok(true) => Err("busy".into()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Whether a roots error means migration 0017's index is absent.
 pub(crate) fn index_missing(err: &str) -> bool {
-    err.contains("no such index")
+    // Absent, or present but refused by the planner for INDEXED BY.
+    err.contains("no such index") || err.contains("no query solution")
 }
 
 /// Compute the answer for `channel` at `now`; `None` when the section does
@@ -1008,7 +1032,7 @@ impl super::NostrRelayDO {
             return;
         }
         let shared: Shared = match self.section_stats_flight.begin(&channel) {
-            Role::Busy => Err("busy".into()),
+            Role::Busy => busy_answer(self.section_exists(&channel).await),
             Role::Wait(slot) => slot.wait().await,
             Role::Lead(guard) => {
                 let indexed = now >= self.section_stats_index_retry.get();
@@ -1064,6 +1088,19 @@ impl super::NostrRelayDO {
         indexed: bool,
     ) -> Result<(Option<SectionAnswer>, bool), String> {
         compute(&NoD1, channel, now, indexed).await
+    }
+
+    /// [`EXISTS_SQL`] through D1.
+    #[cfg(target_arch = "wasm32")]
+    async fn section_exists(&self, channel: &str) -> Result<bool, String> {
+        let db = self.env.d1("DB").map_err(|e| e.to_string())?;
+        d1::D1Stats(&db).exists(channel).await
+    }
+
+    /// Native builds have no D1.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn section_exists(&self, channel: &str) -> Result<bool, String> {
+        NoD1.exists(channel).await
     }
 
     fn send_section_stats(ws: &worker::WebSocket, id: &str, payload: &serde_json::Value) {
