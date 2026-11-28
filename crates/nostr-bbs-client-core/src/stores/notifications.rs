@@ -1000,21 +1000,52 @@ impl NotificationStoreV2 {
         let _ = LocalStorage::set(items_key(&owner), data);
     }
 
-    /// Persist the producer sync state (baseline + already-notified ids) to the
+    /// Persist the producer sync state (baseline + already-handled ids) to the
     /// CURRENT account's per-pubkey localStorage key. No-op until the resolver
     /// has established an owner. Cheap; called at most once per effect run.
+    ///
+    /// The stored value is shared with every other tab of the account, and the
+    /// `storage` listener deliberately ignores this key, so a plain overwrite
+    /// would drop any id another tab recorded and this tab never processed
+    /// (last writer wins). The id lists are therefore merged with what is
+    /// stored ([`merge_sync_state`]) before writing, and this tab's in-memory
+    /// sets adopt the merge, so the ids are also honoured here from now on.
+    /// The baseline stays this tab's own. An unreadable stored value is
+    /// replaced by the in-memory state, as before.
     fn persist_sync_state(&self) {
         let owner = match self.owner.get_untracked() {
             Some(o) => o,
             None => return,
         };
-        let state = SyncState {
+        let key = sync_state_key(&owner);
+        let memory = SyncState {
             baseline: self.baseline.get_untracked(),
             notified_ids: self.seen_messages.with_untracked(|s| s.ids()),
             announced_channels: self.announced_channels.with_untracked(|s| s.ids()),
             announced_members: self.announced_members.with_untracked(|s| s.ids()),
         };
-        let _ = LocalStorage::set(sync_state_key(&owner), state);
+        let stored = LocalStorage::get::<SyncState>(&key).ok();
+        let merged = merge_sync_state(stored.as_ref(), &memory);
+
+        // Adopt the merge in memory without notifying: these sets feed no view,
+        // and a notifying write from inside an effect that reads them could
+        // re-trigger that effect.
+        if merged.notified_ids != memory.notified_ids {
+            self.seen_messages.update_untracked(|s| {
+                *s = SeenIds::from_ids(merged.notified_ids.clone(), MAX_SEEN_IDS)
+            });
+        }
+        if merged.announced_channels != memory.announced_channels {
+            self.announced_channels.update_untracked(|s| {
+                *s = SeenIds::from_ids(merged.announced_channels.clone(), MAX_ANNOUNCED_IDS)
+            });
+        }
+        if merged.announced_members != memory.announced_members {
+            self.announced_members.update_untracked(|s| {
+                *s = SeenIds::from_ids(merged.announced_members.clone(), MAX_ANNOUNCED_IDS)
+            });
+        }
+        let _ = LocalStorage::set(key, merged);
     }
 }
 
@@ -1223,6 +1254,39 @@ fn adopt_listed_notices(
         }
     }
     adopted
+}
+
+/// Merge the sync state stored for an account with this tab's in-memory state.
+///
+/// Another tab of the same account may have recorded ids this tab never saw;
+/// the `storage` listener ignores the sync-state key, so without a merge the
+/// next save from this tab would silently drop them. Each id list becomes the
+/// union, stored ids first (they are older), then this tab's ids not already
+/// present, in order; when the union exceeds its cap the oldest entries go,
+/// exactly as [`SeenIds`] evicts. The baseline is always this tab's own. With
+/// no readable stored state the result is the in-memory state, unchanged.
+/// Merging twice gives the same result as merging once.
+fn merge_sync_state(stored: Option<&SyncState>, memory: &SyncState) -> SyncState {
+    fn union(stored: &[String], memory: &[String], cap: usize) -> Vec<String> {
+        SeenIds::from_ids(stored.iter().chain(memory).cloned(), cap).ids()
+    }
+    let Some(stored) = stored else {
+        return memory.clone();
+    };
+    SyncState {
+        baseline: memory.baseline,
+        notified_ids: union(&stored.notified_ids, &memory.notified_ids, MAX_SEEN_IDS),
+        announced_channels: union(
+            &stored.announced_channels,
+            &memory.announced_channels,
+            MAX_ANNOUNCED_IDS,
+        ),
+        announced_members: union(
+            &stored.announced_members,
+            &memory.announced_members,
+            MAX_ANNOUNCED_IDS,
+        ),
+    }
 }
 
 /// Compute the per-pubkey localStorage key for the producer sync state.
@@ -2137,6 +2201,81 @@ mod tests {
             NoticeState::Announced,
             "a cleared notice recorded from another tab must not return"
         );
+    }
+
+    fn sync(baseline: u64, notified: &[&str], channels: &[&str], members: &[&str]) -> SyncState {
+        let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        SyncState {
+            baseline,
+            notified_ids: own(notified),
+            announced_channels: own(channels),
+            announced_members: own(members),
+        }
+    }
+
+    #[test]
+    fn merging_keeps_ids_only_the_other_tab_recorded() {
+        let stored = sync(10, &["e1", "e2"], &["c1"], &["m1"]);
+        let memory = sync(20, &["e2", "e3"], &["c2"], &[]);
+        let merged = merge_sync_state(Some(&stored), &memory);
+        assert_eq!(merged.notified_ids, ["e1", "e2", "e3"]);
+        assert_eq!(merged.announced_channels, ["c1", "c2"]);
+        assert_eq!(merged.announced_members, ["m1"]);
+        // The baseline is this tab's own, never the stored one.
+        assert_eq!(merged.baseline, 20);
+    }
+
+    #[test]
+    fn merging_respects_each_bound_and_keeps_the_newest() {
+        let ids = |range: std::ops::Range<usize>| -> Vec<String> {
+            range.map(|n| format!("c{n}")).collect()
+        };
+        let stored = SyncState {
+            announced_channels: ids(0..MAX_ANNOUNCED_IDS),
+            notified_ids: (0..MAX_SEEN_IDS).map(|n| format!("e{n}")).collect(),
+            ..SyncState::default()
+        };
+        let memory = SyncState {
+            announced_channels: ids(MAX_ANNOUNCED_IDS..MAX_ANNOUNCED_IDS + 5),
+            notified_ids: vec!["new-event".into()],
+            ..SyncState::default()
+        };
+        let merged = merge_sync_state(Some(&stored), &memory);
+        assert_eq!(merged.announced_channels.len(), MAX_ANNOUNCED_IDS);
+        assert_eq!(merged.announced_channels.first().unwrap(), "c5");
+        assert_eq!(
+            merged.announced_channels.last().unwrap(),
+            &format!("c{}", MAX_ANNOUNCED_IDS + 4)
+        );
+        assert_eq!(merged.notified_ids.len(), MAX_SEEN_IDS);
+        assert_eq!(merged.notified_ids.last().unwrap(), "new-event");
+        assert!(!merged.notified_ids.contains(&"e0".to_string()));
+    }
+
+    #[test]
+    fn an_unreadable_stored_state_falls_back_to_memory() {
+        let memory = sync(7, &["e1"], &["c1"], &["m1"]);
+        let merged = merge_sync_state(None, &memory);
+        assert_eq!(merged.baseline, 7);
+        assert_eq!(merged.notified_ids, memory.notified_ids);
+        assert_eq!(merged.announced_channels, memory.announced_channels);
+        assert_eq!(merged.announced_members, memory.announced_members);
+        // A corrupt blob is what `LocalStorage::get(..).ok()` turns into None.
+        assert!(serde_json::from_str::<SyncState>("{not json").is_err());
+    }
+
+    #[test]
+    fn merging_is_idempotent() {
+        let stored = sync(10, &["e1", "e2"], &["c1"], &["m1"]);
+        let memory = sync(20, &["e2", "e3"], &["c2"], &["m2"]);
+        let once = merge_sync_state(Some(&stored), &memory);
+        let twice = merge_sync_state(Some(&once), &once);
+        let again = merge_sync_state(Some(&once), &memory);
+        for other in [&twice, &again] {
+            assert_eq!(other.notified_ids, once.notified_ids);
+            assert_eq!(other.announced_channels, once.announced_channels);
+            assert_eq!(other.announced_members, once.announced_members);
+        }
     }
 
     #[test]
