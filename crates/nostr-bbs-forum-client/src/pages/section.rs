@@ -36,7 +36,7 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 
@@ -58,8 +58,8 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::topics::{
-    first_paint_ready, keys_final, out_of_order, stable_order, updated_accessible_name,
-    updated_label, FIRST_PAINT_TIMEOUT_MS,
+    first_paint_ready, first_row_in_full_view, older_paging_armed, out_of_order, sealed_aliases,
+    stable_order, updated_accessible_name, updated_label, FIRST_PAINT_TIMEOUT_MS,
 };
 use crate::utils::capitalize;
 use crate::utils::lookup::{
@@ -231,19 +231,28 @@ fn list_branch(
 }
 
 /// The display order's state for one channel: whether it is frozen (the
-/// list has painted and the zone's keys are final, so rows keep their
-/// place from now on).
+/// list has painted, so rows keep their place from now on), the topics
+/// whose first stats had landed by the last update (a row whose first
+/// stats land after the freeze is placed once, see
+/// [`stable_order`]), and every sealed envelope and original seen, both
+/// ways (an envelope leaves the list when it opens, so the pair is kept).
 struct OrderState {
     cid: Option<String>,
     frozen: bool,
+    answered: HashSet<String>,
+    aliases: HashMap<String, String>,
 }
 
-/// Whether topic row `id` (its `data-anchor-id`) is at least partly in the
-/// window's viewport.
-fn row_in_view(id: &str) -> bool {
+/// Whether the reader is at the top of the topic list: the page is not
+/// scrolled, or row `id` (the first shown, by its `data-anchor-id`) lies
+/// wholly in the window's viewport.
+fn at_list_top(id: &str) -> bool {
     let Some(window) = web_sys::window() else {
         return false;
     };
+    if window.scroll_y().is_ok_and(|y| y <= 1.0) {
+        return true;
+    }
     let height = window
         .inner_height()
         .ok()
@@ -259,7 +268,7 @@ fn row_in_view(id: &str) -> bool {
         })
         .is_some_and(|el| {
             let r = el.get_bounding_client_rect();
-            r.bottom() > 0.0 && r.top() < height
+            first_row_in_full_view(r.top(), r.bottom(), 0.0, height)
         })
 }
 
@@ -523,12 +532,19 @@ pub fn SectionPage() -> impl IntoView {
             .get()
             .is_some_and(|cid| store.topic_roots_answered(&cid))
     });
-    let stats_answered = Memo::new(move |_| {
+    let answered_ids = Memo::new(move |_| {
         topics.with(|ts| {
             ts.iter()
                 .filter(|t| store.topic_stats_answered(&t.id))
-                .count()
+                .map(|t| t.id.clone())
+                .collect::<HashSet<_>>()
         })
+    });
+    let stats_answered = Memo::new(move |_| answered_ids.with(HashSet::len));
+    let roots_failed = Memo::new(move |_| {
+        channel_id
+            .get()
+            .is_some_and(|cid| store.topic_roots_failed(&cid))
     });
     let hold_expired = RwSignal::new(Option::<String>::None);
     {
@@ -551,10 +567,14 @@ pub fn SectionPage() -> impl IntoView {
             );
         });
     }
+    let hold_expired_here = Memo::new(move |_| {
+        let cid = channel_id.get();
+        hold_expired.with(|e| e.is_some() && *e == cid)
+    });
     let branch = Memo::new(move |prev: Option<&ListBranch>| {
         let cid = channel_id.get();
         list_branch(prev, topics_lookup.get(), cid.clone(), || {
-            let timed_out = hold_expired.with(|e| e.is_some() && *e == cid);
+            let timed_out = hold_expired_here.get();
             first_paint_ready(
                 roots_answered.get(),
                 stats_answered.get(),
@@ -565,10 +585,12 @@ pub fn SectionPage() -> impl IntoView {
     });
 
     // Display order (cause: every stats answer re-sorted the painted list).
-    // Before the list freezes it follows the true order; once it has
-    // painted and the zone's keys are final, a listed topic keeps its place,
-    // a new one goes on top and an older page at the bottom, with the
-    // reader's place kept. Navigating away and back starts afresh.
+    // Before the list paints it follows the true order; once painted, a
+    // listed topic keeps its place, a new one goes on top and an older page
+    // at the bottom, with the reader's place kept. A sealed root that opens
+    // (or closes again) swaps in place; a row whose first stats land after
+    // the paint is placed once and not counted as updated. Navigating away
+    // and back starts afresh.
     let true_ids =
         Memo::new(move |_| topics.with(|ts| ts.iter().map(|t| t.id.clone()).collect::<Vec<_>>()));
     let by_id = Memo::new(move |_| {
@@ -578,40 +600,72 @@ pub fn SectionPage() -> impl IntoView {
                 .collect::<HashMap<_, _>>()
         })
     });
+    // Sealed envelopes and their originals in this channel's lists.
+    let sealed_pairs = Memo::new(move |_| {
+        let Some(cid) = channel_id.get() else {
+            return Vec::new();
+        };
+        let roots_key = crate::stores::channels::roots_key(&cid);
+        store.channel_messages.with(|m| {
+            let mut pairs = Vec::new();
+            for key in [&cid, &roots_key] {
+                if let Some(events) = m.get(key) {
+                    pairs.extend(sealed_aliases(events));
+                }
+            }
+            pairs
+        })
+    });
     let order = RwSignal::new(true_ids.get_untracked());
     {
         let state = StoredValue::new(OrderState {
             cid: channel_id.get_untracked(),
             frozen: false,
+            answered: HashSet::new(),
+            aliases: HashMap::new(),
         });
         Effect::new(move |_| {
             let ids = true_ids.get();
             let cid = channel_id.get();
-            let freeze = matches!(branch.get(), ListBranch::List(_)) && keys_final(keys.get());
-            let Some(frozen) = state.try_update_value(|s| {
+            let answered = answered_ids.get();
+            let painted = matches!(branch.get(), ListBranch::List(_));
+            let Some((frozen, first_stats, aliases)) = state.try_update_value(|s| {
                 if s.cid != cid {
                     s.cid = cid;
                     s.frozen = false;
+                    s.answered.clear();
+                    s.aliases.clear();
                 }
+                sealed_pairs.with(|pairs| {
+                    for (env, orig) in pairs {
+                        s.aliases.insert(env.clone(), orig.clone());
+                        s.aliases.insert(orig.clone(), env.clone());
+                    }
+                });
                 let was = s.frozen;
-                s.frozen |= freeze;
-                was
+                s.frozen |= painted;
+                let first_stats: HashSet<String> = if was {
+                    answered.difference(&s.answered).cloned().collect()
+                } else {
+                    HashSet::new()
+                };
+                s.answered = answered;
+                (was, first_stats, s.aliases.clone())
             }) else {
                 return;
             };
             let next = order.with_untracked(|shown| {
                 let next = if frozen {
-                    stable_order(shown, &ids)
+                    stable_order(shown, &ids, &aliases, &first_stats)
                 } else {
                     ids.clone()
                 };
                 (next != *shown).then_some(next)
             });
             if let Some(next) = next {
-                // A frozen list only gains rows at its ends or loses some:
-                // keep the row on screen where it is, unless the reader is
+                // Keep the row on screen where it is, unless the reader is
                 // at the top of the list, where a new topic should be seen.
-                let at_top = order.with_untracked(|o| o.first().is_some_and(|id| row_in_view(id)));
+                let at_top = order.with_untracked(|o| o.first().is_some_and(|id| at_list_top(id)));
                 let anchor = if frozen && !at_top {
                     scroll_anchor::capture(None)
                 } else {
@@ -911,10 +965,17 @@ pub fn SectionPage() -> impl IntoView {
                                 .is_some_and(|c| store.topic_roots_complete(&c))
                         });
                         // Older pages are not pulled until the root list has
-                        // answered: before that, dormant roots would land in
-                        // the middle of a list already on screen.
+                        // answered (before that, dormant roots would land in a
+                        // list already on screen), failed, or the first-paint
+                        // hold has expired: a slow or refusing relay never
+                        // switches paging off.
                         let older_exhausted = Signal::derive(move || {
-                            topics_complete.get() || !roots_answered.get()
+                            !older_paging_armed(
+                                topics_complete.get(),
+                                roots_answered.get(),
+                                roots_failed.get(),
+                                hold_expired_here.get(),
+                            )
                         });
                         // Bounded window: once older pages have evicted the
                         // newest topics, a loader above the list brings them back.
