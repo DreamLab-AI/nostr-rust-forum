@@ -137,6 +137,12 @@ pub struct Zone {
     /// [`Zone::effective_search`] exactly as the config does.
     #[serde(default)]
     pub search: Option<String>,
+    /// Kind-40 channel ids pinned to this zone (ADR-2037), projected from
+    /// `nostr_bbs_config::schema::Zone::channels`. A pinned channel belongs to
+    /// this zone whatever its signed `section` tag says; see
+    /// [`pinned_zone_for`] and [`effective_section`]. Empty (default): no pins.
+    #[serde(default)]
+    pub channels: Vec<String>,
 }
 
 impl Zone {
@@ -159,11 +165,14 @@ impl Zone {
 impl Zone {
     /// Whether a user holding `user_cohorts` is a member of this zone.
     ///
-    /// A zone with empty `required_cohorts` requires no cohort (membership is
-    /// driven by visibility/auth elsewhere); admins are handled by the caller.
+    /// Mirrors the relay's read rule (`ZoneConfig::cohorts_can_read`): holding
+    /// any of `required_cohorts` makes a member, and a zone with no required
+    /// cohorts has members only when it is `Public` (an empty list on a
+    /// `Locked` or `Hidden` zone means admins only). Admins are handled by the
+    /// caller.
     pub fn is_member(&self, user_cohorts: &[String]) -> bool {
         if self.required_cohorts.is_empty() {
-            return true;
+            return self.visibility == ZoneVisibility::Public;
         }
         self.required_cohorts
             .iter()
@@ -307,6 +316,59 @@ pub fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
     zones.first().map(|z| z.id.clone())
 }
 
+/// The zone that pins `channel_id` through its `channels` list (ADR-2037),
+/// or `None` when no zone does.
+///
+/// Ids compare case-insensitively and entries that are not 64 hex digits are
+/// skipped, as the relay does. Config validation refuses a channel pinned by
+/// two zones; should a config do it anyway, the first such zone in config
+/// order is returned here, while the relay refuses every read and write of
+/// the channel, so the result is still never more open than the relay.
+pub fn pinned_zone_for<'a>(channel_id: &str, zones: &'a [Zone]) -> Option<&'a Zone> {
+    zones.iter().find(|z| {
+        z.channels.iter().map(|c| c.trim()).any(|c| {
+            c.len() == 64
+                && c.bytes().all(|b| b.is_ascii_hexdigit())
+                && c.eq_ignore_ascii_case(channel_id)
+        })
+    })
+}
+
+/// The section a channel is routed by: the raw signed `section` tag, unless a
+/// zone pins the channel (ADR-2037) and the tag does not already name that
+/// zone, in which case the pinning zone's id.
+///
+/// Every resolver ([`section_to_zone`], [`zone_id_for_section`],
+/// [`media_target_for_section`], the forum index, search and the BBS views)
+/// reads `ChannelMeta::section`, which holds this value, so they all follow a
+/// pin with no change of their own. The pinned zone's id is used verbatim so
+/// it resolves by exact match, never by a prefix that another zone might
+/// share. With no pins this is `section_tag` unchanged.
+pub fn effective_section(channel_id: &str, section_tag: &str, zones: &[Zone]) -> String {
+    match pinned_zone_for(channel_id, zones) {
+        Some(z) if zone_id_for_section(section_tag, zones).as_deref() != Some(z.id.as_str()) => {
+            z.id.clone()
+        }
+        _ => section_tag.to_string(),
+    }
+}
+
+/// The zone the admin "Bind to zone" action (and bind-on-create) would write
+/// to the relay's `channel_zones` for a channel, or `None` when there is
+/// nothing to bind.
+///
+/// A pinned channel (ADR-2037) is never bound: the pin already decides its
+/// zone on the relay, and a `channel_zones` row written now would outlive the
+/// pin, so removing the pin later would not hand the channel back to the zone
+/// its tag names. An unpinned channel binds to the zone its signed `section`
+/// tag names strictly ([`zone_id_for_section`]).
+pub fn bind_zone_for(channel_id: &str, section_tag: &str, zones: &[Zone]) -> Option<String> {
+    if pinned_zone_for(channel_id, zones).is_some() {
+        return None;
+    }
+    zone_id_for_section(section_tag, zones)
+}
+
 /// Pod container for images attached in a channel with this `section`: the
 /// strict zone ([`zone_id_for_section`]) when the deployment declares zones,
 /// `Unzoned` (upload refused) when it declares zones but the section names
@@ -412,6 +474,7 @@ fn fallback_zones() -> Vec<Zone> {
             section_order: Vec::new(),
             kanban: false,
             search: None,
+            channels: Vec::new(),
         },
         Zone {
             id: "friends".to_string(),
@@ -428,6 +491,7 @@ fn fallback_zones() -> Vec<Zone> {
             section_order: Vec::new(),
             kanban: false,
             search: None,
+            channels: Vec::new(),
         },
         Zone {
             id: "family".to_string(),
@@ -444,6 +508,7 @@ fn fallback_zones() -> Vec<Zone> {
             section_order: Vec::new(),
             kanban: false,
             search: None,
+            channels: Vec::new(),
         },
         Zone {
             id: "business".to_string(),
@@ -460,6 +525,7 @@ fn fallback_zones() -> Vec<Zone> {
             section_order: Vec::new(),
             kanban: false,
             search: None,
+            channels: Vec::new(),
         },
     ]
 }
@@ -518,6 +584,7 @@ mod tests {
             section_order: Vec::new(),
             kanban: false,
             search: None,
+            channels: Vec::new(),
         }
     }
 
@@ -722,5 +789,186 @@ mod tests {
         assert!(!section_routes_to_zone("friends-music", "welcome", &zones));
         assert!(section_routes_to_zone("anything", "", &zones));
         assert!(!section_routes_to_zone("public-intros", "nope", &zones));
+    }
+
+    // -- ADR-2037 channel pins and the empty-cohort rule --------------------
+
+    const PIN: &str = "9999999999999999999999999999999999999999999999999999999999999999";
+    const LOOSE: &str = "8888888888888888888888888888888888888888888888888888888888888888";
+
+    /// "open" is the zone the channel's tag names; "staff" pins it.
+    fn pinned_zones() -> Vec<Zone> {
+        vec![
+            Zone {
+                required_cohorts: vec!["members".into()],
+                visibility: ZoneVisibility::Locked,
+                encrypted: true,
+                ..zone("open")
+            },
+            Zone {
+                visibility: ZoneVisibility::Hidden,
+                encrypted: true,
+                channels: vec![PIN.to_string()],
+                ..zone("staff")
+            },
+        ]
+    }
+
+    #[test]
+    fn channels_deserialise_and_default_to_empty() {
+        let zones: Vec<Zone> = serde_json::from_str(&format!(
+            r#"[{{"id":"open"}},{{"id":"staff","channels":["{PIN}"]}}]"#
+        ))
+        .unwrap();
+        assert!(zones[0].channels.is_empty());
+        assert_eq!(zones[1].channels, vec![PIN.to_string()]);
+    }
+
+    #[test]
+    fn pinned_zone_for_matches_like_the_relay() {
+        let zones = pinned_zones();
+        assert_eq!(
+            pinned_zone_for(PIN, &zones).map(|z| z.id.as_str()),
+            Some("staff")
+        );
+        assert_eq!(
+            pinned_zone_for(&PIN.to_uppercase(), &zones).map(|z| z.id.as_str()),
+            Some("staff")
+        );
+        assert!(pinned_zone_for(LOOSE, &zones).is_none());
+        let junk = vec![Zone {
+            channels: vec!["abc".into(), "zz".repeat(32)],
+            ..zone("x")
+        }];
+        assert!(pinned_zone_for("abc", &junk).is_none());
+        assert!(pinned_zone_for(&"zz".repeat(32), &junk).is_none());
+        // A (validation-refused) double pin: the first zone in config order.
+        let doubled = vec![
+            Zone {
+                channels: vec![PIN.into()],
+                ..zone("a")
+            },
+            Zone {
+                channels: vec![PIN.into()],
+                ..zone("b")
+            },
+        ];
+        assert_eq!(
+            pinned_zone_for(PIN, &doubled).map(|z| z.id.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn effective_section_is_the_pinned_zone_for_a_pinned_channel() {
+        let zones = pinned_zones();
+        assert_eq!(effective_section(PIN, "open-agents", &zones), "staff");
+        assert_eq!(effective_section(PIN, "", &zones), "staff");
+        assert_eq!(effective_section(PIN, "legacy-lobby", &zones), "staff");
+        // A tag that already names the pinned zone is kept as it is.
+        assert_eq!(effective_section(PIN, "staff-notes", &zones), "staff-notes");
+        // An unpinned channel keeps its tag.
+        assert_eq!(
+            effective_section(LOOSE, "open-agents", &zones),
+            "open-agents"
+        );
+        // Every resolver then lands on the pinned zone.
+        let routed = effective_section(PIN, "open-agents", &zones);
+        assert_eq!(section_to_zone(&routed, &zones).as_deref(), Some("staff"));
+        assert_eq!(
+            zone_id_for_section(&routed, &zones).as_deref(),
+            Some("staff")
+        );
+        assert!(section_routes_to_zone(&routed, "staff", &zones));
+        assert!(!section_routes_to_zone(&routed, "open", &zones));
+    }
+
+    #[test]
+    fn with_no_pins_effective_section_is_the_tag() {
+        let zones = sample_zones();
+        for tag in ["family-events", "", "Family", "stray", "BUSINESS-Deals"] {
+            assert_eq!(effective_section(PIN, tag, &zones), tag);
+        }
+        assert_eq!(
+            effective_section(PIN, "family-events", &[]),
+            "family-events"
+        );
+    }
+
+    #[test]
+    fn bind_never_targets_a_pinned_channel() {
+        let zones = pinned_zones();
+        // The pinned channel's tag names "open"; binding it there would undo
+        // the pin's effect once the pin is removed, so nothing is bound.
+        assert_eq!(bind_zone_for(PIN, "open-agents", &zones), None);
+        assert_eq!(
+            bind_zone_for(LOOSE, "open-agents", &zones).as_deref(),
+            Some("open")
+        );
+        assert_eq!(bind_zone_for(LOOSE, "legacy-lobby", &zones), None);
+        // No pins: exactly the strict resolver, as before.
+        let plain = sample_zones();
+        for tag in ["family-events", "home-lobby", "Business"] {
+            assert_eq!(
+                bind_zone_for(PIN, tag, &plain),
+                zone_id_for_section(tag, &plain)
+            );
+        }
+    }
+
+    #[test]
+    fn the_key_for_a_pinned_channel_is_the_pinned_zone_key() {
+        let zones = pinned_zones();
+        let routed = effective_section(PIN, "open-agents", &zones);
+        let zone = crate::zone_crypto::store::zone_for_channel_section(&routed, &zones).unwrap();
+        assert_eq!(zone.id, "staff");
+        assert!(zone.encrypted);
+        // Without the pin the same channel uses the zone its tag names.
+        let unpinned: Vec<Zone> = pinned_zones()
+            .into_iter()
+            .map(|z| Zone {
+                channels: Vec::new(),
+                ..z
+            })
+            .collect();
+        let routed = effective_section(PIN, "open-agents", &unpinned);
+        let zone = crate::zone_crypto::store::zone_for_channel_section(&routed, &unpinned).unwrap();
+        assert_eq!(zone.id, "open");
+    }
+
+    #[test]
+    fn empty_cohorts_mean_open_only_on_a_public_zone() {
+        let none: Vec<String> = vec![];
+        let some = vec!["members".to_string()];
+        // A public zone with no cohorts (a welcome zone) stays open to all.
+        let public = zone("welcome");
+        assert!(public.is_member(&none));
+        assert!(public.is_member(&some));
+        // Locked or hidden with no cohorts: admins only, as on the relay.
+        for vis in [ZoneVisibility::Locked, ZoneVisibility::Hidden] {
+            let z = Zone {
+                visibility: vis,
+                ..zone("staff")
+            };
+            assert!(!z.is_member(&none), "{vis:?}");
+            assert!(!z.is_member(&some), "{vis:?}");
+        }
+        // Zones with cohorts are unchanged, whatever their visibility.
+        for vis in [
+            ZoneVisibility::Public,
+            ZoneVisibility::Locked,
+            ZoneVisibility::Hidden,
+        ] {
+            let z = Zone {
+                visibility: vis,
+                required_cohorts: vec!["members".into()],
+                ..zone("open")
+            };
+            assert!(z.is_member(&some));
+            assert!(!z.is_member(&none));
+        }
+        // The built-in fallback list keeps its open public zone.
+        let fallback = fallback_zones();
+        assert!(fallback[0].is_member(&none));
     }
 }

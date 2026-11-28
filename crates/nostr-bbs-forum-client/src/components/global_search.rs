@@ -1163,6 +1163,7 @@ mod tests {
             name: name.into(),
             description: format!("about {name}"),
             section: section.into(),
+            section_tag: section.into(),
             picture: String::new(),
             created_at: 0,
         }
